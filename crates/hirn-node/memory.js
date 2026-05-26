@@ -128,7 +128,7 @@ function isAlreadyRegisteredError(error) {
  *
  * @example
  * ```js
- * const { Memory } = require('hirn');
+ * const { Memory } = require('@hupe1980/hirn');
  *
  * const mem = Memory.open('./brain.hirn');
  * try {

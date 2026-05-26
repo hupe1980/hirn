@@ -1,5 +1,5 @@
 {
-  "name": "hirn",
+  "name": "@hupe1980/hirn",
   "version": "0.1.0",
   "description": "Node.js bindings for the hirn cognitive memory database",
   "main": "index.js",
@@ -24,7 +24,10 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/hupe1980/hirn"
+    "url": "git+https://github.com/hupe1980/hirn.git"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "files": [
     "index.js",

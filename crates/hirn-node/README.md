@@ -7,7 +7,7 @@ Brain-inspired cognitive memory database for LLMs. Native Rust performance via n
 ## Installation
 
 ```bash
-npm install hirn
+npm install @hupe1980/hirn
 ```
 
 ## Quick Start
@@ -15,7 +15,7 @@ npm install hirn
 ### Level 1: Zero-Config API
 
 ```js
-const { Memory } = require('hirn');
+const { Memory } = require('@hupe1980/hirn');
 
 // Auto-detects embeddings from OPENAI_API_KEY or OLLAMA_HOST
 const mem = Memory.open('./brain.hirn');
@@ -39,7 +39,7 @@ try {
 ### Historical Recall
 
 ```js
-const { Memory } = require('hirn');
+const { Memory } = require('@hupe1980/hirn');
 
 const mem = Memory.open('./brain.hirn');
 
@@ -71,7 +71,7 @@ snapshots.
 High-level semantic editing is available directly on `Memory`.
 
 ```js
-const { Memory } = require('hirn');
+const { Memory } = require('@hupe1980/hirn');
 
 const mem = Memory.open('./brain.hirn');
 
@@ -102,7 +102,7 @@ mem.close();
 ### Level 1: ESM Import
 
 ```js
-import { Memory } from 'hirn';
+import { Memory } from '@hupe1980/hirn';
 
 const mem = Memory.open('./brain.hirn');
 // ...
@@ -137,7 +137,7 @@ mem.close();
 ### Rust Tokenizer Selection
 
 ```js
-const { Memory } = require('hirn');
+const { Memory } = require('@hupe1980/hirn');
 
 const mem = Memory.open('./brain.hirn', { tokenizerName: 'estimating' });
 ```
@@ -188,7 +188,7 @@ mem.close();
 ### Explicit
 
 ```js
-const { Memory, OpenAIEmbeddings, OllamaEmbeddings, FakeEmbeddings } = require('hirn');
+const { Memory, OpenAIEmbeddings, OllamaEmbeddings, FakeEmbeddings } = require('@hupe1980/hirn');
 
 // OpenAI
 const mem = Memory.open('./brain.hirn', {
@@ -250,7 +250,7 @@ try {
 Full TypeScript declarations (`.d.ts`) included. All types auto-complete in VS Code.
 
 ```ts
-import { Memory, Stats, RecallResult, Context, EmbeddingFunction } from 'hirn';
+import { Memory, Stats, RecallResult, Context, EmbeddingFunction } from '@hupe1980/hirn';
 ```
 
 ## Platform Support

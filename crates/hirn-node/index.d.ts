@@ -131,7 +131,7 @@ export class WatchStream {
  *
  * @example
  * ```ts
- * import { Memory } from 'hirn';
+ * import { Memory } from '@hupe1980/hirn';
  *
  * const mem = Memory.open('./brain.hirn');
  * try {
@@ -145,7 +145,7 @@ export class WatchStream {
  *
  * With explicit embeddings:
  * ```ts
- * import { Memory, OpenAIEmbeddings } from 'hirn';
+ * import { Memory, OpenAIEmbeddings } from '@hupe1980/hirn';
  *
  * const mem = Memory.open('./brain.hirn', {
  *   embeddings: new OpenAIEmbeddings(),
