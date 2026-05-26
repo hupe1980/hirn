@@ -1,0 +1,78 @@
+[package]
+name = "hirn"
+description = "A cognitive memory database engine for LLM systems — the brain an LLM never had"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme = "README.md"
+keywords = ["llm", "memory", "cognitive", "database", "ai"]
+categories = ["database", "science"]
+
+[dependencies]
+hirn-core = { workspace = true }
+hirn-engine = { workspace = true }
+hirn-storage = { workspace = true }
+hirn-provider = { workspace = true }
+toml = { workspace = true }
+
+[features]
+default = ["tiktoken"]
+tiktoken = ["hirn-engine/tiktoken", "hirn-provider/tiktoken"]
+openai = ["hirn-engine/openai"]
+ollama = ["hirn-engine/ollama"]
+cohere = ["hirn-engine/cohere"]
+anthropic = ["hirn-engine/anthropic"]
+voyage = ["hirn-engine/voyage"]
+hf-tokenizer = ["hirn-engine/hf-tokenizer"]
+
+[dev-dependencies]
+hirn-storage = { workspace = true }
+tempfile = { workspace = true }
+serde_json = { workspace = true }
+image = { workspace = true }
+native-tls = "0.2"
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true
+
+[[example]]
+name = "basic_usage"
+path = "../../examples/basic_usage.rs"
+
+[[example]]
+name = "consolidation"
+path = "../../examples/consolidation.rs"
+
+[[example]]
+name = "graph_and_activation"
+path = "../../examples/graph_and_activation.rs"
+
+[[example]]
+name = "hirnql"
+path = "../../examples/hirnql.rs"
+
+[[example]]
+name = "multi_agent"
+path = "../../examples/multi_agent.rs"
+
+[[example]]
+name = "openai_embeddings"
+path = "../../examples/openai_embeddings.rs"
+
+[[example]]
+name = "personal_assistant"
+path = "../../examples/personal_assistant.rs"
+
+[[example]]
+name = "multi_agent_acl"
+path = "../../examples/multi_agent_acl.rs"
+
+[[example]]
+name = "enterprise_rag_cedar"
+path = "../../examples/enterprise_rag_cedar.rs"
+
+[[example]]
+name = "resource_memory"
+path = "../../examples/resource_memory.rs"

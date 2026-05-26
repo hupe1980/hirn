@@ -1,0 +1,52 @@
+[package]
+name = "hirn-provider"
+description = "Unified embedding + LLM providers for the hirn cognitive memory database"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hirn-core = { workspace = true }
+hirn-storage = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+secrecy = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+metrics = { workspace = true }
+tiktoken-rs = { workspace = true, optional = true }
+getrandom = "0.3"
+
+# Optional: remote API providers
+reqwest = { version = "0.12", features = ["json", "stream"], optional = true }
+
+# Optional: local cross-encoder reranking via ONNX Runtime
+ort = { workspace = true, optional = true }
+ndarray = { workspace = true, optional = true }
+hf-hub = { workspace = true, optional = true }
+tokenizers = { workspace = true, optional = true }
+
+[features]
+default = []
+tiktoken = ["dep:tiktoken-rs"]
+openai = ["dep:reqwest"]
+ollama = ["dep:reqwest"]
+cohere = ["dep:reqwest"]
+voyage = ["dep:reqwest"]
+anthropic = ["dep:reqwest"]
+hf-tokenizer = ["dep:hf-hub", "dep:tokenizers"]
+cross-encoder = ["dep:ort", "dep:ndarray", "dep:hf-hub", "dep:tokenizers"]
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true }
+metrics-util = { workspace = true }
+
+[lints]
+workspace = true

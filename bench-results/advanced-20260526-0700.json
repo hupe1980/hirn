@@ -1,0 +1,373 @@
+{
+  "run_id": "01KSHAXV2N3S0TGKKN3MBQGNXC",
+  "metadata": {
+    "generated_at_rfc3339": "2026-05-26T05:08:13.319984+00:00",
+    "runs": 3,
+    "offline_wait_ms": 5000,
+    "repro_threshold": 0.15,
+    "environment": {
+      "label": "release-20260526",
+      "os": "macos",
+      "arch": "aarch64",
+      "logical_cpus": 14,
+      "git_commit_sha": "2b0787f12360e43a0e77e2651445bf47bac3860b",
+      "cargo_lock_blake3": "c6ddbe1cb1bcc0178f4b200f3bf8d70d8a59da909f943a0f942812a765dc384d"
+    }
+  },
+  "results": [
+    {
+      "benchmark": "explanation-quality",
+      "strategy": "hirn-advanced",
+      "run_id": "01KSHAXV2N3S0TGKKN3MBQGNXC",
+      "quality": {
+        "primary_score": 0.9791666666666666,
+        "precision": 0.9523809523809524,
+        "recall": 1.0,
+        "accuracy": 1.0,
+        "usefulness": 0.9642857142857143
+      },
+      "latency": {
+        "p50": 8958.972000000002,
+        "p95": 19761.709,
+        "p99": 19761.709,
+        "min": 6109.361,
+        "max": 19761.709,
+        "mean": 11610.014
+      },
+      "cost": {
+        "context_tokens": 78,
+        "prompt_tokens": 11,
+        "completion_tokens": 0,
+        "total_tokens": 83,
+        "estimated_spend_usd": 0.0
+      },
+      "total_cases": 3,
+      "total_time_secs": 0.06280740266666668,
+      "reproducibility": {
+        "runs": 3,
+        "threshold": 0.15,
+        "materially_similar": true,
+        "max_relative_delta": 0.04350490196078431,
+        "mean_relative_delta": 0.006692331618410867,
+        "metrics": [
+          {
+            "metric": "primary_score",
+            "max_relative_delta": 0.0,
+            "mean_relative_delta": 0.0
+          },
+          {
+            "metric": "precision",
+            "max_relative_delta": 0.0,
+            "mean_relative_delta": 0.0
+          },
+          {
+            "metric": "recall",
+            "max_relative_delta": 0.0,
+            "mean_relative_delta": 0.0
+          },
+          {
+            "metric": "accuracy",
+            "max_relative_delta": 0.0,
+            "mean_relative_delta": 0.0
+          },
+          {
+            "metric": "usefulness",
+            "max_relative_delta": 0.0,
+            "mean_relative_delta": 0.0
+          },
+          {
+            "metric": "latency_p50_us",
+            "max_relative_delta": 0.04350490196078431,
+            "mean_relative_delta": 0.0361156318082789
+          },
+          {
+            "metric": "latency_p95_us",
+            "max_relative_delta": 0.029022688909889974,
+            "mean_relative_delta": 0.015403842187914886
+          },
+          {
+            "metric": "latency_p99_us",
+            "max_relative_delta": 0.029022688909889974,
+            "mean_relative_delta": 0.015403842187914886
+          },
+          {
+            "metric": "total_tokens",
+            "max_relative_delta": 0.0,
+            "mean_relative_delta": 0.0
+          },
+          {
+            "metric": "estimated_spend_usd",
+            "max_relative_delta": 0.0,
+            "mean_relative_delta": 0.0
+          }
+        ]
+      }
+    },
+    {
+      "benchmark": "dream-hypothesis",
+      "strategy": "hirn-advanced",
+      "run_id": "01KSHAXV2N3S0TGKKN3MBQGNXC",
+      "quality": {
+        "primary_score": 0.9742656238377094,
+        "precision": 1.0,
+        "recall": 1.0,
+        "accuracy": 1.0,
+        "usefulness": 0.8970624953508377
+      },
+      "latency": {
+        "p50": 12878.306,
+        "p95": 12878.306,
+        "p99": 12878.306,
+        "min": 12878.306,
+        "max": 12878.306,
+        "mean": 12878.306
+      },
+      "cost": {
+        "context_tokens": 17,
+        "prompt_tokens": 150,
+        "completion_tokens": 47,
+        "total_tokens": 214,
+        "estimated_spend_usd": 0.0
+      },
+      "total_cases": 1,
+      "total_time_secs": 0.012878305666666666,
+      "reproducibility": {
+        "runs": 3,
+        "threshold": 0.15,
+        "materially_similar": true,
+        "max_relative_delta": 0.023684099944809283,
+        "mean_relative_delta": 0.0036200950393890006,
+        "metrics": [
+          {
+            "metric": "primary_score",
+            "max_relative_delta": 0.0,
+            "mean_relative_delta": 0.0
+          },
+          {
+            "metric": "precision",
+            "max_relative_delta": 0.0,
+            "mean_relative_delta": 0.0
+          },
+          {
+            "metric": "recall",
+            "max_relative_delta": 0.0,
+            "mean_relative_delta": 0.0
+          },
+          {
+            "metric": "accuracy",
+            "max_relative_delta": 0.0,
+            "mean_relative_delta": 0.0
+          },
+          {
+            "metric": "usefulness",
+            "max_relative_delta": 0.0,
+            "mean_relative_delta": 0.0
+          },
+          {
+            "metric": "latency_p50_us",
+            "max_relative_delta": 0.023684099944809283,
+            "mean_relative_delta": 0.012066983464630003
+          },
+          {
+            "metric": "latency_p95_us",
+            "max_relative_delta": 0.023684099944809283,
+            "mean_relative_delta": 0.012066983464630003
+          },
+          {
+            "metric": "latency_p99_us",
+            "max_relative_delta": 0.023684099944809283,
+            "mean_relative_delta": 0.012066983464630003
+          },
+          {
+            "metric": "total_tokens",
+            "max_relative_delta": 0.0,
+            "mean_relative_delta": 0.0
+          },
+          {
+            "metric": "estimated_spend_usd",
+            "max_relative_delta": 0.0,
+            "mean_relative_delta": 0.0
+          }
+        ]
+      }
+    },
+    {
+      "benchmark": "reconcile-accuracy",
+      "strategy": "hirn-advanced",
+      "run_id": "01KSHAXV2N3S0TGKKN3MBQGNXC",
+      "quality": {
+        "primary_score": 1.0,
+        "precision": 1.0,
+        "recall": 1.0,
+        "accuracy": 1.0,
+        "usefulness": 1.0
+      },
+      "latency": {
+        "p50": 13261.056,
+        "p95": 13261.056,
+        "p99": 13261.056,
+        "min": 13261.056,
+        "max": 13261.056,
+        "mean": 13261.056
+      },
+      "cost": {
+        "context_tokens": 14,
+        "prompt_tokens": 0,
+        "completion_tokens": 300,
+        "total_tokens": 314,
+        "estimated_spend_usd": 0.0
+      },
+      "total_cases": 1,
+      "total_time_secs": 0.013261055666666665,
+      "reproducibility": {
+        "runs": 3,
+        "threshold": 0.15,
+        "materially_similar": true,
+        "max_relative_delta": 0.025396825396825397,
+        "mean_relative_delta": 0.007769537178841215,
+        "metrics": [
+          {
+            "metric": "primary_score",
+            "max_relative_delta": 0.0,
+            "mean_relative_delta": 0.0
+          },
+          {
+            "metric": "precision",
+            "max_relative_delta": 0.0,
+            "mean_relative_delta": 0.0
+          },
+          {
+            "metric": "recall",
+            "max_relative_delta": 0.0,
+            "mean_relative_delta": 0.0
+          },
+          {
+            "metric": "accuracy",
+            "max_relative_delta": 0.0,
+            "mean_relative_delta": 0.0
+          },
+          {
+            "metric": "usefulness",
+            "max_relative_delta": 0.0,
+            "mean_relative_delta": 0.0
+          },
+          {
+            "metric": "latency_p50_us",
+            "max_relative_delta": 0.022343351344174325,
+            "mean_relative_delta": 0.0195492509135977
+          },
+          {
+            "metric": "latency_p95_us",
+            "max_relative_delta": 0.022343351344174325,
+            "mean_relative_delta": 0.0195492509135977
+          },
+          {
+            "metric": "latency_p99_us",
+            "max_relative_delta": 0.022343351344174325,
+            "mean_relative_delta": 0.0195492509135977
+          },
+          {
+            "metric": "total_tokens",
+            "max_relative_delta": 0.025396825396825397,
+            "mean_relative_delta": 0.01904761904761905
+          },
+          {
+            "metric": "estimated_spend_usd",
+            "max_relative_delta": 0.0,
+            "mean_relative_delta": 0.0
+          }
+        ]
+      }
+    },
+    {
+      "benchmark": "planning-usefulness",
+      "strategy": "hirn-advanced",
+      "run_id": "01KSHAXV2N3S0TGKKN3MBQGNXC",
+      "quality": {
+        "primary_score": 0.99609375,
+        "precision": 1.0,
+        "recall": 1.0,
+        "accuracy": 1.0,
+        "usefulness": 0.984375
+      },
+      "latency": {
+        "p50": 12939.736,
+        "p95": 12939.736,
+        "p99": 12939.736,
+        "min": 12939.736,
+        "max": 12939.736,
+        "mean": 12939.736
+      },
+      "cost": {
+        "context_tokens": 43,
+        "prompt_tokens": 0,
+        "completion_tokens": 1085,
+        "total_tokens": 1128,
+        "estimated_spend_usd": 0.0
+      },
+      "total_cases": 1,
+      "total_time_secs": 0.012939735666666667,
+      "reproducibility": {
+        "runs": 3,
+        "threshold": 0.15,
+        "materially_similar": true,
+        "max_relative_delta": 0.028906955736224028,
+        "mean_relative_delta": 0.007212291525252099,
+        "metrics": [
+          {
+            "metric": "primary_score",
+            "max_relative_delta": 0.0,
+            "mean_relative_delta": 0.0
+          },
+          {
+            "metric": "precision",
+            "max_relative_delta": 0.0,
+            "mean_relative_delta": 0.0
+          },
+          {
+            "metric": "recall",
+            "max_relative_delta": 0.0,
+            "mean_relative_delta": 0.0
+          },
+          {
+            "metric": "accuracy",
+            "max_relative_delta": 0.0,
+            "mean_relative_delta": 0.0
+          },
+          {
+            "metric": "usefulness",
+            "max_relative_delta": 0.0,
+            "mean_relative_delta": 0.0
+          },
+          {
+            "metric": "latency_p50_us",
+            "max_relative_delta": 0.026724947662524732,
+            "mean_relative_delta": 0.014405319838765652
+          },
+          {
+            "metric": "latency_p95_us",
+            "max_relative_delta": 0.026724947662524732,
+            "mean_relative_delta": 0.014405319838765652
+          },
+          {
+            "metric": "latency_p99_us",
+            "max_relative_delta": 0.026724947662524732,
+            "mean_relative_delta": 0.014405319838765652
+          },
+          {
+            "metric": "total_tokens",
+            "max_relative_delta": 0.028906955736224028,
+            "mean_relative_delta": 0.028906955736224028
+          },
+          {
+            "metric": "estimated_spend_usd",
+            "max_relative_delta": 0.0,
+            "mean_relative_delta": 0.0
+          }
+        ]
+      }
+    }
+  ],
+  "total_time_secs": 1.8514440410000002,
+  "overall_primary_score": 0.987381510126094
+}

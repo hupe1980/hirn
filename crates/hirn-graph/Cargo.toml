@@ -1,0 +1,27 @@
+[package]
+name = "hirn-graph"
+description = "Property graph, spreading activation, and Hebbian learning for hirn"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hirn-core = { workspace = true }
+petgraph = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+tracing = { workspace = true }
+crossbeam-queue = { workspace = true }
+
+[dev-dependencies]
+bincode = { workspace = true }
+criterion = { workspace = true }
+proptest = { workspace = true }
+
+[[bench]]
+name = "graph_ops"
+harness = false
+
+[lints]
+workspace = true

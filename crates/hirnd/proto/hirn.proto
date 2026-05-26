@@ -1,0 +1,968 @@
+syntax = "proto3";
+
+package hirn.v1;
+
+// ─── Core Identity ───────────────────────────────────────────
+
+// Universally unique identifier for a memory record or graph edge.
+// Internally a ULID providing both uniqueness and temporal ordering.
+message MemoryId {
+  string value = 1;
+  reserved 2 to 10;
+}
+
+// High-resolution timestamp (seconds + nanoseconds since Unix epoch).
+message Timestamp {
+  int64 seconds = 1;
+  int32 nanos = 2;
+  reserved 3 to 10;
+}
+
+// ─── Enums ───────────────────────────────────────────────────
+
+// The three memory layers modeled after human cognitive architecture.
+enum Layer {
+  LAYER_UNSPECIFIED = 0;
+  LAYER_WORKING = 1;   // Short-lived scratch-pad entries (focus/defocus).
+  LAYER_EPISODIC = 2;  // Timestamped event records ("what happened").
+  LAYER_SEMANTIC = 3;  // Distilled concepts and knowledge ("what is known").
+  LAYER_PROCEDURAL = 4; // Learned procedures and action sequences ("how to do it").
+}
+
+// Classification of an episodic event.
+enum EventType {
+  EVENT_TYPE_UNSPECIFIED = 0;
+  EVENT_TYPE_CONVERSATION = 1;  // User ↔ agent dialogue turn.
+  EVENT_TYPE_TOOL_CALL = 2;     // Invocation of an external tool or API.
+  EVENT_TYPE_OBSERVATION = 3;   // Passive observation or sensor reading.
+  EVENT_TYPE_EXPERIMENT = 4;    // Deliberate experimental action.
+  EVENT_TYPE_ERROR = 5;         // Error or failure event.
+  EVENT_TYPE_DECISION = 6;      // Explicit agent decision point.
+}
+
+// Urgency level for working-memory entries.
+enum Priority {
+  PRIORITY_UNSPECIFIED = 0;
+  PRIORITY_NORMAL = 1;
+  PRIORITY_HIGH = 2;
+  PRIORITY_CRITICAL = 3;
+}
+
+// Ontological category for a semantic concept.
+enum KnowledgeType {
+  KNOWLEDGE_TYPE_UNSPECIFIED = 0;
+  KNOWLEDGE_TYPE_PROPOSITIONAL = 1;  // Declarative fact ("X is Y").
+  KNOWLEDGE_TYPE_PRESCRIPTIVE = 2;   // Rule or guideline ("always do X").
+  KNOWLEDGE_TYPE_TAXONOMIC = 3;      // Category or hierarchy ("X is a kind of Y").
+}
+
+// How a record was created (provenance).
+enum Origin {
+  ORIGIN_UNSPECIFIED = 0;
+  ORIGIN_DIRECT_OBSERVATION = 1;  // Recorded from live input.
+  ORIGIN_LLM_EXTRACTION = 2;     // Extracted by an LLM from raw text.
+  ORIGIN_CONSOLIDATION = 3;      // Produced by the consolidation engine.
+  ORIGIN_USER_PROVIDED = 4;      // Explicitly provided by a human user.
+  ORIGIN_CROSS_AGENT = 5;        // Shared from another agent's namespace.
+}
+
+// Typed relationship between two memory nodes in the knowledge graph.
+enum EdgeRelation {
+  EDGE_RELATION_UNSPECIFIED = 0;
+  EDGE_RELATION_RELATED_TO = 1;
+  EDGE_RELATION_CAUSES = 2;
+  EDGE_RELATION_CAUSED_BY = 3;
+  EDGE_RELATION_DERIVED_FROM = 4;
+  EDGE_RELATION_CONTRADICTS = 5;
+  EDGE_RELATION_SUPPORTS = 6;
+  EDGE_RELATION_TEMPORAL_NEXT = 7;
+  EDGE_RELATION_PART_OF = 8;
+  EDGE_RELATION_INSTANCE_OF = 9;
+  EDGE_RELATION_SIMILAR_TO = 10;
+  EDGE_RELATION_INHIBITS = 11;
+  EDGE_RELATION_PARTICIPATES_IN = 12;
+}
+
+// Strategy for spreading activation across the knowledge graph.
+enum ActivationMode {
+  ACTIVATION_MODE_UNSPECIFIED = 0;
+  ACTIVATION_MODE_NONE = 1;      // Vector similarity only; no graph walk.
+  ACTIVATION_MODE_STATIC = 2;    // Fixed-weight activation from seed nodes.
+  ACTIVATION_MODE_SPREADING = 3; // Multi-hop spreading activation (default for Think).
+  ACTIVATION_MODE_PPR = 4;       // Personalized PageRank activation.
+}
+
+// Output format for the Think RPC assembled context.
+enum ContextFormat {
+  CONTEXT_FORMAT_UNSPECIFIED = 0;
+  CONTEXT_FORMAT_STRUCTURED = 1;  // Labeled sections (working / episodic / semantic).
+  CONTEXT_FORMAT_NARRATIVE = 2;   // Free-text prose.
+  CONTEXT_FORMAT_JSON = 3;        // Machine-readable JSON.
+}
+
+// Derived member state for grouped belief conflicts.
+enum ConflictMemberStatus {
+  CONFLICT_MEMBER_STATUS_UNSPECIFIED = 0;
+  CONFLICT_MEMBER_STATUS_ACTIVE = 1;
+  CONFLICT_MEMBER_STATUS_SUPERSEDED = 2;
+  CONFLICT_MEMBER_STATUS_RETRACTED = 3;
+  CONFLICT_MEMBER_STATUS_QUARANTINED = 4;
+  CONFLICT_MEMBER_STATUS_MERGED = 5;
+}
+
+// Derived arbitration state for grouped belief conflicts.
+enum ConflictArbitrationStatus {
+  CONFLICT_ARBITRATION_STATUS_UNSPECIFIED = 0;
+  CONFLICT_ARBITRATION_STATUS_UNRESOLVED = 1;
+  CONFLICT_ARBITRATION_STATUS_RESOLVED = 2;
+  CONFLICT_ARBITRATION_STATUS_QUARANTINED = 3;
+  CONFLICT_ARBITRATION_STATUS_SUPERSEDED = 4;
+}
+
+// Retention mode for the Forget RPC.
+enum ForgetMode {
+  FORGET_MODE_UNSPECIFIED = 0;
+  FORGET_MODE_ARCHIVE = 1;  // Soft-delete: mark as archived, exclude from recall.
+  FORGET_MODE_PURGE = 2;    // Hard-delete: permanently remove record and embeddings.
+}
+
+// ─── Metadata ────────────────────────────────────────────────
+
+// Dynamically-typed metadata value attached to records or edges.
+message MetadataValue {
+  oneof value {
+    bool bool_value = 1;
+    int64 int_value = 2;
+    double float_value = 3;
+    string string_value = 4;
+  }
+  reserved 5 to 10;
+}
+
+// Reference to a named entity involved in an episodic event.
+message EntityRef {
+  string name = 1;            // Entity name (e.g. "production-server", "Alice").
+  string role = 2;            // Role in the event (e.g. "actor", "target", "subject").
+  optional MemoryId entity_id = 3;  // Optional link to a semantic concept representing this entity.
+  reserved 4 to 10;
+}
+
+// Weighted link from a semantic concept to a related concept.
+message ConceptEdge {
+  MemoryId target_id = 1;  // ID of the related semantic record.
+  string relation = 2;     // Free-text relation label.
+  float weight = 3;        // Association strength (0.0–1.0).
+  reserved 4 to 10;
+}
+
+// ─── Memory Records ──────────────────────────────────────────
+
+// A timestamped event record ("what happened") — the episodic layer.
+message EpisodicRecord {
+  MemoryId id = 1;              // Server-assigned unique identifier.
+  Timestamp timestamp = 2;     // When the event occurred.
+  EventType event_type = 3;    // Classification of the event.
+  string content = 4;          // Raw event content / description.
+  string summary = 5;          // Optional concise summary.
+  repeated EntityRef entities = 6;  // Entities involved in the event.
+  repeated float embedding = 7;    // Pre-computed embedding vector (768-dim default).
+  float importance = 8;        // Importance score (0.0–1.0).
+  float surprise = 9;          // Surprise / novelty score (0.0–1.0).
+  uint64 access_count = 10;    // Number of times this record has been recalled.
+  Timestamp last_accessed = 11;// When the record was last recalled.
+  string namespace = 12;       // Namespace this record belongs to.
+  bool archived = 13;          // Whether the record has been soft-deleted.
+  map<string, MetadataValue> metadata = 14; // Arbitrary key-value metadata.
+  reserved 15 to 20;
+}
+
+// A distilled concept ("what is known") — the semantic layer.
+message SemanticRecord {
+  MemoryId id = 1;
+  string concept = 2;                  // Concept name or short label.
+  KnowledgeType knowledge_type = 3;    // Kind of knowledge this represents.
+  string description = 4;              // Detailed description of the concept.
+  repeated float embedding = 5;        // Embedding vector for similarity search.
+  repeated ConceptEdge related_concepts = 6; // Links to related concepts.
+  float confidence = 7;                // Confidence level (0.0–1.0).
+  repeated MemoryId source_episodes = 8;    // Episodic records this concept was derived from.
+  uint32 evidence_count = 9;           // Number of supporting episodes.
+  repeated MemoryId contradiction_ids = 10; // IDs of contradicting records.
+  Timestamp created_at = 11;
+  Timestamp updated_at = 12;
+  uint64 access_count = 13;
+  uint32 version = 14;                 // Schema version for optimistic concurrency.
+  string namespace = 15;
+  reserved 16 to 20;
+}
+
+// A short-lived scratch-pad entry — the working memory layer.
+message WorkingMemoryEntry {
+  MemoryId id = 1;
+  string content = 2;                // Content of the working memory entry.
+  Timestamp created_at = 3;
+  Timestamp expires_at = 4;          // TTL: entry is evicted after this time.
+  float relevance_score = 5;         // Current relevance (decays over time).
+  uint32 token_count = 6;            // Approximate token count for budget tracking.
+  optional MemoryRef source = 7;     // Optional reference to the source memory.
+  Priority priority = 8;
+  string agent_id = 9;               // Agent that owns this working memory entry.
+  reserved 10 to 15;
+}
+
+// Polymorphic wrapper for any memory record type.
+message MemoryRef {
+  Layer layer = 1;    // Which layer the referenced record belongs to.
+  MemoryId id = 2;    // The record's unique identifier.
+  reserved 3 to 10;
+}
+
+// A step in a procedural action sequence.
+message ActionStep {
+  string description = 1;          // Human-readable description of the step.
+  string tool = 2;                 // Tool or function to invoke.
+  map<string, string> parameters = 3; // Parameters for the tool invocation.
+}
+
+// A learned procedure ("how to do it") — the procedural memory layer.
+message ProceduralRecord {
+  MemoryId id = 1;
+  string name = 2;                        // Short name of the procedure.
+  string description = 3;                 // Detailed description of what this procedure does.
+  repeated ActionStep steps = 4;          // Ordered sequence of action steps.
+  repeated string preconditions = 5;      // Conditions that must hold before execution.
+  repeated float embedding = 6;           // Embedding vector for similarity search.
+  uint64 success_count = 7;              // Number of successful invocations.
+  uint64 invocation_count = 8;           // Total number of invocations.
+  double success_rate = 9;               // success_count / invocation_count.
+  repeated MemoryId source_episodes = 10; // Episodic records this procedure was extracted from.
+  Timestamp created_at = 11;
+  Timestamp updated_at = 12;
+  Timestamp last_accessed = 13;
+  uint64 access_count = 14;
+  string namespace = 15;
+  bool archived = 16;
+  map<string, MetadataValue> metadata = 17;
+  reserved 18 to 25;
+}
+
+// Union type carrying one of the memory record types.
+message MemoryRecord {
+  oneof record {
+    WorkingMemoryEntry working = 1;
+    EpisodicRecord episodic = 2;
+    SemanticRecord semantic = 3;
+    ProceduralRecord procedural = 4;
+  }
+}
+
+// ─── Scoring ─────────────────────────────────────────────────
+
+// Client-specified weights for multi-signal scoring during recall/think.
+// Each weight is a multiplier (0.0 = ignore signal, 1.0 = full weight).
+message ScoringWeights {
+  float similarity = 1;        // Weight for vector similarity score.
+  float importance = 2;        // Weight for record importance.
+  float recency = 3;           // Weight for temporal recency.
+  float activation = 4;        // Weight for graph activation spread.
+  float causal_relevance = 5;  // Weight for causal-chain relevance.
+  float source_reliability = 6; // Weight for source reliability (provenance).
+  reserved 7 to 10;
+}
+
+// Per-signal breakdown of a record's composite score.
+message ScoreBreakdown {
+  float similarity = 1;
+  float importance = 2;
+  float recency = 3;
+  float activation = 4;
+  float causal_relevance = 5;
+  float surprise = 6;
+  float source_reliability = 7;
+  reserved 8 to 10;
+}
+
+// A memory record paired with its relevance scores.
+message ScoredMemory {
+  MemoryRecord record = 1;          // The memory record.
+  float score = 2;                  // Composite score (weighted sum).
+  ScoreBreakdown score_breakdown = 3; // Individual signal contributions.
+  optional RevisionRef revision = 11; // Revision identity for revision-native memories.
+  reserved 4 to 10;
+}
+
+// ─── Graph ───────────────────────────────────────────────────
+
+// A typed, weighted edge in the knowledge graph connecting two memory records.
+message GraphEdge {
+  MemoryId id = 1;       // Unique edge identifier.
+  MemoryId source = 2;   // Source node (record ID).
+  MemoryId target = 3;   // Target node (record ID).
+  EdgeRelation relation = 4;  // Semantic relationship type.
+  float weight = 5;      // Edge weight / strength (0.0–1.0).
+  uint64 co_retrieval_count = 6; // Times source and target were co-retrieved.
+  Timestamp created_at = 7;
+  Timestamp updated_at = 8;
+  map<string, MetadataValue> metadata = 9; // Arbitrary edge metadata.
+  optional string valid_from = 10;
+  optional string valid_until = 11;
+  reserved 12 to 15;
+}
+
+// Edge + neighboring node ID, returned by Inspect for graph context.
+message NeighborInfo {
+  GraphEdge edge = 1;
+  MemoryId neighbor_id = 2;
+  reserved 3 to 10;
+}
+
+message SemanticRevisionEntry {
+  MemoryId memory_id = 1;
+  string revision_id = 2;
+  uint32 version = 3;
+  string operation = 4;
+  string state = 5;
+  optional string reason = 6;
+  Timestamp created_at = 7;
+  optional MemoryId superseded_by = 8;
+}
+
+message SemanticRevisionSummary {
+  string logical_memory_id = 1;
+  string current_revision_id = 2;
+  string head_revision_id = 3;
+  string current_state = 4;
+  string logical_state = 5;
+  uint32 revision_count = 6;
+  repeated SemanticRevisionEntry revisions = 7;
+}
+
+message RevisionRef {
+  string logical_memory_id = 1;
+  string revision_id = 2;
+  string state = 3;
+}
+
+// ─── Request / Response Messages ─────────────────────────────
+
+// Remember — store a new memory record in any layer.
+message RememberRequest {
+  oneof record {
+    EpisodicRecord episodic = 1;  // Store an episodic event.
+    SemanticRecord semantic = 2;  // Store a semantic concept.
+    WorkingMemoryEntry working = 3; // Store a working memory entry.
+  }
+}
+
+message RememberResponse {
+  MemoryId id = 1;  // Server-assigned ID for the stored record.
+  Layer layer = 2;  // Which layer the record was stored in.
+}
+
+message RecallSnapshot {
+  oneof target {
+    Timestamp observed_at = 1;
+    Timestamp recorded_at = 2;
+    string revision_id = 3;
+  }
+}
+
+// Recall — retrieve memories by vector similarity with multi-signal scoring.
+message RecallRequest {
+  repeated float query_embedding = 1;  // Query vector for similarity search.
+  uint32 limit = 2;                    // Maximum number of results.
+  float threshold = 3;                 // Minimum similarity threshold (0.0–1.0).
+  optional Layer layer_filter = 4;     // Restrict to a specific layer.
+  optional string namespace = 5;       // Restrict to a specific namespace.
+  optional Timestamp after = 6;        // Only records after this time.
+  optional Timestamp before = 7;       // Only records before this time.
+  optional ScoringWeights weights = 8; // Custom scoring weights.
+  ActivationMode activation_mode = 9;  // Graph activation strategy.
+  uint32 activation_depth = 10;        // Max hops for spreading activation.
+  optional RecallSnapshot snapshot = 16; // Observed-time, recorded-time, or revision snapshot.
+  reserved 11 to 15;
+}
+
+// A single recall result with its scores.
+message RecallResult {
+  MemoryRecord record = 1;       // The matched memory record.
+  float similarity = 2;          // Raw vector similarity score.
+  float composite_score = 3;     // Weighted composite score.
+  optional RevisionRef revision = 11; // Revision identity for the returned memory.
+  optional ScoreBreakdown score_breakdown = 12; // Canonical per-factor score breakdown.
+  reserved 4 to 10;
+}
+
+message RecallResponse {
+  repeated RecallResult results = 1;
+}
+
+// Think — recall + assemble context within a token budget.
+message ThinkRequest {
+  repeated float query_embedding = 1;
+  uint32 limit = 2;
+  float threshold = 3;
+  optional Layer layer_filter = 4;
+  optional string namespace = 5;
+  optional Timestamp after = 6;
+  optional Timestamp before = 7;
+  optional ScoringWeights weights = 8;
+  ActivationMode activation_mode = 9;
+  uint32 activation_depth = 10;
+  uint32 budget = 11;          // Token budget for the assembled context.
+  ContextFormat format = 12;   // Output format (structured, narrative, JSON).
+  reserved 13 to 18;
+}
+
+message ThinkResponse {
+  string context = 1;                        // Assembled context string.
+  uint32 token_count = 2;                    // Tokens used (≤ budget).
+  repeated MemoryId records_included = 3;    // IDs of records included in context.
+  uint32 records_excluded_count = 4;         // Records that didn't fit in budget.
+  repeated ConflictPair contradictions = 5;  // Detected contradictions among included records.
+  double query_time_ms = 6;                  // Total query execution time.
+  ScoreDistribution score_distribution = 7;  // Score statistics for the result set.
+  reserved 8 to 12;
+  repeated ConflictGroup conflict_groups = 13;
+}
+
+// A pair of records that contradict each other.
+message ConflictPair {
+  MemoryId memory_a = 1;
+  MemoryId memory_b = 2;
+  string content_a = 3;
+  string content_b = 4;
+  float confidence = 5;
+  float source_reliability_a = 6;
+  float source_reliability_b = 7;
+}
+
+// A visible member of a grouped belief conflict.
+message ConflictMember {
+  MemoryId memory_id = 1;
+  optional string logical_memory_id = 2;
+  optional string revision_id = 3;
+  ConflictMemberStatus status = 4;
+  Layer layer = 5;
+  string content = 6;
+  bool in_result_set = 7;
+  float source_reliability = 8;
+}
+
+// A grouped belief conflict assembled from connected contradiction edges.
+message ConflictGroup {
+  string conflict_id = 1;
+  repeated ConflictMember members = 2;
+  uint32 omitted_member_count = 3;
+  uint32 pair_count = 4;
+  float confidence = 5;
+  uint32 evidence_count = 6;
+  float source_reliability = 7;
+  ConflictArbitrationStatus arbitration_status = 8;
+  optional MemoryId authoritative_memory_id = 9;
+  optional MemoryId preferred_memory_id = 10;
+}
+
+// Summary statistics for a result set's scores.
+message ScoreDistribution {
+  float min = 1;
+  float max = 2;
+  float mean = 3;
+  reserved 4 to 10;
+}
+
+// Forget — archive or permanently delete a memory record.
+message ForgetRequest {
+  MemoryId id = 1;     // Record to forget.
+  ForgetMode mode = 2;  // Archive (soft-delete) or purge (hard-delete).
+}
+
+message ForgetResponse {}
+
+// Focus — insert a working memory entry (scratch-pad).
+message FocusRequest {
+  WorkingMemoryEntry entry = 1;
+}
+
+message FocusResponse {
+  MemoryId id = 1;
+}
+
+// Defocus — remove a working memory entry.
+message DefocusRequest {
+  MemoryId id = 1;
+}
+
+message DefocusResponse {}
+
+// Connect — create a typed edge between two memory records.
+message ConnectRequest {
+  MemoryId source = 1;       // Source record.
+  MemoryId target = 2;       // Target record.
+  EdgeRelation relation = 3; // Relationship type.
+  float weight = 4;          // Edge weight (0.0–1.0).
+  map<string, MetadataValue> metadata = 5; // Optional edge metadata.
+}
+
+message ConnectResponse {
+  MemoryId edge_id = 1;  // ID of the created edge.
+}
+
+// UpdateMemory — modify an existing memory's content, metadata, or importance.
+message UpdateMemoryRequest {
+  MemoryId id = 1;                              // Memory to update (required).
+  optional string content = 2;                  // New content (replaces existing if set).
+  map<string, MetadataValue> metadata = 3;      // Metadata to merge (if non-empty).
+  optional float importance = 4;                // New importance score (0.0–1.0).
+}
+
+message UpdateMemoryResponse {
+  // Empty on success.
+}
+
+// ToolkitIntrospect — return database stats and optionally graph neighborhood.
+message ToolkitIntrospectRequest {
+  optional MemoryId id = 1;  // Optional memory ID for graph neighborhood.
+}
+
+message ToolkitIntrospectResponse {
+  uint64 total_memories = 1;
+  uint64 episodic_count = 2;
+  uint64 semantic_count = 3;
+  uint64 procedural_count = 4;
+  uint64 working_count = 5;
+  uint64 edge_count = 6;
+  repeated EdgeInfo edges = 7;  // Graph neighborhood (if id provided).
+}
+
+// Summary of a graph edge in introspection.
+message EdgeInfo {
+  MemoryId source = 1;
+  MemoryId target = 2;
+  EdgeRelation relation = 3;
+  float weight = 4;
+}
+
+// Inspect — retrieve full metadata and graph neighbors for a record.
+message InspectRequest {
+  MemoryId id = 1;
+}
+
+message InspectResponse {
+  MemoryRecord record = 1;            // The full record.
+  float importance = 2;               // Current importance score.
+  uint64 access_count = 3;            // Total recall count.
+  Timestamp last_accessed = 4;
+  repeated NeighborInfo neighbors = 5; // Graph neighbors and edges.
+  float trust_score = 6;              // Provenance trust score (0.0–1.0).
+  optional SemanticRevisionSummary semantic_revision = 13;
+  repeated ConflictGroup conflict_groups = 14;
+  reserved 7 to 12;
+}
+
+// Trace — retrieve provenance and lineage for a memory record.
+message TraceRequest {
+  MemoryId id = 1;
+}
+
+message TraceResponse {
+  MemoryRecord record = 1;                  // The record being traced.
+  repeated MemoryId source_episodes = 2;    // Episodic records that sourced this concept.
+  repeated MemoryId derived_records = 3;    // Records derived from this one.
+  uint32 mutation_count = 4;                // Number of times this record was updated.
+  float trust_score = 5;                    // Provenance trust score (0.0–1.0).
+  string lineage_tree = 6;                  // Human-readable lineage visualization.
+  optional SemanticRevisionSummary semantic_revision = 13;
+  repeated ConflictGroup conflict_groups = 14;
+  reserved 7 to 12;
+}
+
+// Execute — run a HirnQL query string against the database.
+message ExecuteRequest {
+  string query = 1;                            // HirnQL query string.
+  repeated string allowed_namespaces = 2;      // Namespace restriction (server-enforced).
+}
+
+// Polymorphic result for HirnQL queries — the variant depends on the verb.
+message ExecuteResponse {
+  oneof result {
+    RecordResults records = 1;         // RECALL / THINK results.
+    CreatedResult created = 2;         // REMEMBER result.
+    ForgottenResult forgotten = 3;     // FORGET result.
+    InspectedResult inspected = 5;     // INSPECT result.
+    TracedResult traced = 6;           // TRACE result.
+    ConsolidatedResult consolidated = 7; // CONSOLIDATE result.
+    WatchAckResult watch_ack = 8;      // WATCH acknowledgment.
+    CorrectedResult corrected = 9;     // CORRECT result.
+    RetractedResult retracted = 10;    // RETRACT result.
+    HistoryResult history = 11;        // HISTORY result.
+    SupersededResult superseded = 12;  // SUPERSEDE result.
+    MergedResult merged = 13;          // MERGE MEMORY result.
+    ExplainPlanResult explain_plan = 14; // EXPLAIN / EXPLAIN ANALYZE result.
+    AggregatedResult aggregated = 15;  // GROUP BY recall result.
+    PolicyResult policy = 16;          // SHOW/EXPLAIN/GRANT/REVOKE policy result.
+    SvoEventQueryResult svo_events = 18; // RECALL EVENTS result.
+    CausalResult causal = 19;          // EXPLAIN CAUSES / WHAT_IF / COUNTERFACTUAL result.
+  }
+  reserved 17;
+}
+
+// Query results containing scored memory records.
+message RecordResults {
+  repeated ScoredMemory records = 1;
+  double query_time_ms = 2;       // Query execution time.
+  uint32 records_scanned = 3;     // Total records evaluated.
+  uint32 records_returned = 4;    // Records in the result set.
+  optional string context = 5;    // Assembled context (for THINK queries).
+  reserved 6 to 10;
+  repeated ConflictPair conflicts = 11;
+  repeated ConflictGroup conflict_groups = 12;
+}
+
+message CreatedResult {
+  MemoryId id = 1;
+  Layer layer = 2;
+}
+
+message ForgottenResult {
+  string target = 1;   // ID or description of what was forgotten.
+  string mode = 2;     // "archive" or "purge".
+}
+
+message CorrectedResult {
+  string logical_memory_id = 1;
+  string prior_revision_id = 2;
+  string new_revision_id = 3;
+}
+
+message SupersededResult {
+  string logical_memory_id = 1;
+  string prior_revision_id = 2;
+  string new_revision_id = 3;
+  optional string reason = 4;
+}
+
+message MergedResult {
+  string target_logical_memory_id = 1;
+  string prior_target_revision_id = 2;
+  string new_target_revision_id = 3;
+  repeated string source_logical_memory_ids = 4;
+  repeated string source_revision_ids = 5;
+  optional string reason = 6;
+}
+
+message RetractedResult {
+  string logical_memory_id = 1;
+  string prior_revision_id = 2;
+  string tombstone_revision_id = 3;
+  optional string reason = 4;
+}
+
+message InspectedResult {
+  MemoryRecord record = 1;
+  float importance = 2;
+  uint64 access_count = 3;
+  Timestamp last_accessed = 4;
+  repeated NeighborInfo neighbors = 5;
+  float trust_score = 6;
+  optional SemanticRevisionSummary semantic_revision = 7;
+  repeated ConflictGroup conflict_groups = 8;
+}
+
+message SemanticHistoryItem {
+  SemanticRecord record = 1;
+  SemanticRevisionEntry revision = 2;
+}
+
+message HistoryResult {
+  SemanticRevisionSummary semantic_revision = 1;
+  repeated SemanticHistoryItem items = 2;
+}
+
+message TracedResult {
+  MemoryRecord record = 1;
+  repeated MemoryId source_episodes = 2;
+  repeated MemoryId derived_records = 3;
+  uint32 mutation_count = 4;
+  float trust_score = 5;
+  string lineage_tree = 6;
+  optional SemanticRevisionSummary semantic_revision = 7;
+  repeated ConflictGroup conflict_groups = 8;
+}
+
+message QueryDiagnostics {
+  optional string query_id = 1;
+  optional uint64 authorize_us = 2;
+  optional double embed_ms = 3;
+  optional double vector_search_ms = 4;
+  optional double graph_expand_ms = 5;
+  optional double rerank_ms = 6;
+  optional double neural_rerank_ms = 7;
+  optional double assemble_ms = 8;
+  optional double total_ms = 9;
+  optional uint32 records_scanned = 10;
+  optional uint32 records_returned = 11;
+  optional uint32 threshold_filtered_count = 12;
+  optional uint32 competitive_inhibition_count = 13;
+  optional uint32 truncated_by_limit_count = 14;
+  optional uint32 raw_text_redacted_results = 15;
+  optional uint32 multivector_fallback_count = 16;
+  optional uint32 neural_rerank_fallback_count = 17;
+  optional double optimize_ms = 18;
+  optional double physical_plan_ms = 19;
+  optional double execute_plan_ms = 20;
+}
+
+message ExplainPlanResult {
+  string plan_text = 1;
+  optional ExecuteResponse actual_result = 2;
+  optional QueryDiagnostics diagnostics = 3;
+}
+
+message AggregatedGroup {
+  string key = 1;
+  double value = 2;
+}
+
+message AggregatedResult {
+  string group_field = 1;
+  string function = 2;
+  repeated AggregatedGroup groups = 3;
+  double query_time_ms = 4;
+  optional string formatted = 5;
+}
+
+message PolicyEntry {
+  string name = 1;
+  string text = 2;
+}
+
+message PolicyResult {
+  string message = 1;
+  repeated PolicyEntry policies = 2;
+}
+
+message SvoEventEntry {
+  string source_memory_id = 1;
+  string subject = 2;
+  string verb = 3;
+  string object = 4;
+  optional string time_start = 5;
+  optional string time_end = 6;
+  float confidence = 7;
+}
+
+message SvoEventQueryResult {
+  repeated SvoEventEntry events = 1;
+  uint32 events_returned = 2;
+}
+
+message CausalColumn {
+  string key = 1;
+  string value = 2;
+}
+
+message CausalRow {
+  repeated CausalColumn columns = 1;
+}
+
+message CausalResult {
+  string kind = 1;
+  double query_time_ms = 2;
+  repeated CausalRow rows = 3;
+}
+
+message ConsolidatedResult {
+  uint32 records_processed = 1;
+}
+
+message WatchAckResult {
+  string message = 1;
+}
+
+// Consolidate — trigger memory consolidation (merge episodes → semantic concepts).
+message ConsolidateRequest {
+  optional float topic_threshold = 1;      // Cosine similarity threshold for topic clustering.
+  optional float surprise_threshold = 2;   // Minimum surprise for anomaly detection.
+  optional int64 temporal_gap_secs = 3;    // Max gap between events in a temporal segment.
+  bool archive = 4;                        // Whether to archive consolidated episodes.
+}
+
+message ConsolidateResponse {
+  uint32 records_processed = 1;           // Episodes analyzed.
+  uint32 segments_created = 2;            // Temporal segments formed.
+  uint32 patterns_detected = 3;           // Recurring patterns found.
+  uint32 threads_formed = 4;              // Narrative threads identified.
+  uint32 concepts_extracted = 5;          // New semantic concepts created.
+  uint32 provenance_edges_created = 6;    // Provenance graph edges added.
+  uint32 episodes_archived = 7;           // Episodes archived after consolidation.
+  double execution_time_ms = 8;           // Total consolidation time.
+  reserved 9 to 15;
+}
+
+// Stats — retrieve database-level statistics.
+message StatsRequest {}
+
+message StatsResponse {
+  uint64 working_count = 1;      // Number of working memory entries.
+  uint64 episodic_count = 2;     // Number of episodic records.
+  uint64 semantic_count = 3;     // Number of semantic concepts.
+  uint64 total_count = 4;        // Total records across all layers.
+  uint64 file_size_bytes = 5;    // Database file size in bytes.
+  reserved 6 to 10;
+}
+
+// CreateNamespace — create a new namespace for multi-agent collaboration.
+message CreateNamespaceRequest {
+  string name = 1;                         // Namespace name (e.g. "team-backend").
+  string kind = 2;                         // Kind: "shared", "team", "project".
+  repeated string member_agent_ids = 3;    // Agents with access to this namespace.
+}
+
+message CreateNamespaceResponse {}
+
+// ShareMemory — copy a memory record into another namespace.
+message ShareMemoryRequest {
+  MemoryId id = 1;                // Record to share.
+  string target_namespace = 2;    // Destination namespace.
+  string agent_id = 3;            // Agent performing the share.
+}
+
+message ShareMemoryResponse {
+  MemoryId new_id = 1;  // ID of the shared copy in the target namespace.
+}
+
+// Watch — subscribe to real-time memory events (server-streaming).
+message WatchRequest {
+  optional Layer layer_filter = 1;       // Only events for this layer.
+  repeated string entities = 2;          // Only events involving these entities.
+  optional float min_importance = 3;     // Only events above this importance.
+  optional string namespace = 4;         // Only events in this namespace.
+}
+
+// Classification of a watch event.
+enum WatchEventType {
+  WATCH_EVENT_TYPE_UNSPECIFIED = 0;
+  WATCH_EVENT_TYPE_CREATED = 1;       // A new memory record was stored.
+  WATCH_EVENT_TYPE_UPDATED = 2;       // An existing record was modified.
+  WATCH_EVENT_TYPE_CONSOLIDATED = 3;  // Records were consolidated.
+  WATCH_EVENT_TYPE_CONFLICT = 4;      // A contradiction was detected.
+}
+
+// A single event in the watch stream.
+message WatchEvent {
+  WatchEventType event_type = 1;    // What happened.
+  MemoryRecord record = 2;         // The affected record.
+  Timestamp timestamp = 3;         // When the event occurred.
+  optional string description = 4; // Human-readable event description.
+  reserved 5 to 10;
+}
+
+// ─── Service ─────────────────────────────────────────────────
+
+// HirnService — cognitive memory database for LLM agents.
+//
+// Provides three memory layers (working, episodic, semantic),
+// a knowledge graph, vector similarity search, temporal reasoning,
+// and memory consolidation. Designed for multi-agent collaboration
+// with namespace-based isolation.
+service HirnService {
+  // Store a new memory record (episodic event, semantic concept, or working entry).
+  rpc Remember(RememberRequest) returns (RememberResponse);
+
+  // Retrieve memories by vector similarity with multi-signal scoring.
+  rpc Recall(RecallRequest) returns (RecallResponse);
+
+  // Server-streaming variant of Recall for large result sets.
+  // Streams individual RecallResult messages as they become available.
+  rpc RecallStream(RecallRequest) returns (stream RecallResult);
+
+  // Recall + assemble context within a token budget for LLM consumption.
+  rpc Think(ThinkRequest) returns (ThinkResponse);
+
+  // Archive or permanently delete a memory record.
+  rpc Forget(ForgetRequest) returns (ForgetResponse);
+
+  // Insert a working memory entry (short-lived scratch-pad).
+  rpc Focus(FocusRequest) returns (FocusResponse);
+
+  // Remove a working memory entry.
+  rpc Defocus(DefocusRequest) returns (DefocusResponse);
+
+  // Create a typed edge between two memory records in the knowledge graph.
+  rpc LinkMemories(ConnectRequest) returns (ConnectResponse);
+
+  // Retrieve full metadata and graph neighbors for a record.
+  rpc Inspect(InspectRequest) returns (InspectResponse);
+
+  // Retrieve provenance and lineage for a record.
+  rpc Trace(TraceRequest) returns (TraceResponse);
+
+  // Run a HirnQL query string against the database.
+  rpc Execute(ExecuteRequest) returns (ExecuteResponse);
+
+  // Trigger memory consolidation (episodic → semantic distillation).
+  rpc Consolidate(ConsolidateRequest) returns (ConsolidateResponse);
+
+  // Create a new namespace for multi-agent collaboration.
+  rpc CreateNamespace(CreateNamespaceRequest) returns (CreateNamespaceResponse);
+
+  // Copy a memory record into another namespace.
+  rpc ShareMemory(ShareMemoryRequest) returns (ShareMemoryResponse);
+
+  // Retrieve database-level statistics.
+  rpc Stats(StatsRequest) returns (StatsResponse);
+
+  // Subscribe to real-time memory events (server-streaming).
+  rpc Watch(WatchRequest) returns (stream WatchEvent);
+
+  // Create a named snapshot (tags all datasets at their current version).
+  rpc CreateSnapshot(CreateSnapshotRequest) returns (CreateSnapshotResponse);
+
+  // List all available snapshots.
+  rpc ListSnapshots(ListSnapshotsRequest) returns (ListSnapshotsResponse);
+
+  // Roll back all datasets to a named snapshot.
+  rpc Rollback(RollbackRequest) returns (RollbackResponse);
+
+  // Update an existing memory's content, metadata, or importance.
+  rpc UpdateMemory(UpdateMemoryRequest) returns (UpdateMemoryResponse);
+
+  // Return database stats and optionally graph neighborhood for a memory.
+  rpc ToolkitIntrospect(ToolkitIntrospectRequest) returns (ToolkitIntrospectResponse);
+}
+
+// ─── Versioning Messages ─────────────────────────────────────
+
+message CreateSnapshotRequest {
+  // Human-readable snapshot name (used as LanceDB tag on every dataset).
+  string name = 1;
+}
+
+message CreateSnapshotResponse {
+  // Number of datasets tagged.
+  uint32 datasets_tagged = 1;
+}
+
+message ListSnapshotsRequest {}
+
+message SnapshotInfo {
+  // Snapshot tag name.
+  string name = 1;
+  // Per-dataset version numbers at snapshot time.
+  map<string, uint64> versions = 2;
+}
+
+message ListSnapshotsResponse {
+  repeated SnapshotInfo snapshots = 1;
+}
+
+message RollbackRequest {
+  // Tag name of the snapshot to roll back to.
+  string name = 1;
+}
+
+message RollbackResponse {
+  // Number of datasets rolled back.
+  uint32 datasets_rolled_back = 1;
+}

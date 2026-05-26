@@ -1,0 +1,340 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/hirn",
+    "crates/hirn-core",
+    "crates/hirn-graph",
+    "crates/hirn-query",
+    "crates/hirn-engine",
+    "crates/hirn-provider",
+    "crates/hirn-python",
+    "crates/hirn-node",
+    "crates/hirn-bench",
+    "crates/hirnd",
+    "crates/hirn-storage",
+    "crates/hirn-exec",
+    "crates/hirn-policy",
+]
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "Apache-2.0"
+repository = "https://github.com/hupe1980/hirn"
+
+[workspace.dependencies]
+# Core
+ulid = { version = "1", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+bincode = "1"
+thiserror = "2"
+
+# Storage
+lance = "=4.0.0"
+lance-index = "=4.0.0"
+lance-linalg = "=4.0.0"
+lance-table = "=4.0.0"
+lance-namespace = "=4.0.0"
+lance-namespace-impls = { version = "=4.0.0", default-features = false }
+arrow-schema = "57"
+arrow-array = "57"
+arrow-ipc = "57"
+arrow-select = "57"
+arrow-ord = "57"
+arrow-cast = "57"
+object_store = "0.12"
+futures = "0.3"
+
+# DataFusion
+datafusion = { version = "52", default-features = false }
+datafusion-physical-plan = "52"
+datafusion-physical-expr = "52"
+datafusion-expr = "52"
+datafusion-common = "52"
+datafusion-execution = "52"
+datafusion-optimizer = "52"
+datafusion-physical-optimizer = "52"
+datafusion-datasource = "52"
+
+# Logging
+tracing = "0.1"
+
+# Pattern matching
+aho-corasick = "1"
+
+# Graph
+petgraph = "0.6"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Concurrency
+parking_lot = "0.12"
+
+# Crypto
+subtle = "2"
+blake3 = "1"
+secrecy = { version = "0.10", features = ["serde"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }
+
+# Authorization
+cedar-policy = "4.9.1"
+
+# Concurrent data structures
+dashmap = "6"
+crossbeam-queue = "0.3"
+
+# Config
+toml = "0.8"
+
+# Tokenization
+tiktoken-rs = "0.6"
+
+# ONNX Runtime (for local cross-encoder reranking)
+ort = "2.0.0-rc.9"
+ndarray = "0.17"
+hf-hub = "0.4"
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+
+# Parser
+pest = "2"
+pest_derive = "2"
+
+# Benchmarks
+criterion = "0.5"
+
+# Testing
+proptest = "1"
+tempfile = "3"
+
+# HTTP client (blocking, for bench tools)
+ureq = { version = "3", features = ["json"] }
+dotenvy = "0.15"
+
+# Internal
+hirn = { path = "crates/hirn", version = "0.1.0" }
+hirn-core = { path = "crates/hirn-core", version = "0.1.0" }
+hirn-graph = { path = "crates/hirn-graph", version = "0.1.0" }
+hirn-query = { path = "crates/hirn-query", version = "0.1.0" }
+hirn-engine = { path = "crates/hirn-engine", version = "0.1.0" }
+hirn-provider = { path = "crates/hirn-provider", version = "0.1.0" }
+hirn-storage = { path = "crates/hirn-storage", version = "0.1.0" }
+hirn-exec = { path = "crates/hirn-exec", version = "0.1.0" }
+hirn-policy = { path = "crates/hirn-policy", version = "0.1.0" }
+hirnd = { path = "crates/hirnd", version = "0.1.0" }
+
+# Async Runtime
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+
+# gRPC
+tonic = { version = "0.13", features = ["tls-ring"] }
+tonic-build = "0.13"
+prost = "0.13"
+
+# HTTP
+axum = { version = "0.8", features = ["json"] }
+tower = { version = "0.5", features = ["util"] }
+hyper = { version = "1" }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1", "http2"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Observability
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter", "registry"] }
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+metrics-util = "0.19"
+opentelemetry = "0.28"
+opentelemetry_sdk = { version = "0.28", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.28", features = ["grpc-tonic"] }
+tracing-opentelemetry = "0.29"
+
+# TLS
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rustls-pemfile = "2"
+rcgen = "0.13"
+x509-parser = "0.18"
+
+# MCP
+rmcp = { version = "0.1", features = ["server", "transport-sse-server"] }
+schemars = "0.8"
+
+# JWT
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+
+# Security
+zeroize = { version = "1", features = ["derive"] }
+
+# Raft consensus
+openraft = { version = "0.9", features = ["serde", "storage-v2"] }
+redb = "2"
+
+# AWS (serverless mode)
+aws-sdk-dynamodb = "1"
+aws-sdk-s3 = "1"
+aws-config = "1"
+
+# Async streaming
+async-stream = "0.3"
+tokio-stream = "0.1"
+
+
+# Python
+pyo3 = "0.28"
+pyo3-build-config = "0.28"
+numpy = "0.28"
+pyo3-async-runtimes = { version = "0.28", features = ["tokio-runtime"] }
+
+# Node.js
+napi = { version = "3", features = ["serde-json", "async", "napi6"] }
+napi-derive = "3"
+
+# Internal
+hirn-python = { path = "crates/hirn-python" }
+hirn-node = { path = "crates/hirn-node" }
+hirn-bench = { path = "crates/hirn-bench" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+needless_pass_by_value = "allow"
+io_other_error = "allow"
+clone_on_copy = "allow"
+result_large_err = "allow"
+drop_non_drop = "allow"
+redundant_else = "allow"
+new_without_default = "allow"
+trailing_empty_array = "allow"
+# Style — cosmetic, not correctness
+doc_markdown = "allow"
+items_after_statements = "allow"
+wildcard_imports = "allow"
+similar_names = "allow"
+return_self_not_must_use = "allow"
+match_same_arms = "allow"
+cast_lossless = "allow"
+redundant_closure_for_method_calls = "allow"
+unnecessary_wraps = "allow"
+manual_let_else = "allow"
+uninlined_format_args = "allow"
+too_many_lines = "allow"
+too_many_arguments = "allow"
+implicit_hasher = "allow"
+trivially_copy_pass_by_ref = "allow"
+if_not_else = "allow"
+single_match_else = "allow"
+match_wildcard_for_single_variants = "allow"
+float_cmp = "allow"
+needless_raw_string_hashes = "allow"
+redundant_closure = "allow"
+collapsible_if = "allow"
+field_reassign_with_default = "allow"
+needless_lifetimes = "allow"
+redundant_clone = "allow"
+used_underscore_binding = "allow"
+map_unwrap_or = "allow"
+cloned_instead_of_copied = "allow"
+unused_self = "allow"
+len_zero = "allow"
+unreadable_literal = "allow"
+needless_continue = "allow"
+redundant_field_names = "allow"
+many_single_char_names = "allow"
+let_and_return = "allow"
+match_like_matches_macro = "allow"
+or_fun_call = "allow"
+default_trait_access = "allow"
+type_complexity = "allow"
+single_match = "allow"
+manual_range_contains = "allow"
+derive_partial_eq_without_eq = "allow"
+too_long_first_doc_paragraph = "allow"
+needless_question_mark = "allow"
+for_kv_map = "allow"
+manual_unwrap_or_default = "allow"
+needless_range_loop = "allow"
+manual_div_ceil = "allow"
+ignore_without_reason = "allow"
+manual_is_multiple_of = "allow"
+unnecessary_unwrap = "allow"
+elidable_lifetime_names = "allow"
+useless_format = "allow"
+if_same_then_else = "allow"
+iter_on_single_items = "allow"
+ref_option = "allow"
+unnecessary_cast = "allow"
+match_result_ok = "allow"
+writeln_empty_string = "allow"
+write_with_newline = "allow"
+manual_strip = "allow"
+manual_string_new = "allow"
+bool_assert_comparison = "allow"
+unwrap_or_default = "allow"
+unnecessary_struct_initialization = "allow"
+while_let_loop = "allow"
+ignored_unit_patterns = "allow"
+approx_constant = "allow"
+wildcard_in_or_patterns = "allow"
+match_wild_err_arm = "allow"
+# Nursery — unstable / too noisy
+missing_const_for_fn = "allow"
+significant_drop_tightening = "allow"
+unused_async = "allow"
+suboptimal_flops = "allow"
+use_self = "allow"
+needless_borrows_for_generic_args = "allow"
+redundant_pub_crate = "allow"
+option_if_let_else = "allow"
+unnecessary_literal_bound = "allow"
+format_push_string = "allow"
+needless_collect = "allow"
+let_underscore_future = "allow"
+unnecessary_map_or = "allow"
+iter_on_empty_collections = "allow"
+format_collect = "allow"
+collection_is_never_read = "allow"
+imprecise_flops = "allow"
+await_holding_lock = "allow"
+never_loop = "allow"
+
+# ── Dev / Test profiles — reduce binary size & peak memory ───────────
+[profile.dev]
+debug = 0                     # Drastically smaller binaries; use RUST_BACKTRACE=full if needed
+split-debuginfo = "unpacked"  # macOS: keep DWARF out of binaries
+
+[profile.dev.package."*"]
+opt-level = 2                 # Optimise non-workspace deps (Arrow, LanceDB, etc.)
+
+[profile.test]
+debug = 0
+split-debuginfo = "unpacked"
+
+# ── Release profile ──────────────────────────────────────────────────
+[profile.release]
+lto = "thin"         # "fat" LTO on lance+arrow+datafusion exceeds 48 GB RAM
+codegen-units = 1
+strip = true
+panic = "abort"
+
+# ── Bench profile (inherits release) ────────────────────────────────
+[profile.bench]
+inherits = "release"
+debug = false        # no debug info for benchmarks

@@ -1,0 +1,497 @@
+// HirnQL PEG Grammar
+// Case-insensitive, whitespace-tolerant query language for cognitive memory operations.
+
+// ── Entry point ────────────────────────────────────────────────────────
+statement = { SOI ~ WHITESPACE* ~ (
+    explain_stmt
+  | explain_policy_stmt
+  | explain_causes_stmt
+  | show_cluster_stmt
+  | show_policies_stmt
+  | set_tier_policy_stmt
+  | create_realm_stmt
+  | drop_realm_stmt
+  | grant_stmt
+  | revoke_stmt
+  | what_if_stmt
+  | counterfactual_stmt
+  | recall_events_stmt
+  | recall_stmt
+  | think_stmt
+  | remember_stmt
+  | forget_stmt
+    | correct_stmt
+    | supersede_stmt
+        | merge_memory_stmt
+    | retract_stmt
+  | connect_stmt
+  | inspect_stmt
+    | history_stmt
+  | trace_stmt
+  | consolidate_stmt
+  | watch_stmt
+  | traverse_stmt
+) ~ WHITESPACE* ~ EOI }
+
+// ── EXPLAIN ────────────────────────────────────────────────────────────
+explain_stmt = {
+    ^"explain" ~ analyze_flag? ~ inner_stmt
+}
+analyze_flag = { ^"analyze" }
+inner_stmt = {
+    recall_events_stmt | recall_stmt | think_stmt | forget_stmt | correct_stmt | supersede_stmt | merge_memory_stmt | retract_stmt | history_stmt | traverse_stmt | inspect_stmt | trace_stmt | explain_causes_stmt | what_if_stmt | counterfactual_stmt | show_policies_stmt | explain_policy_stmt
+}
+
+// ── EXPLAIN CAUSES (Pearl Rung 1) ─────────────────────────────────────
+explain_causes_stmt = {
+    ^"explain" ~ ^"causes" ~ (parameter | string_literal)
+    ~ namespace_clause?
+    ~ causes_depth_clause?
+}
+causes_depth_clause = { ^"depth" ~ integer_literal }
+
+// ── WHAT_IF (Pearl Rung 2) ────────────────────────────────────────────
+what_if_stmt = {
+    ^"what_if" ~ (parameter | string_literal)
+    ~ ^"then" ~ (parameter | string_literal)
+    ~ namespace_clause?
+}
+
+// ── COUNTERFACTUAL (Pearl Rung 3) ─────────────────────────────────────
+counterfactual_stmt = {
+    ^"counterfactual" ~ (parameter | string_literal)
+    ~ ^"then" ~ (parameter | string_literal)
+    ~ namespace_clause?
+}
+
+// ── RECALL EVENTS (audit query) ────────────────────────────────────────
+recall_events_stmt = {
+    ^"recall" ~ ^"events"
+    ~ events_for_clause?
+    ~ where_clause*
+    ~ temporal_clause?
+    ~ namespace_clause?
+    ~ limit_clause?
+}
+
+events_for_clause = { ^"for" ~ (parameter | string_literal) }
+
+// ── RECALL ─────────────────────────────────────────────────────────────
+recall_stmt = {
+    ^"recall" ~ layer_filter
+    ~ about_clause
+    ~ involving_clause?
+    ~ temporal_clause?
+    ~ as_of_clause?
+    ~ expand_clause?
+    ~ follow_causes_clause?
+    ~ where_clause*
+    ~ modality_clause?
+    ~ resource_role_clause?
+    ~ hydration_clause?
+    ~ artifact_clause?
+    ~ depth_clause?
+    ~ topic_clause?
+    ~ with_prospective_clause?
+    ~ with_mcfa_clause?
+    ~ with_conflicts_clause?
+    ~ with_provenance_clause?
+    ~ group_by_clause?
+    ~ select_clause?
+    ~ as_clause?
+    ~ format_clause?
+    ~ budget_clause?
+    ~ namespace_clause?
+    ~ from_realm_clause?
+    ~ consistency_clause?
+    ~ limit_clause?
+    ~ hybrid_clause?
+}
+
+// ── THINK ──────────────────────────────────────────────────────────────
+think_stmt = {
+    ^"think"
+    ~ global_clause?
+    ~ about_clause
+    ~ involving_clause?
+    ~ temporal_clause?
+    ~ expand_clause?
+    ~ follow_causes_clause?
+    ~ where_clause*
+    ~ depth_clause?
+    ~ with_prospective_clause?
+    ~ with_mcfa_clause?
+    ~ with_provenance_clause?
+    ~ as_clause?
+    ~ budget_clause?
+    ~ namespace_clause?
+    ~ consistency_clause?
+    ~ limit_clause?
+    ~ mode_clause?
+    ~ community_depth_clause?
+    ~ hybrid_clause?
+}
+
+// ── REMEMBER ───────────────────────────────────────────────────────────
+remember_stmt = {
+    ^"remember" ~ remember_layer
+    ~ (concept_clause | content_clause)
+    ~ type_clause?
+    ~ entities_clause?
+    ~ importance_clause?
+    ~ on_conflict_clause?
+}
+
+remember_layer = { ^"episode" | ^"semantic" }
+
+content_clause = { ^"content" ~ (modal_content | parameter | string_literal) }
+
+modal_content = {
+    image_content
+  | code_content
+  | audio_content
+    | video_content
+    | document_content
+        | external_content
+        | tool_output_content
+  | structured_content
+}
+
+image_content      = { ^"image" ~ (parameter | string_literal) ~ ^"description" ~ (parameter | string_literal) }
+code_content       = { ^"code" ~ (parameter | string_literal) ~ ^"language" ~ (parameter | string_literal) }
+audio_content      = { ^"audio" ~ (parameter | string_literal) ~ ^"transcript" ~ (parameter | string_literal) }
+video_content      = { ^"video" ~ (parameter | string_literal) ~ ^"transcript" ~ (parameter | string_literal) ~ ^"description" ~ (parameter | string_literal) }
+document_content   = { ^"document" ~ (parameter | string_literal) ~ ^"title" ~ (parameter | string_literal) }
+external_content   = { ^"external" ~ (parameter | string_literal) ~ external_title_clause ~ external_snippet_clause? ~ external_mime_clause? ~ external_checksum_clause? ~ external_fetch_policy_clause? ~ external_stale_at_clause? }
+external_title_clause = { ^"title" ~ (parameter | string_literal) }
+external_snippet_clause = { ^"snippet" ~ (parameter | string_literal) }
+external_mime_clause = { ^"mime" ~ (parameter | string_literal) }
+external_checksum_clause = { ^"checksum" ~ (parameter | string_literal) }
+external_fetch_policy_clause = { ^"fetch_policy" ~ external_fetch_policy_name }
+external_stale_at_clause = { ^"stale_at" ~ (parameter | string_literal) }
+external_fetch_policy_name = { ^"on_demand" | ^"if_stale" | ^"never" }
+tool_output_content = { ^"tool_output" ~ (parameter | string_literal) ~ tool_output_tool_clause ~ tool_output_mime_clause? ~ tool_output_schema_clause? ~ tool_output_call_id_clause? ~ tool_output_checksum_clause? }
+tool_output_tool_clause = { ^"tool" ~ (parameter | string_literal) }
+tool_output_mime_clause = { ^"mime" ~ (parameter | string_literal) }
+tool_output_schema_clause = { ^"schema" ~ (parameter | string_literal) }
+tool_output_call_id_clause = { ^"call_id" ~ (parameter | string_literal) }
+tool_output_checksum_clause = { ^"checksum" ~ (parameter | string_literal) }
+structured_content = { ^"structured" ~ (parameter | string_literal) ~ ^"schema" ~ (parameter | string_literal) }
+
+concept_clause = { ^"concept" ~ (parameter | string_literal) }
+
+type_clause = { ^"type" ~ identifier }
+
+entities_clause = { ^"entities" ~ string_list }
+
+importance_clause = { ^"importance" ~ float_literal }
+
+on_conflict_clause = {
+    ^"on" ~ ^"conflict" ~ ^"update" ~ ^"set" ~ set_assignment_list
+}
+
+set_assignment_list = { set_assignment ~ ("," ~ set_assignment)* }
+
+set_assignment = { identifier ~ "=" ~ set_value }
+
+set_value = {
+    set_function
+  | float_literal
+  | integer_literal
+  | string_literal
+}
+
+set_function = { (^"max" | ^"min") ~ "(" ~ identifier ~ "," ~ (float_literal | integer_literal) ~ ")" }
+
+// ── FORGET ─────────────────────────────────────────────────────────────
+forget_stmt = {
+    ^"forget" ~ (batch_forget | single_forget)
+}
+
+single_forget = { string_literal ~ forget_mode? }
+
+batch_forget = {
+    layer_filter ~ where_clause+ ~ forget_mode?
+}
+
+forget_mode = { ^"archive" | ^"purge" | ^"hard" }
+
+// ── CORRECT / RETRACT ─────────────────────────────────────────────────
+correct_stmt = {
+    ^"correct" ~ semantic_target_ref
+    ~ ^"set" ~ set_assignment_list
+    ~ reason_clause?
+    ~ observed_at_clause?
+    ~ caused_by_clause?
+    ~ namespace_clause?
+}
+
+supersede_stmt = {
+    ^"supersede" ~ semantic_target_ref
+    ~ ^"set" ~ set_assignment_list
+    ~ reason_clause?
+    ~ observed_at_clause?
+    ~ caused_by_clause?
+    ~ namespace_clause?
+}
+
+merge_memory_stmt = {
+    ^"merge" ~ ^"memory" ~ semantic_target_list
+    ~ ^"into" ~ semantic_target_ref
+    ~ merge_set_clause?
+    ~ reason_clause?
+    ~ observed_at_clause?
+    ~ caused_by_clause?
+    ~ namespace_clause?
+}
+
+merge_set_clause = { ^"set" ~ set_assignment_list }
+
+retract_stmt = {
+    ^"retract" ~ semantic_target_ref
+    ~ reason_clause?
+    ~ observed_at_clause?
+    ~ caused_by_clause?
+    ~ namespace_clause?
+}
+
+// ── CONNECT ────────────────────────────────────────────────────────────
+connect_stmt = {
+    ^"connect" ~ string_literal
+    ~ ^"to" ~ string_literal
+    ~ ^"as" ~ identifier
+    ~ weight_clause?
+}
+
+weight_clause = { ^"weight" ~ float_literal }
+
+// ── INSPECT ────────────────────────────────────────────────────────────
+inspect_stmt = { ^"inspect" ~ semantic_target_ref }
+
+// ── HISTORY ────────────────────────────────────────────────────────────
+history_stmt = { ^"history" ~ semantic_target_ref ~ namespace_clause? }
+
+// ── TRACE ──────────────────────────────────────────────────────────────
+trace_stmt = { ^"trace" ~ semantic_target_ref }
+
+// ── CONSOLIDATE ────────────────────────────────────────────────────────
+consolidate_stmt = {
+    ^"consolidate" ~ where_clause*
+}
+
+// ── WATCH ──────────────────────────────────────────────────────────────
+watch_stmt = {
+    ^"watch" ~ watch_target
+    ~ involving_clause?
+    ~ where_clause*
+    ~ namespace_clause?
+    ~ format_clause?
+}
+
+watch_target = { ^"all" | ^"contradictions" | layer_filter }
+format_clause = { ^"format" ~ output_format }
+
+// ── TRAVERSE ──────────────────────────────────────────────────────────
+traverse_stmt = {
+    ^"traverse" ~ ^"from" ~ string_literal
+    ~ via_clause?
+    ~ ^"depth" ~ integer_literal
+    ~ where_clause*
+    ~ limit_clause?
+}
+
+via_clause = { ^"via" ~ relation_list }
+relation_list = { identifier ~ ("," ~ identifier)* }
+
+// ── CREATE REALM / DROP REALM (BACKLOG 15, Story 1.5) ─────────────────
+create_realm_stmt = {
+    ^"create" ~ ^"realm" ~ string_literal ~ realm_description?
+}
+realm_description = { ^"description" ~ string_literal }
+
+drop_realm_stmt = {
+    ^"drop" ~ ^"realm" ~ string_literal ~ confirm_flag?
+}
+confirm_flag = { ^"confirm" }
+
+// ── GRANT / REVOKE (BACKLOG 15, Story 1.6) ────────────────────────────
+grant_stmt = {
+    ^"grant" ~ action_list
+    ~ grant_target
+    ~ ^"to" ~ principal_ref
+}
+
+revoke_stmt = {
+    ^"revoke" ~ action_list
+    ~ grant_target
+    ~ ^"from" ~ principal_ref
+}
+
+action_list = { action_name ~ ("," ~ action_name)* }
+action_name = { ^"remember" | ^"recall" | ^"think" | ^"forget" | ^"consolidate" | ^"watch" | ^"connect" | ^"execute" | ^"admin" }
+
+grant_target = {
+    (^"on" ~ ^"namespace" ~ string_literal)
+  | (^"on" ~ ^"realm" ~ string_literal)
+}
+
+principal_ref = {
+    (^"agent" ~ string_literal)
+  | (^"team" ~ string_literal)
+}
+
+// ── SHOW CLUSTER (BACKLOG 15, Story 2.1) ──────────────────────────────
+show_cluster_stmt = {
+    ^"show" ~ ^"cluster" ~ (^"status")?
+}
+
+// ── SET TIER_POLICY (BACKLOG 6, Story 3.2) ────────────────────────────
+set_tier_policy_stmt = {
+    ^"set" ~ ^"tier_policy" ~ tier_policy_field ~ "=" ~ tier_policy_value
+}
+tier_policy_field = @{ (ASCII_ALPHA | "_")+ }
+tier_policy_value = { string_literal | float_literal | integer_literal }
+
+// ── SHOW POLICIES / EXPLAIN POLICY (BACKLOG 15, Story 1.6) ────────────
+show_policies_stmt = {
+    ^"show" ~ ^"policies" ~ (^"for" ~ principal_ref)?
+}
+
+explain_policy_stmt = {
+    ^"explain" ~ ^"policy" ~ ^"for" ~ principal_ref
+    ~ ^"on" ~ (^"namespace" | ^"realm") ~ string_literal
+    ~ ^"action" ~ action_name
+}
+
+// ── Aggregation & Projection ───────────────────────────────────────────
+group_by_clause = { ^"group" ~ ^"by" ~ identifier ~ agg_function }
+agg_function    = { ^"count" | ^"avg" | ^"sum" | ^"min" | ^"max" }
+select_clause   = { ^"select" ~ field_list }
+field_list      = { identifier ~ ("," ~ identifier)* }
+
+// ── Shared clauses ─────────────────────────────────────────────────────
+about_clause    = { ^"about" ~ (parameter | string_literal) }
+
+involving_clause = { ^"involving" ~ string_list }
+
+temporal_clause = {
+    after_clause
+  | before_clause
+  | between_clause
+}
+
+after_clause   = { ^"after" ~ string_literal }
+before_clause  = { ^"before" ~ string_literal }
+between_clause = { ^"between" ~ string_literal ~ ^"and" ~ string_literal }
+
+expand_clause = {
+    ^"expand" ~ ^"graph" ~ ^"depth" ~ integer_literal
+    ~ min_weight_clause?
+    ~ activation_clause?
+}
+
+min_weight_clause  = { ^"min_weight" ~ float_literal }
+activation_clause  = { ^"activation" ~ activation_mode }
+activation_mode    = { ^"spreading" | ^"static" | ^"ppr" | ^"pagerank" | ^"none" }
+
+follow_causes_clause = { ^"follow" ~ ^"causes" ~ ^"depth" ~ integer_literal }
+
+where_clause = { ^"where" ~ (in_subquery_condition | condition) }
+
+condition = {
+    identifier ~ comparison_op ~ (parameter | float_literal | integer_literal | string_literal)
+}
+
+in_subquery_condition = {
+    identifier ~ ^"in" ~ "(" ~ subquery ~ ")"
+}
+
+subquery = {
+    ^"recall" ~ layer_filter ~ about_clause ~ involving_clause? ~ temporal_clause? ~ limit_clause?
+}
+
+as_of_clause = {
+    ^"as" ~ ^"of" ~ (as_of_observed | as_of_recorded | as_of_revision | string_literal)
+}
+as_of_observed = { ^"observed" ~ string_literal }
+as_of_recorded = { ^"recorded" ~ string_literal }
+as_of_revision = { ^"revision" ~ string_literal }
+
+comparison_op = { ">=" | "<=" | "!=" | ">" | "<" | "=" }
+
+as_clause = { ^"as" ~ output_format }
+output_format = { ^"narrative" | ^"context" | ^"graph" | ^"causal_chain" | ^"json" | ^"csv" | ^"structured" }
+
+budget_clause      = { ^"budget" ~ (parameter | integer_literal) }
+reason_clause      = { ^"reason" ~ (parameter | string_literal) }
+observed_at_clause = { ^"observed" ~ ^"at" ~ (parameter | string_literal) }
+caused_by_clause   = { ^"caused" ~ ^"by" ~ (parameter | string_literal) }
+namespace_clause   = { ^"namespace" ~ (string_literal | namespace_identifier) }
+from_realm_clause  = { ^"from" ~ ^"realm" ~ string_literal ~ ("," ~ string_literal)* }
+consistency_clause = { ^"consistency" ~ consistency_level }
+consistency_level  = { ^"linearizable" | ^"eventual" | ^"session" }
+limit_clause       = { ^"limit" ~ (parameter | integer_literal) }
+hybrid_clause      = { ^"hybrid" }
+global_clause      = { ^"global" }
+mode_clause        = { ^"mode" ~ retrieval_mode ~ max_hops_clause? }
+retrieval_mode     = { ^"iterative" | ^"adaptive" | ^"global" | ^"hybrid" | ^"local" | ^"raptor" }
+community_depth_clause = { ^"community_depth" ~ integer_literal }
+
+depth_clause     = { ^"depth" ~ depth_mode }
+depth_mode       = { ^"auto" | ^"full" | ^"summary" }
+
+topic_clause     = { ^"topic" ~ (parameter | string_literal) }
+
+with_prospective_clause  = { ^"with" ~ ^"prospective" ~ on_off }
+with_mcfa_clause         = { ^"with" ~ ^"mcfa_defense" ~ on_off }
+with_conflicts_clause    = { ^"with" ~ ^"conflicts" }
+with_provenance_clause   = { ^"with" ~ ^"provenance" ~ ^"depth" ~ integer_literal }
+on_off                   = { ^"on" | ^"off" }
+
+max_hops_clause  = { ^"max_hops" ~ integer_literal }
+
+layer_filter = { layer_name ~ ("," ~ layer_name)* }
+layer_name   = { ^"episodic" | ^"semantic" | ^"working" | ^"procedural" }
+
+modality_clause = { ^"modality" ~ modality_list }
+modality_list   = { modality_name ~ ("," ~ modality_name)* }
+modality_name   = { ^"image" | ^"text" | ^"code" | ^"audio" | ^"video" | ^"document" | ^"structured" | ^"composite" | ^"external" }
+
+resource_role_clause = { ^"resource_role" ~ evidence_role_list }
+evidence_role_list   = { evidence_role_name ~ ("," ~ evidence_role_name)* }
+evidence_role_name   = { ^"source" | ^"attachment" | ^"proof" | ^"output" | ^"preview" | ^"derived" }
+
+hydration_clause   = { ^"hydration" ~ hydration_mode_list }
+hydration_mode_list = { hydration_mode_name ~ ("," ~ hydration_mode_name)* }
+hydration_mode_name = { ^"metadata" | ^"metadata_only" | ^"preview" | ^"full" }
+
+artifact_clause    = { (^"artifact" | ^"artifacts") ~ artifact_kind_list }
+artifact_kind_list = { artifact_kind_name ~ ("," ~ artifact_kind_name)* }
+artifact_kind_name = { ^"preview" | ^"ocr_text" | ^"transcript" | ^"caption" | ^"thumbnail" | ^"syntax_summary" | ^"schema_summary" }
+
+// ── Shared tokens ──────────────────────────────────────────────────────
+string_list = { string_literal ~ ("," ~ string_literal)* }
+
+semantic_target_list = { semantic_target_ref ~ ("," ~ semantic_target_ref)* }
+semantic_target_ref = { logical_target_ref | revision_target_ref | string_literal }
+logical_target_ref = { ^"logical" ~ string_literal }
+revision_target_ref = { ^"revision" ~ string_literal }
+
+string_literal = ${ (double_quoted | single_quoted) }
+double_quoted  = _{ "\"" ~ double_inner ~ "\"" }
+double_inner   =  { (escape_seq | (!"\"" ~ !"\\" ~ ANY))* }
+single_quoted  = _{ "'" ~ single_inner ~ "'" }
+single_inner   =  { (escape_seq | (!"'" ~ !"\\" ~ ANY))* }
+escape_seq     = ${ "\\" ~ ("\"" | "'" | "\\" | "n" | "t" | "r") }
+
+parameter       = @{ "$" ~ (ASCII_DIGIT+ | (ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")*)) }
+
+float_literal   = @{ "-"? ~ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
+integer_literal = @{ "-"? ~ ASCII_DIGIT+ }
+
+identifier           = @{ (ASCII_ALPHANUMERIC | "_" | ".")+ }
+namespace_identifier = @{ (ASCII_ALPHANUMERIC | "_" | "." | ":" | "-")+ }
+
+// ── Whitespace / Comments ──────────────────────────────────────────────
+WHITESPACE  = _{ " " | "\t" | "\r" | "\n" }
+COMMENT     = _{ "--" ~ (!"\n" ~ ANY)* }

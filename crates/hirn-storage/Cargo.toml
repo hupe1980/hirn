@@ -1,0 +1,59 @@
+[package]
+name = "hirn-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Cognitive storage engine for hirn — lance 4.0 + lance-namespace"
+
+[dependencies]
+hirn-core = { workspace = true }
+lance = { workspace = true }
+lance-index = { workspace = true }
+lance-linalg = { workspace = true }
+lance-table = { workspace = true }
+lance-namespace = { workspace = true }
+lance-namespace-impls = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-select = { workspace = true }
+arrow-ord = { workspace = true }
+arrow-cast = { workspace = true }
+object_store = { workspace = true }
+dashmap = { workspace = true }
+blake3 = { workspace = true }
+image = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+metrics = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+hirn-graph = { workspace = true }
+datafusion = { workspace = true }
+datafusion-common = { workspace = true }
+datafusion-expr = { workspace = true }
+datafusion-execution = { workspace = true }
+datafusion-physical-plan = { workspace = true }
+
+[dev-dependencies]
+hirn-provider = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["full", "test-util"] }
+proptest = { workspace = true }
+tracing-test = "0.2"
+
+[features]
+default = []
+s3 = ["lance-namespace-impls/dir-aws"]
+gcs = ["lance-namespace-impls/dir-gcp"]
+azure = ["lance-namespace-impls/dir-azure"]
+oss = ["lance-namespace-impls/dir-oss"]
+credential-vending = [
+    "lance-namespace-impls/credential-vendor-aws",
+    "lance-namespace-impls/credential-vendor-gcp",
+    "lance-namespace-impls/credential-vendor-azure",
+]

@@ -1,0 +1,399 @@
+{
+  "run_id": "01KSHB6EDM7C7NWN0E1MZ9PP6B",
+  "metadata": {
+    "generated_at_rfc3339": "2026-05-26T05:13:08.440749+00:00",
+    "dataset_source": "external:longmemeval:auto-download",
+    "corpus_embedding_source": "pseudo-embedding",
+    "embedding_model_label": "pseudo-embedding",
+    "query_embedding_source": "pseudo",
+    "query_embedding_model_label": "pseudo-embedding",
+    "embedding_dims": 64,
+    "token_budget": 4096,
+    "k": 10,
+    "retrieval_profile": "minimal",
+    "execution_surface": "compiled-hirnql",
+    "query_text_hybrid": false,
+    "active_retrieval_surfaces": {
+      "query_text_hybrid": false,
+      "graph_routing": true,
+      "multivector": false,
+      "reranker": false,
+      "tokenizer": false,
+      "compiled_hirnql": true,
+      "quality_gate": false,
+      "iterative_retrieval": false,
+      "notes": [
+        "compiled_hirnql=true via plain THINK/RECALL execution with diagnostics; quality_gate=false for benchmark minimal-profile parity, while iterative retrieval remains off because benchmark queries use local THINK mode",
+        "WARNING: using hash-based pseudo-embeddings (no real embedding provider or cache found) — scores will be LOWER than with real embeddings; do not publish these results as-is",
+        "minimal profile keeps provider-backed retrieval extras disabled"
+      ]
+    },
+    "runs": 1,
+    "baseline_strategies": [
+      "full-context",
+      "iterative-retrieval"
+    ],
+    "environment": {
+      "os": "macos",
+      "arch": "aarch64",
+      "logical_cpus": 14,
+      "git_commit_sha": "2b0787f12360e43a0e77e2651445bf47bac3860b",
+      "cargo_lock_blake3": "c6ddbe1cb1bcc0178f4b200f3bf8d70d8a59da909f943a0f942812a765dc384d"
+    }
+  },
+  "results": [
+    {
+      "benchmark": "LongMemEval (/Users/hupe/.cache/hirn-bench/longmemeval)",
+      "strategy": "hirn",
+      "run_id": "01KSHB6EDM7C7NWN0E1MZ9PP6B",
+      "categories": [
+        {
+          "name": "knowledge-update",
+          "containment": 0.4732307547524939,
+          "token_f1": 0.0015963331031553516,
+          "recall_accuracy": 0.11594202898550725,
+          "mrr": 0.04675638371290545,
+          "ndcg": 0.06744652590198981,
+          "semantic_similarity": 0.22237830005809484,
+          "false_positive_rate": 0.0,
+          "total": 69
+        },
+        {
+          "name": "multi-session",
+          "containment": 0.595326968740413,
+          "token_f1": 0.003117537116255014,
+          "recall_accuracy": 0.3870967741935484,
+          "mrr": 0.28198924731182795,
+          "ndcg": 0.30704616705576543,
+          "semantic_similarity": 0.2048873852036321,
+          "false_positive_rate": 0.0,
+          "total": 62
+        },
+        {
+          "name": "single-session-assistant",
+          "containment": 0.21428571428571427,
+          "token_f1": 0.0013100436681222707,
+          "recall_accuracy": 0.0,
+          "mrr": 0.0,
+          "ndcg": 0.0,
+          "semantic_similarity": 0.41295716696827567,
+          "false_positive_rate": 0.0,
+          "total": 2
+        },
+        {
+          "name": "temporal-reasoning",
+          "containment": 0.4129468153105924,
+          "token_f1": 0.0024335980841952137,
+          "recall_accuracy": 0.05,
+          "mrr": 0.027777777777777776,
+          "ndcg": 0.03408431809070081,
+          "semantic_similarity": 0.3579188495762383,
+          "false_positive_rate": 0.0,
+          "total": 60
+        }
+      ],
+      "overall_containment": 0.4910288833525111,
+      "overall_token_f1": 0.0023423329415206595,
+      "overall_recall_accuracy": 0.18134715025906736,
+      "overall_mrr": 0.11593881075746361,
+      "overall_ndcg": 0.13334576025977615,
+      "overall_semantic_similarity": 0.26087132588157824,
+      "false_positive_rate": 0.0,
+      "execution_latency": {
+        "p50": 32144.166,
+        "p95": 37006.625,
+        "p99": 41709.5,
+        "min": 21329.208,
+        "max": 59148.917,
+        "mean": 32009.846
+      },
+      "evaluation_latency": {
+        "p50": 141.5,
+        "p95": 207.875,
+        "p99": 293.41700000000003,
+        "min": 95.667,
+        "max": 327.75,
+        "mean": 147.017
+      },
+      "end_to_end_latency": {
+        "p50": 32303.417,
+        "p95": 37123.5,
+        "p99": 41868.834,
+        "min": 21434.541,
+        "max": 59339.834,
+        "mean": 32156.864
+      },
+      "token_cost": {
+        "context_tokens": 615206,
+        "prompt_tokens": 618267,
+        "completion_tokens": 0,
+        "total_tokens": 618267,
+        "avg_context_tokens_per_query": 3187.5958549222796,
+        "avg_prompt_tokens_per_query": 3203.455958549223,
+        "avg_total_tokens_per_query": 3203.455958549223
+      },
+      "total_queries": 193,
+      "ingest_time_secs": 5.3691775,
+      "query_time_secs": 6.207911583,
+      "total_time_secs": 11.763935792,
+      "compiled_phase_timings": {
+        "optimize": {
+          "p50": 98.251,
+          "p95": 121.667,
+          "p99": 135.625,
+          "min": 62.876,
+          "max": 140.04299999999998,
+          "mean": 99.016
+        },
+        "physical_plan": {
+          "p50": 161.958,
+          "p95": 189.792,
+          "p99": 204.292,
+          "min": 112.417,
+          "max": 214.291,
+          "mean": 162.90599999999998
+        },
+        "execute_plan": {
+          "p50": 16244.042,
+          "p95": 21177.5,
+          "p99": 25085.667999999998,
+          "min": 3795.6679999999997,
+          "max": 26624.959,
+          "mean": 15788.935000000001
+        },
+        "embed": {
+          "p50": 2.084,
+          "p95": 3.209,
+          "p99": 4.833,
+          "min": 0.75,
+          "max": 5.0409999999999995,
+          "mean": 2.198
+        },
+        "decode": {
+          "p50": 3031.542,
+          "p95": 3393.25,
+          "p99": 3488.4590000000003,
+          "min": 2340.25,
+          "max": 3707.584,
+          "mean": 3047.218
+        },
+        "assemble": {
+          "p50": 11455.833,
+          "p95": 12624.0,
+          "p99": 13773.542,
+          "min": 9864.457999999999,
+          "max": 16723.292,
+          "mean": 11529.710000000001
+        },
+        "total": {
+          "p50": 30971.915999999997,
+          "p95": 35748.708,
+          "p99": 39648.125,
+          "min": 20143.625,
+          "max": 40624.583,
+          "mean": 30713.252
+        }
+      },
+      "baselines": [
+        {
+          "benchmark": "LongMemEval (/Users/hupe/.cache/hirn-bench/longmemeval)",
+          "strategy": "full-context",
+          "run_id": "01KSHB6EDM7C7NWN0E1MZ9PP6B",
+          "categories": [
+            {
+              "name": "knowledge-update",
+              "containment": 0.4249513771252902,
+              "token_f1": 0.001122792788937463,
+              "recall_accuracy": 0.18840579710144928,
+              "mrr": 0.09149413388543824,
+              "ndcg": 0.09818901565929725,
+              "semantic_similarity": 0.22237830005809484,
+              "false_positive_rate": 0.0,
+              "total": 69
+            },
+            {
+              "name": "multi-session",
+              "containment": 0.5382650118800691,
+              "token_f1": 0.0022051106087376815,
+              "recall_accuracy": 0.3548387096774194,
+              "mrr": 0.2903225806451613,
+              "ndcg": 0.3216773421167711,
+              "semantic_similarity": 0.2048873852036321,
+              "false_positive_rate": 0.0,
+              "total": 62
+            },
+            {
+              "name": "single-session-assistant",
+              "containment": 0.21428571428571427,
+              "token_f1": 0.0009702457956015524,
+              "recall_accuracy": 0.0,
+              "mrr": 0.0,
+              "ndcg": 0.0,
+              "semantic_similarity": 0.41295716696827567,
+              "false_positive_rate": 0.0,
+              "total": 2
+            },
+            {
+              "name": "temporal-reasoning",
+              "containment": 0.41059273981952,
+              "token_f1": 0.0018081675158510137,
+              "recall_accuracy": 0.05,
+              "mrr": 0.041666666666666664,
+              "ndcg": 0.043004653514196876,
+              "semantic_similarity": 0.3579188495762383,
+              "false_positive_rate": 0.0,
+              "total": 60
+            }
+          ],
+          "overall_containment": 0.45470575946089076,
+          "overall_token_f1": 0.0016819694441486271,
+          "overall_recall_accuracy": 0.19689119170984457,
+          "overall_mrr": 0.13892795460152974,
+          "overall_ndcg": 0.15180993006519758,
+          "overall_semantic_similarity": 0.26087132588157824,
+          "false_positive_rate": 0.0,
+          "execution_latency": {
+            "p50": 5.625,
+            "p95": 8.834,
+            "p99": 13.125,
+            "min": 3.208,
+            "max": 31.083000000000002,
+            "mean": 6.005999999999999
+          },
+          "evaluation_latency": {
+            "p50": 101.833,
+            "p95": 159.708,
+            "p99": 226.167,
+            "min": 58.791,
+            "max": 244.959,
+            "mean": 107.08
+          },
+          "end_to_end_latency": {
+            "p50": 107.70800000000001,
+            "p95": 167.167,
+            "p99": 230.167,
+            "min": 62.666,
+            "max": 252.459,
+            "mean": 113.086
+          },
+          "token_cost": {
+            "context_tokens": 783194,
+            "prompt_tokens": 786255,
+            "completion_tokens": 0,
+            "total_tokens": 786255,
+            "avg_context_tokens_per_query": 4058.0,
+            "avg_prompt_tokens_per_query": 4073.860103626943,
+            "avg_total_tokens_per_query": 4073.860103626943
+          },
+          "total_queries": 193,
+          "ingest_time_secs": 0.0,
+          "query_time_secs": 0.023255083,
+          "total_time_secs": 0.552104959,
+          "embedding_cache_miss_count": 5772
+        },
+        {
+          "benchmark": "LongMemEval (/Users/hupe/.cache/hirn-bench/longmemeval)",
+          "strategy": "iterative-retrieval",
+          "run_id": "01KSHB6EDM7C7NWN0E1MZ9PP6B",
+          "categories": [
+            {
+              "name": "knowledge-update",
+              "containment": 0.553362820754125,
+              "token_f1": 0.009041552939284665,
+              "recall_accuracy": 0.4782608695652174,
+              "mrr": 0.2706521739130434,
+              "ndcg": 0.31966488931364134,
+              "semantic_similarity": 0.22237830005809484,
+              "false_positive_rate": 0.0,
+              "total": 69
+            },
+            {
+              "name": "multi-session",
+              "containment": 0.6193343340959553,
+              "token_f1": 0.005736658626294029,
+              "recall_accuracy": 0.4032258064516129,
+              "mrr": 0.34453405017921146,
+              "ndcg": 0.3660202235442433,
+              "semantic_similarity": 0.2048873852036321,
+              "false_positive_rate": 0.0,
+              "total": 62
+            },
+            {
+              "name": "single-session-assistant",
+              "containment": 0.21428571428571427,
+              "token_f1": 0.003236245954692557,
+              "recall_accuracy": 0.0,
+              "mrr": 0.0,
+              "ndcg": 0.0,
+              "semantic_similarity": 0.41295716696827567,
+              "false_positive_rate": 0.0,
+              "total": 2
+            },
+            {
+              "name": "temporal-reasoning",
+              "containment": 0.54268308420166,
+              "token_f1": 0.006466895151784994,
+              "recall_accuracy": 0.18333333333333332,
+              "mrr": 0.09657407407407408,
+              "ndcg": 0.12105553879908258,
+              "semantic_similarity": 0.3579188495762383,
+              "false_positive_rate": 0.0,
+              "total": 60
+            }
+          ],
+          "overall_containment": 0.567721864386813,
+          "overall_token_f1": 0.007119306676981121,
+          "overall_recall_accuracy": 0.35751295336787564,
+          "overall_mrr": 0.23746401842256773,
+          "overall_ndcg": 0.26949981114160254,
+          "overall_semantic_similarity": 0.26087132588157824,
+          "false_positive_rate": 0.0,
+          "execution_latency": {
+            "p50": 10538.375,
+            "p95": 12600.25,
+            "p99": 14496.25,
+            "min": 8532.417000000001,
+            "max": 15045.125,
+            "mean": 10660.361
+          },
+          "evaluation_latency": {
+            "p50": 80.125,
+            "p95": 185.0,
+            "p99": 238.75,
+            "min": 28.125,
+            "max": 251.87499999999997,
+            "mean": 91.80199999999999
+          },
+          "end_to_end_latency": {
+            "p50": 10619.541,
+            "p95": 12651.75,
+            "p99": 14607.458,
+            "min": 8661.208,
+            "max": 15147.582999999999,
+            "mean": 10752.164
+          },
+          "token_cost": {
+            "context_tokens": 247739,
+            "prompt_tokens": 250800,
+            "completion_tokens": 0,
+            "total_tokens": 250800,
+            "avg_context_tokens_per_query": 1283.6217616580311,
+            "avg_prompt_tokens_per_query": 1299.481865284974,
+            "avg_total_tokens_per_query": 1299.481865284974
+          },
+          "total_queries": 193,
+          "ingest_time_secs": 0.0,
+          "query_time_secs": 2.078925041,
+          "total_time_secs": 2.6149428329999997,
+          "embedding_cache_miss_count": 6158
+        }
+      ],
+      "embedding_cache_miss_count": 5386
+    }
+  ],
+  "total_time_secs": 11.763935792,
+  "final_score": 0.4910288833525111,
+  "geometric_mean": 0.4910288833525111,
+  "min_suite_score": 0.4910288833525111,
+  "all_competitive": true
+}

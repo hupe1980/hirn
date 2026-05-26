@@ -1,0 +1,27 @@
+[package]
+name = "hirn-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+hirn-query = { path = "../crates/hirn-query" }
+hirn-core = { path = "../crates/hirn-core" }
+
+[[bin]]
+name = "hirnql_parse"
+path = "fuzz_targets/hirnql_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lance_filter"
+path = "fuzz_targets/lance_filter.rs"
+test = false
+doc = false
+bench = false

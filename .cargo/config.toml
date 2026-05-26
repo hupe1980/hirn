@@ -1,0 +1,6 @@
+[build]
+# Each test binary links ~260 MB of deps (lance+arrow+datafusion+tokio).
+# The macOS ld linker uses 2-4 GB RAM per link. With 37 integration test
+# binaries across the workspace, default jobs=14 can cause 14 concurrent
+# links = 42+ GB peak memory, exhausting 48 GB RAM.
+jobs = 4

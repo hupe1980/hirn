@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 593ff1afe03a1f1da82385481c27f48a7125614359054655fef52d50e9c065bf # shrinks to record = Working(WorkingMemoryEntry { id: MemoryId(Ulid(2145109918951838263815820490941331089)), content: " ", created_at: Timestamp(2026-03-24T23:02:16.752590Z), expires_at: Timestamp(2026-03-25T00:02:16.752590Z), relevance_score: 0.0, token_count: 0, source: None, priority: Normal, agent_id: AgentId("prop_agent"), multi_content: None })

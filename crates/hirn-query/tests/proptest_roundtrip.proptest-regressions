@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 02edc252308957851e8277988e8bf29f7ce9d12ab81affb749d6133ba5b69865 # shrinks to query = "CONSOLIDATE"
+cc 6f08044fab0550941a382a3f6a4b70012b60c76855ba540bb03b7d034de905d9 # shrinks to query = "FORGET \"01HQ1A2B3C4D5E6F7G8H9J0K1M\""
+cc 5e429241f7f70773f268db9a8cf0faf7814d9aa791cfbe82095e6810e5c483de # shrinks to query = "CONNECT \"01HQ1A2B3C4D5E6F7G8H9J0K1M\" TO \"01HQ1A2B3C4D5E6F7G8H9J0K2N\" AS related_to"
+cc 18e0e631bec4876c67bb68aa3f4dba94cc2210d44075d98887cfd952c7d97e82 # shrinks to query = "REMEMBER episode CONTENT \"a\""

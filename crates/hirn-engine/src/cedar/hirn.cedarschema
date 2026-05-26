@@ -1,0 +1,136 @@
+// hirn authorization schema — defines the Cedar entity model for cognitive memory operations.
+//
+// Entity hierarchy:
+//   Agent ∈ Team ∈ Organization
+//   Namespace ∈ Realm
+//   MemoryLayer, Operation, Tool — standalone entities for fine-grained policies
+//
+// Actions covering all hirn memory operations:
+//   remember, correct, supersede, merge, retract, purge, recall, think,
+//   forget, consolidate, watch, connect, execute, admin, recall_raw_text,
+//   read, write, delete
+
+namespace Hirn {
+    entity Agent in [Team] = {
+        "reputation": Long,
+        "created_at": String,
+    };
+
+    entity Team in [Organization] = {
+        "description": String,
+    };
+
+    entity Organization = {
+        "description": String,
+    };
+
+    entity Realm = {
+        "description": String,
+    };
+
+    entity Namespace in [Realm] = {
+        "classification": String,
+    };
+
+    entity MemoryLayer = {
+        "description": String,
+    };
+
+    entity Operation = {
+        "description": String,
+    };
+
+    entity Tool = {
+        "description": String,
+    };
+
+    action "remember" appliesTo {
+        principal: [Agent, Team],
+        resource: [Namespace, Realm],
+    };
+
+    action "correct" appliesTo {
+        principal: [Agent, Team],
+        resource: [Namespace, Realm],
+    };
+
+    action "supersede" appliesTo {
+        principal: [Agent, Team],
+        resource: [Namespace, Realm],
+    };
+
+    action "merge" appliesTo {
+        principal: [Agent, Team],
+        resource: [Namespace, Realm],
+    };
+
+    action "retract" appliesTo {
+        principal: [Agent, Team],
+        resource: [Namespace, Realm],
+    };
+
+    action "purge" appliesTo {
+        principal: [Agent, Team],
+        resource: [Namespace, Realm],
+    };
+
+    action "recall" appliesTo {
+        principal: [Agent, Team],
+        resource: [Namespace, Realm],
+    };
+
+    action "think" appliesTo {
+        principal: [Agent, Team],
+        resource: [Namespace, Realm],
+    };
+
+    action "forget" appliesTo {
+        principal: [Agent, Team],
+        resource: [Namespace, Realm],
+    };
+
+    action "consolidate" appliesTo {
+        principal: [Agent, Team],
+        resource: [Namespace, Realm],
+    };
+
+    action "watch" appliesTo {
+        principal: [Agent, Team],
+        resource: [Namespace, Realm],
+    };
+
+    action "connect" appliesTo {
+        principal: [Agent, Team],
+        resource: [Namespace, Realm],
+    };
+
+    action "execute" appliesTo {
+        principal: [Agent, Team],
+        resource: [Namespace, Realm],
+    };
+
+    action "admin" appliesTo {
+        principal: [Agent, Team],
+        resource: [Namespace, Realm],
+    };
+
+    action "recall_raw_text" appliesTo {
+        principal: [Agent, Team],
+        resource: [Namespace, Realm],
+    };
+
+    action "read" appliesTo {
+        principal: [Agent, Team],
+        resource: [Namespace, Realm, MemoryLayer, Operation, Tool],
+    };
+
+    action "write" appliesTo {
+        principal: [Agent, Team],
+        resource: [Namespace, Realm, MemoryLayer, Operation, Tool],
+    };
+
+    action "delete" appliesTo {
+        principal: [Agent, Team],
+        resource: [Namespace, Realm, MemoryLayer],
+    };
+}

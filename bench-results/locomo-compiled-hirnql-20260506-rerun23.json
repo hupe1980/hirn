@@ -1,0 +1,429 @@
+{
+  "run_id": "01KQZKPNF7AG0XPC7RNHA77D3B",
+  "metadata": {
+    "generated_at_rfc3339": "2026-05-06T21:44:10.497368+00:00",
+    "dataset_source": "external:locomo:auto-download",
+    "corpus_embedding_source": "cache:embeddings/locomo_embeddings.json",
+    "embedding_model_label": "text-embedding-3-small",
+    "query_embedding_source": "cache",
+    "query_embedding_model_label": "text-embedding-3-small",
+    "embedding_dims": 1536,
+    "token_budget": 4096,
+    "k": 10,
+    "retrieval_profile": "minimal",
+    "execution_surface": "compiled-hirnql",
+    "query_text_hybrid": false,
+    "active_retrieval_surfaces": {
+      "query_text_hybrid": false,
+      "graph_routing": true,
+      "multivector": false,
+      "reranker": false,
+      "tokenizer": false,
+      "compiled_hirnql": true,
+      "quality_gate": false,
+      "iterative_retrieval": false,
+      "notes": [
+        "compiled_hirnql=true via plain THINK/RECALL execution with diagnostics; quality_gate=false for benchmark minimal-profile parity, while iterative retrieval remains off because benchmark queries use local THINK mode",
+        "cache-backed benchmark embedder installed for query-time parity with ingest",
+        "minimal profile keeps provider-backed retrieval extras disabled"
+      ]
+    },
+    "runs": 1,
+    "baseline_strategies": [
+      "full-context",
+      "iterative-retrieval"
+    ],
+    "environment": {
+      "os": "macos",
+      "arch": "aarch64",
+      "logical_cpus": 14,
+      "git_commit_sha": "32c5d7e56d3b2600f86d81ff0a847ec3367d1b82",
+      "cargo_lock_blake3": "c6a4ce0eb42c159dfb440b29bdfdaa7e542014553cf39f57a2923165bdcf1d90"
+    }
+  },
+  "results": [
+    {
+      "benchmark": "LoCoMo (/Users/hupe/.cache/hirn-bench/locomo)",
+      "strategy": "hirn",
+      "run_id": "01KQZKPNF7AG0XPC7RNHA77D3B",
+      "categories": [
+        {
+          "name": "adversarial",
+          "containment": 1.0,
+          "token_f1": 0.0,
+          "recall_accuracy": 0.44730941704035876,
+          "mrr": 0.24231528934443727,
+          "ndcg": 0.33430724376802085,
+          "semantic_similarity": 0.01363639070383214,
+          "false_positive_rate": 0.0,
+          "total": 446
+        },
+        {
+          "name": "multi-hop",
+          "containment": 0.776705730885838,
+          "token_f1": 0.004435111017307181,
+          "recall_accuracy": 0.4941460948739784,
+          "mrr": 0.5075073173477428,
+          "ndcg": 0.46708322379367867,
+          "semantic_similarity": 0.01060783764071119,
+          "false_positive_rate": 0.0,
+          "total": 282
+        },
+        {
+          "name": "single-hop",
+          "containment": 0.9401728914913503,
+          "token_f1": 0.0038222940943955603,
+          "recall_accuracy": 0.7120491478398732,
+          "mrr": 0.5579836928826225,
+          "ndcg": 0.6906049649658946,
+          "semantic_similarity": 0.010404060987843617,
+          "false_positive_rate": 0.0,
+          "total": 841
+        },
+        {
+          "name": "temporal",
+          "containment": 0.7753510853978137,
+          "token_f1": 0.0023989992059955,
+          "recall_accuracy": 0.7816718587746624,
+          "mrr": 0.6637875191613509,
+          "ndcg": 0.7881344708322581,
+          "semantic_similarity": 0.009959027468211996,
+          "false_positive_rate": 0.0,
+          "total": 321
+        },
+        {
+          "name": "world-knowledge",
+          "containment": 0.472184503120949,
+          "token_f1": 0.003563857209820482,
+          "recall_accuracy": 0.35304330065359485,
+          "mrr": 0.2984912367724868,
+          "ndcg": 0.3354431670423994,
+          "semantic_similarity": 0.012261037736830049,
+          "false_positive_rate": 0.0,
+          "total": 96
+        }
+      ],
+      "overall_containment": 0.8811348582912099,
+      "overall_token_f1": 0.0028083885586780493,
+      "overall_recall_accuracy": 0.6155545597266903,
+      "overall_mrr": 0.48448384724819826,
+      "overall_ndcg": 0.577447625649496,
+      "overall_semantic_similarity": 0.011176718630109727,
+      "false_positive_rate": 0.0,
+      "execution_latency": {
+        "p50": 59893.667,
+        "p95": 127660.95799999998,
+        "p99": 176592.875,
+        "min": 39083.583999999995,
+        "max": 260780.87500000003,
+        "mean": 69409.754
+      },
+      "evaluation_latency": {
+        "p50": 1183.5,
+        "p95": 1371.2920000000001,
+        "p99": 1455.667,
+        "min": 680.7090000000001,
+        "max": 3051.541,
+        "mean": 1152.961
+      },
+      "end_to_end_latency": {
+        "p50": 61043.25,
+        "p95": 128779.708,
+        "p99": 177664.58299999998,
+        "min": 40480.958999999995,
+        "max": 261876.95799999998,
+        "mean": 70562.715
+      },
+      "token_cost": {
+        "context_tokens": 6292787,
+        "prompt_tokens": 6316855,
+        "completion_tokens": 0,
+        "total_tokens": 6316855,
+        "avg_context_tokens_per_query": 3168.5735146022157,
+        "avg_prompt_tokens_per_query": 3180.692346424975,
+        "avg_total_tokens_per_query": 3180.692346424975
+      },
+      "total_queries": 1986,
+      "ingest_time_secs": 38.225110834,
+      "query_time_secs": 140.158116292,
+      "total_time_secs": 179.391041166,
+      "compiled_phase_timings": {
+        "optimize": {
+          "p50": 239.249,
+          "p95": 296.333,
+          "p99": 313.29200000000003,
+          "min": 192.833,
+          "max": 538.626,
+          "mean": 246.512
+        },
+        "physical_plan": {
+          "p50": 499.042,
+          "p95": 658.209,
+          "p99": 686.9159999999999,
+          "min": 404.667,
+          "max": 1160.75,
+          "mean": 522.2099999999999
+        },
+        "execute_plan": {
+          "p50": 13875.083999999999,
+          "p95": 28459.0,
+          "p99": 31911.125,
+          "min": 11443.208,
+          "max": 35643.333,
+          "mean": 16217.766000000001
+        },
+        "embed": {
+          "p50": 18.791999999999998,
+          "p95": 21.75,
+          "p99": 28.0,
+          "min": 13.499,
+          "max": 49.208,
+          "mean": 18.983
+        },
+        "decode": {
+          "p50": 4310.125,
+          "p95": 5473.209,
+          "p99": 6088.583,
+          "min": 3292.5,
+          "max": 7805.625,
+          "mean": 4407.2390000000005
+        },
+        "assemble": {
+          "p50": 39131.75,
+          "p95": 93715.375,
+          "p99": 141785.166,
+          "min": 18556.334,
+          "max": 225239.334,
+          "mean": 46123.31
+        },
+        "total": {
+          "p50": 58239.792,
+          "p95": 125878.58299999998,
+          "p99": 174802.334,
+          "min": 37353.126000000004,
+          "max": 259042.333,
+          "mean": 67716.796
+        }
+      },
+      "baselines": [
+        {
+          "benchmark": "LoCoMo (/Users/hupe/.cache/hirn-bench/locomo)",
+          "strategy": "full-context",
+          "run_id": "01KQZKPNF7AG0XPC7RNHA77D3B",
+          "categories": [
+            {
+              "name": "adversarial",
+              "containment": 1.0,
+              "token_f1": 3.6561801326827773e-6,
+              "recall_accuracy": 0.08071748878923767,
+              "mrr": 0.00480827152735107,
+              "ndcg": 0.0044440485374681385,
+              "semantic_similarity": 0.01363639070383214,
+              "false_positive_rate": 0.0,
+              "total": 446
+            },
+            {
+              "name": "multi-hop",
+              "containment": 0.2731876265018998,
+              "token_f1": 0.0014657640209763427,
+              "recall_accuracy": 0.17479402622179782,
+              "mrr": 0.04327210828812953,
+              "ndcg": 0.02901880837338544,
+              "semantic_similarity": 0.01060783764071119,
+              "false_positive_rate": 0.0,
+              "total": 282
+            },
+            {
+              "name": "single-hop",
+              "containment": 0.37897981738560116,
+              "token_f1": 0.001716855837286681,
+              "recall_accuracy": 0.08323424494649227,
+              "mrr": 0.006911745868490216,
+              "ndcg": 0.009367558284870134,
+              "semantic_similarity": 0.010404060987843617,
+              "false_positive_rate": 0.0,
+              "total": 841
+            },
+            {
+              "name": "temporal",
+              "containment": 0.37370320921722777,
+              "token_f1": 0.001085520258407024,
+              "recall_accuracy": 0.13655244029075805,
+              "mrr": 0.014942448128392398,
+              "ndcg": 0.0174799636633425,
+              "semantic_similarity": 0.009959027468211996,
+              "false_positive_rate": 0.0,
+              "total": 321
+            },
+            {
+              "name": "world-knowledge",
+              "containment": 0.3306604083758084,
+              "token_f1": 0.002216186121117494,
+              "recall_accuracy": 0.1257937834224599,
+              "mrr": 0.01066675001822507,
+              "ndcg": 0.011967070663378739,
+              "semantic_similarity": 0.012261037736830049,
+              "false_positive_rate": 0.0,
+              "total": 96
+            }
+          ],
+          "overall_containment": 0.5002331653865236,
+          "overall_token_f1": 0.0012185587814645142,
+          "overall_recall_accuracy": 0.10634514196195191,
+          "overall_mrr": 0.013081840767781962,
+          "overall_ndcg": 0.01248911039587038,
+          "overall_semantic_similarity": 0.011176718630109727,
+          "false_positive_rate": 0.0,
+          "execution_latency": {
+            "p50": 12.042,
+            "p95": 16.458000000000002,
+            "p99": 21.125,
+            "min": 8.666,
+            "max": 69.792,
+            "mean": 12.548
+          },
+          "evaluation_latency": {
+            "p50": 1319.125,
+            "p95": 1581.5829999999999,
+            "p99": 1902.084,
+            "min": 1120.75,
+            "max": 2634.833,
+            "mean": 1348.035
+          },
+          "end_to_end_latency": {
+            "p50": 1331.875,
+            "p95": 1595.4579999999999,
+            "p99": 1914.459,
+            "min": 1138.416,
+            "max": 2651.333,
+            "mean": 1360.583
+          },
+          "token_cost": {
+            "context_tokens": 8093754,
+            "prompt_tokens": 8117822,
+            "completion_tokens": 0,
+            "total_tokens": 8117822,
+            "avg_context_tokens_per_query": 4075.404833836858,
+            "avg_prompt_tokens_per_query": 4087.523665659617,
+            "avg_total_tokens_per_query": 4087.523665659617
+          },
+          "total_queries": 1986,
+          "ingest_time_secs": 0.0,
+          "query_time_secs": 2.722691792,
+          "total_time_secs": 2.993938625
+        },
+        {
+          "benchmark": "LoCoMo (/Users/hupe/.cache/hirn-bench/locomo)",
+          "strategy": "iterative-retrieval",
+          "run_id": "01KQZKPNF7AG0XPC7RNHA77D3B",
+          "categories": [
+            {
+              "name": "adversarial",
+              "containment": 0.9955156950672646,
+              "token_f1": 0.0,
+              "recall_accuracy": 0.2600896860986547,
+              "mrr": 0.1534522030037726,
+              "ndcg": 0.2577853533915766,
+              "semantic_similarity": 0.01363639070383214,
+              "false_positive_rate": 0.0,
+              "total": 446
+            },
+            {
+              "name": "multi-hop",
+              "containment": 0.29276611814134007,
+              "token_f1": 0.01566114430913818,
+              "recall_accuracy": 0.06034854625280159,
+              "mrr": 0.0864263199369582,
+              "ndcg": 0.07517823606806819,
+              "semantic_similarity": 0.01060783764071119,
+              "false_positive_rate": 0.0,
+              "total": 282
+            },
+            {
+              "name": "single-hop",
+              "containment": 0.5761005789691874,
+              "token_f1": 0.022304027428819456,
+              "recall_accuracy": 0.310543004359889,
+              "mrr": 0.19935498178661096,
+              "ndcg": 0.3275224885875034,
+              "semantic_similarity": 0.010404060987843617,
+              "false_positive_rate": 0.0,
+              "total": 841
+            },
+            {
+              "name": "temporal",
+              "containment": 0.5116711170449487,
+              "token_f1": 0.016007669369084813,
+              "recall_accuracy": 0.3136033229491173,
+              "mrr": 0.19909879839786385,
+              "ndcg": 0.333781539737593,
+              "semantic_similarity": 0.009959027468211996,
+              "false_positive_rate": 0.0,
+              "total": 321
+            },
+            {
+              "name": "world-knowledge",
+              "containment": 0.20129580243230452,
+              "token_f1": 0.014204906467678463,
+              "recall_accuracy": 0.09114583333333333,
+              "mrr": 0.061111111111111116,
+              "ndcg": 0.09212100967279219,
+              "semantic_similarity": 0.012261037736830049,
+              "false_positive_rate": 0.0,
+              "total": 96
+            }
+          ],
+          "overall_containment": 0.6015264138136326,
+          "overall_token_f1": 0.014942730438664401,
+          "overall_recall_accuracy": 0.25357584258641647,
+          "overall_mrr": 0.16628742467111035,
+          "overall_ndcg": 0.2656628571350885,
+          "overall_semantic_similarity": 0.011176718630109727,
+          "false_positive_rate": 0.0,
+          "execution_latency": {
+            "p50": 47752.5,
+            "p95": 55592.542,
+            "p99": 59837.416999999994,
+            "min": 31710.750000000004,
+            "max": 65326.333,
+            "mean": 47933.354999999996
+          },
+          "evaluation_latency": {
+            "p50": 247.37499999999997,
+            "p95": 443.08299999999997,
+            "p99": 611.125,
+            "min": 65.792,
+            "max": 1345.0420000000001,
+            "mean": 258.025
+          },
+          "end_to_end_latency": {
+            "p50": 48018.125,
+            "p95": 55872.459,
+            "p99": 60218.041,
+            "min": 31853.959000000003,
+            "max": 65450.041,
+            "mean": 48191.38
+          },
+          "token_cost": {
+            "context_tokens": 774291,
+            "prompt_tokens": 798359,
+            "completion_tokens": 0,
+            "total_tokens": 798359,
+            "avg_context_tokens_per_query": 389.8746223564955,
+            "avg_prompt_tokens_per_query": 401.9934541792548,
+            "avg_total_tokens_per_query": 401.9934541792548
+          },
+          "total_queries": 1986,
+          "ingest_time_secs": 0.0,
+          "query_time_secs": 95.747120333,
+          "total_time_secs": 96.014575959
+        }
+      ]
+    }
+  ],
+  "total_time_secs": 179.391041166,
+  "final_score": 0.8811348582912099,
+  "geometric_mean": 0.8811348582912099,
+  "min_suite_score": 0.8811348582912099,
+  "all_competitive": true
+}

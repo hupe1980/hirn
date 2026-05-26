@@ -1,0 +1,42 @@
+[package]
+name = "hirn-python"
+description = "Python bindings for the hirn cognitive memory database"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false  # Distributed via PyPI (maturin), not crates.io
+
+[lib]
+# Keep the Rust target name unique from the facade crate; the Python extension
+# import path remains `hirn._hirn` via pyproject.toml + `#[pymodule] fn _hirn`.
+name = "hirn_python"
+crate-type = ["cdylib", "rlib"]
+doc = false  # Avoid cargo doc collision with the hirn facade crate
+doctest = false
+
+[dependencies]
+hirn = { workspace = true }
+hirn-storage = { workspace = true }
+pyo3 = { workspace = true, features = ["auto-initialize"] }
+numpy = { workspace = true }
+pyo3-async-runtimes = { workspace = true }
+serde_json = { workspace = true }
+ulid = { workspace = true }
+tokio = { workspace = true }
+
+[build-dependencies]
+pyo3-build-config = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+# Override workspace lints — PyO3 requires unsafe internally
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+# FFI binding crate — relaxed lints (wrapper code, not core logic)
+all = "allow"
+pedantic = "allow"
+nursery = "allow"

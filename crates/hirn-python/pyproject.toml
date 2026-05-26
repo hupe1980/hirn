@@ -1,0 +1,27 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "hirn"
+version = "0.1.0"
+description = "Brain-inspired cognitive memory database for LLMs"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: 3",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.optional-dependencies]
+openai = ["openai>=1.0"]
+ollama = ["ollama>=0.3"]
+sentence-transformers = ["sentence-transformers>=2.0"]
+all = ["openai>=1.0", "ollama>=0.3", "sentence-transformers>=2.0"]
+
+[tool.maturin]
+python-source = "python"
+module-name = "hirn._hirn"

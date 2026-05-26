@@ -1,0 +1,94 @@
+[package]
+name = "hirn-engine"
+description = "Engine for the hirn cognitive memory database"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hirn-core = { workspace = true }
+hirn-provider = { workspace = true }
+hirn-graph = { workspace = true }
+hirn-query = { workspace = true }
+hirn-storage = { workspace = true }
+hirn-exec = { workspace = true }
+hirn-policy = { workspace = true, features = ["cedar"] }
+datafusion = { workspace = true }
+lance-linalg = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-select = { workspace = true }
+async-trait = { workspace = true }
+ulid = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+parking_lot = { workspace = true }
+petgraph = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+metrics = { workspace = true }
+toml = { workspace = true }
+blake3 = { workspace = true }
+futures = { workspace = true }
+dashmap = { workspace = true }
+
+[dev-dependencies]
+hirn-storage = { workspace = true }
+proptest = { workspace = true }
+tempfile = { workspace = true }
+criterion = { workspace = true }
+metrics-util = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
+image = { workspace = true }
+
+[features]
+default = ["cedar", "tiktoken"]
+cedar = ["hirn-policy/cedar"]
+tiktoken = ["hirn-provider/tiktoken"]
+openai = ["hirn-provider/openai"]
+ollama = ["hirn-provider/ollama"]
+cohere = ["hirn-provider/cohere"]
+anthropic = ["hirn-provider/anthropic"]
+voyage = ["hirn-provider/voyage"]
+cross-encoder = ["hirn-provider/cross-encoder"]
+hf-tokenizer = ["hirn-provider/hf-tokenizer"]
+
+[[bench]]
+name = "graph_ops"
+harness = false
+
+[[bench]]
+name = "think_assembly"
+harness = false
+
+[[bench]]
+name = "lance_ops"
+harness = false
+
+[[bench]]
+name = "ql_ops"
+harness = false
+
+[[bench]]
+name = "consolidation_ops"
+harness = false
+
+[[bench]]
+name = "scaling"
+harness = false
+
+[[bench]]
+name = "event_bus"
+harness = false
+
+[[bench]]
+name = "semantic_revision_ops"
+harness = false
+
+[lints]
+workspace = true

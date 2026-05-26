@@ -1,0 +1,10 @@
+# .dockerignore — keep the Docker build context small
+target
+.git
+.github
+.env
+embeddings
+benchmarks_report.md
+*.hirn
+**/*.rs.bk
+**/mutants.out*

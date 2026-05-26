@@ -1,0 +1,164 @@
+{
+  "run_id": "01KSHANRJ8QPEGB3W9V3XH2DET",
+  "config": {
+    "writers": 4,
+    "readers": 8,
+    "writes_per_writer": 50,
+    "writer_batch_size": 16,
+    "max_auto_edges_per_record": 0,
+    "reads_per_reader": 100,
+    "preseed_records": 128,
+    "embedding_dims": 64,
+    "k": 10
+  },
+  "remember_latency": {
+    "p50": 4900.468,
+    "p95": 6111.445,
+    "p99": 57861.292,
+    "min": 1735.46,
+    "max": 57861.292,
+    "mean": 6557.6230000000005
+  },
+  "recall_latency": {
+    "p50": 53542.875,
+    "p95": 80254.375,
+    "p99": 89555.375,
+    "min": 4630.459,
+    "max": 97801.709,
+    "mean": 51654.214
+  },
+  "batch_remember_stage_latency": [
+    {
+      "stage": "authorize",
+      "observations": 15,
+      "latency": {
+        "p50": 1.042,
+        "p95": 2.3329999999999997,
+        "p99": 2.3329999999999997,
+        "min": 0.5419999999999999,
+        "max": 2.3329999999999997,
+        "mean": 1.2049999999999998
+      }
+    },
+    {
+      "stage": "admission",
+      "observations": 15,
+      "latency": {
+        "p50": 1.375,
+        "p95": 8.417,
+        "p99": 8.417,
+        "min": 0.625,
+        "max": 8.417,
+        "mean": 1.8050000000000002
+      }
+    },
+    {
+      "stage": "embedding",
+      "observations": 15,
+      "latency": {
+        "p50": 0.041,
+        "p95": 0.041999999999999996,
+        "p99": 0.041999999999999996,
+        "min": 0.0,
+        "max": 0.041999999999999996,
+        "mean": 0.022
+      }
+    },
+    {
+      "stage": "prepare",
+      "observations": 15,
+      "latency": {
+        "p50": 1.166,
+        "p95": 2.9170000000000003,
+        "p99": 2.9170000000000003,
+        "min": 0.25,
+        "max": 2.9170000000000003,
+        "mean": 1.266
+      }
+    },
+    {
+      "stage": "auto_edge_prefetch",
+      "observations": 15,
+      "latency": {
+        "p50": 8.042,
+        "p95": 30.750000000000004,
+        "p99": 30.750000000000004,
+        "min": 1.625,
+        "max": 30.750000000000004,
+        "mean": 9.38
+      }
+    },
+    {
+      "stage": "graph_prepare",
+      "observations": 15,
+      "latency": {
+        "p50": 16248.416000000001,
+        "p95": 30090.0,
+        "p99": 30090.0,
+        "min": 8304.5,
+        "max": 30090.0,
+        "mean": 16638.947
+      }
+    },
+    {
+      "stage": "append",
+      "observations": 15,
+      "latency": {
+        "p50": 28747.542,
+        "p95": 54113.792,
+        "p99": 54113.792,
+        "min": 14646.958999999999,
+        "max": 54113.792,
+        "mean": 31181.18
+      }
+    },
+    {
+      "stage": "temporal_next",
+      "observations": 15,
+      "latency": {
+        "p50": 22166.375,
+        "p95": 36311.375,
+        "p99": 36311.375,
+        "min": 11828.708,
+        "max": 36311.375,
+        "mean": 22976.722
+      }
+    },
+    {
+      "stage": "events",
+      "observations": 15,
+      "latency": {
+        "p50": 14341.207999999999,
+        "p95": 20341.959,
+        "p99": 20341.959,
+        "min": 10856.667000000001,
+        "max": 20341.959,
+        "mean": 14742.713
+      }
+    },
+    {
+      "stage": "slow_path",
+      "observations": 15,
+      "latency": {
+        "p50": 0.667,
+        "p95": 2.0,
+        "p99": 2.0,
+        "min": 0.291,
+        "max": 2.0,
+        "mean": 0.78
+      }
+    }
+  ],
+  "throughput": {
+    "remember_ops_per_sec": 38.42502545057545,
+    "recall_ops_per_sec": 153.7001018023018,
+    "total_ops_per_sec": 192.12512725287726
+  },
+  "writer_failures": 0,
+  "reader_failures": 0,
+  "peak_memory_bytes": 219529216,
+  "db_file_size_bytes": 64,
+  "preseed_time": 15907.667,
+  "load_time": 5204941.25,
+  "total_time": 5303210.208000001
+}

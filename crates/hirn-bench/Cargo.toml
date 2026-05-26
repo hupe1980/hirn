@@ -1,0 +1,39 @@
+[package]
+name = "hirn-bench"
+description = "Benchmark framework for the hirn cognitive memory database"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false  # Internal benchmark tool — not useful on crates.io
+
+[[bin]]
+name = "hirn-bench"
+path = "src/main.rs"
+
+[dependencies]
+hirn = { workspace = true }
+hirn-core = { workspace = true }
+hirn-storage = { workspace = true }
+hirn-engine = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+bincode = { workspace = true }
+tokio = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+tempfile = { workspace = true }
+ulid = { workspace = true }
+ureq = { workspace = true }
+dotenvy = { workspace = true }
+tiktoken-rs = { workspace = true }
+metrics = { workspace = true }
+metrics-util = { workspace = true }
+blake3 = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+
+[lints]
+workspace = true

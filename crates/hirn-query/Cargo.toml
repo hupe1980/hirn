@@ -1,0 +1,31 @@
+[package]
+name = "hirn-query"
+description = "HirnQL parser, AST, and compiler for the hirn cognitive memory database"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hirn-core = { workspace = true }
+chrono = { workspace = true }
+dashmap = { workspace = true }
+datafusion = { workspace = true }
+datafusion-common = { workspace = true }
+datafusion-expr = { workspace = true }
+parking_lot = { workspace = true }
+pest = { workspace = true }
+pest_derive = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+proptest = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
+
+[[bench]]
+name = "parse_ops"
+harness = false
+
+[lints]
+workspace = true

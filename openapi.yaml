@@ -1,0 +1,882 @@
+openapi: 3.0.3
+info:
+  title: Hirn REST API
+  description: |
+    Cognitive memory database for LLMs. Hirn stores episodic and semantic
+    memories, retrieves them via embedding similarity, assembles context with
+    token budgets, and maintains a knowledge graph linking related memories.
+  version: 0.1.0
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+
+servers:
+  - url: http://localhost:3000
+    description: Local development server
+
+tags:
+  - name: Memory
+    description: Store, recall, and manage memories
+  - name: Graph
+    description: Knowledge graph operations
+  - name: Query
+    description: HirnQL query execution
+  - name: Ops
+    description: Operational endpoints (health, stats, consolidation)
+
+paths:
+  /health:
+    get:
+      operationId: health
+      summary: Health check
+      tags: [Ops]
+      responses:
+        "200":
+          description: Server is healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+
+  /metrics:
+    get:
+      operationId: metrics
+      summary: Prometheus metrics
+      tags: [Ops]
+      description: |
+        Returns Prometheus text-format metrics. Only available when metrics are
+        enabled in the server configuration.
+      responses:
+        "200":
+          description: Prometheus metrics
+          content:
+            text/plain:
+              schema:
+                type: string
+        "404":
+          description: Metrics are disabled
+
+  /v1/remember:
+    post:
+      operationId: remember
+      summary: Store a memory
+      tags: [Memory]
+      description: |
+        Store an episodic or semantic memory record. The `layer` field
+        discriminates the variant; each variant has its own required fields.
+      parameters:
+        - $ref: "#/components/parameters/AgentId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RememberRequest"
+      responses:
+        "201":
+          description: Memory stored
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RememberResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /v1/recall:
+    post:
+      operationId: recall
+      summary: Recall memories by similarity
+      tags: [Memory]
+      description: |
+        Retrieve memories ranked by embedding similarity, activation score,
+        and composite scoring.
+      parameters:
+        - $ref: "#/components/parameters/AgentId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RecallRequest"
+      responses:
+        "200":
+          description: Recall results
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RecallResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /v1/think:
+    post:
+      operationId: think
+      summary: Assemble contextual thought
+      tags: [Memory]
+      description: |
+        Generate a context string from relevant memories, respecting an
+        optional token budget. Returns the assembled context together with
+        metadata about included/excluded records.
+      parameters:
+        - $ref: "#/components/parameters/AgentId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ThinkRequest"
+      responses:
+        "200":
+          description: Assembled context
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ThinkResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /v1/forget:
+    post:
+      operationId: forget
+      summary: Forget (archive or purge) a memory
+      tags: [Memory]
+      description: |
+        Archive or permanently delete a memory record. The default mode is
+        `archive`; use `purge` for irreversible deletion.
+      parameters:
+        - $ref: "#/components/parameters/AgentId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ForgetRequest"
+      responses:
+        "200":
+          description: Memory forgotten
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ForgetResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /v1/connect:
+    post:
+      operationId: connect
+      summary: Create a graph edge between two memories
+      tags: [Graph]
+      description: |
+        Create a directed edge in the knowledge graph linking a source memory
+        to a target memory with an optional relation type and weight.
+      parameters:
+        - $ref: "#/components/parameters/AgentId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ConnectRequest"
+      responses:
+        "201":
+          description: Edge created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConnectResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /v1/inspect/{id}:
+    get:
+      operationId: inspect
+      summary: Inspect a memory record
+      tags: [Memory]
+      description: |
+        Return detailed metadata for a single memory record, including
+        importance, access count, trust score, and graph neighbor count.
+      parameters:
+        - $ref: "#/components/parameters/AgentId"
+        - $ref: "#/components/parameters/MemoryId"
+      responses:
+        "200":
+          description: Record metadata
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InspectResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /v1/trace/{id}:
+    get:
+      operationId: trace
+      summary: Trace memory provenance
+      tags: [Memory]
+      description: |
+        Trace the lineage of a memory record — its source episodes, derived
+        records, mutation history, trust score, and full lineage tree.
+      parameters:
+        - $ref: "#/components/parameters/AgentId"
+        - $ref: "#/components/parameters/MemoryId"
+      responses:
+        "200":
+          description: Provenance trace
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TraceResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /v1/execute:
+    post:
+      operationId: execute
+      summary: Execute a HirnQL query
+      tags: [Query]
+      description: |
+        Parse and execute a HirnQL query string. The response shape depends on
+        the query type (RECALL, REMEMBER, FORGET, INSPECT, TRACE,
+        CONSOLIDATE, WATCH).
+      parameters:
+        - $ref: "#/components/parameters/AgentId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExecuteRequest"
+      responses:
+        "200":
+          description: Query result (polymorphic)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExecuteResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /v1/stats:
+    get:
+      operationId: stats
+      summary: Database statistics
+      tags: [Ops]
+      parameters:
+        - $ref: "#/components/parameters/AgentId"
+      responses:
+        "200":
+          description: Current database statistics
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatsResponse"
+
+  /v1/consolidate:
+    post:
+      operationId: consolidate
+      summary: Trigger memory consolidation
+      tags: [Ops]
+      description: |
+        Run the consolidation engine to segment episodes, detect patterns,
+        form narrative threads, and extract semantic concepts.
+      parameters:
+        - $ref: "#/components/parameters/AgentId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ConsolidateRequest"
+      responses:
+        "200":
+          description: Consolidation results
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConsolidateResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+components:
+  parameters:
+    AgentId:
+      name: X-Agent-ID
+      in: header
+      required: true
+      description: Identifier of the agent making the request.
+      schema:
+        type: string
+        minLength: 1
+
+    MemoryId:
+      name: id
+      in: path
+      required: true
+      description: UUID of the memory record.
+      schema:
+        type: string
+        format: uuid
+
+  responses:
+    BadRequest:
+      description: Invalid input
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+
+    NotFound:
+      description: Record not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+
+  schemas:
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+
+    # ── Health / Stats ──
+
+    HealthResponse:
+      type: object
+      required: [status, uptime_secs, record_count]
+      properties:
+        status:
+          type: string
+          example: ok
+        uptime_secs:
+          type: integer
+          format: int64
+        record_count:
+          type: integer
+          format: int64
+
+    StatsResponse:
+      type: object
+      required:
+        - working_count
+        - episodic_count
+        - semantic_count
+        - total_count
+        - file_size_bytes
+      properties:
+        working_count:
+          type: integer
+          format: int64
+        episodic_count:
+          type: integer
+          format: int64
+        semantic_count:
+          type: integer
+          format: int64
+        total_count:
+          type: integer
+          format: int64
+        file_size_bytes:
+          type: integer
+          format: int64
+
+    # ── Remember ──
+
+    RememberRequest:
+      discriminator:
+        propertyName: layer
+        mapping:
+          episodic: "#/components/schemas/RememberEpisodicRequest"
+          semantic: "#/components/schemas/RememberSemanticRequest"
+      oneOf:
+        - $ref: "#/components/schemas/RememberEpisodicRequest"
+        - $ref: "#/components/schemas/RememberSemanticRequest"
+
+    RememberEpisodicRequest:
+      type: object
+      required: [layer, content]
+      properties:
+        layer:
+          type: string
+          enum: [episodic]
+        content:
+          type: string
+        event_type:
+          type: string
+          enum:
+            - conversation
+            - tool_call
+            - observation
+            - experiment
+            - error
+            - decision
+        summary:
+          type: string
+        entities:
+          type: array
+          items:
+            $ref: "#/components/schemas/EntityInput"
+          default: []
+        embedding:
+          type: array
+          items:
+            type: number
+            format: float
+          default: []
+        importance:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+        surprise:
+          type: number
+          format: float
+        namespace:
+          type: string
+
+    RememberSemanticRequest:
+      type: object
+      required: [layer, concept, description]
+      properties:
+        layer:
+          type: string
+          enum: [semantic]
+        concept:
+          type: string
+        description:
+          type: string
+        knowledge_type:
+          type: string
+          enum: [propositional, prescriptive, taxonomic]
+        embedding:
+          type: array
+          items:
+            type: number
+            format: float
+          default: []
+        confidence:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+        namespace:
+          type: string
+
+    EntityInput:
+      type: object
+      required: [name, role]
+      properties:
+        name:
+          type: string
+        role:
+          type: string
+
+    RememberResponse:
+      type: object
+      required: [id, layer]
+      properties:
+        id:
+          type: string
+          format: uuid
+        layer:
+          type: string
+          enum: [episodic, semantic]
+
+    # ── Recall ──
+
+    RecallRequest:
+      type: object
+      required: [query_embedding]
+      properties:
+        query_embedding:
+          type: array
+          items:
+            type: number
+            format: float
+          minItems: 1
+        limit:
+          type: integer
+        threshold:
+          type: number
+          format: float
+        namespace:
+          type: string
+
+    RecallResponse:
+      type: object
+      required: [results]
+      properties:
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/RecallResult"
+
+    RecallResult:
+      type: object
+      required: [id, layer, similarity, composite_score, activation_score]
+      properties:
+        id:
+          type: string
+          format: uuid
+        layer:
+          type: string
+          enum: [Episodic, Semantic, Working]
+        similarity:
+          type: number
+          format: float
+        composite_score:
+          type: number
+          format: float
+        activation_score:
+          type: number
+          format: float
+
+    # ── Think ──
+
+    ThinkRequest:
+      type: object
+      required: [query_embedding]
+      properties:
+        query_embedding:
+          type: array
+          items:
+            type: number
+            format: float
+          minItems: 1
+        limit:
+          type: integer
+        budget:
+          type: integer
+          description: Token budget for the assembled context.
+        namespace:
+          type: string
+
+    ThinkResponse:
+      type: object
+      required:
+        - context
+        - token_count
+        - records_included
+        - records_excluded_count
+        - query_time_ms
+      properties:
+        context:
+          type: string
+        token_count:
+          type: integer
+        records_included:
+          type: array
+          items:
+            type: string
+            format: uuid
+        records_excluded_count:
+          type: integer
+        query_time_ms:
+          type: number
+          format: double
+
+    # ── Forget ──
+
+    ForgetRequest:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: string
+          format: uuid
+        mode:
+          type: string
+          enum: [archive, purge]
+          default: archive
+
+    ForgetResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          example: ok
+
+    # ── Connect ──
+
+    ConnectRequest:
+      type: object
+      required: [source, target]
+      properties:
+        source:
+          type: string
+          format: uuid
+        target:
+          type: string
+          format: uuid
+        relation:
+          type: string
+          enum:
+            - causes
+            - caused_by
+            - derived_from
+            - contradicts
+            - supports
+            - temporal_next
+            - part_of
+            - instance_of
+            - similar_to
+            - inhibits
+            - related_to
+        weight:
+          type: number
+          format: float
+          default: 1.0
+
+    ConnectResponse:
+      type: object
+      required: [edge_id]
+      properties:
+        edge_id:
+          type: string
+          format: uuid
+
+    # ── Inspect ──
+
+    InspectResponse:
+      type: object
+      required:
+        - id
+        - layer
+        - importance
+        - access_count
+        - trust_score
+        - neighbor_count
+      properties:
+        id:
+          type: string
+          format: uuid
+        layer:
+          type: string
+          enum: [Episodic, Semantic, Working]
+        importance:
+          type: number
+          format: float
+        access_count:
+          type: integer
+          format: int64
+        trust_score:
+          type: number
+          format: float
+        neighbor_count:
+          type: integer
+
+    # ── Trace ──
+
+    TraceResponse:
+      type: object
+      required:
+        - id
+        - layer
+        - source_episodes
+        - derived_records
+        - mutation_count
+        - trust_score
+        - lineage_tree
+      properties:
+        id:
+          type: string
+          format: uuid
+        layer:
+          type: string
+          enum: [Episodic, Semantic, Working]
+        source_episodes:
+          type: array
+          items:
+            type: string
+            format: uuid
+        derived_records:
+          type: array
+          items:
+            type: string
+            format: uuid
+        mutation_count:
+          type: integer
+        trust_score:
+          type: number
+          format: float
+        lineage_tree:
+          type: object
+          description: Hierarchical lineage tree structure.
+
+    # ── Execute ──
+
+    ExecuteRequest:
+      type: object
+      required: [query]
+      properties:
+        query:
+          type: string
+          description: HirnQL query string.
+          minLength: 1
+
+    ExecuteResponse:
+      description: |
+        Polymorphic result keyed by `type`. The shape depends on the HirnQL
+        query that was executed.
+      oneOf:
+        - $ref: "#/components/schemas/ExecuteRecordsResult"
+        - $ref: "#/components/schemas/ExecuteCreatedResult"
+        - $ref: "#/components/schemas/ExecuteForgottenResult"
+        - $ref: "#/components/schemas/ExecuteInspectedResult"
+        - $ref: "#/components/schemas/ExecuteTracedResult"
+        - $ref: "#/components/schemas/ExecuteConsolidatedResult"
+        - $ref: "#/components/schemas/ExecuteWatchAckResult"
+      discriminator:
+        propertyName: type
+        mapping:
+          records: "#/components/schemas/ExecuteRecordsResult"
+          created: "#/components/schemas/ExecuteCreatedResult"
+          forgotten: "#/components/schemas/ExecuteForgottenResult"
+          inspected: "#/components/schemas/ExecuteInspectedResult"
+          traced: "#/components/schemas/ExecuteTracedResult"
+          consolidated: "#/components/schemas/ExecuteConsolidatedResult"
+          watch_ack: "#/components/schemas/ExecuteWatchAckResult"
+
+    ExecuteRecordsResult:
+      type: object
+      required: [type, records_returned, records_scanned, query_time_ms, context]
+      properties:
+        type:
+          type: string
+          enum: [records]
+        records_returned:
+          type: integer
+        records_scanned:
+          type: integer
+        query_time_ms:
+          type: number
+          format: double
+        context:
+          type: string
+
+    ExecuteCreatedResult:
+      type: object
+      required: [type, id, layer]
+      properties:
+        type:
+          type: string
+          enum: [created]
+        id:
+          type: string
+          format: uuid
+        layer:
+          type: string
+
+    ExecuteForgottenResult:
+      type: object
+      required: [type, target]
+      properties:
+        type:
+          type: string
+          enum: [forgotten]
+        target:
+          type: string
+
+    ExecuteInspectedResult:
+      type: object
+      required: [type, id, importance, trust_score]
+      properties:
+        type:
+          type: string
+          enum: [inspected]
+        id:
+          type: string
+          format: uuid
+        importance:
+          type: number
+          format: float
+        trust_score:
+          type: number
+          format: float
+
+    ExecuteTracedResult:
+      type: object
+      required: [type, id, trust_score]
+      properties:
+        type:
+          type: string
+          enum: [traced]
+        id:
+          type: string
+          format: uuid
+        trust_score:
+          type: number
+          format: float
+
+    ExecuteConsolidatedResult:
+      type: object
+      required: [type, records_processed]
+      properties:
+        type:
+          type: string
+          enum: [consolidated]
+        records_processed:
+          type: integer
+
+    ExecuteWatchAckResult:
+      type: object
+      required: [type, message]
+      properties:
+        type:
+          type: string
+          enum: [watch_ack]
+        message:
+          type: string
+
+    # ── Consolidate ──
+
+    ConsolidateRequest:
+      type: object
+      properties:
+        topic_threshold:
+          type: number
+          format: float
+        surprise_threshold:
+          type: number
+          format: float
+        temporal_gap_secs:
+          type: integer
+          format: int64
+        archive:
+          type: boolean
+          default: false
+
+    ConsolidateResponse:
+      type: object
+      required:
+        - records_processed
+        - segments_created
+        - patterns_detected
+        - threads_formed
+        - concepts_extracted
+        - episodes_archived
+        - execution_time_ms
+      properties:
+        records_processed:
+          type: integer
+        segments_created:
+          type: integer
+        patterns_detected:
+          type: integer
+        threads_formed:
+          type: integer
+        concepts_extracted:
+          type: integer
+        episodes_archived:
+          type: integer
+        execution_time_ms:
+          type: number
+          format: double

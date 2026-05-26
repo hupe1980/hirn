@@ -1,0 +1,108 @@
+[package]
+name = "hirnd"
+description = "hirn standalone daemon — gRPC, HTTP, and MCP server for cognitive memory"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[package.metadata.cargo-machete]
+ignored = ["schemars"]  # Required by #[derive(JsonSchema)] from rmcp
+
+[features]
+default = []
+serverless = ["aws-sdk-dynamodb", "aws-sdk-s3", "aws-config"]
+
+[[bin]]
+name = "hirnd"
+path = "src/main.rs"
+
+[dependencies]
+hirn = { workspace = true }
+hirn-core = { workspace = true }
+hirn-engine = { workspace = true }
+hirn-storage = { workspace = true }
+
+# Async
+tokio = { workspace = true }
+
+# gRPC
+tonic = { workspace = true }
+prost = { workspace = true }
+
+# HTTP
+axum = { workspace = true }
+tower = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+
+# CLI
+clap = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+
+# Observability
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+
+# TLS
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+rcgen = { workspace = true }
+x509-parser = { workspace = true }
+
+# MCP
+rmcp = { workspace = true }
+schemars = { workspace = true }
+
+# JWT
+jsonwebtoken = { workspace = true }
+
+# Crypto (constant-time key comparison)
+blake3 = { workspace = true }
+subtle = { workspace = true }
+
+# Async streaming
+async-stream = { workspace = true }
+tokio-stream = { workspace = true }
+
+# Raft consensus
+openraft = { workspace = true }
+redb = { workspace = true }
+bincode = { workspace = true }
+anyerror = "0.1"
+
+# AWS (serverless mode)
+aws-sdk-dynamodb = { workspace = true, optional = true }
+aws-sdk-s3 = { workspace = true, optional = true }
+aws-config = { workspace = true, optional = true }
+
+# Misc
+chrono = { workspace = true }
+ulid = { workspace = true }
+tempfile = { workspace = true }
+parking_lot = { workspace = true }
+zeroize = { workspace = true }
+getrandom = "0.3"
+reqwest = { version = "0.12", features = ["json"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+rmcp = { version = "0.1", features = ["server", "client", "transport-sse-server"] }
+
+[build-dependencies]
+tonic-build = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,48 @@
+{
+  "name": "hirn",
+  "version": "0.1.0",
+  "description": "Node.js bindings for the hirn cognitive memory database",
+  "main": "index.js",
+  "module": "index.mjs",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./index.d.ts",
+        "default": "./index.mjs"
+      },
+      "require": {
+        "types": "./index.d.ts",
+        "default": "./index.js"
+      }
+    }
+  },
+  "napi": {
+    "name": "hirn",
+    "triples": {}
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hupe1980/hirn"
+  },
+  "files": [
+    "index.js",
+    "index.mjs",
+    "index.d.ts",
+    "bridge.js",
+    "memory.js",
+    "embeddings.js",
+    "errors.js"
+  ],
+  "devDependencies": {
+    "@types/node": "^22.0.0"
+  },
+  "engines": {
+    "node": ">= 18"
+  },
+  "scripts": {
+    "build": "cargo build -p hirn-node --release",
+    "test": "node --test tests/test_hirn.mjs"
+  }
+}

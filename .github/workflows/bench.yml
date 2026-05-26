@@ -1,0 +1,139 @@
+name: Benchmarks (PR)
+
+on:
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  microbench:
+    name: Microbenchmarks
+    runs-on: ubuntu-latest
+    env:
+      BENCH_BASELINE_TARGET_DIR: /tmp/hirn-bench-baseline-target
+      BENCH_PR_TARGET_DIR: /tmp/hirn-bench-pr-target
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      # --- Baseline: checkout main and run benchmarks ---
+      - name: Checkout baseline (main)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          path: baseline
+
+      - name: Run baseline benchmarks
+        working-directory: baseline
+        run: |
+          rm -rf "$BENCH_BASELINE_TARGET_DIR"
+          cargo bench -p hirn-engine -- --save-baseline main --warm-up-time 2 --measurement-time 3 --sample-size 20 2>&1 | tee /tmp/bench-baseline.txt
+        env:
+          CARGO_TARGET_DIR: ${{ env.BENCH_BASELINE_TARGET_DIR }}
+
+      # --- PR: run benchmarks ---
+      - name: Run PR benchmarks
+        run: |
+          rm -rf "$BENCH_PR_TARGET_DIR"
+          cargo bench -p hirn-engine -- --save-baseline pr --warm-up-time 2 --measurement-time 3 --sample-size 20 2>&1 | tee /tmp/bench-pr.txt
+        env:
+          CARGO_TARGET_DIR: ${{ env.BENCH_PR_TARGET_DIR }}
+
+      # --- Compare ---
+      - name: Install critcmp
+        run: cargo install critcmp
+
+      - name: Export benchmark baselines
+        run: |
+          critcmp --target-dir "$BENCH_BASELINE_TARGET_DIR" --export main > /tmp/bench-baseline.json
+          critcmp --target-dir "$BENCH_PR_TARGET_DIR" --export pr > /tmp/bench-pr.json
+
+      - name: Compare benchmarks
+        id: compare
+        run: |
+          echo "## Benchmark Comparison (main → PR)" > /tmp/bench-report.md
+          echo "" >> /tmp/bench-report.md
+          echo '```' >> /tmp/bench-report.md
+          critcmp --color never /tmp/bench-baseline.json /tmp/bench-pr.json 2>&1 | tee -a /tmp/bench-report.md || echo "No comparison data available" >> /tmp/bench-report.md
+          echo '```' >> /tmp/bench-report.md
+
+      - name: Check for regressions (>5%)
+        run: |
+          # critcmp exits with code 0 when it finds comparisons to show and
+          # with code 1 when the threshold filters everything out.
+          if critcmp --color never --list --threshold 5 /tmp/bench-baseline.json /tmp/bench-pr.json > /tmp/bench-regressions.txt 2>&1; then
+            echo "Benchmark regressions above 5% detected:"
+            cat /tmp/bench-regressions.txt
+            {
+              echo ""
+              echo "## Regressions Above 5%"
+              echo ""
+              echo '```'
+              cat /tmp/bench-regressions.txt
+              echo '```'
+            } >> /tmp/bench-report.md
+            exit 1
+          fi
+
+          if grep -q "no benchmark comparisons to show" /tmp/bench-regressions.txt; then
+            echo "No microbenchmark regressions above 5%."
+          else
+            echo "critcmp failed unexpectedly:"
+            cat /tmp/bench-regressions.txt
+            exit 1
+          fi
+
+      - name: Upload benchmark report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-report
+          path: /tmp/bench-report.md
+          retention-days: 30
+
+  cognitive-quick:
+    name: Cognitive Smoke Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Run H1-H6 cognitive benchmarks (pseudo-embeddings)
+        run: |
+          cargo run -p hirn-bench -- cognitive \
+            --benchmark all \
+            --dims 64 \
+            --token-budget 4096 \
+            --k 10 \
+            --runs 1 \
+            --no-baselines \
+            --environment-label github-actions-pr \
+            --format json \
+            --output /tmp/cognitive-pr.json \
+            --tracker /tmp/cognitive-history.json
+
+      - name: Validate floor thresholds
+        run: cargo test -p hirn-bench --test cognitive -- pseudo_embedding_floor
+
+      - name: Validate concurrent load smoke test
+        run: cargo test -p hirn-bench --test load
+
+      - name: Upload cognitive results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cognitive-results
+          path: /tmp/cognitive-pr.json
+          retention-days: 30

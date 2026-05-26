@@ -1,0 +1,640 @@
+{
+  "run_id": "01KSHE5KP63PV3FJC605YS7RAM",
+  "metadata": {
+    "generated_at_rfc3339": "2026-05-26T06:07:21.814461+00:00",
+    "dataset_source": "external:locomo:auto-download",
+    "corpus_embedding_source": "cache:embeddings/locomo_embeddings.json",
+    "embedding_model_label": "text-embedding-3-small",
+    "query_embedding_source": "cache",
+    "query_embedding_model_label": "text-embedding-3-small",
+    "embedding_dims": 1536,
+    "token_budget": 4096,
+    "k": 10,
+    "retrieval_profile": "ablation",
+    "execution_surface": "compiled-hirnql",
+    "query_text_hybrid": true,
+    "active_retrieval_surfaces": {
+      "query_text_hybrid": true,
+      "graph_routing": true,
+      "multivector": false,
+      "reranker": true,
+      "tokenizer": false,
+      "compiled_hirnql": true,
+      "quality_gate": true,
+      "iterative_retrieval": false,
+      "notes": [
+        "compiled_hirnql=true via plain THINK/RECALL execution with diagnostics; quality_gate reflects the compiled read path, while iterative retrieval remains off because benchmark queries use local THINK mode",
+        "cache-backed benchmark embedder installed for query-time parity with ingest",
+        "default embedder does not support multivector late interaction"
+      ]
+    },
+    "runs": 3,
+    "baseline_strategies": [
+      "full-context",
+      "iterative-retrieval"
+    ],
+    "environment": {
+      "label": "release-20260526-fullstack",
+      "os": "macos",
+      "arch": "aarch64",
+      "logical_cpus": 14,
+      "git_commit_sha": "2b0787f12360e43a0e77e2651445bf47bac3860b",
+      "cargo_lock_blake3": "c6ddbe1cb1bcc0178f4b200f3bf8d70d8a59da909f943a0f942812a765dc384d"
+    }
+  },
+  "results": [
+    {
+      "benchmark": "LoCoMo (/Users/hupe/.cache/hirn-bench/locomo)",
+      "strategy": "hirn",
+      "run_id": "01KSHE5KP63PV3FJC605YS7RAM",
+      "categories": [
+        {
+          "name": "adversarial",
+          "containment": 1.0,
+          "token_f1": 0.000022234080398434723,
+          "recall_accuracy": 0.46875,
+          "mrr": 0.24907407407407411,
+          "ndcg": 0.37254414854013823,
+          "semantic_similarity": 0.032227275270577,
+          "false_positive_rate": 0.0,
+          "total": 48
+        },
+        {
+          "name": "multi-hop",
+          "containment": 0.3395833333333333,
+          "token_f1": 0.001711684263503927,
+          "recall_accuracy": 0.3541666666666667,
+          "mrr": 0.28506944444444443,
+          "ndcg": 0.27572664526300605,
+          "semantic_similarity": 0.011691762612986212,
+          "false_positive_rate": 0.0,
+          "total": 32
+        },
+        {
+          "name": "single-hop",
+          "containment": 0.9159955124240838,
+          "token_f1": 0.0050874067194688405,
+          "recall_accuracy": 0.6071428571428571,
+          "mrr": 0.47922335600907034,
+          "ndcg": 0.597963248450658,
+          "semantic_similarity": 0.0084994271311831,
+          "false_positive_rate": 0.0,
+          "total": 70
+        },
+        {
+          "name": "temporal",
+          "containment": 0.7477477477477477,
+          "token_f1": 0.0032518171207634393,
+          "recall_accuracy": 0.8648648648648649,
+          "mrr": 0.759009009009009,
+          "ndcg": 0.86151484912209,
+          "semantic_similarity": 0.007237900829234488,
+          "false_positive_rate": 0.0,
+          "total": 37
+        },
+        {
+          "name": "world-knowledge",
+          "containment": 0.27472527472527475,
+          "token_f1": 0.0028901137849876974,
+          "recall_accuracy": 0.3076923076923077,
+          "mrr": 0.4230769230769231,
+          "ndcg": 0.41325673180547784,
+          "semantic_similarity": 0.014607934900471386,
+          "false_positive_rate": 0.0,
+          "total": 13
+        }
+      ],
+      "overall_containment": 0.7711222388722391,
+      "overall_token_f1": 0.0028492415766357827,
+      "overall_recall_accuracy": 0.5616666666666668,
+      "overall_mrr": 0.44103373015873054,
+      "overall_ndcg": 0.5290559305043869,
+      "overall_semantic_similarity": 0.014868555000869374,
+      "false_positive_rate": 0.0,
+      "execution_latency": {
+        "p50": 53948.721999999994,
+        "p95": 68078.792,
+        "p99": 77776.81999999999,
+        "min": 48951.514,
+        "max": 80626.68100000001,
+        "mean": 56047.079
+      },
+      "evaluation_latency": {
+        "p50": 122.11099999999999,
+        "p95": 163.958,
+        "p99": 243.083,
+        "min": 71.38900000000001,
+        "max": 353.09700000000004,
+        "mean": 124.897
+      },
+      "end_to_end_latency": {
+        "p50": 54069.375,
+        "p95": 68192.722,
+        "p99": 77922.806,
+        "min": 49061.347,
+        "max": 80760.875,
+        "mean": 56171.977
+      },
+      "token_cost": {
+        "context_tokens": 633748,
+        "prompt_tokens": 635746,
+        "completion_tokens": 0,
+        "total_tokens": 635746,
+        "avg_context_tokens_per_query": 3168.7383333333332,
+        "avg_prompt_tokens_per_query": 3178.728333333334,
+        "avg_total_tokens_per_query": 3178.728333333334
+      },
+      "total_queries": 200,
+      "ingest_time_secs": 36.645120083666676,
+      "query_time_secs": 11.235968514,
+      "total_time_secs": 48.216819791333336,
+      "compiled_phase_timings": {
+        "optimize": {
+          "p50": 120.18,
+          "p95": 162.25,
+          "p99": 331.819,
+          "min": 97.903,
+          "max": 366.458,
+          "mean": 126.981
+        },
+        "physical_plan": {
+          "p50": 193.083,
+          "p95": 301.26399999999995,
+          "p99": 551.652,
+          "min": 159.15300000000002,
+          "max": 689.222,
+          "mean": 211.767
+        },
+        "execute_plan": {
+          "p50": 34804.847,
+          "p95": 44078.68,
+          "p99": 47693.125,
+          "min": 31946.556,
+          "max": 50260.513999999996,
+          "mean": 36306.308000000005
+        },
+        "embed": {
+          "p50": 5.8340000000000005,
+          "p95": 7.763,
+          "p99": 10.764000000000001,
+          "min": 4.194,
+          "max": 21.68,
+          "mean": 6.056
+        },
+        "decode": {
+          "p50": 3086.653,
+          "p95": 4089.944,
+          "p99": 4701.3330000000005,
+          "min": 2437.916,
+          "max": 4735.709,
+          "mean": 3180.372
+        },
+        "assemble": {
+          "p50": 14282.68,
+          "p95": 19198.43,
+          "p99": 23566.736,
+          "min": 12184.680999999999,
+          "max": 25620.944,
+          "mean": 14864.666000000001
+        },
+        "total": {
+          "p50": 52718.833,
+          "p95": 66695.76400000001,
+          "p99": 73296.209,
+          "min": 47941.763999999996,
+          "max": 78670.556,
+          "mean": 54796.259
+        }
+      },
+      "baselines": [
+        {
+          "benchmark": "LoCoMo (/Users/hupe/.cache/hirn-bench/locomo)",
+          "strategy": "full-context",
+          "run_id": "01KSHE5KP63PV3FJC605YS7RAM",
+          "categories": [
+            {
+              "name": "adversarial",
+              "containment": 1.0,
+              "token_f1": 0.000033972007066177476,
+              "recall_accuracy": 0.10416666666666667,
+              "mrr": 0.0029484604640404254,
+              "ndcg": 0.0,
+              "semantic_similarity": 0.032227275270577,
+              "false_positive_rate": 0.0,
+              "total": 48
+            },
+            {
+              "name": "multi-hop",
+              "containment": 0.41287202380952387,
+              "token_f1": 0.0010422579527784696,
+              "recall_accuracy": 0.22395833333333334,
+              "mrr": 0.030731469576976273,
+              "ndcg": 0.018188838507206016,
+              "semantic_similarity": 0.011691762612986212,
+              "false_positive_rate": 0.0,
+              "total": 32
+            },
+            {
+              "name": "single-hop",
+              "containment": 0.5816889657961086,
+              "token_f1": 0.003006678331151909,
+              "recall_accuracy": 0.11428571428571428,
+              "mrr": 0.0033412670915256315,
+              "ndcg": 0.0,
+              "semantic_similarity": 0.0084994271311831,
+              "false_positive_rate": 0.0,
+              "total": 70
+            },
+            {
+              "name": "temporal",
+              "containment": 0.43243243243243246,
+              "token_f1": 0.0015179035889916447,
+              "recall_accuracy": 0.18918918918918917,
+              "mrr": 0.014459230689069397,
+              "ndcg": 0.013513513513513514,
+              "semantic_similarity": 0.007237900829234488,
+              "false_positive_rate": 0.0,
+              "total": 37
+            },
+            {
+              "name": "world-knowledge",
+              "containment": 0.5032967032967034,
+              "token_f1": 0.0025635476717722266,
+              "recall_accuracy": 0.11538461538461538,
+              "mrr": 0.00992063492063492,
+              "ndcg": 0.014198130521505243,
+              "semantic_similarity": 0.014607934900471386,
+              "false_positive_rate": 0.0,
+              "total": 13
+            }
+          ],
+          "overall_containment": 0.6223649475524473,
+          "overall_token_f1": 0.0016746947326722564,
+          "overall_recall_accuracy": 0.14333333333333334,
+          "overall_mrr": 0.010113908073038984,
+          "overall_ndcg": 0.006333092645050803,
+          "overall_semantic_similarity": 0.014868555000869374,
+          "false_positive_rate": 0.0,
+          "execution_latency": {
+            "p50": 5.403,
+            "p95": 11.986,
+            "p99": 46.931000000000004,
+            "min": 3.834,
+            "max": 80.972,
+            "mean": 6.797000000000001
+          },
+          "evaluation_latency": {
+            "p50": 160.056,
+            "p95": 306.722,
+            "p99": 544.389,
+            "min": 98.5,
+            "max": 814.972,
+            "mean": 177.39399999999998
+          },
+          "end_to_end_latency": {
+            "p50": 165.65300000000002,
+            "p95": 322.278,
+            "p99": 550.305,
+            "min": 103.833,
+            "max": 821.375,
+            "mean": 184.19199999999998
+          },
+          "token_cost": {
+            "context_tokens": 815716,
+            "prompt_tokens": 817714,
+            "completion_tokens": 0,
+            "total_tokens": 817714,
+            "avg_context_tokens_per_query": 4078.58,
+            "avg_prompt_tokens_per_query": 4088.57,
+            "avg_total_tokens_per_query": 4088.57
+          },
+          "total_queries": 200,
+          "ingest_time_secs": 0.0,
+          "query_time_secs": 0.038436860999999996,
+          "total_time_secs": 0.210274722,
+          "reproducibility": {
+            "runs": 3,
+            "threshold": 0.15,
+            "materially_similar": false,
+            "max_relative_delta": 0.3258785942492013,
+            "mean_relative_delta": 0.06136527414446293,
+            "metrics": [
+              {
+                "metric": "containment",
+                "max_relative_delta": 0.0,
+                "mean_relative_delta": 0.0
+              },
+              {
+                "metric": "token_f1",
+                "max_relative_delta": 0.0,
+                "mean_relative_delta": 0.0
+              },
+              {
+                "metric": "recall_accuracy",
+                "max_relative_delta": 0.0,
+                "mean_relative_delta": 0.0
+              },
+              {
+                "metric": "mrr",
+                "max_relative_delta": 0.0,
+                "mean_relative_delta": 0.0
+              },
+              {
+                "metric": "ndcg",
+                "max_relative_delta": 0.0,
+                "mean_relative_delta": 0.0
+              },
+              {
+                "metric": "false_positive_rate",
+                "max_relative_delta": 0.0,
+                "mean_relative_delta": 0.0
+              },
+              {
+                "metric": "execution_p50_us",
+                "max_relative_delta": 0.031314457153572235,
+                "mean_relative_delta": 0.019594974685918004
+              },
+              {
+                "metric": "execution_p95_us",
+                "max_relative_delta": 0.2740919199406968,
+                "mean_relative_delta": 0.1659562638991846
+              },
+              {
+                "metric": "execution_p99_us",
+                "max_relative_delta": 0.3258785942492013,
+                "mean_relative_delta": 0.299258785942492
+              },
+              {
+                "metric": "evaluation_p95_us",
+                "max_relative_delta": 0.18639575971731448,
+                "mean_relative_delta": 0.12573498233215546
+              },
+              {
+                "metric": "end_to_end_p95_us",
+                "max_relative_delta": 0.16409492355398306,
+                "mean_relative_delta": 0.12583828287380522
+              },
+              {
+                "metric": "total_tokens",
+                "max_relative_delta": 0.0,
+                "mean_relative_delta": 0.0
+              }
+            ]
+          },
+          "embedding_cache_miss_count": 1200
+        },
+        {
+          "benchmark": "LoCoMo (/Users/hupe/.cache/hirn-bench/locomo)",
+          "strategy": "iterative-retrieval",
+          "run_id": "01KSHE5KP63PV3FJC605YS7RAM",
+          "categories": [
+            {
+              "name": "adversarial",
+              "containment": 0.9583333333333334,
+              "token_f1": 0.0,
+              "recall_accuracy": 0.3645833333333333,
+              "mrr": 0.1601521164021164,
+              "ndcg": 0.2905172045812872,
+              "semantic_similarity": 0.032227275270577,
+              "false_positive_rate": 0.0,
+              "total": 48
+            },
+            {
+              "name": "multi-hop",
+              "containment": 0.3255952380952381,
+              "token_f1": 0.005105647617661484,
+              "recall_accuracy": 0.0,
+              "mrr": 0.0,
+              "ndcg": 0.0,
+              "semantic_similarity": 0.011691762612986212,
+              "false_positive_rate": 0.0,
+              "total": 32
+            },
+            {
+              "name": "single-hop",
+              "containment": 0.6758460587032017,
+              "token_f1": 0.02120285912392289,
+              "recall_accuracy": 0.32142857142857145,
+              "mrr": 0.16537414965986397,
+              "ndcg": 0.27979230453592463,
+              "semantic_similarity": 0.0084994271311831,
+              "false_positive_rate": 0.0,
+              "total": 70
+            },
+            {
+              "name": "temporal",
+              "containment": 0.545045045045045,
+              "token_f1": 0.013557431730541835,
+              "recall_accuracy": 0.37837837837837834,
+              "mrr": 0.152027027027027,
+              "ndcg": 0.28385051194967287,
+              "semantic_similarity": 0.007237900829234488,
+              "false_positive_rate": 0.0,
+              "total": 37
+            },
+            {
+              "name": "world-knowledge",
+              "containment": 0.2445054945054945,
+              "token_f1": 0.009590012041454628,
+              "recall_accuracy": 0.038461538461538464,
+              "mrr": 0.012820512820512822,
+              "ndcg": 0.016800572062935705,
+              "semantic_similarity": 0.014607934900471386,
+              "false_positive_rate": 0.0,
+              "total": 13
+            }
+          ],
+          "overall_containment": 0.6353675491175492,
+          "overall_token_f1": 0.011369379965043636,
+          "overall_recall_accuracy": 0.2725,
+          "overall_mrr": 0.1252757936507936,
+          "overall_ndcg": 0.22125581758186283,
+          "overall_semantic_similarity": 0.014868555000869374,
+          "false_positive_rate": 0.0,
+          "execution_latency": {
+            "p50": 6211.917,
+            "p95": 7468.278,
+            "p99": 8316.319000000001,
+            "min": 4487.333,
+            "max": 8828.916,
+            "mean": 6238.6359999999995
+          },
+          "evaluation_latency": {
+            "p50": 58.361,
+            "p95": 135.875,
+            "p99": 239.88899999999998,
+            "min": 26.014,
+            "max": 293.764,
+            "mean": 68.55300000000001
+          },
+          "end_to_end_latency": {
+            "p50": 6281.681,
+            "p95": 7548.111,
+            "p99": 8379.792000000001,
+            "min": 4550.416,
+            "max": 8906.666000000001,
+            "mean": 6307.19
+          },
+          "token_cost": {
+            "context_tokens": 103687,
+            "prompt_tokens": 105685,
+            "completion_tokens": 0,
+            "total_tokens": 105685,
+            "avg_context_tokens_per_query": 518.435,
+            "avg_prompt_tokens_per_query": 528.425,
+            "avg_total_tokens_per_query": 528.425
+          },
+          "total_queries": 200,
+          "ingest_time_secs": 0.0,
+          "query_time_secs": 1.2644980696666668,
+          "total_time_secs": 1.4420772643333333,
+          "reproducibility": {
+            "runs": 3,
+            "threshold": 0.15,
+            "materially_similar": true,
+            "max_relative_delta": 0.08022688615979434,
+            "mean_relative_delta": 0.0164769275178968,
+            "metrics": [
+              {
+                "metric": "containment",
+                "max_relative_delta": 0.0,
+                "mean_relative_delta": 0.0
+              },
+              {
+                "metric": "token_f1",
+                "max_relative_delta": 0.0,
+                "mean_relative_delta": 0.0
+              },
+              {
+                "metric": "recall_accuracy",
+                "max_relative_delta": 0.0,
+                "mean_relative_delta": 0.0
+              },
+              {
+                "metric": "mrr",
+                "max_relative_delta": 0.0,
+                "mean_relative_delta": 0.0
+              },
+              {
+                "metric": "ndcg",
+                "max_relative_delta": 0.0,
+                "mean_relative_delta": 0.0
+              },
+              {
+                "metric": "false_positive_rate",
+                "max_relative_delta": 0.0,
+                "mean_relative_delta": 0.0
+              },
+              {
+                "metric": "execution_p50_us",
+                "max_relative_delta": 0.06745032768126495,
+                "mean_relative_delta": 0.05087901799646312
+              },
+              {
+                "metric": "execution_p95_us",
+                "max_relative_delta": 0.05694617284249109,
+                "mean_relative_delta": 0.03889050147529913
+              },
+              {
+                "metric": "execution_p99_us",
+                "max_relative_delta": 0.026307838602539657,
+                "mean_relative_delta": 0.01729189001284687
+              },
+              {
+                "metric": "evaluation_p95_us",
+                "max_relative_delta": 0.08022688615979434,
+                "mean_relative_delta": 0.053072479188364954
+              },
+              {
+                "metric": "end_to_end_p95_us",
+                "max_relative_delta": 0.056596089159312926,
+                "mean_relative_delta": 0.03758924154178757
+              },
+              {
+                "metric": "total_tokens",
+                "max_relative_delta": 0.0,
+                "mean_relative_delta": 0.0
+              }
+            ]
+          },
+          "embedding_cache_miss_count": 1800
+        }
+      ],
+      "reproducibility": {
+        "runs": 3,
+        "threshold": 0.15,
+        "materially_similar": true,
+        "max_relative_delta": 0.13300491132005235,
+        "mean_relative_delta": 0.016929110276527336,
+        "metrics": [
+          {
+            "metric": "containment",
+            "max_relative_delta": 0.0,
+            "mean_relative_delta": 0.0
+          },
+          {
+            "metric": "token_f1",
+            "max_relative_delta": 0.00030173055407449164,
+            "mean_relative_delta": 0.00017351629152316495
+          },
+          {
+            "metric": "recall_accuracy",
+            "max_relative_delta": 0.0,
+            "mean_relative_delta": 0.0
+          },
+          {
+            "metric": "mrr",
+            "max_relative_delta": 0.0,
+            "mean_relative_delta": 0.0
+          },
+          {
+            "metric": "ndcg",
+            "max_relative_delta": 0.0,
+            "mean_relative_delta": 0.0
+          },
+          {
+            "metric": "false_positive_rate",
+            "max_relative_delta": 0.0,
+            "mean_relative_delta": 0.0
+          },
+          {
+            "metric": "execution_p50_us",
+            "max_relative_delta": 0.04830290133278545,
+            "mean_relative_delta": 0.03890539121803431
+          },
+          {
+            "metric": "execution_p95_us",
+            "max_relative_delta": 0.027588352689278384,
+            "mean_relative_delta": 0.021479063319623518
+          },
+          {
+            "metric": "execution_p99_us",
+            "max_relative_delta": 0.13300491132005235,
+            "mean_relative_delta": 0.09907021746700767
+          },
+          {
+            "metric": "evaluation_p95_us",
+            "max_relative_delta": 0.026514456312936675,
+            "mean_relative_delta": 0.02192306280512426
+          },
+          {
+            "metric": "end_to_end_p95_us",
+            "max_relative_delta": 0.02782025245995195,
+            "mean_relative_delta": 0.02142978109539408
+          },
+          {
+            "metric": "total_tokens",
+            "max_relative_delta": 0.00030355314460611227,
+            "mean_relative_delta": 0.00016829112162100525
+          }
+        ]
+      },
+      "embedding_cache_miss_count": 600
+    }
+  ],
+  "total_time_secs": 48.216819791333336,
+  "final_score": 0.7711222388722391,
+  "geometric_mean": 0.7711222388722391,
+  "min_suite_score": 0.7711222388722391,
+  "all_competitive": true
+}

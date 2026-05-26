@@ -1,0 +1,48 @@
+[package]
+name = "hirn-exec"
+description = "DataFusion physical operators, scoring UDFs, and optimizer rules for hirn"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hirn-core = { workspace = true }
+hirn-graph = { workspace = true }
+hirn-query = { workspace = true }
+hirn-storage = { workspace = true }
+datafusion = { workspace = true }
+datafusion-physical-plan = { workspace = true }
+datafusion-physical-expr = { workspace = true }
+datafusion-expr = { workspace = true }
+datafusion-common = { workspace = true }
+datafusion-execution = { workspace = true }
+datafusion-optimizer = { workspace = true }
+datafusion-physical-optimizer = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-select = { workspace = true }
+arrow-ord = { workspace = true }
+arrow-cast = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+crossbeam-queue = { workspace = true }
+aho-corasick = { workspace = true }
+tiktoken-rs = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+tempfile = { workspace = true }
+datafusion-datasource = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "udf_ops"
+harness = false
+
+[lints]
+workspace = true

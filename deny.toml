@@ -1,0 +1,39 @@
+[advisories]
+ignore = [
+    { id = "RUSTSEC-2026-0044", reason = "aws-lc-sys 0.38 pinned by transitive deps; awaiting upstream update" },
+    { id = "RUSTSEC-2026-0048", reason = "aws-lc-sys 0.38 pinned by transitive deps; awaiting upstream update" },
+    { id = "RUSTSEC-2023-0071", reason = "rsa crate Marvin attack — hirn does not perform RSA decryption" },
+    { id = "RUSTSEC-2024-0436", reason = "paste unmaintained — transitive dep, no replacement available" },
+    { id = "RUSTSEC-2025-0134", reason = "bincode unmaintained — used by openraft, no replacement available" },
+    { id = "RUSTSEC-2025-0141", reason = "rustls-pemfile unmaintained — transitive dep, no replacement available" },
+]
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "0BSD",
+    "ISC",
+    "Zlib",
+    "bzip2-1.0.6",
+    "BSL-1.0",
+    "CC0-1.0",
+    "MPL-2.0",
+    "OpenSSL",
+    "CDLA-Permissive-2.0",
+    "Unicode-3.0",
+]
+
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
