@@ -39,7 +39,7 @@ print(ctx.context)
 **Node.js:**
 
 ```js
-import { Memory } from 'hirn';
+import { Memory } from '@hupe1980/hirn';
 
 const mem = Memory.open('./brain');
 await mem.remember('The sky is blue');

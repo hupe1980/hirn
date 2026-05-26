@@ -190,7 +190,7 @@ mem.close()
 ### Node.js
 
 ```js
-const { Memory } = require('hirn');
+const { Memory } = require('@hupe1980/hirn');
 
 const mem = Memory.open('./brain');
 await mem.remember('User prefers dark mode');

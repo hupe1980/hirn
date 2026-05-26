@@ -47,7 +47,7 @@ pip install hirn
 ### Node.js
 
 ```bash
-npm install hirn
+npm install @hupe1980/hirn
 ```
 
 ---
@@ -80,7 +80,7 @@ mem = Memory.open("./my-brain")
 ### Node.js
 
 ```js
-const { Memory } = require('hirn');
+const { Memory } = require('@hupe1980/hirn');
 
 const mem = Memory.open('./my-brain');
 ```
