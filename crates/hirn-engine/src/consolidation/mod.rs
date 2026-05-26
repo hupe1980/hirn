@@ -161,7 +161,7 @@ impl Default for ConsolidationConfig {
             raptor_min_cluster_input: 3,
             raptor_min_cluster_size: 3,
             llm_timeout: std::time::Duration::from_secs(10),
-            total_consolidation_timeout: std::time::Duration::from_secs(300),
+            total_consolidation_timeout: std::time::Duration::from_mins(5),
         }
     }
 }
