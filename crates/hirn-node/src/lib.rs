@@ -281,6 +281,40 @@ fn parse_optional_recall_snapshot(
     }
 }
 
+fn parse_optional_observed_at(value: Option<&str>) -> napi::Result<Option<Timestamp>> {
+    value
+        .map(|raw| {
+            Timestamp::parse_date_or_rfc3339(raw).ok_or_else(|| {
+                napi::Error::new(
+                    napi::Status::InvalidArg,
+                    format!(
+                        "invalid observed_at '{raw}' (expected YYYY-MM-DD or RFC 3339)"
+                    ),
+                )
+            })
+        })
+        .transpose()
+}
+
+fn parse_optional_evidence_count(value: Option<i64>) -> napi::Result<Option<u32>> {
+    value
+        .map(|raw| {
+            if raw < 0 {
+                return Err(napi::Error::new(
+                    napi::Status::InvalidArg,
+                    "evidence_count must be a non-negative integer",
+                ));
+            }
+            u32::try_from(raw).map_err(|_| {
+                napi::Error::new(
+                    napi::Status::InvalidArg,
+                    "evidence_count exceeds u32 range",
+                )
+            })
+        })
+        .transpose()
+}
+
 fn runtime_handle() -> tokio::runtime::Handle {
     tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
         static RT: std::sync::LazyLock<tokio::runtime::Runtime> =
@@ -1295,6 +1329,7 @@ impl Hirn {
         let aid = parse_agent_id(&agent_id)?;
         let mut builder = SemanticRecord::builder()
             .agent_id(aid)
+            .namespace(Namespace::private_for(&aid))
             .concept(&concept)
             .description(&description)
             .confidence(confidence.unwrap_or(0.5) as f32);
@@ -1302,8 +1337,157 @@ impl Hirn {
             builder = builder.embedding(to_f32_vec(emb)?);
         }
         let record = builder.build().map_err(to_napi_err)?;
-        let id = db.semantic().store(record).await.map_err(to_napi_err)?;
+        let ctx = db.as_agent(&aid).await.map_err(to_napi_err)?;
+        let id = ctx.store_semantic(record).await.map_err(to_napi_err)?;
         Ok(id.to_string())
+    }
+
+    /// Apply a semantic correction revision directly through the semantic view API.
+    #[napi]
+    pub async fn correct_semantic(
+        &self,
+        agent_id: String,
+        id: String,
+        description: Option<String>,
+        confidence: Option<f64>,
+        evidence_count: Option<i64>,
+        reason: Option<String>,
+        observed_at: Option<String>,
+        caused_by: Option<String>,
+    ) -> napi::Result<JsQueryResult> {
+        let db = self.db()?;
+        let aid = parse_agent_id(&agent_id)?;
+        let mid = parse_memory_id(&id)?;
+        let causation_id = caused_by.as_deref().map(parse_memory_id).transpose()?.unwrap_or(mid);
+        let observed_at = parse_optional_observed_at(observed_at.as_deref())?;
+        let evidence_count = parse_optional_evidence_count(evidence_count)?;
+
+        let prior = db.semantic().get(mid).await.map_err(to_napi_err)?;
+        let ctx = db.as_agent(&aid).await.map_err(to_napi_err)?;
+        let corrected = ctx
+            .correct_semantic(
+                mid,
+                hirn::semantic::SemanticUpdate {
+                    description,
+                    confidence: confidence.map(|v| v as f32),
+                    evidence_count,
+                    reason,
+                    actor_id: aid,
+                    observed_at,
+                    causation_id,
+                },
+            )
+            .await
+            .map_err(to_napi_err)?;
+
+        let data = serde_json::json!({
+            "type": "corrected",
+            "logical_memory_id": corrected.logical_memory_id.to_string(),
+            "prior_revision_id": prior.revision_id.to_string(),
+            "new_revision_id": corrected.revision_id.to_string(),
+        });
+
+        Ok(JsQueryResult {
+            r#type: "corrected".to_string(),
+            data,
+        })
+    }
+
+    /// Apply a semantic supersession revision directly through the semantic view API.
+    #[napi]
+    pub async fn supersede_semantic(
+        &self,
+        agent_id: String,
+        id: String,
+        description: Option<String>,
+        confidence: Option<f64>,
+        evidence_count: Option<i64>,
+        reason: Option<String>,
+        observed_at: Option<String>,
+        caused_by: Option<String>,
+    ) -> napi::Result<JsQueryResult> {
+        let db = self.db()?;
+        let aid = parse_agent_id(&agent_id)?;
+        let mid = parse_memory_id(&id)?;
+        let causation_id = caused_by.as_deref().map(parse_memory_id).transpose()?.unwrap_or(mid);
+        let observed_at = parse_optional_observed_at(observed_at.as_deref())?;
+        let evidence_count = parse_optional_evidence_count(evidence_count)?;
+
+        let prior = db.semantic().get(mid).await.map_err(to_napi_err)?;
+        let ctx = db.as_agent(&aid).await.map_err(to_napi_err)?;
+        let superseded = ctx
+            .supersede_semantic(
+                mid,
+                hirn::semantic::SemanticSupersession {
+                    description,
+                    confidence: confidence.map(|v| v as f32),
+                    evidence_count,
+                    reason: reason.clone(),
+                    actor_id: aid,
+                    observed_at,
+                    causation_id,
+                },
+            )
+            .await
+            .map_err(to_napi_err)?;
+
+        let data = serde_json::json!({
+            "type": "superseded",
+            "logical_memory_id": superseded.logical_memory_id.to_string(),
+            "prior_revision_id": prior.revision_id.to_string(),
+            "new_revision_id": superseded.revision_id.to_string(),
+            "reason": reason,
+        });
+
+        Ok(JsQueryResult {
+            r#type: "superseded".to_string(),
+            data,
+        })
+    }
+
+    /// Apply a semantic retraction revision directly through the semantic view API.
+    #[napi]
+    pub async fn retract_semantic(
+        &self,
+        agent_id: String,
+        id: String,
+        reason: Option<String>,
+        observed_at: Option<String>,
+        caused_by: Option<String>,
+    ) -> napi::Result<JsQueryResult> {
+        let db = self.db()?;
+        let aid = parse_agent_id(&agent_id)?;
+        let mid = parse_memory_id(&id)?;
+        let causation_id = caused_by.as_deref().map(parse_memory_id).transpose()?.unwrap_or(mid);
+        let observed_at = parse_optional_observed_at(observed_at.as_deref())?;
+
+        let prior = db.semantic().get(mid).await.map_err(to_napi_err)?;
+        let ctx = db.as_agent(&aid).await.map_err(to_napi_err)?;
+        let retracted = ctx
+            .retract_semantic(
+                mid,
+                hirn::semantic::SemanticRetraction {
+                    reason: reason.clone(),
+                    actor_id: aid,
+                    observed_at,
+                    causation_id,
+                },
+            )
+            .await
+            .map_err(to_napi_err)?;
+
+        let data = serde_json::json!({
+            "type": "retracted",
+            "logical_memory_id": retracted.logical_memory_id.to_string(),
+            "prior_revision_id": prior.revision_id.to_string(),
+            "tombstone_revision_id": retracted.revision_id.to_string(),
+            "reason": reason,
+        });
+
+        Ok(JsQueryResult {
+            r#type: "retracted".to_string(),
+            data,
+        })
     }
 
     /// Store a procedural record (skill / action sequence).

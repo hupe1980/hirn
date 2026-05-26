@@ -323,9 +323,29 @@ class Memory {
    * @returns {Promise<import('./index').QueryResult>}
    */
   async correct(memoryId, options = {}) {
+    if (!this._hirn) throw new Error('memory is closed');
     const { agentId, ...editOptions } = options;
-    const hirnql = buildSemanticEditQuery('CORRECT', memoryId, editOptions);
-    return this.query(hirnql, { agentId });
+    const id = requireNonEmptyString(memoryId, 'memoryId');
+    formatSemanticAssignments(editOptions, true);
+    const aid = this._effectiveAgent(agentId);
+    await this._ensureAgent(aid);
+
+    const reason = editOptions.reason == null ? null : requireNonEmptyString(editOptions.reason, 'reason');
+    const observedAt = editOptions.observedAt == null
+      ? null
+      : requireNonEmptyString(editOptions.observedAt, 'observedAt');
+    const causedBy = editOptions.causedBy == null ? null : requireNonEmptyString(editOptions.causedBy, 'causedBy');
+
+    return this._call(() => this._hirn.correctSemantic(
+      aid,
+      id,
+      editOptions.description ?? null,
+      editOptions.confidence ?? null,
+      editOptions.evidenceCount ?? null,
+      reason,
+      observedAt,
+      causedBy,
+    ));
   }
 
   /**
@@ -343,9 +363,29 @@ class Memory {
    * @returns {Promise<import('./index').QueryResult>}
    */
   async supersede(memoryId, options = {}) {
+    if (!this._hirn) throw new Error('memory is closed');
     const { agentId, ...editOptions } = options;
-    const hirnql = buildSemanticEditQuery('SUPERSEDE', memoryId, editOptions);
-    return this.query(hirnql, { agentId });
+    const id = requireNonEmptyString(memoryId, 'memoryId');
+    formatSemanticAssignments(editOptions, true);
+    const aid = this._effectiveAgent(agentId);
+    await this._ensureAgent(aid);
+
+    const reason = editOptions.reason == null ? null : requireNonEmptyString(editOptions.reason, 'reason');
+    const observedAt = editOptions.observedAt == null
+      ? null
+      : requireNonEmptyString(editOptions.observedAt, 'observedAt');
+    const causedBy = editOptions.causedBy == null ? null : requireNonEmptyString(editOptions.causedBy, 'causedBy');
+
+    return this._call(() => this._hirn.supersedeSemantic(
+      aid,
+      id,
+      editOptions.description ?? null,
+      editOptions.confidence ?? null,
+      editOptions.evidenceCount ?? null,
+      reason,
+      observedAt,
+      causedBy,
+    ));
   }
 
   /**
@@ -381,9 +421,25 @@ class Memory {
    * @returns {Promise<import('./index').QueryResult>}
    */
   async retract(memoryId, options = {}) {
+    if (!this._hirn) throw new Error('memory is closed');
     const { agentId, ...editOptions } = options;
-    const hirnql = buildSemanticRetractQuery(memoryId, editOptions);
-    return this.query(hirnql, { agentId });
+    const id = requireNonEmptyString(memoryId, 'memoryId');
+    const aid = this._effectiveAgent(agentId);
+    await this._ensureAgent(aid);
+
+    const reason = editOptions.reason == null ? null : requireNonEmptyString(editOptions.reason, 'reason');
+    const observedAt = editOptions.observedAt == null
+      ? null
+      : requireNonEmptyString(editOptions.observedAt, 'observedAt');
+    const causedBy = editOptions.causedBy == null ? null : requireNonEmptyString(editOptions.causedBy, 'causedBy');
+
+    return this._call(() => this._hirn.retractSemantic(
+      aid,
+      id,
+      reason,
+      observedAt,
+      causedBy,
+    ));
   }
 
   /**
