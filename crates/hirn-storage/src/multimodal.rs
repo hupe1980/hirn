@@ -1454,10 +1454,56 @@ mod tests {
     use hirn_core::metadata::MetadataValue;
     use hirn_core::types::AgentId;
     use serde_json::json;
+    use std::hash::{Hash, Hasher};
+    use std::collections::hash_map::DefaultHasher;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    struct TestPseudoEmbedder {
+        dimensions: usize,
+    }
+
+    impl TestPseudoEmbedder {
+        const fn new(dimensions: usize) -> Self {
+            Self { dimensions }
+        }
+    }
+
+    #[async_trait]
+    impl Embedder for TestPseudoEmbedder {
+        async fn embed(&self, texts: &[&str]) -> HirnResult<Vec<Embedding>> {
+            let mut out = Vec::with_capacity(texts.len());
+            for text in texts {
+                let mut vector = vec![0.0; self.dimensions];
+                for (i, slot) in vector.iter_mut().enumerate() {
+                    let mut hasher = DefaultHasher::new();
+                    text.hash(&mut hasher);
+                    i.hash(&mut hasher);
+                    let hash = hasher.finish();
+                    *slot = (hash as f64 / u64::MAX as f64) as f32;
+                }
+                out.push(Embedding {
+                    vector,
+                    model_id: "test-pseudo".to_string(),
+                });
+            }
+            Ok(out)
+        }
+
+        fn dimensions(&self) -> usize {
+            self.dimensions
+        }
+
+        fn model_id(&self) -> &str {
+            "test-pseudo"
+        }
+
+        fn max_input_tokens(&self) -> usize {
+            8192
+        }
+    }
+
     fn pseudo_embedder() -> Arc<dyn Embedder> {
-        Arc::new(hirn_provider::PseudoEmbedder::new(4))
+        Arc::new(TestPseudoEmbedder::new(4))
     }
     fn test_config() -> MultimodalIngestConfig {
         MultimodalIngestConfig {

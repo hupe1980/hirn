@@ -40,7 +40,6 @@ datafusion-execution = { workspace = true }
 datafusion-physical-plan = { workspace = true }
 
 [dev-dependencies]
-hirn-provider = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }
 proptest = { workspace = true }
