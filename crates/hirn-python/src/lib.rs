@@ -999,17 +999,16 @@ impl Hirn {
                 std::time::Instant::now() + std::time::Duration::from_millis(duration_ms);
             let mut events = Vec::new();
             while std::time::Instant::now() < deadline {
-                match block_on(tokio::time::timeout(
-                    std::time::Duration::from_millis(50),
-                    rx.recv(),
-                )) {
-                    Ok(Ok(ev)) => {
+                match rx.try_recv() {
+                    Ok(ev) => {
                         let json = serde_json::to_value(&ev).unwrap_or_default();
                         events.push(json);
                     }
-                    Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
-                    Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
-                    Err(_timeout) => continue,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
                 }
             }
             events
