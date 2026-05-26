@@ -348,7 +348,10 @@ mod tests {
             .emit("default", "shared", "", MemoryEvent::Forgotten { id })
             .await;
 
-        let event = receiver.recv().await.expect("subscriber should receive event");
+        let event = receiver
+            .recv()
+            .await
+            .expect("subscriber should receive event");
         assert!(matches!(event, MemoryEvent::Forgotten { id: eid } if eid == id));
     }
 
@@ -365,7 +368,10 @@ mod tests {
             .emit("default", "shared", "", MemoryEvent::Forgotten { id })
             .await;
 
-        let event = receiver.recv().await.expect("subscriber should receive event");
+        let event = receiver
+            .recv()
+            .await
+            .expect("subscriber should receive event");
         assert!(matches!(event, MemoryEvent::Forgotten { id: eid } if eid == id));
         assert_eq!(log.next_seq(), 1);
     }
@@ -421,12 +427,12 @@ mod tests {
             .await;
 
         // Verify no event was broadcast within a short deadline.
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            receiver.recv(),
-        )
-        .await;
-        assert!(result.is_err(), "subscriber should not receive event after failed append");
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(50), receiver.recv()).await;
+        assert!(
+            result.is_err(),
+            "subscriber should not receive event after failed append"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -488,11 +494,11 @@ mod tests {
             .await;
         assert!(error.is_err());
 
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            receiver.recv(),
-        )
-        .await;
-        assert!(result.is_err(), "subscriber should not receive event after failed append");
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(50), receiver.recv()).await;
+        assert!(
+            result.is_err(),
+            "subscriber should not receive event after failed append"
+        );
     }
 }

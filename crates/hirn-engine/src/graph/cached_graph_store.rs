@@ -175,7 +175,10 @@ impl CachedGraphStore {
         if dirty.is_empty() {
             return Ok(());
         }
-        tracing::debug!(dirty_count = dirty.len(), "flushing access counts to cold tier");
+        tracing::debug!(
+            dirty_count = dirty.len(),
+            "flushing access counts to cold tier"
+        );
         self.cold.flush_access_counts(&dirty).await
     }
 

@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use futures::FutureExt as _;
 use hirn_core::embed::{ChatMessage, LlmOptions, LlmProvider};
+use hirn_core::episodic::EpisodicRecord;
 use hirn_core::offline::{
     CognitiveJob, ConflictResolutionPolicySnapshot, GeneratedCognitionDecision,
     GeneratedCognitionKind, GeneratedCognitionReview, GeneratedReviewRequirement, OfflineJobId,
@@ -17,7 +18,6 @@ use hirn_core::offline::{
     PlanningSupportKind, ReconcileArbitrationStatus, ReconcileProposal, ReconcileProposalAction,
     ReconcileProposalMember,
 };
-use hirn_core::episodic::EpisodicRecord;
 use hirn_core::procedural::ProceduralRecord;
 use hirn_core::provenance::EvidenceRef;
 use hirn_core::resource::{EvidenceLink, EvidenceRole, ResourceId};
@@ -1426,7 +1426,13 @@ impl DefaultOfflineJobExecutor {
         let ep_filter = format!("id = '{}'", id_str.replace('\'', "''"));
         let ep_batches = self
             .storage
-            .scan(EP_DS, ScanOptions { filter: Some(ep_filter), ..ScanOptions::default() })
+            .scan(
+                EP_DS,
+                ScanOptions {
+                    filter: Some(ep_filter),
+                    ..ScanOptions::default()
+                },
+            )
             .await
             .map_err(HirnError::storage)?;
         let mut episodic_heads: Vec<EpisodicRecord> = ep_batches
@@ -1454,10 +1460,14 @@ impl DefaultOfflineJobExecutor {
 
         // ── Find top-k similar semantic records via Lance ANN search ─────────
         let top_k = record.job.budget.max_result_volume.max(5) as usize;
-        let ns_str = record.job.target.namespace.map(|ns| ns.as_str().to_string());
-        let ns_filter = ns_str.as_deref().map(|ns| {
-            format!("namespace = '{}'", ns.replace('\'', "''"))
-        });
+        let ns_str = record
+            .job
+            .target
+            .namespace
+            .map(|ns| ns.as_str().to_string());
+        let ns_filter = ns_str
+            .as_deref()
+            .map(|ns| format!("namespace = '{}'", ns.replace('\'', "''")));
         let results = self
             .storage
             .vector_search(
@@ -1478,11 +1488,17 @@ impl DefaultOfflineJobExecutor {
         let mut affected_ids = vec![new_id];
 
         for batch in &results {
-            let id_col = match batch.column_by_name("id").and_then(|c| c.as_any().downcast_ref::<arrow_array::StringArray>()) {
+            let id_col = match batch
+                .column_by_name("id")
+                .and_then(|c| c.as_any().downcast_ref::<arrow_array::StringArray>())
+            {
                 Some(c) => c,
                 None => continue,
             };
-            let dist_col = match batch.column_by_name("_distance").and_then(|c| c.as_any().downcast_ref::<arrow_array::Float32Array>()) {
+            let dist_col = match batch
+                .column_by_name("_distance")
+                .and_then(|c| c.as_any().downcast_ref::<arrow_array::Float32Array>())
+            {
                 Some(c) => c,
                 None => continue,
             };
@@ -1501,7 +1517,10 @@ impl DefaultOfflineJobExecutor {
                     continue;
                 }
 
-                if let Err(e) = self.evolve_semantic_record(candidate_id, &triggering, sim).await {
+                if let Err(e) = self
+                    .evolve_semantic_record(candidate_id, &triggering, sim)
+                    .await
+                {
                     tracing::warn!(
                         candidate_id = %candidate_id,
                         triggering_id = %new_id,
@@ -1552,7 +1571,10 @@ impl DefaultOfflineJobExecutor {
                 SEM_DS,
                 ScanOptions {
                     filter: Some(filter.clone()),
-                    columns: Some(vec!["description".to_string(), "evidence_count".to_string()]),
+                    columns: Some(vec![
+                        "description".to_string(),
+                        "evidence_count".to_string(),
+                    ]),
                     ..ScanOptions::default()
                 },
             )
@@ -1576,7 +1598,9 @@ impl DefaultOfflineJobExecutor {
             4..=7 => 0.7,
             _ => 0.85,
         };
-        let now_ms = hirn_core::timestamp::Timestamp::now().timestamp_ms().to_string();
+        let now_ms = hirn_core::timestamp::Timestamp::now()
+            .timestamp_ms()
+            .to_string();
         let new_evidence_str = new_evidence_count.to_string();
         let new_confidence_str = new_confidence.to_string();
         // SQL-quote the description: wrap in single quotes and escape interior quotes.
@@ -1812,14 +1836,15 @@ impl DefaultOfflineJobExecutor {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as i64;
-        let cutoff_ms = now_ms.saturating_sub(
-            (self.decay_sweep_window_secs as i64).saturating_mul(1_000),
-        );
+        let cutoff_ms =
+            now_ms.saturating_sub((self.decay_sweep_window_secs as i64).saturating_mul(1_000));
 
         // Optionally scope to a single namespace if the job specifies one.
-        let ns_clause = record.job.target.namespace.map(|ns| {
-            format!(" AND namespace = '{}'", ns.as_str().replace('\'', "''"))
-        });
+        let ns_clause = record
+            .job
+            .target
+            .namespace
+            .map(|ns| format!(" AND namespace = '{}'", ns.as_str().replace('\'', "''")));
         // `importance` is only present on the episodic dataset.
         // Semantic memories use `confidence` (managed separately); we only
         // decay episodic records here.

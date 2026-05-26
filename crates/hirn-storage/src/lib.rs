@@ -48,9 +48,8 @@ pub use resource_ops::{
     list_derived_artifacts, list_resource_revisions, load_resource_blob,
     persist_default_derived_artifacts, persist_derived_artifact, persist_resource,
     persist_resource_with_quota_policy, purge_resource, reconcile_pending_resource_blob_staging,
-    reconcile_resource_head_mutations,
-    redact_resource, supersede_resource, supersede_resource_with_quota_policy,
-    text_backed_resource_checksum,
+    reconcile_resource_head_mutations, redact_resource, supersede_resource,
+    supersede_resource_with_quota_policy, text_backed_resource_checksum,
 };
 pub use store::{DistanceMetric, NormalizeMethod, PhysicalStore, RecordBatchStream};
 pub use with_embeddings::{EmbeddingMapping, WithEmbeddings};

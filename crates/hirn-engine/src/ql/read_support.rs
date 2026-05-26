@@ -352,7 +352,8 @@ pub(crate) fn derive_temporal_bounds_from_query_text(
     if lower.contains("a week ago") || lower.contains("weeks ago") {
         return Some(window(14));
     }
-    if lower.contains("last month") || lower.contains("this month") || lower.contains("a month ago") {
+    if lower.contains("last month") || lower.contains("this month") || lower.contains("a month ago")
+    {
         return Some(window(30));
     }
     if lower.contains("months ago") {
@@ -364,7 +365,8 @@ pub(crate) fn derive_temporal_bounds_from_query_text(
     if lower.contains("years ago") {
         return Some(window(730));
     }
-    if lower.contains("recently") || lower.contains("a few days ago") || lower.contains("days ago") {
+    if lower.contains("recently") || lower.contains("a few days ago") || lower.contains("days ago")
+    {
         return Some(window(7));
     }
     None
@@ -1528,11 +1530,17 @@ mod tests {
     #[test]
     fn detect_temporal_positive_cases() {
         assert!(detect_temporal_in_query_text("What happened yesterday?"));
-        assert!(detect_temporal_in_query_text("Tell me about last week's meeting"));
+        assert!(detect_temporal_in_query_text(
+            "Tell me about last week's meeting"
+        ));
         assert!(detect_temporal_in_query_text("What did I do today?"));
-        assert!(detect_temporal_in_query_text("Show me events from last month"));
+        assert!(detect_temporal_in_query_text(
+            "Show me events from last month"
+        ));
         assert!(detect_temporal_in_query_text("What happened recently?"));
-        assert!(detect_temporal_in_query_text("Tell me about things from days ago"));
+        assert!(detect_temporal_in_query_text(
+            "Tell me about things from days ago"
+        ));
         assert!(detect_temporal_in_query_text("YESTERDAY upper case")); // case-insensitive
     }
 
@@ -1546,7 +1554,8 @@ mod tests {
     #[test]
     fn derive_temporal_bounds_yesterday() {
         let now_ms: i64 = 1_700_000_000_000; // arbitrary epoch
-        let (start, end) = derive_temporal_bounds_from_query_text("What happened yesterday?", now_ms).unwrap();
+        let (start, end) =
+            derive_temporal_bounds_from_query_text("What happened yesterday?", now_ms).unwrap();
         assert!(start < end);
         assert!(end <= now_ms);
         // should span roughly 1 day ending before now
@@ -1557,7 +1566,8 @@ mod tests {
     #[test]
     fn derive_temporal_bounds_last_week() {
         let now_ms: i64 = 1_700_000_000_000;
-        let (start, end) = derive_temporal_bounds_from_query_text("last week's results", now_ms).unwrap();
+        let (start, end) =
+            derive_temporal_bounds_from_query_text("last week's results", now_ms).unwrap();
         assert_eq!(end, now_ms);
         assert_eq!(now_ms - start, 7 * 86_400_000);
     }

@@ -227,7 +227,11 @@ impl QueryPipeline {
     ///
     /// If a cache is attached and there is a hit for `(query, ctx.default_namespace)`,
     /// returns the cached plan directly (skipping parse + analyze + plan).
-    pub fn compile_with_ctx(&self, query: &str, ctx: &AnalyzeContext) -> HirnResult<Arc<CompiledPlan>> {
+    pub fn compile_with_ctx(
+        &self,
+        query: &str,
+        ctx: &AnalyzeContext,
+    ) -> HirnResult<Arc<CompiledPlan>> {
         let (normalized, base_key) = plan_compiler::query_normalize_and_hash(query);
         // Mix the default-namespace interned ID into the cache key so that the
         // same query text compiled under different default namespaces produces

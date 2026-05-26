@@ -147,10 +147,8 @@ impl LancePhysicalStore {
 
         // Start from the existing cached snapshot (Arc clone = O(1) on fast path), or
         // empty Vec for the first write.
-        let mut new_snapshot: Vec<RecordBatch> = existing
-            .as_deref()
-            .map(|v| v.clone())
-            .unwrap_or_default();
+        let mut new_snapshot: Vec<RecordBatch> =
+            existing.as_deref().map(|v| v.clone()).unwrap_or_default();
 
         // Determine the canonical schema from the existing snapshot (if any).
         let canonical_schema: Option<arrow_schema::SchemaRef> =
@@ -879,17 +877,13 @@ impl LancePhysicalStore {
 /// `arrow_select::concat::concat` rejects them without an explicit cast.
 ///
 /// Fields that are absent in `target` or that cannot be cast are kept as-is.
-fn normalize_batch_to_schema(
-    batch: &RecordBatch,
-    target: &arrow_schema::Schema,
-) -> RecordBatch {
+fn normalize_batch_to_schema(batch: &RecordBatch, target: &arrow_schema::Schema) -> RecordBatch {
     if batch.schema().as_ref() == target {
         return batch.clone();
     }
     let mut changed = false;
     let mut new_cols: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
-    let mut new_fields: Vec<Arc<arrow_schema::Field>> =
-        Vec::with_capacity(batch.num_columns());
+    let mut new_fields: Vec<Arc<arrow_schema::Field>> = Vec::with_capacity(batch.num_columns());
 
     for (i, field) in batch.schema().fields().iter().enumerate() {
         let col = batch.column(i);
@@ -1214,8 +1208,10 @@ impl PhysicalStore for LancePhysicalStore {
             builder = builder.set(col, expr).map_err(HirnDbError::from)?;
         }
         let job = builder.build().map_err(HirnDbError::from)?;
-        let UpdateResult { new_dataset, rows_updated } =
-            job.execute().await.map_err(HirnDbError::from)?;
+        let UpdateResult {
+            new_dataset,
+            rows_updated,
+        } = job.execute().await.map_err(HirnDbError::from)?;
         let new_version = new_dataset.version().version;
 
         // Preserve flat-vector snapshots by re-keying to the new version.
@@ -2275,7 +2271,7 @@ mod tests {
     fn normalize_batch_to_schema_unifies_fixedlist_nullability() {
         use std::sync::Arc;
 
-        use arrow_array::{Float32Array, FixedSizeListArray, RecordBatch, StringArray};
+        use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch, StringArray};
         use arrow_schema::{DataType, Field, Schema};
 
         let dim = 4_i32;
@@ -2299,13 +2295,8 @@ mod tests {
         );
         let values = Float32Array::from(vec![1.0_f32, 0.0, 0.0, 0.0]);
         let emb_col = Arc::new(
-            FixedSizeListArray::try_new(
-                non_null_child,
-                dim,
-                Arc::new(values),
-                None,
-            )
-            .expect("build FixedSizeListArray"),
+            FixedSizeListArray::try_new(non_null_child, dim, Arc::new(values), None)
+                .expect("build FixedSizeListArray"),
         );
         let id_col = Arc::new(StringArray::from(vec!["id1"])) as Arc<dyn arrow_array::Array>;
         let src_schema = Arc::new(Schema::new(vec![id_field, non_null_emb_field]));
@@ -2324,13 +2315,8 @@ mod tests {
         let nullable_child2 = Arc::new(Field::new("item", DataType::Float32, true));
         let values2 = Float32Array::from(vec![0.0_f32, 1.0, 0.0, 0.0]);
         let emb_col2 = Arc::new(
-            FixedSizeListArray::try_new(
-                nullable_child2,
-                dim,
-                Arc::new(values2),
-                None,
-            )
-            .expect("build FixedSizeListArray"),
+            FixedSizeListArray::try_new(nullable_child2, dim, Arc::new(values2), None)
+                .expect("build FixedSizeListArray"),
         );
         let id_col2 = Arc::new(StringArray::from(vec!["id2"])) as Arc<dyn arrow_array::Array>;
         let scanned_batch =
@@ -2338,11 +2324,13 @@ mod tests {
                 .expect("scanned batch");
 
         // Concat must succeed — this is the exact operation that used to fail.
-        let combined = arrow_select::concat::concat_batches(
-            &target_schema,
-            &[normalized, scanned_batch],
+        let combined =
+            arrow_select::concat::concat_batches(&target_schema, &[normalized, scanned_batch]);
+        assert!(
+            combined.is_ok(),
+            "concat_batches failed: {:?}",
+            combined.err()
         );
-        assert!(combined.is_ok(), "concat_batches failed: {:?}", combined.err());
         assert_eq!(combined.unwrap().num_rows(), 2);
     }
 }

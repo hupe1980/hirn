@@ -144,7 +144,9 @@ impl ProceduralRecord {
         self.invocation_count += 1;
         self.success_count += 1;
         // EMA: rate = α·outcome + (1-α)·rate, α = 0.1
-        self.success_rate = 0.1_f32.mul_add(1.0, 0.9 * self.success_rate).clamp(0.0, 1.0);
+        self.success_rate = 0.1_f32
+            .mul_add(1.0, 0.9 * self.success_rate)
+            .clamp(0.0, 1.0);
         self.updated_at = Timestamp::now();
     }
 

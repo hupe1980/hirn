@@ -411,7 +411,9 @@ impl HirnDb {
             if let Some(actual_schema) = existing_map.get(name) {
                 // Check for embedding dimension mismatch first to produce a
                 // specific, actionable error rather than a generic SchemaMismatch.
-                if let Some(stored_dim) = extract_embedding_dim(actual_schema).filter(|&d| d != embedding_dims) {
+                if let Some(stored_dim) =
+                    extract_embedding_dim(actual_schema).filter(|&d| d != embedding_dims)
+                {
                     return Err(HirnDbError::DimensionMismatch {
                         dataset: (*name).to_string(),
                         stored: stored_dim,

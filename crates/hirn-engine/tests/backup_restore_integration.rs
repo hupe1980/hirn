@@ -157,10 +157,7 @@ mod tests {
         let (db, _dir, storage) = temp_db_with_storage().await;
 
         // At least one dataset must exist for rollback to look up the tag.
-        db.episodic()
-            .remember(simple_record("seed"))
-            .await
-            .unwrap();
+        db.episodic().remember(simple_record("seed")).await.unwrap();
 
         let result = backup::rollback(storage.as_ref(), "no-such-tag").await;
         assert!(

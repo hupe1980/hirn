@@ -1211,7 +1211,10 @@ impl HirnDB {
         // used as the default; if none are given we fall back to the pipeline
         // default (typically "default").
         let ctx = if let Some(&ns) = allowed_namespaces.first() {
-            hirn_query::AnalyzeContext { default_namespace: ns, agent_id: actor_id }
+            hirn_query::AnalyzeContext {
+                default_namespace: ns,
+                agent_id: actor_id,
+            }
         } else {
             let mut c = self.query_pipeline().context().clone();
             c.agent_id = actor_id;

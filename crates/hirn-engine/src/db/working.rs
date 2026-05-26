@@ -406,8 +406,8 @@ impl HirnDB {
 
         let mut all_entries = Vec::new();
         while let Some(batch) = stream.try_next().await.map_err(HirnError::storage)? {
-            let records = hirn_storage::datasets::working::from_batch(&batch)
-                .map_err(HirnError::storage)?;
+            let records =
+                hirn_storage::datasets::working::from_batch(&batch).map_err(HirnError::storage)?;
             all_entries.extend(records);
         }
         self.write_runtime.working_cache_load(all_entries);

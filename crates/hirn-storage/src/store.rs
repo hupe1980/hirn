@@ -143,10 +143,7 @@ impl ExactMatchFilter {
 
         let column = column.into();
         Self::assert_safe_column(&column);
-        Some(Self::Utf8In {
-            column,
-            values,
-        })
+        Some(Self::Utf8In { column, values })
     }
 
     #[must_use]

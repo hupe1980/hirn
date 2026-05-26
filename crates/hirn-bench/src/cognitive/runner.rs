@@ -725,11 +725,16 @@ pub fn run_with_embeddings(
     run_id: &str,
     embeddings: Option<&EmbeddingCache>,
 ) -> Option<CognitiveRunReport> {
-    let embedding_runtime =
-        prepare_benchmark_embedding_runtime(dataset, config, embeddings)
-            .unwrap_or_else(|error| panic!("prepare benchmark embeddings: {error}"))?;
+    let embedding_runtime = prepare_benchmark_embedding_runtime(dataset, config, embeddings)
+        .unwrap_or_else(|error| panic!("prepare benchmark embeddings: {error}"))?;
 
-    Some(run_with_prepared_embeddings(dataset, config, db_path, run_id, &embedding_runtime))
+    Some(run_with_prepared_embeddings(
+        dataset,
+        config,
+        db_path,
+        run_id,
+        &embedding_runtime,
+    ))
 }
 
 pub fn run_with_prepared_embeddings(
@@ -805,11 +810,16 @@ pub fn run_baseline_with_embeddings(
     strategy: BaselineStrategy,
     embeddings: Option<&EmbeddingCache>,
 ) -> Option<CognitiveResult> {
-    let embedding_runtime =
-        prepare_benchmark_embedding_runtime(dataset, config, embeddings)
-            .unwrap_or_else(|error| panic!("prepare benchmark embeddings: {error}"))?;
+    let embedding_runtime = prepare_benchmark_embedding_runtime(dataset, config, embeddings)
+        .unwrap_or_else(|error| panic!("prepare benchmark embeddings: {error}"))?;
 
-    Some(run_baseline_with_prepared_embeddings(dataset, config, run_id, strategy, &embedding_runtime))
+    Some(run_baseline_with_prepared_embeddings(
+        dataset,
+        config,
+        run_id,
+        strategy,
+        &embedding_runtime,
+    ))
 }
 
 pub fn run_baseline_with_prepared_embeddings(

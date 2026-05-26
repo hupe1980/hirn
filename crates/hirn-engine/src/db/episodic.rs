@@ -1007,8 +1007,10 @@ impl HirnDB {
                 );
                 vec![1.0_f32; indexed_embeddings.len()]
             } else {
-                let embeddings: Vec<Vec<f32>> =
-                    indexed_embeddings.iter().map(|(_, _, e)| e.clone()).collect();
+                let embeddings: Vec<Vec<f32>> = indexed_embeddings
+                    .iter()
+                    .map(|(_, _, e)| e.clone())
+                    .collect();
                 match super::write_path::batch_vector_search_max_sim(
                     self.storage_backend(),
                     &embeddings,
@@ -1032,13 +1034,13 @@ impl HirnDB {
             };
 
             // Step 3: compute z-score per record and apply RPE decisions — mutable borrow.
-            for ((ai, orig_idx, _), max_sim) in
-                indexed_embeddings.iter().zip(max_sims.iter())
-            {
+            for ((ai, orig_idx, _), max_sim) in indexed_embeddings.iter().zip(max_sims.iter()) {
                 let (_, rec) = &mut admitted[*ai];
-                let key = self
-                    .write_runtime()
-                    .rpe_partition_key(rec.namespace, &self.rpe_model_id(), hirn_core::types::Layer::Episodic);
+                let key = self.write_runtime().rpe_partition_key(
+                    rec.namespace,
+                    &self.rpe_model_id(),
+                    hirn_core::types::Layer::Episodic,
+                );
                 let stats = partition_stats
                     .entry(key.clone())
                     .or_insert_with(|| self.write_runtime().snapshot_rpe_stats(&key));
@@ -1281,7 +1283,10 @@ impl HirnDB {
             });
         }
 
-        let envelope_list: Vec<_> = prepared.iter().map(|r| r.episode_envelope.clone()).collect();
+        let envelope_list: Vec<_> = prepared
+            .iter()
+            .map(|r| r.episode_envelope.clone())
+            .collect();
         let graph_nodes = prepared
             .iter()
             .map(|prepared_record| crate::graph::GraphNodeData {
@@ -1325,8 +1330,7 @@ impl HirnDB {
             (Ok(()), Err(error)) => {
                 let message = error.to_string();
                 for prepared_record in &prepared {
-                    results[prepared_record.idx] =
-                        Some(Err(HirnError::storage(message.clone())));
+                    results[prepared_record.idx] = Some(Err(HirnError::storage(message.clone())));
                 }
                 record_batch_stage("graph_prepare", stage_start.elapsed());
                 return results
@@ -1527,7 +1531,8 @@ impl HirnDB {
                 self.storage_backend(),
                 &temporal_envelope_updates,
             ),
-            self.cached_graph().add_edges_best_effort(&temporal_edge_requests),
+            self.cached_graph()
+                .add_edges_best_effort(&temporal_edge_requests),
         );
         if let Err(error) = envelope_result {
             tracing::warn!(
@@ -1882,9 +1887,11 @@ impl HirnDB {
         // ── RPE-gated fast/slow path ──
         let (is_fast_path, rpe_max_similarity) = if self.config.rpe_enabled {
             if let Some(ref emb) = record.embedding {
-                let key = self
-                    .write_runtime()
-                    .rpe_partition_key(record.namespace, &self.rpe_model_id(), hirn_core::types::Layer::Episodic);
+                let key = self.write_runtime().rpe_partition_key(
+                    record.namespace,
+                    &self.rpe_model_id(),
+                    hirn_core::types::Layer::Episodic,
+                );
                 let mut stats_snapshot = self.write_runtime().snapshot_rpe_stats(&key);
                 let rpe = super::write_path::compute_rpe(
                     self.storage_backend(),
@@ -2236,12 +2243,8 @@ impl HirnDB {
                     evolution_top_k: max_neighbors,
                     ..Default::default()
                 };
-                if let Err(e) = crate::consolidation::evolve_on_new_memory(
-                    self,
-                    &record,
-                    &evo_config,
-                )
-                .await
+                if let Err(e) =
+                    crate::consolidation::evolve_on_new_memory(self, &record, &evo_config).await
                 {
                     tracing::warn!(id = %id, error = %e, "synchronous backward evolution failed; skipping");
                 }

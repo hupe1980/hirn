@@ -287,9 +287,7 @@ fn parse_optional_observed_at(value: Option<&str>) -> napi::Result<Option<Timest
             Timestamp::parse_date_or_rfc3339(raw).ok_or_else(|| {
                 napi::Error::new(
                     napi::Status::InvalidArg,
-                    format!(
-                        "invalid observed_at '{raw}' (expected YYYY-MM-DD or RFC 3339)"
-                    ),
+                    format!("invalid observed_at '{raw}' (expected YYYY-MM-DD or RFC 3339)"),
                 )
             })
         })
@@ -306,10 +304,7 @@ fn parse_optional_evidence_count(value: Option<i64>) -> napi::Result<Option<u32>
                 ));
             }
             u32::try_from(raw).map_err(|_| {
-                napi::Error::new(
-                    napi::Status::InvalidArg,
-                    "evidence_count exceeds u32 range",
-                )
+                napi::Error::new(napi::Status::InvalidArg, "evidence_count exceeds u32 range")
             })
         })
         .transpose()
@@ -1357,7 +1352,11 @@ impl Hirn {
         let db = self.db()?;
         let aid = parse_agent_id(&agent_id)?;
         let mid = parse_memory_id(&id)?;
-        let causation_id = caused_by.as_deref().map(parse_memory_id).transpose()?.unwrap_or(mid);
+        let causation_id = caused_by
+            .as_deref()
+            .map(parse_memory_id)
+            .transpose()?
+            .unwrap_or(mid);
         let observed_at = parse_optional_observed_at(observed_at.as_deref())?;
         let evidence_count = parse_optional_evidence_count(evidence_count)?;
 
@@ -1408,7 +1407,11 @@ impl Hirn {
         let db = self.db()?;
         let aid = parse_agent_id(&agent_id)?;
         let mid = parse_memory_id(&id)?;
-        let causation_id = caused_by.as_deref().map(parse_memory_id).transpose()?.unwrap_or(mid);
+        let causation_id = caused_by
+            .as_deref()
+            .map(parse_memory_id)
+            .transpose()?
+            .unwrap_or(mid);
         let observed_at = parse_optional_observed_at(observed_at.as_deref())?;
         let evidence_count = parse_optional_evidence_count(evidence_count)?;
 
@@ -1457,7 +1460,11 @@ impl Hirn {
         let db = self.db()?;
         let aid = parse_agent_id(&agent_id)?;
         let mid = parse_memory_id(&id)?;
-        let causation_id = caused_by.as_deref().map(parse_memory_id).transpose()?.unwrap_or(mid);
+        let causation_id = caused_by
+            .as_deref()
+            .map(parse_memory_id)
+            .transpose()?
+            .unwrap_or(mid);
         let observed_at = parse_optional_observed_at(observed_at.as_deref())?;
 
         let prior = db.semantic().get(mid).await.map_err(to_napi_err)?;

@@ -387,13 +387,10 @@ async fn e2e_watch_events() {
     mem.remember("Watch stream observed a fresh event")
         .await
         .unwrap();
-    let event = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        receiver.recv(),
-    )
-    .await
-    .expect("event not received within 2s")
-    .expect("recv error");
+    let event = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
+        .await
+        .expect("event not received within 2s")
+        .expect("recv error");
     assert!(!format!("{event:?}").is_empty());
 }
 

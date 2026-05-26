@@ -1454,8 +1454,8 @@ mod tests {
     use hirn_core::metadata::MetadataValue;
     use hirn_core::types::AgentId;
     use serde_json::json;
-    use std::hash::{Hash, Hasher};
     use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct TestPseudoEmbedder {

@@ -40,11 +40,7 @@ impl EmbeddingDimension {
             return Err(HirnError::InvalidConfig {
                 field: "embedding_dimensions".into(),
                 value: dims.to_string(),
-                reason: format!(
-                    "must be in the range {}..={}",
-                    Self::MIN,
-                    Self::MAX
-                ),
+                reason: format!("must be in the range {}..={}", Self::MIN, Self::MAX),
             });
         }
         Ok(Self(dims))

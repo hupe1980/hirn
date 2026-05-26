@@ -460,11 +460,7 @@ impl PersistentGraph {
     /// This soft-deletes the edges from live traversal (which filters on
     /// `valid_until_ms IS NULL OR valid_until_ms > now()`) while keeping them
     /// readable for `AS OF` time-travel queries.
-    pub async fn expire_node_edges(
-        &self,
-        node_id: MemoryId,
-        expiry: Timestamp,
-    ) -> HirnResult<()> {
+    pub async fn expire_node_edges(&self, node_id: MemoryId, expiry: Timestamp) -> HirnResult<()> {
         let id_str = node_id.to_string();
         let expiry_ms = expiry.timestamp_ms() as i64;
         let expiry_expr = expiry_ms.to_string();
@@ -497,7 +493,6 @@ impl PersistentGraph {
         }
         Ok(())
     }
-
 
     /// Check if a node exists.
     pub async fn has_node(&self, id: MemoryId) -> HirnResult<bool> {
@@ -955,9 +950,8 @@ impl PersistentGraph {
         }
         // Active = valid_until_ms not set (NULL or 0) or in the future.
         let now_ms = hirn_core::timestamp::Timestamp::now().timestamp_ms();
-        let active_filter = format!(
-            "valid_until_ms IS NULL OR valid_until_ms = 0 OR valid_until_ms > {now_ms}"
-        );
+        let active_filter =
+            format!("valid_until_ms IS NULL OR valid_until_ms = 0 OR valid_until_ms > {now_ms}");
         self.storage
             .count(DATASET_EDGES_NAME, Some(&active_filter))
             .await

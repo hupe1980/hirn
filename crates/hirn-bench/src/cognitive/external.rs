@@ -1332,9 +1332,8 @@ fn load_longmemeval_raw(
         processed_files += 1;
         let file = std::fs::File::open(&file_path)
             .map_err(|error| format!("cannot read {}: {error}", file_path.display()))?;
-        let parse_result = process_json_array_reader::<LongMemEvalRawRow, _, _>(
-            BufReader::new(file),
-            |row| {
+        let parse_result =
+            process_json_array_reader::<LongMemEvalRawRow, _, _>(BufReader::new(file), |row| {
                 if let Some(limits) = limits {
                     if sessions.len() >= limits.max_sessions
                         || queries.len() >= limits.max_queries
@@ -1355,8 +1354,7 @@ fn load_longmemeval_raw(
                     &mut current_records,
                     limits,
                 )
-            },
-        );
+            });
 
         match parse_result {
             Ok(_) => {}

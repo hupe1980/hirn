@@ -577,15 +577,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Raft votes and committed log entries across restarts, which can elect
         // two leaders for the same term — a Raft safety violation.
         if raft_config.data_dir.is_none() && !config.insecure_dev_mode {
-            return Err(
-                "raft.data_dir must be set for production deployments. \
+            return Err("raft.data_dir must be set for production deployments. \
                 Without a durable log store, a process restart will lose votes and \
                 committed log entries (Raft safety violation). \
                 Set `raft.data_dir` to a writable directory, or set \
                 `insecure_dev_mode = true` to explicitly opt into the volatile \
                 in-memory log (development/testing only)."
-                    .into(),
-            );
+                .into());
         }
 
         let log_store_result: Result<hirnd::raft::DurableLogStore, String> =

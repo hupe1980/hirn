@@ -2,10 +2,10 @@ pub mod agent;
 pub mod audit;
 pub mod causal;
 pub mod circuit_breaker;
-pub mod embedding_dimension;
 pub mod config;
 pub mod content;
 pub mod embed;
+pub mod embedding_dimension;
 pub mod episodic;
 pub mod error;
 pub mod id;
@@ -43,6 +43,7 @@ pub use embed::{
     ExtractedRelation, LlmChunk, LlmOptions, LlmProvider, LlmResponse, LlmStream, NoopReranker,
     RerankResult, Reranker, ResponseFormat, TokenCounter, TokenUsage,
 };
+pub use embedding_dimension::EmbeddingDimension;
 pub use error::{EmbeddingFailureDetail, HirnError, HirnResult, PartialEmbeddingBatch};
 pub use id::MemoryId;
 pub use offline::{
@@ -67,7 +68,6 @@ pub use resource::{
 pub use revision::{
     LogicalMemoryId, RecallSnapshot, RevisionId, RevisionOperation, RevisionRef, RevisionState,
 };
-pub use embedding_dimension::EmbeddingDimension;
 pub use stats::WelfordStats;
 pub use timestamp::Timestamp;
 pub use tokenizer::{EstimatingTokenizer, Tokenizer};

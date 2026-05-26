@@ -277,8 +277,7 @@ async fn execute_consolidation_pipeline_inner(
         // No new episodes since the cursor — but still run archive + provenance-repair
         // for any existing semantic concepts whose source episodes haven't been archived
         // yet or whose DerivedFrom edges were removed.
-        let (episodes_archived, provenance_edges_created) =
-            run_rerun_repair_pass(db, config).await;
+        let (episodes_archived, provenance_edges_created) = run_rerun_repair_pass(db, config).await;
         return Ok(ConsolidationResult {
             records_processed: 0,
             segments_created: 0,

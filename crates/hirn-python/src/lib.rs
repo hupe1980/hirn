@@ -1398,11 +1398,7 @@ impl WatchStream {
 
                 let result = {
                     let mut guard = rx.lock().await;
-                    tokio::time::timeout(
-                        std::time::Duration::from_millis(200),
-                        guard.recv(),
-                    )
-                    .await
+                    tokio::time::timeout(std::time::Duration::from_millis(200), guard.recv()).await
                 };
 
                 match result {

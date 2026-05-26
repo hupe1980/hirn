@@ -326,10 +326,8 @@ impl ExecutionPlan for QualityGateExec {
             let merged =
                 arrow_select::concat::concat_batches(&batches[0].schema(), batches.iter())?;
 
-            let coherence = QualityGateExec::compute_coherence_from_batch(
-                &merged,
-                config.coherence_fallback,
-            );
+            let coherence =
+                QualityGateExec::compute_coherence_from_batch(&merged, config.coherence_fallback);
             let assessment = QualityGateExec::assess_quality(
                 &config,
                 token_budget,

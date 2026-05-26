@@ -44,7 +44,8 @@ pub(crate) struct WriteRuntime {
     /// Per-partition RPE circuit breakers (realm × namespace × model_id).
     /// Isolates circuit-open state so one failing partition does not fast-path
     /// RPE admission for every other partition.
-    rpe_circuit_breakers: DashMap<write_path::RpePartitionKey, std::sync::Arc<write_path::RpeCircuitBreaker>>,
+    rpe_circuit_breakers:
+        DashMap<write_path::RpePartitionKey, std::sync::Arc<write_path::RpeCircuitBreaker>>,
     /// Lock-free importance-access accumulator (PERF-2 fix).
     ///
     /// Records how many times each episodic memory was retrieved since the
@@ -140,7 +141,11 @@ impl WriteRuntime {
                     acc.clear();
                     keys
                 };
-                if to_flush.is_empty() { None } else { Some(to_flush) }
+                if to_flush.is_empty() {
+                    None
+                } else {
+                    Some(to_flush)
+                }
             }
             Err(_) => None,
         }
@@ -184,10 +189,7 @@ impl WriteRuntime {
 
     /// Bulk-populate the L0 cache from an iterator of all working-memory
     /// revisions.  Called once at DB open after the initial Lance scan.
-    pub(super) fn working_cache_load(
-        &self,
-        entries: impl IntoIterator<Item = WorkingMemoryEntry>,
-    ) {
+    pub(super) fn working_cache_load(&self, entries: impl IntoIterator<Item = WorkingMemoryEntry>) {
         for entry in entries {
             self.working_cache_upsert(entry);
         }
@@ -389,7 +391,9 @@ impl WriteRuntime {
         threshold: f32,
         cooldown_secs: u64,
     ) -> write_path::InterferenceAction {
-        let action = self.interference_tracker.accumulate(score, namespace, threshold, cooldown_secs);
+        let action =
+            self.interference_tracker
+                .accumulate(score, namespace, threshold, cooldown_secs);
         Self::record_interference_state_metrics(&self.interference_tracker);
 
         match &action {
@@ -417,11 +421,11 @@ impl WriteRuntime {
         &self,
         result: &crate::consolidation::ConsolidationResult,
     ) -> write_path::ConsolidationFeedbackResult {
-        let feedback =
-            self.interference_tracker
-                .record_consolidation_feedback(write_path::ConsolidationFeedback::Succeeded {
-                    progress_made: result.made_progress(),
-                });
+        let feedback = self.interference_tracker.record_consolidation_feedback(
+            write_path::ConsolidationFeedback::Succeeded {
+                progress_made: result.made_progress(),
+            },
+        );
         Self::record_interference_feedback_metrics(&self.interference_tracker, feedback);
         feedback
     }
@@ -567,7 +571,11 @@ mod tests {
     #[test]
     fn rpe_partition_key_uses_runtime_default_realm() {
         let runtime = WriteRuntime::new("realm-a");
-        let key = runtime.rpe_partition_key(Namespace::default(), "model-x", hirn_core::types::Layer::Episodic);
+        let key = runtime.rpe_partition_key(
+            Namespace::default(),
+            "model-x",
+            hirn_core::types::Layer::Episodic,
+        );
 
         assert_eq!(key.realm(), "realm-a");
         assert_eq!(key.namespace(), Namespace::default());
@@ -578,7 +586,11 @@ mod tests {
     #[test]
     fn merge_rpe_stats_accumulates_without_overwrite() {
         let runtime = WriteRuntime::new("realm-a");
-        let key = runtime.rpe_partition_key(Namespace::default(), "model-x", hirn_core::types::Layer::Episodic);
+        let key = runtime.rpe_partition_key(
+            Namespace::default(),
+            "model-x",
+            hirn_core::types::Layer::Episodic,
+        );
 
         let mut first = write_path::RunningRpeStats::default();
         first.update(0.1);
@@ -598,7 +610,11 @@ mod tests {
     #[test]
     fn concurrent_rpe_distance_updates_keep_all_samples() {
         let runtime = Arc::new(WriteRuntime::new("realm-a"));
-        let key = runtime.rpe_partition_key(Namespace::default(), "model-x", hirn_core::types::Layer::Episodic);
+        let key = runtime.rpe_partition_key(
+            Namespace::default(),
+            "model-x",
+            hirn_core::types::Layer::Episodic,
+        );
 
         let mut handles = Vec::new();
         for i in 0..32 {
@@ -620,7 +636,11 @@ mod tests {
     #[test]
     fn concurrent_rpe_batch_merges_keep_all_samples() {
         let runtime = Arc::new(WriteRuntime::new("realm-a"));
-        let key = runtime.rpe_partition_key(Namespace::default(), "model-x", hirn_core::types::Layer::Episodic);
+        let key = runtime.rpe_partition_key(
+            Namespace::default(),
+            "model-x",
+            hirn_core::types::Layer::Episodic,
+        );
 
         let mut handles = Vec::new();
         for batch in 0..8 {

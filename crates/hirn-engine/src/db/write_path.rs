@@ -319,8 +319,9 @@ pub async fn batch_vector_search_max_sim(
                 for (i, batches) in results.into_iter().enumerate() {
                     for batch in &batches {
                         if let Some(dist_col) = batch.column_by_name("_distance") {
-                            if let Some(dists) =
-                                dist_col.as_any().downcast_ref::<arrow_array::Float32Array>()
+                            if let Some(dists) = dist_col
+                                .as_any()
+                                .downcast_ref::<arrow_array::Float32Array>()
                             {
                                 for j in 0..dists.len() {
                                     if !dists.is_null(j) {
@@ -773,8 +774,11 @@ impl ShardedInterferenceTracker {
         }
 
         // Take a consistent snapshot of current scores under the trigger lock.
-        let snapshot_scores: std::collections::HashMap<_, _> =
-            self.backlog.iter().map(|e| (*e.key(), *e.value())).collect();
+        let snapshot_scores: std::collections::HashMap<_, _> = self
+            .backlog
+            .iter()
+            .map(|e| (*e.key(), *e.value()))
+            .collect();
         let namespaces = sorted_namespaces(snapshot_scores.keys().copied());
 
         trigger.pending_consolidation = Some(PendingConsolidation { snapshot_scores });
@@ -808,7 +812,9 @@ impl ShardedInterferenceTracker {
         };
 
         match feedback {
-            ConsolidationFeedback::Succeeded { progress_made: true } => {
+            ConsolidationFeedback::Succeeded {
+                progress_made: true,
+            } => {
                 let reduced_score = self.subtract_snapshot(&pending.snapshot_scores);
                 ConsolidationFeedbackResult {
                     outcome: ConsolidationFeedbackOutcome::ProgressRecorded,

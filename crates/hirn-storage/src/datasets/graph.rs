@@ -5,8 +5,8 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, BinaryArray, Float32Array, Int64Array, ListArray, RecordBatch, StringArray,
-    UInt32Array, UInt64Array,
+    Array, BinaryArray, Float32Array, Int64Array, ListArray, RecordBatch, StringArray, UInt32Array,
+    UInt64Array,
     builder::{ListBuilder, StringBuilder},
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -93,9 +93,9 @@ pub fn nodes_from_batch(batch: &RecordBatch) -> Result<Vec<GraphNodeData>, HirnD
             .map_err(|e| HirnDbError::InvalidArgument(e.to_string()))?;
         let namespace = Namespace::new(ns_col.value(i))
             .map_err(|e| HirnDbError::InvalidArgument(e.to_string()))?;
-        let access_count = ac_col.and_then(|c| {
-            if c.is_null(i) { None } else { Some(c.value(i)) }
-        }).unwrap_or(0);
+        let access_count = ac_col
+            .and_then(|c| if c.is_null(i) { None } else { Some(c.value(i)) })
+            .unwrap_or(0);
 
         nodes.push(GraphNodeData {
             id,
@@ -362,12 +362,20 @@ pub fn edges_from_batch(batch: &RecordBatch) -> Result<Vec<GraphEdge>, HirnDbErr
             co_retrieval_count: cr_col.value(i),
             created_at: Timestamp::from_millis(ca_col.value(i) as u64),
             updated_at: Timestamp::from_millis(ua_col.value(i) as u64),
-            valid_from: valid_from_col
-                .as_ref()
-                .and_then(|c| if c.is_null(i) { None } else { Some(Timestamp::from_millis(c.value(i) as u64)) }),
-            valid_until: valid_until_col
-                .as_ref()
-                .and_then(|c| if c.is_null(i) { None } else { Some(Timestamp::from_millis(c.value(i) as u64)) }),
+            valid_from: valid_from_col.as_ref().and_then(|c| {
+                if c.is_null(i) {
+                    None
+                } else {
+                    Some(Timestamp::from_millis(c.value(i) as u64))
+                }
+            }),
+            valid_until: valid_until_col.as_ref().and_then(|c| {
+                if c.is_null(i) {
+                    None
+                } else {
+                    Some(Timestamp::from_millis(c.value(i) as u64))
+                }
+            }),
             metadata,
             resolved: false,
             namespace,

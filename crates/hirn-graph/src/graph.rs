@@ -553,8 +553,7 @@ impl PropertyGraph {
             self.eviction_heap
                 .push(Reverse((self.graph[idx].access_count, id)));
             // Track for periodic cold-tier flush.
-            *self.dirty_access_counts.entry(id).or_insert(0) =
-                self.graph[idx].access_count;
+            *self.dirty_access_counts.entry(id).or_insert(0) = self.graph[idx].access_count;
         }
     }
 

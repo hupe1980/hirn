@@ -1954,7 +1954,10 @@ embedding_dimensions = 64
         let config: HirnConfig = toml::from_str(legacy_toml).unwrap();
 
         assert_eq!(config.db_path, std::path::PathBuf::from("./legacy-brain"));
-        assert_eq!(config.embedding_dimensions, crate::EmbeddingDimension::new_const(64));
+        assert_eq!(
+            config.embedding_dimensions,
+            crate::EmbeddingDimension::new_const(64)
+        );
         assert!((config.rpe_fast_path_threshold - 0.3).abs() < f32::EPSILON);
         assert!((config.quality_gate_threshold - 0.5).abs() < f32::EPSILON);
         assert!((config.offline_dream_quality_threshold - 0.55).abs() < f32::EPSILON);

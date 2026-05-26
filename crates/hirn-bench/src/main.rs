@@ -162,7 +162,10 @@ fn external_dataset_size(dataset: &cognitive::CognitiveDataset) -> ExternalDatas
     }
 }
 
-fn apply_external_safety_limits(dataset: &mut cognitive::CognitiveDataset, limits: ExternalSafetyLimits) {
+fn apply_external_safety_limits(
+    dataset: &mut cognitive::CognitiveDataset,
+    limits: ExternalSafetyLimits,
+) {
     if dataset.sessions.len() > limits.max_sessions {
         dataset.sessions.truncate(limits.max_sessions);
     }
@@ -225,7 +228,9 @@ impl CognitiveBenchmarkTarget {
     }
 }
 
-fn parse_cognitive_benchmark_targets(benchmark: &str) -> Result<Vec<CognitiveBenchmarkTarget>, String> {
+fn parse_cognitive_benchmark_targets(
+    benchmark: &str,
+) -> Result<Vec<CognitiveBenchmarkTarget>, String> {
     if benchmark == "all" {
         return Ok(cognitive::Benchmark::all()
             .iter()
@@ -1113,8 +1118,7 @@ fn run_cognitive(
     environment_label: Option<String>,
 ) {
     use cognitive::{
-        BaselineStrategy, BenchmarkRetrievalProfile, CognitiveConfig,
-        CognitiveSuiteResult,
+        BaselineStrategy, BenchmarkRetrievalProfile, CognitiveConfig, CognitiveSuiteResult,
     };
     use std::time::Instant;
 
@@ -1191,9 +1195,7 @@ fn run_cognitive(
 
     let benchmark_targets = parse_cognitive_benchmark_targets(&benchmark).unwrap_or_else(|e| {
         eprintln!("Error: {e}");
-        eprintln!(
-            "Expected: h1, h2, h3, h4, h5, h6, {H2_TEMPORAL_CONTRADICTION_SLICE}, or all"
-        );
+        eprintln!("Expected: h1, h2, h3, h4, h5, h6, {H2_TEMPORAL_CONTRADICTION_SLICE}, or all");
         std::process::exit(1);
     });
 
@@ -1591,10 +1593,7 @@ fn run_external(
     if full_corpus {
         eprintln!(
             "Warning: --full-corpus enabled; safety limits disabled for external dataset '{}' (sessions={} records={} queries={}).",
-            dataset.name,
-            original_size.sessions,
-            original_size.records,
-            original_size.queries,
+            dataset.name, original_size.sessions, original_size.records, original_size.queries,
         );
     } else {
         let limits = ExternalSafetyLimits {
@@ -2264,20 +2263,17 @@ fn execute_cognitive_bundle(
 ) -> CognitiveRunBundle {
     let dir = tempfile::tempdir().expect("create temp dir");
     let db_path = dir.path().join(subdir);
-    let embedding_runtime = cognitive::runner::prepare_benchmark_embedding_runtime(
-        dataset,
-        config,
-        embedding_cache,
-    )
-    .unwrap_or_else(|error| panic!("prepare benchmark embeddings: {error}"))
-    .unwrap_or_else(|| {
-        eprintln!(
-            "[hirn-bench] benchmark skipped: no real embedder available and \
+    let embedding_runtime =
+        cognitive::runner::prepare_benchmark_embedding_runtime(dataset, config, embedding_cache)
+            .unwrap_or_else(|error| panic!("prepare benchmark embeddings: {error}"))
+            .unwrap_or_else(|| {
+                eprintln!(
+                    "[hirn-bench] benchmark skipped: no real embedder available and \
              embedder_policy={}; using pseudo embeddings as fallback for bundle execution",
-            config.embedder_policy
-        );
-        cognitive::runner::BenchmarkEmbeddingRuntime::pseudo()
-    });
+                    config.embedder_policy
+                );
+                cognitive::runner::BenchmarkEmbeddingRuntime::pseudo()
+            });
     let report = cognitive::runner::run_with_prepared_embeddings(
         dataset,
         config,

@@ -7,12 +7,12 @@ use hirn_core::content::MemoryContent;
 use hirn_core::embed::{Embedder, Reranker};
 use hirn_core::tokenizer::Tokenizer;
 use hirn_core::{HirnConfig, HirnError, HirnResult};
-use parking_lot::RwLock;
 use hirn_provider::{
     BatchingEmbedder, CircuitBreakerEmbedder, MultiModalEmbedder, PersistentCacheConfig,
     PersistentCachedEmbedder, RetryConfig, RetryingEmbedder,
 };
 use hirn_storage::PhysicalStore;
+use parking_lot::RwLock;
 
 pub(crate) fn compose_embedder(
     embedder: Arc<dyn Embedder>,
@@ -163,10 +163,10 @@ impl ProviderRuntime {
     }
 
     pub(crate) fn rpe_model_id(&self) -> String {
-        self.embedder
-            .read()
-            .as_deref()
-            .map_or_else(|| "precomputed".to_string(), |embedder| embedder.model_id().to_string())
+        self.embedder.read().as_deref().map_or_else(
+            || "precomputed".to_string(),
+            |embedder| embedder.model_id().to_string(),
+        )
     }
 
     pub(crate) fn multivec_search_embedder(&self) -> Option<Arc<dyn Embedder>> {
