@@ -552,7 +552,7 @@ fn benchmark_hirn_config(config: &CognitiveConfig, db_path: &Path) -> HirnConfig
 }
 
 fn configure_benchmark_retrieval(
-    db: &mut HirnDB,
+    db: &HirnDB,
     config: &CognitiveConfig,
     embedding_runtime: &BenchmarkEmbeddingRuntime,
 ) -> BenchmarkRetrievalSetup {
@@ -754,8 +754,8 @@ pub fn run_with_prepared_embeddings(
         .store_arc();
 
     let hirn_config = benchmark_hirn_config(config, db_path);
-    let mut db = block_on(HirnDB::open_with_config(hirn_config, backend)).expect("open HirnDB");
-    let retrieval_setup = configure_benchmark_retrieval(&mut db, config, embedding_runtime);
+    let db = block_on(HirnDB::open_with_config(hirn_config, backend)).expect("open HirnDB");
+    let retrieval_setup = configure_benchmark_retrieval(&db, config, embedding_runtime);
 
     // Phase 1: Ingest all sessions as episodic records.
     let ingest_start = Instant::now();
@@ -3121,7 +3121,7 @@ mod tests {
             BenchmarkExecutionSurface::CompiledHirnql,
             false,
         );
-        let mut db = block_on(HirnDB::open_with_config(
+        let db = block_on(HirnDB::open_with_config(
             benchmark_hirn_config(&config, &db_path),
             storage,
         ))
@@ -3133,7 +3133,7 @@ mod tests {
         let embedding_runtime =
             BenchmarkEmbeddingRuntime::cache_backed(Arc::new(cache), config.embedding_dims);
 
-        let setup = configure_benchmark_retrieval(&mut db, &config, &embedding_runtime);
+        let setup = configure_benchmark_retrieval(&db, &config, &embedding_runtime);
 
         assert!(db.embedder().is_some());
         assert_eq!(setup.query_embedding_source, QueryEmbeddingSource::Cache);
@@ -3162,14 +3162,14 @@ mod tests {
             BenchmarkExecutionSurface::CompiledHirnql,
             false,
         );
-        let mut db = block_on(HirnDB::open_with_config(
+        let db = block_on(HirnDB::open_with_config(
             benchmark_hirn_config(&config, &db_path),
             storage,
         ))
         .unwrap();
         let embedding_runtime = BenchmarkEmbeddingRuntime::pseudo();
 
-        let setup = configure_benchmark_retrieval(&mut db, &config, &embedding_runtime);
+        let setup = configure_benchmark_retrieval(&db, &config, &embedding_runtime);
 
         assert_eq!(setup.query_embedding_source, QueryEmbeddingSource::Pseudo);
         assert!(setup.query_embedding_model_label.is_none());
@@ -3235,7 +3235,7 @@ mod tests {
             BenchmarkExecutionSurface::CompiledHirnql,
             false,
         );
-        let mut db = block_on(HirnDB::open_with_config(
+        let db = block_on(HirnDB::open_with_config(
             benchmark_hirn_config(&config, &db_path),
             storage,
         ))
@@ -3268,7 +3268,7 @@ mod tests {
         )
         .unwrap();
 
-        let setup = configure_benchmark_retrieval(&mut db, &config, &embedding_runtime);
+        let setup = configure_benchmark_retrieval(&db, &config, &embedding_runtime);
 
         assert!(db.embedder().is_some());
         assert_eq!(setup.query_embedding_source, QueryEmbeddingSource::Provider);

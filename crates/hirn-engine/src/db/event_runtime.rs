@@ -357,7 +357,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn emit_with_event_log_reaches_live_subscribers_after_append() {
-        let mut runtime = EventRuntime::new();
+        let runtime = EventRuntime::new();
         let log = Arc::new(EventLog::open(Arc::new(MemoryStore::new())).await.unwrap());
         runtime.set_event_log(Arc::clone(&log));
 
@@ -378,7 +378,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn emit_memory_recalled_notifies_subscribers_without_persisting() {
-        let mut runtime = EventRuntime::new();
+        let runtime = EventRuntime::new();
         let log = Arc::new(EventLog::open(Arc::new(MemoryStore::new())).await.unwrap());
         runtime.set_event_log(Arc::clone(&log));
 
@@ -412,7 +412,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn emit_does_not_notify_subscribers_when_event_log_append_fails() {
-        let mut runtime = EventRuntime::new();
+        let runtime = EventRuntime::new();
         let failing_store = Arc::new(RejectEventAppendStore {
             inner: MemoryStore::new(),
         });
@@ -437,7 +437,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn emit_checked_batch_with_event_log_reaches_live_subscribers_after_append() {
-        let mut runtime = EventRuntime::new();
+        let runtime = EventRuntime::new();
         let log = Arc::new(EventLog::open(Arc::new(MemoryStore::new())).await.unwrap());
         runtime.set_event_log(Arc::clone(&log));
 
@@ -473,7 +473,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn emit_checked_batch_does_not_notify_subscribers_when_event_log_append_fails() {
-        let mut runtime = EventRuntime::new();
+        let runtime = EventRuntime::new();
         let failing_store = Arc::new(RejectEventAppendStore {
             inner: MemoryStore::new(),
         });

@@ -536,7 +536,7 @@ mod tests {
             .embedding_dimensions(DIM as u32)
             .build()
             .unwrap();
-        let mut db = HirnDB::open_with_config(config, storage.clone())
+        let db = HirnDB::open_with_config(config, storage.clone())
             .await
             .unwrap();
 

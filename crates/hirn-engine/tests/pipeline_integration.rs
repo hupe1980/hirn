@@ -93,7 +93,7 @@ mod tests {
             .working_memory_token_limit(2000)
             .build()
             .unwrap();
-        let mut db = HirnDB::open_with_config(config, Arc::clone(&backend))
+        let db = HirnDB::open_with_config(config, Arc::clone(&backend))
             .await
             .unwrap();
         let log = Arc::new(EventLog::open(backend).await.unwrap());
@@ -2691,7 +2691,7 @@ mod tests {
 
         metrics::with_local_recorder(&recorder, || {
             tokio::runtime::Runtime::new().unwrap().block_on(async {
-                let (mut db, _dir) = temp_db().await;
+                let (db, _dir) = temp_db().await;
                 db.set_tokenizer(Arc::new(CharTokenizer));
                 let dims = db.embedding_dims();
 
@@ -2849,7 +2849,7 @@ mod tests {
 
         metrics::with_local_recorder(&recorder, || {
             tokio::runtime::Runtime::new().unwrap().block_on(async {
-                let (mut db, _dir) = temp_db_with_causal_budget_weights().await;
+                let (db, _dir) = temp_db_with_causal_budget_weights().await;
                 db.set_tokenizer(Arc::new(CharTokenizer));
                 let dims = db.embedding_dims();
 

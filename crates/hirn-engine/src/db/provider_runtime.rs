@@ -170,11 +170,13 @@ impl ProviderRuntime {
     }
 
     pub(crate) fn multivec_search_embedder(&self) -> Option<Arc<dyn Embedder>> {
-        if let Some(embedder) = self.multivec_embedder.read().clone() {
+        let dedicated_multivec = self.multivec_embedder.read().clone();
+        if let Some(embedder) = dedicated_multivec {
             return Some(embedder);
         }
 
-        match self.embedder.read().clone() {
+        let base_embedder = self.embedder.read().clone();
+        match base_embedder {
             Some(embedder) if embedder.supports_multivec() => Some(embedder),
             _ => None,
         }
@@ -347,7 +349,7 @@ mod tests {
 
     #[test]
     fn dedicated_multivec_embedder_takes_priority() {
-        let mut runtime = ProviderRuntime::new(16);
+        let runtime = ProviderRuntime::new(16);
         runtime.set_multimodal_embedder(Arc::new(MultiModalEmbedder::new(Arc::new(
             TestEmbedder {
                 model_id: "base",
@@ -369,7 +371,7 @@ mod tests {
 
     #[test]
     fn tokenizer_and_reranker_are_swappable() {
-        let mut runtime = ProviderRuntime::new(8);
+        let runtime = ProviderRuntime::new(8);
         runtime.set_tokenizer(Arc::new(TestTokenizer));
         runtime.set_reranker(Arc::new(TestReranker));
 
@@ -386,7 +388,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn embed_content_uses_multimodal_router_when_configured() {
-        let mut runtime = ProviderRuntime::new(64);
+        let runtime = ProviderRuntime::new(64);
         let multimodal = Arc::new(
             MultiModalEmbedder::new(Arc::new(hirn_provider::PseudoEmbedder::new(64)))
                 .with_audio_embedder(Arc::new(hirn_provider::PseudoEmbedder::new(32))),

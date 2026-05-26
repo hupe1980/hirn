@@ -638,7 +638,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn think_uses_registry_tokenizer_across_repeated_calls() {
-        let (mut db, _dir) = temp_db().await;
+        let (db, _dir) = temp_db().await;
         populate(&db, 8).await;
 
         let count_calls = Arc::new(AtomicUsize::new(0));
@@ -684,7 +684,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn think_with_estimating_tokenizer_fallback_stays_within_budget() {
-        let (mut db, _dir) = temp_db().await;
+        let (db, _dir) = temp_db().await;
         populate(&db, 20).await;
 
         let registry = ProviderRegistry::new();

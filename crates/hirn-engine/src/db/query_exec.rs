@@ -4269,7 +4269,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn compiled_recall_temporal_filter_keeps_in_window_contiguity() {
         let storage: Arc<dyn PhysicalStore> = Arc::new(MemoryStore::new());
-        let (mut db, _dir) = temp_db_with_storage(storage).await;
+        let (db, _dir) = temp_db_with_storage(storage).await;
         db.set_embedder(Arc::new(TemporalKeywordEmbedder));
 
         let older_ts = Timestamp::parse_date_or_rfc3339("2026-01-01T00:00:00Z").unwrap();
@@ -4356,7 +4356,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn compiled_think_respects_limit_after_overfetch() {
         let storage: Arc<dyn PhysicalStore> = Arc::new(MemoryStore::new());
-        let (mut db, _dir) = temp_db_with_storage(storage).await;
+        let (db, _dir) = temp_db_with_storage(storage).await;
         db.set_embedder(Arc::new(UniformKeywordEmbedder));
 
         for idx in 0..4 {
@@ -4395,7 +4395,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn compiled_recall_matches_direct_on_plain_semantic_ranking() {
         let storage: Arc<dyn PhysicalStore> = Arc::new(MemoryStore::new());
-        let (mut db, _dir) = temp_db_with_storage(storage).await;
+        let (db, _dir) = temp_db_with_storage(storage).await;
         db.set_embedder(Arc::new(TemporalKeywordEmbedder));
 
         let agent = test_agent();
@@ -4508,7 +4508,7 @@ mod tests {
 
         let make_records = || async {
             let storage: Arc<dyn PhysicalStore> = Arc::new(MemoryStore::new());
-            let (mut db, dir) = temp_db_with_storage(storage).await;
+            let (db, dir) = temp_db_with_storage(storage).await;
             db.set_embedder(Arc::new(TemporalKeywordEmbedder));
 
             let seed_id = db

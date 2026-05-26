@@ -42,7 +42,7 @@ mod event_sourcing {
             .embedding_dimensions(DIM as u32)
             .build()
             .unwrap();
-        let mut db = HirnDB::open_with_config(config, storage.clone())
+        let db = HirnDB::open_with_config(config, storage.clone())
             .await
             .unwrap();
 
@@ -851,7 +851,7 @@ mod admission_integration {
             .embedding_dimensions(DIM as u32)
             .build()
             .unwrap();
-        let mut db = HirnDB::open_with_config(config, storage.clone())
+        let db = HirnDB::open_with_config(config, storage.clone())
             .await
             .unwrap();
 
@@ -1092,7 +1092,7 @@ mod admission_consolidation {
             .embedding_dimensions(DIM as u32)
             .build()
             .unwrap();
-        let mut db = HirnDB::open_with_config(config, storage.clone())
+        let db = HirnDB::open_with_config(config, storage.clone())
             .await
             .unwrap();
 
@@ -1458,7 +1458,7 @@ mod graphrag_streaming {
             .embedding_dimensions(DIM as u32)
             .build()
             .unwrap();
-        let mut db = HirnDB::open_with_config(config, storage.clone())
+        let db = HirnDB::open_with_config(config, storage.clone())
             .await
             .unwrap();
 
@@ -2398,7 +2398,7 @@ mod multimodal_embedding {
     async fn db_multimodal_embedder_auto_embeds_audio_with_specialized_provider() {
         use hirn_provider::MultiModalEmbedder;
 
-        let (mut db, _dir) = temp_db().await;
+        let (db, _dir) = temp_db().await;
         let multimodal = Arc::new(
             MultiModalEmbedder::new(Arc::new(ConstantEmbedder {
                 model_id: "text",
@@ -2433,7 +2433,7 @@ mod multimodal_embedding {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn db_set_embedder_auto_embeds_composite_with_default_policy() {
-        let (mut db, _dir) = temp_db().await;
+        let (db, _dir) = temp_db().await;
         db.set_embedder(Arc::new(SignatureEmbedder));
 
         let record = EpisodicRecord::builder()
@@ -2458,7 +2458,7 @@ mod multimodal_embedding {
     async fn text_query_recalls_document_via_extracted_text_surrogate() {
         use hirn_provider::MultiModalEmbedder;
 
-        let (mut db, _dir) = temp_db().await;
+        let (db, _dir) = temp_db().await;
         db.set_multimodal_embedder(Arc::new(
             MultiModalEmbedder::new(Arc::new(TokenSpaceEmbedder { model_id: "text" }))
                 .with_document_embedder(Arc::new(TokenSpaceEmbedder {
@@ -2518,7 +2518,7 @@ mod multimodal_embedding {
     async fn text_query_recalls_image_via_description_surrogate() {
         use hirn_provider::MultiModalEmbedder;
 
-        let (mut db, _dir) = temp_db().await;
+        let (db, _dir) = temp_db().await;
         db.set_multimodal_embedder(Arc::new(
             MultiModalEmbedder::new(Arc::new(TokenSpaceEmbedder { model_id: "text" }))
                 .with_image_embedder(Arc::new(TokenSpaceEmbedder { model_id: "image" })),
@@ -5156,7 +5156,7 @@ mod multivector_search {
             .build()
             .unwrap();
 
-        let mut db = HirnDB::open_with_config(config, storage).await.unwrap();
+        let db = HirnDB::open_with_config(config, storage).await.unwrap();
 
         // Set embedder that supports multivec.
         let embedder = Arc::new(PseudoEmbedder::new(DIM));
@@ -5942,7 +5942,7 @@ mod lifecycle_compaction {
             .embedding_dimensions(DIM as u32)
             .build()
             .unwrap();
-        let mut db = HirnDB::open_with_config(config, storage.clone())
+        let db = HirnDB::open_with_config(config, storage.clone())
             .await
             .unwrap();
 

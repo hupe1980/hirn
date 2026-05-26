@@ -136,6 +136,7 @@ struct CognitiveBenchmarkTarget {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[allow(clippy::struct_field_names)]
 struct ExternalSafetyLimits {
     max_sessions: usize,
     max_records: usize,
@@ -1491,7 +1492,7 @@ fn run_cognitive(
     emit_outputs(&outputs, &suite_result, output::write_cognitive_result);
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 fn run_external(
     format_name: String,
     data_dir: Option<String>,

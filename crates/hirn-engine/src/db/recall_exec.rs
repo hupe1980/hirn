@@ -1786,7 +1786,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn direct_recall_multivector_failures_are_visible_in_diagnostics() {
         let store = Arc::new(FailingRecallHydrationStore::new());
-        let (mut db, _dir) = temp_db_with_storage_config(store.clone(), |builder| {
+        let (db, _dir) = temp_db_with_storage_config(store.clone(), |builder| {
             builder.multivector_enabled(true).multivector_weight(0.3)
         })
         .await;
@@ -1824,7 +1824,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn direct_recall_reranker_failures_are_visible_in_diagnostics() {
-        let (mut db, _dir) = temp_db().await;
+        let (db, _dir) = temp_db().await;
         db.set_reranker(Arc::new(FailingReranker));
 
         db.remember(

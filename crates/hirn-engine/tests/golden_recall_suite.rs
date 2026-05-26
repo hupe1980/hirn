@@ -283,7 +283,7 @@ async fn golden_db() -> (HirnDB, tempfile::TempDir) {
         .embedding_dimensions(DIM as u32)
         .build()
         .unwrap();
-    let mut db = HirnDB::open_with_config(config, backend).await.unwrap();
+    let db = HirnDB::open_with_config(config, backend).await.unwrap();
     db.set_embedder(Arc::new(PseudoEmbedder::new(DIM)));
     (db, dir)
 }

@@ -1064,7 +1064,7 @@ impl Hirn {
             .block_on(HirnDb::open(storage_config))
             .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("storage: {e}")))?
             .store_arc();
-        let mut db = rt
+        let db = rt
             .block_on(hirn::HirnDB::open_with_config(config, storage))
             .map_err(to_napi_err)?;
         if let Some(tokenizer_name) = tokenizer_name.as_deref() {

@@ -600,8 +600,7 @@ impl Hirn {
             .map_err(to_py_err)?;
         let storage = block_on(open_lance_storage(path))
             .map_err(|e| PyRuntimeError::new_err(format!("storage: {e}")))?;
-        let mut db =
-            block_on(hirn::HirnDB::open_with_config(config, storage)).map_err(to_py_err)?;
+        let db = block_on(hirn::HirnDB::open_with_config(config, storage)).map_err(to_py_err)?;
         if let Some(tokenizer_name) = tokenizer_name {
             db.set_tokenizer(resolve_registry_tokenizer(tokenizer_name)?);
         }
@@ -1071,7 +1070,7 @@ impl AsyncHirn {
             let storage = open_lance_storage(&path)
                 .await
                 .map_err(|e| PyRuntimeError::new_err(format!("storage: {e}")))?;
-            let mut db = hirn::HirnDB::open_with_config(config, storage)
+            let db = hirn::HirnDB::open_with_config(config, storage)
                 .await
                 .map_err(to_py_err)?;
             if let Some(tokenizer_name) = tokenizer_name.as_deref() {

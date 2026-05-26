@@ -79,7 +79,7 @@ mod tests {
             .working_memory_token_limit(1000)
             .build()
             .unwrap();
-        let mut db = HirnDB::open_with_config(config, Arc::clone(&backend))
+        let db = HirnDB::open_with_config(config, Arc::clone(&backend))
             .await
             .unwrap();
         let log = Arc::new(EventLog::open(backend).await.unwrap());

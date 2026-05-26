@@ -1127,7 +1127,7 @@ async fn batch_remember_prospective_indexing_runs() {
         ])
         .build()
         .unwrap();
-    let mut db = HirnDB::open_with_config(config, backend).await.unwrap();
+    let db = HirnDB::open_with_config(config, backend).await.unwrap();
     db.set_embedder(Arc::new(PseudoEmbedder::new(DIM)));
 
     let records = vec![
@@ -1250,7 +1250,7 @@ async fn batch_remember_temporal_edges_created() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn temporal_next_preserves_arrival_order_when_slow_path_overtakes() {
-    let (mut db, _dir) = full_write_path_db().await;
+    let (db, _dir) = full_write_path_db().await;
     let (blocking_embedder, entered_rx) = BlockingEmbedder::new(DIM);
     let blocking_embedder = Arc::new(blocking_embedder);
     db.set_embedder(blocking_embedder.clone());
@@ -1613,7 +1613,7 @@ async fn prospective_indexing_with_embedder_stores_implications() {
         ])
         .build()
         .unwrap();
-    let mut db = HirnDB::open_with_config(config, backend).await.unwrap();
+    let db = HirnDB::open_with_config(config, backend).await.unwrap();
 
     // Set embedder so prospective indexing can actually embed implications.
     let embedder = Arc::new(PseudoEmbedder::new(DIM));
@@ -1665,7 +1665,7 @@ async fn prospective_implications_have_correct_source_memory_id() {
         ])
         .build()
         .unwrap();
-    let mut db = HirnDB::open_with_config(config, backend).await.unwrap();
+    let db = HirnDB::open_with_config(config, backend).await.unwrap();
     db.set_embedder(Arc::new(PseudoEmbedder::new(DIM)));
 
     let record = EpisodicRecord::builder()
@@ -1714,7 +1714,7 @@ async fn prospective_implications_searchable_by_vector() {
         ])
         .build()
         .unwrap();
-    let mut db = HirnDB::open_with_config(config, backend.clone())
+    let db = HirnDB::open_with_config(config, backend.clone())
         .await
         .unwrap();
     db.set_embedder(Arc::new(PseudoEmbedder::new(DIM)));
@@ -1771,7 +1771,7 @@ async fn fast_path_skips_prospective_indexing() {
         .prospective_indexing_templates(vec!["Question about {content}?".into()])
         .build()
         .unwrap();
-    let mut db = HirnDB::open_with_config(config, backend).await.unwrap();
+    let db = HirnDB::open_with_config(config, backend).await.unwrap();
     db.set_embedder(Arc::new(PseudoEmbedder::new(DIM)));
 
     let emb = rand_vec(42);
@@ -1883,7 +1883,7 @@ async fn fast_path_no_embedder_calls_for_prospective() {
         .prospective_indexing_templates(vec!["What about {content}?".into()])
         .build()
         .unwrap();
-    let mut db = HirnDB::open_with_config(config, backend).await.unwrap();
+    let db = HirnDB::open_with_config(config, backend).await.unwrap();
 
     // Use tracking embedder to count calls.
     let tracker = Arc::new(TrackingEmbedder::new(DIM));
@@ -2268,7 +2268,7 @@ async fn prospective_indexing_timeout_still_stores_memory() {
         ])
         .build()
         .unwrap();
-    let mut db = HirnDB::open_with_config(config, backend).await.unwrap();
+    let db = HirnDB::open_with_config(config, backend).await.unwrap();
 
     // Use a slow embedder that takes 10s — much longer than 1s timeout.
     let slow = Arc::new(SlowEmbedder::new(DIM, 10));
@@ -2337,7 +2337,7 @@ async fn mock_embedder_all_implications_embedded_and_stored() {
         ])
         .build()
         .unwrap();
-    let mut db = HirnDB::open_with_config(config, backend).await.unwrap();
+    let db = HirnDB::open_with_config(config, backend).await.unwrap();
 
     // Use tracking embedder to verify calls.
     let tracker = Arc::new(TrackingEmbedder::new(DIM));
@@ -2410,7 +2410,7 @@ async fn rpe_fast_path_saves_llm_tokens() {
         .svo_extraction_enabled(true)
         .build()
         .unwrap();
-    let mut db = HirnDB::open_with_config(config, backend).await.unwrap();
+    let db = HirnDB::open_with_config(config, backend).await.unwrap();
     let tracker = Arc::new(TrackingEmbedder::new(DIM));
     db.set_embedder(tracker.clone());
 
@@ -2551,7 +2551,7 @@ impl hirn_core::embed::Embedder for FailsSecondBatchChunkEmbedder {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn batch_remember_preserves_partial_embed_successes() {
-    let (mut db, _dir) = rpe_db().await;
+    let (db, _dir) = rpe_db().await;
     let embedder = hirn_provider::BatchingEmbedder::new(
         FailsSecondBatchChunkEmbedder::new(DIM),
         NonZeroUsize::new(2).unwrap(),
@@ -2592,7 +2592,7 @@ async fn embedder_recovery_processes_pending_embeds() {
         .embedding_dimensions(DIM as u32)
         .build()
         .unwrap();
-    let mut db = HirnDB::open_with_config(config, backend).await.unwrap();
+    let db = HirnDB::open_with_config(config, backend).await.unwrap();
 
     // Phase 1: Use a failing embedder. Records with multi_content but no
     // pre-computed embedding will trigger embed failure → provider fallback.

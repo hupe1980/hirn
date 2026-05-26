@@ -393,7 +393,7 @@ async fn batch_remember_slow_path_uses_append_batches_for_buffered_side_effects(
         .svo_confidence_threshold(0.5)
         .build()
         .unwrap();
-    let (mut db, _lance_dir, tracking_store) = temp_tracking_db(config).await;
+    let (db, _lance_dir, tracking_store) = temp_tracking_db(config).await;
     db.set_embedder(Arc::new(PseudoEmbedder::new(DIM)));
 
     let records = vec![

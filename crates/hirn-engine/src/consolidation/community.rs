@@ -249,7 +249,7 @@ pub async fn detect_communities(
         // sqrt(avg_degree) scales resolution with graph density.
         // avg_degree for an undirected graph = 2 * total_weight / n.
         let avg_degree = 2.0 * adj.total_weight / adj.n as f64;
-        avg_degree.sqrt().max(0.1_f64).min(10.0_f64)
+        avg_degree.sqrt().clamp(0.1_f64, 10.0_f64)
     } else {
         config.resolution
     };

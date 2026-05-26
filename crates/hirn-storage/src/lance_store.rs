@@ -147,8 +147,7 @@ impl LancePhysicalStore {
 
         // Start from the existing cached snapshot (Arc clone = O(1) on fast path), or
         // empty Vec for the first write.
-        let mut new_snapshot: Vec<RecordBatch> =
-            existing.as_deref().map(|v| v.clone()).unwrap_or_default();
+        let mut new_snapshot: Vec<RecordBatch> = existing.as_deref().cloned().unwrap_or_default();
 
         // Determine the canonical schema from the existing snapshot (if any).
         let canonical_schema: Option<arrow_schema::SchemaRef> =
