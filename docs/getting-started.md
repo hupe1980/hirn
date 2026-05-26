@@ -241,7 +241,7 @@ assert!(preview.artifacts.iter().any(|artifact| {
 }));
 ```
 
-See [resource_memory.rs](../examples/resource_memory.rs) for the full runnable workflow.
+See [resource_memory.rs](../crates/hirn/examples/resource_memory.rs) for the full runnable workflow.
 
 Hydration modes are intentionally explicit:
 
@@ -371,8 +371,8 @@ mem.close();
 - **[Offline Intelligence](offline-intelligence.md)** — scheduler, budgets, dream/reconcile/plan workflow
 - **[Explanation Surfaces](explanation-surfaces.md)** — retrieval and write-path reasoning surfaces
 - **[Benchmarks](benchmarks.md)** — H1–H6 cognitive benchmark results
-- **[Examples](../examples/)** — runnable example projects
-- **[Resource Memory Example](../examples/resource_memory.rs)** — end-to-end resource ingest, recall, and preview hydration
+- **[Examples](../crates/hirn/examples/)** — runnable example projects
+- **[Resource Memory Example](../crates/hirn/examples/resource_memory.rs)** — end-to-end resource ingest, recall, and preview hydration
 
 ### Deployment
 

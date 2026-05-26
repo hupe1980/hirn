@@ -172,7 +172,7 @@ async fn main() -> HirnResult<()> {
 }
 ```
 
-For first-class resources and grounded evidence, see the resource-backed workflow in [docs/getting-started.md](docs/getting-started.md#5-store-resource-backed-evidence) and the runnable [examples/resource_memory.rs](examples/resource_memory.rs).
+For first-class resources and grounded evidence, see the resource-backed workflow in [docs/getting-started.md](docs/getting-started.md#5-store-resource-backed-evidence) and the runnable [crates/hirn/examples/resource_memory.rs](crates/hirn/examples/resource_memory.rs).
 
 ### Python
 
@@ -310,7 +310,7 @@ See [docs/architecture.md](docs/architecture.md) for the full architecture guide
 | Document | Description |
 |----------|-------------|
 | [Getting Started](docs/getting-started.md) | 5 minutes to working memory (Rust, Python, Node.js) |
-| [Resource Memory Example](examples/resource_memory.rs) | End-to-end image-backed evidence ingest, recall, and preview hydration |
+| [Resource Memory Example](crates/hirn/examples/resource_memory.rs) | End-to-end image-backed evidence ingest, recall, and preview hydration |
 | [Architecture](docs/architecture.md) | Full system architecture guide |
 | [Offline Intelligence](docs/offline-intelligence.md) | Scheduler, budgets, quarantine review, and rollback workflow |
 | [Explanation Surfaces](docs/explanation-surfaces.md) | Retrieval and write-path reasoning surfaces for operators and benchmarks |
