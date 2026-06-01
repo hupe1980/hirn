@@ -2058,33 +2058,35 @@ mod tests {
             )
         });
 
-        let sender_db = Arc::clone(&db);
-        let sender = std::thread::spawn(move || {
-            let runtime = tokio::runtime::Runtime::new().unwrap();
-            runtime.block_on(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                sender_db
-                    .semantic()
-                    .store(
-                        SemanticRecord::builder()
-                            .concept("watch_test")
-                            .description("watch event")
-                            .agent_id(agent())
-                            .build()
-                            .unwrap(),
-                    )
-                    .await
-                    .unwrap();
-            });
-        });
-
         Python::initialize();
         Python::attach(|py| {
-            let events = bridge.watch(py, 250).unwrap();
+            let sender_db = Arc::clone(&db);
+            let sender = std::thread::spawn(move || {
+                let runtime = tokio::runtime::Runtime::new().unwrap();
+                runtime.block_on(async move {
+                    for idx in 0..4 {
+                        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+                        sender_db
+                            .semantic()
+                            .store(
+                                SemanticRecord::builder()
+                                    .concept(format!("watch_test_{idx}"))
+                                    .description("watch event")
+                                    .agent_id(agent())
+                                    .build()
+                                    .unwrap(),
+                            )
+                            .await
+                            .unwrap();
+                    }
+                });
+            });
+
+            let events = bridge.watch(py, 2_500).unwrap();
             let events = events.bind(py);
             assert!(!events.is_empty());
-        });
 
-        sender.join().unwrap();
+            sender.join().unwrap();
+        });
     }
 }
