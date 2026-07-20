@@ -134,7 +134,7 @@ The repository now ships a focused operator-docs surface for tuning, troubleshoo
 
 ```toml
 [dependencies]
-hirn = "0.1"
+hirn = "0.2"
 ```
 
 Default builds enable the provider-owned `tiktoken` tokenizer. For a minimal build,
@@ -146,7 +146,7 @@ from `hirn-provider` if you need to construct a tokenizer explicitly.
 
 ```toml
 [dependencies]
-hirn = { version = "0.1", default-features = false, features = ["hf-tokenizer"] }
+hirn = { version = "0.2", default-features = false, features = ["hf-tokenizer"] }
 hirn-provider = { version = "0.1", features = ["hf-tokenizer"] }
 ```
 

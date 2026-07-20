@@ -386,10 +386,10 @@ Cedar authorization is gated by the `cedar` feature flag (default: **on**).
 
 ```toml
 # With Cedar (default)
-hirn = "0.1"
+hirn = "0.2"
 
 # Without Cedar (explicit open mode for development/testing)
-hirn = { version = "0.1", default-features = false }
+hirn = { version = "0.2", default-features = false }
 ```
 
 When the `cedar` feature is off, all requests are allowed without policy evaluation. Treat this as explicit development/test posture rather than a production default.

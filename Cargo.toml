@@ -18,7 +18,7 @@ members = [
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 # 1.91.1 (not .0) because aws-types 1.3.14 declares rust-version = "1.91.1".
 rust-version = "1.91.1"
@@ -119,16 +119,16 @@ ureq = { version = "3", features = ["json"] }
 dotenvy = "0.15"
 
 # Internal
-hirn = { path = "crates/hirn", version = "0.1.0" }
-hirn-core = { path = "crates/hirn-core", version = "0.1.0" }
-hirn-graph = { path = "crates/hirn-graph", version = "0.1.0" }
-hirn-query = { path = "crates/hirn-query", version = "0.1.0" }
-hirn-engine = { path = "crates/hirn-engine", version = "0.1.0" }
-hirn-provider = { path = "crates/hirn-provider", version = "0.1.0" }
-hirn-storage = { path = "crates/hirn-storage", version = "0.1.0" }
-hirn-exec = { path = "crates/hirn-exec", version = "0.1.0" }
-hirn-policy = { path = "crates/hirn-policy", version = "0.1.0" }
-hirnd = { path = "crates/hirnd", version = "0.1.0" }
+hirn = { path = "crates/hirn", version = "0.2.0" }
+hirn-core = { path = "crates/hirn-core", version = "0.2.0" }
+hirn-graph = { path = "crates/hirn-graph", version = "0.2.0" }
+hirn-query = { path = "crates/hirn-query", version = "0.2.0" }
+hirn-engine = { path = "crates/hirn-engine", version = "0.2.0" }
+hirn-provider = { path = "crates/hirn-provider", version = "0.2.0" }
+hirn-storage = { path = "crates/hirn-storage", version = "0.2.0" }
+hirn-exec = { path = "crates/hirn-exec", version = "0.2.0" }
+hirn-policy = { path = "crates/hirn-policy", version = "0.2.0" }
+hirnd = { path = "crates/hirnd", version = "0.2.0" }
 
 # Async Runtime
 tokio = { version = "1", features = ["full"] }

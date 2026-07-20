@@ -1,6 +1,6 @@
 {
   "name": "@hupe1980/hirn",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Node.js bindings for the hirn cognitive memory database",
   "main": "index.js",
   "module": "index.mjs",

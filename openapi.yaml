@@ -5,7 +5,7 @@ info:
     Cognitive memory database for LLMs. Hirn stores episodic and semantic
     memories, retrieves them via embedding similarity, assembles context with
     token budgets, and maintains a knowledge graph linking related memories.
-  version: 0.1.0
+  version: 0.2.0
   license:
     name: MIT
     url: https://opensource.org/licenses/MIT

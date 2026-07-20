@@ -60,7 +60,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-hirn = "0.1"
+hirn = "0.2"
 tokio = { version = "1", features = ["full"] }
 ```
 

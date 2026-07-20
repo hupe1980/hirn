@@ -4265,7 +4265,7 @@ dependencies = [
 
 [[package]]
 name = "hirn"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hirn-core",
  "hirn-engine",
@@ -4281,7 +4281,7 @@ dependencies = [
 
 [[package]]
 name = "hirn-bench"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4309,7 +4309,7 @@ dependencies = [
 
 [[package]]
 name = "hirn-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "bincode",
@@ -4331,7 +4331,7 @@ dependencies = [
 
 [[package]]
 name = "hirn-engine"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4371,7 +4371,7 @@ dependencies = [
 
 [[package]]
 name = "hirn-exec"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aho-corasick",
  "arrow-array",
@@ -4406,7 +4406,7 @@ dependencies = [
 
 [[package]]
 name = "hirn-graph"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bincode",
  "criterion",
@@ -4420,7 +4420,7 @@ dependencies = [
 
 [[package]]
 name = "hirn-node"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hirn",
  "hirn-storage",
@@ -4437,7 +4437,7 @@ dependencies = [
 
 [[package]]
 name = "hirn-policy"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -4453,7 +4453,7 @@ dependencies = [
 
 [[package]]
 name = "hirn-provider"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -4481,7 +4481,7 @@ dependencies = [
 
 [[package]]
 name = "hirn-python"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hirn",
  "hirn-storage",
@@ -4497,7 +4497,7 @@ dependencies = [
 
 [[package]]
 name = "hirn-query"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "criterion",
@@ -4516,7 +4516,7 @@ dependencies = [
 
 [[package]]
 name = "hirn-storage"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arrow-array",
  "arrow-cast",
@@ -4555,7 +4555,7 @@ dependencies = [
 
 [[package]]
 name = "hirnd"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyerror",
  "async-stream",
