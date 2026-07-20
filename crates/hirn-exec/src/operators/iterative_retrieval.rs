@@ -807,6 +807,8 @@ mod tests {
             Field::new("surprise", DataType::Float32, true),
             Field::new("evidence_count", DataType::UInt32, true),
             Field::new("invocation_count", DataType::UInt64, true),
+            Field::new("confidence", DataType::Float32, true),
+            Field::new("success_rate", DataType::Float32, true),
         ]))
     }
 

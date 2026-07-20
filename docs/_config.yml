@@ -89,6 +89,16 @@ footer_content: >-
 last_edit_timestamp: true
 last_edit_time_format: "%b %e %Y"
 
+# ── Front-matter defaults ────────────────────────────────────────────────
+# Every page uses the theme's default layout unless it opts out. Without
+# this, pages that omit `layout:` in their front matter are emitted as bare
+# HTML fragments — no stylesheet, no navigation.
+defaults:
+  - scope:
+      path: ""
+    values:
+      layout: default
+
 # ── Plugins (SEO, sitemap, relative links) ───────────────────────────────
 plugins:
   - jekyll-seo-tag
