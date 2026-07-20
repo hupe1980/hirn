@@ -311,6 +311,11 @@ pub struct PropertyGraph {
     /// Entries are `(Reverse(access_count), MemoryId)` — smallest access_count at top.
     /// Stale entries (where heap's count ≠ node's current count) are skipped on pop.
     eviction_heap: BinaryHeap<Reverse<(u64, MemoryId)>>,
+    /// Edge ids removed by fan-out-cap eviction since the last drain. A
+    /// write-through cache layer must mirror these removals to durable
+    /// storage — otherwise evicted edges accumulate in the cold tier and
+    /// resurrect on the next reload.
+    evicted_edge_ids: Vec<EdgeId>,
     /// Tracks nodes whose `access_count` has changed since the last cold-tier flush.
     /// Drained by `drain_dirty_access_counts()` and reset to 0 after flush.
     dirty_access_counts: HashMap<MemoryId, u64>,
@@ -329,6 +334,7 @@ impl PropertyGraph {
             graph: StableDiGraph::new(),
             id_to_node: HashMap::new(),
             edge_id_to_idx: HashMap::new(),
+            evicted_edge_ids: Vec::new(),
             max_node_count: 500_000,
             eviction_heap: BinaryHeap::new(),
             dirty_access_counts: HashMap::new(),
@@ -341,6 +347,7 @@ impl PropertyGraph {
             graph: StableDiGraph::new(),
             id_to_node: HashMap::new(),
             edge_id_to_idx: HashMap::new(),
+            evicted_edge_ids: Vec::new(),
             max_node_count,
             eviction_heap: BinaryHeap::new(),
             dirty_access_counts: HashMap::new(),
@@ -383,6 +390,30 @@ impl PropertyGraph {
             pg.edge_id_to_idx.insert(eid, eidx);
         }
         pg
+    }
+
+    /// Insert an edge **verbatim**, preserving its identity and all payload
+    /// (its `EdgeId`, causal data, bi-temporal `valid_from`/`valid_until`,
+    /// `co_retrieval_count`, and `created_at`).
+    ///
+    /// This is the restore primitive used when rehydrating the hot tier from the
+    /// cold (persistent) tier: unlike [`add_edge`](Self::add_edge) it does NOT
+    /// mint a new id, clamp the weight, add a reverse edge, or enforce the
+    /// fan-out cap — the edge already existed in durable storage, so the hot tier
+    /// must mirror it exactly rather than generate a fresh, lossy copy. Missing
+    /// endpoints are created defensively.
+    pub fn insert_edge_raw(&mut self, edge: GraphEdge) {
+        if !self.id_to_node.contains_key(&edge.source) {
+            self.add_node(edge.source, Layer::Episodic, 0.5, edge.created_at);
+        }
+        if !self.id_to_node.contains_key(&edge.target) {
+            self.add_node(edge.target, Layer::Episodic, 0.5, edge.created_at);
+        }
+        let src = self.id_to_node[&edge.source];
+        let tgt = self.id_to_node[&edge.target];
+        let eid = edge.id;
+        let eidx = self.graph.add_edge(src, tgt, edge);
+        self.edge_id_to_idx.insert(eid, eidx);
     }
 
     /// Create a snapshot for persistence.
@@ -684,9 +715,24 @@ impl PropertyGraph {
                     weight = evicted.weight,
                     "evicting lowest-weight edge group from node (MAX_EDGES_PER_NODE reached)"
                 );
+                // Record the whole bidirectional pair so the cache layer can
+                // delete both directions from cold storage.
+                self.evicted_edge_ids.push(evicted.id);
+                if let Some(reverse_idx) = self.reverse_edge_index(&evicted.clone())
+                    && reverse_idx != *evict_eidx
+                    && let Some(reverse_edge) = self.graph.edge_weight(reverse_idx)
+                {
+                    self.evicted_edge_ids.push(reverse_edge.id);
+                }
             }
             self.remove_edge_pair_by_index(*evict_eidx);
         }
+    }
+
+    /// Drain the edge ids removed by fan-out-cap eviction since the last
+    /// call. Callers that persist edges must mirror these as deletions.
+    pub fn take_evicted_edges(&mut self) -> Vec<EdgeId> {
+        std::mem::take(&mut self.evicted_edge_ids)
     }
 
     // ── Edge operations ─────────────────────────────────────────────────
@@ -743,6 +789,16 @@ impl PropertyGraph {
         causal: Option<Box<CausalEdgeData>>,
     ) -> HirnResult<EdgeId> {
         validate_edge_metadata(&metadata)?;
+
+        // Reject non-finite weights before they reach the graph: `f32::NAN`
+        // survives `clamp` (clamp of NaN is NaN) and then poisons every
+        // downstream PPR / spreading-activation computation in the connected
+        // component, causing recall to silently return nothing.
+        if !weight.is_finite() {
+            return Err(HirnError::InvalidInput(format!(
+                "graph edge weight must be finite, got {weight}"
+            )));
+        }
 
         let src_idx = *self
             .id_to_node
@@ -1153,12 +1209,17 @@ impl PropertyGraph {
     }
 
     /// Get outgoing neighbors with their edge weights (used by activation engine).
+    ///
+    /// Returns only currently-active edges (not yet expired via `valid_until`),
+    /// consistent with `get_edges()`, so retracted memories do not keep
+    /// propagating activation through their soft-expired edges.
     pub fn outgoing_weighted(&self, node_id: MemoryId) -> Vec<(MemoryId, f32, EdgeRelation)> {
         let Some(&idx) = self.id_to_node.get(&node_id) else {
             return Vec::new();
         };
         self.graph
             .edges_directed(idx, Direction::Outgoing)
+            .filter(|e| e.weight().is_currently_active())
             .map(|e| {
                 let w = e.weight();
                 (self.graph[e.target()].id, w.weight, w.relation)
@@ -1171,23 +1232,29 @@ impl PropertyGraph {
     /// Unlike [`outgoing_weighted`](Self::outgoing_weighted), this returns petgraph
     /// `NodeIndex` values and borrows the relation instead of copying/collecting.
     /// Ideal for spreading activation hot paths.
+    ///
+    /// Yields only currently-active edges (not yet expired via `valid_until`).
     pub fn outgoing_weighted_iter(
         &self,
         idx: NodeIndex,
     ) -> impl Iterator<Item = (NodeIndex, f32, &EdgeRelation)> {
         self.graph
             .edges_directed(idx, Direction::Outgoing)
+            .filter(|e| e.weight().is_currently_active())
             .map(|e| (e.target(), e.weight().weight, &e.weight().relation))
     }
 
     /// Zero-copy iterator over **incoming** edges from `idx`.
     /// Returns `(source_idx, weight, &relation)`.
+    ///
+    /// Yields only currently-active edges (not yet expired via `valid_until`).
     pub fn incoming_weighted_iter(
         &self,
         idx: NodeIndex,
     ) -> impl Iterator<Item = (NodeIndex, f32, &EdgeRelation)> {
         self.graph
             .edges_directed(idx, Direction::Incoming)
+            .filter(|e| e.weight().is_currently_active())
             .map(|e| (e.source(), e.weight().weight, &e.weight().relation))
     }
 
@@ -1759,6 +1826,46 @@ mod tests {
         let b_out: Vec<_> = pg.outgoing_weighted_iter(b_idx).collect();
         assert_eq!(b_out.len(), 1);
         assert_eq!(b_out[0].0, a_idx);
+    }
+
+    #[test]
+    fn weighted_accessors_exclude_soft_expired_edges() {
+        let mut pg = PropertyGraph::new();
+        let a = make_node(&mut pg);
+        let b = make_node(&mut pg);
+        let c = make_node(&mut pg);
+        // a → b stays active; a ↔ c gets soft-expired via retraction of c.
+        pg.add_edge(a, b, EdgeRelation::Causes, 0.8, Metadata::new())
+            .unwrap();
+        pg.add_edge(a, c, EdgeRelation::Causes, 0.6, Metadata::new())
+            .unwrap();
+        pg.add_edge(c, a, EdgeRelation::Causes, 0.7, Metadata::new())
+            .unwrap();
+
+        pg.expire_edges_for_node(c, Timestamp::from_millis(0));
+
+        let a_idx = pg.node_index(a).unwrap();
+        let b_idx = pg.node_index(b).unwrap();
+        let c_idx = pg.node_index(c).unwrap();
+
+        // outgoing_weighted: active edge to b survives, expired edge to c is gone.
+        let out = pg.outgoing_weighted(a);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, b);
+        assert!(pg.outgoing_weighted(c).is_empty());
+
+        // outgoing_weighted_iter mirrors the same filtering.
+        let out_iter: Vec<_> = pg.outgoing_weighted_iter(a_idx).collect();
+        assert_eq!(out_iter.len(), 1);
+        assert_eq!(out_iter[0].0, b_idx);
+        assert_eq!(pg.outgoing_weighted_iter(c_idx).count(), 0);
+
+        // incoming_weighted_iter: a no longer sees the expired c → a edge,
+        // while b still sees the active a → b edge.
+        assert_eq!(pg.incoming_weighted_iter(a_idx).count(), 0);
+        let b_in: Vec<_> = pg.incoming_weighted_iter(b_idx).collect();
+        assert_eq!(b_in.len(), 1);
+        assert_eq!(b_in[0].0, a_idx);
     }
 
     #[test]

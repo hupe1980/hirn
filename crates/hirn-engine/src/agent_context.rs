@@ -79,11 +79,38 @@ impl<'a> AgentContext<'a> {
         }
     }
 
+    /// Enforce a Cedar authorization `action` for this agent against `ns`.
+    ///
+    /// This is the engine-side authorization choke point for the agent-scoped
+    /// mutation surface. `check_access` only scopes to the token's namespaces;
+    /// this additionally honors Cedar action policies (e.g. "block agents with
+    /// reputation < 50 from `remember`/`connect`"), which previously ran only in
+    /// the MCP toolkit. It is a no-op when no policy engine is configured, so it
+    /// is safe to call unconditionally on every mutation path.
+    async fn enforce(&self, action: crate::policy::Action, ns: &Namespace) -> HirnResult<()> {
+        self.db
+            .enforce(
+                self.agent_id.as_str(),
+                action,
+                &self.db.config().default_realm,
+                ns.as_str(),
+            )
+            .await
+    }
+
     // ── Remember ────────────────────────────────────────────────────────
 
     /// Store an episodic record in the agent's private namespace (default)
     /// or a specified namespace.
+    ///
+    /// The record's `provenance.created_by` is always overwritten with this
+    /// context's agent id: the executing identity is the author, and the
+    /// engine's Cedar action checks evaluate against that field.
     pub async fn remember(&self, mut record: EpisodicRecord) -> HirnResult<MemoryId> {
+        // The context's identity is authoritative — a caller-supplied author
+        // must not be able to impersonate another principal in provenance or
+        // in the Cedar action evaluation performed by the write path.
+        record.provenance.created_by = self.agent_id;
         // Default to private namespace if record uses the default namespace.
         if record.namespace == Namespace::default() {
             record.namespace = self.private_namespace();
@@ -105,11 +132,16 @@ impl<'a> AgentContext<'a> {
     }
 
     /// Store a record explicitly in a named namespace.
+    ///
+    /// As with [`Self::remember`], `provenance.created_by` is overwritten with
+    /// this context's agent id.
     pub async fn remember_in(
         &self,
         mut record: EpisodicRecord,
         namespace: Namespace,
     ) -> HirnResult<MemoryId> {
+        // The executing identity is the author; see `remember`.
+        record.provenance.created_by = self.agent_id;
         self.check_access(&namespace)?;
         record.namespace = namespace;
 
@@ -202,7 +234,13 @@ impl<'a> AgentContext<'a> {
     // ── Store Semantic ─────────────────────────────────────────────────
 
     /// Store a semantic record, enforcing namespace access.
+    ///
+    /// As with [`Self::remember`], `provenance.created_by` is overwritten with
+    /// this context's agent id so the write path's Cedar action check runs
+    /// against the executing identity.
     pub async fn store_semantic(&self, mut record: SemanticRecord) -> HirnResult<MemoryId> {
+        // The executing identity is the author; see `remember`.
+        record.provenance.created_by = self.agent_id;
         if record.namespace == Namespace::default() {
             record.namespace = self.private_namespace();
         }
@@ -227,11 +265,15 @@ impl<'a> AgentContext<'a> {
     }
 
     /// Retract a semantic record, verifying namespace access.
+    ///
+    /// The retraction's `actor_id` is overwritten with this context's agent id
+    /// — the executing identity is the actor the engine enforces and records.
     pub async fn retract_semantic(
         &self,
         id: MemoryId,
-        retraction: SemanticRetraction,
+        mut retraction: SemanticRetraction,
     ) -> HirnResult<SemanticRecord> {
+        retraction.actor_id = self.agent_id;
         let record = self.db.get_memory(id).await?;
         let ns = record_namespace(&record);
         self.check_access(&ns)?;
@@ -239,11 +281,14 @@ impl<'a> AgentContext<'a> {
     }
 
     /// Apply a durable semantic override, verifying namespace access.
+    ///
+    /// The override's `actor_id` is overwritten with this context's agent id.
     pub async fn override_semantic(
         &self,
         id: MemoryId,
-        override_request: SemanticOverride,
+        mut override_request: SemanticOverride,
     ) -> HirnResult<SemanticRecord> {
+        override_request.actor_id = self.agent_id;
         let record = self.db.get_memory(id).await?;
         let ns = record_namespace(&record);
         self.check_access(&ns)?;
@@ -251,11 +296,14 @@ impl<'a> AgentContext<'a> {
     }
 
     /// Correct a semantic record, verifying namespace access.
+    ///
+    /// The update's `actor_id` is overwritten with this context's agent id.
     pub async fn correct_semantic(
         &self,
         id: MemoryId,
-        update: SemanticUpdate,
+        mut update: SemanticUpdate,
     ) -> HirnResult<SemanticRecord> {
+        update.actor_id = self.agent_id;
         let record = self.db.get_memory(id).await?;
         let ns = record_namespace(&record);
         self.check_access(&ns)?;
@@ -263,11 +311,14 @@ impl<'a> AgentContext<'a> {
     }
 
     /// Supersede a semantic record, verifying namespace access.
+    ///
+    /// The supersession's `actor_id` is overwritten with this context's agent id.
     pub async fn supersede_semantic(
         &self,
         id: MemoryId,
-        supersession: SemanticSupersession,
+        mut supersession: SemanticSupersession,
     ) -> HirnResult<SemanticRecord> {
+        supersession.actor_id = self.agent_id;
         let record = self.db.get_memory(id).await?;
         let ns = record_namespace(&record);
         self.check_access(&ns)?;
@@ -275,11 +326,14 @@ impl<'a> AgentContext<'a> {
     }
 
     /// Merge semantic logical memories, verifying namespace access for the target and sources.
+    ///
+    /// The merge's `actor_id` is overwritten with this context's agent id.
     pub async fn merge_semantic(
         &self,
         target: MemoryId,
-        merge: SemanticMerge,
+        mut merge: SemanticMerge,
     ) -> HirnResult<SemanticMergeOutcome> {
+        merge.actor_id = self.agent_id;
         let target_record = self.db.get_memory(target).await?;
         self.check_access(&record_namespace(&target_record))?;
         for source_id in &merge.source_ids {
@@ -310,8 +364,11 @@ impl<'a> AgentContext<'a> {
     ) -> HirnResult<crate::graph::EdgeId> {
         let source_record = self.db.get_memory(source).await?;
         let target_record = self.db.get_memory(target).await?;
-        self.check_access(&record_namespace(&source_record))?;
+        let source_ns = record_namespace(&source_record);
+        self.check_access(&source_ns)?;
         self.check_access(&record_namespace(&target_record))?;
+        self.enforce(crate::policy::Action::Connect, &source_ns)
+            .await?;
         self.db
             .connect_with(source, target, relation, weight, metadata)
             .await
@@ -348,6 +405,9 @@ impl<'a> AgentContext<'a> {
                 let source_namespace = ep.namespace.as_str().to_string();
                 ep.id = MemoryId::new();
                 ep.namespace = target_namespace.clone();
+                // The sharing agent authors the copy; the DerivedFrom edge and
+                // the ShareMemory audit entry preserve the original lineage.
+                ep.provenance.created_by = self.agent_id;
                 let new_id = self.db.remember(ep).await?;
 
                 // Create DerivedFrom edge.
@@ -378,6 +438,8 @@ impl<'a> AgentContext<'a> {
                 let source_namespace = sem.namespace.as_str().to_string();
                 sem.id = MemoryId::new();
                 sem.namespace = target_namespace.clone();
+                // The sharing agent authors the copy; see the episodic arm.
+                sem.provenance.created_by = self.agent_id;
                 let new_id = self.db.store_semantic(sem).await?;
 
                 self.db

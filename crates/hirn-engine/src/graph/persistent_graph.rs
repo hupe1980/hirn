@@ -1270,11 +1270,14 @@ impl PersistentGraph {
             }
         }
 
-        // DFS over the BFS result to enumerate individual chains.
+        // DFS over the BFS result to enumerate individual chains. Chain count
+        // is capped: distinct paths in a DAG grow exponentially with depth,
+        // so an uncapped enumeration is a single-query OOM/CPU hazard on
+        // deep, high-fan-out graphs (this is the delegated deep-query path).
         let mut rows = Vec::new();
         let mut chain_counter = 0_u32;
 
-        for &seed in start_ids {
+        'seeds: for &seed in start_ids {
             // Stack: (current_node, depth, chain_edges_so_far, visited)
             let mut stack: Vec<(MemoryId, usize, Vec<CausalBfsEdge>, HashSet<MemoryId>)> = vec![{
                 let mut visited = HashSet::new();
@@ -1283,6 +1286,13 @@ impl PersistentGraph {
             }];
 
             while let Some((node, depth, chain_edges, visited)) = stack.pop() {
+                if chain_counter as usize >= crate::graph::causal::MAX_CAUSAL_CHAINS {
+                    tracing::warn!(
+                        max_chains = crate::graph::causal::MAX_CAUSAL_CHAINS,
+                        "deep causal BFS truncated: chain cap reached"
+                    );
+                    break 'seeds;
+                }
                 if depth >= max_depth {
                     if !chain_edges.is_empty() {
                         emit_causal_rows(&chain_edges, &mut rows, &mut chain_counter);
@@ -1556,6 +1566,15 @@ impl PersistentGraph {
     /// Get the namespace of a node.
     pub async fn node_namespace(&self, id: MemoryId) -> HirnResult<Option<Namespace>> {
         Ok(self.get_node(id).await?.map(|n| n.namespace))
+    }
+
+    /// Get all currently-active (non-soft-expired) edges, verbatim.
+    ///
+    /// Used to rehydrate the hot tier: unlike [`all_edges`](Self::all_edges) it
+    /// applies the `is_currently_active()` bi-temporal filter, so retracted
+    /// edges are not reloaded as live.
+    pub async fn active_edges(&self) -> HirnResult<Vec<GraphEdge>> {
+        self.scan_edges(ScanOptions::default()).await
     }
 
     /// Get all edges in the graph.

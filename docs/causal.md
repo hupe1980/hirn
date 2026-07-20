@@ -1,28 +1,75 @@
-# HIRN — Causal Reasoning Engine
+---
+title: Causal Reasoning
+parent: Concepts
+nav_order: 3
+description: >-
+  Pearl's three-rung causal hierarchy — association, intervention, counterfactual —
+  over hirn's property graph, plus deep traversal, NLI, and ABA conflict resolution.
+---
 
-> **⚠️ Experimental:** This project is under active development. APIs, on-disk formats, and behaviour may change without notice. Not recommended for production use.
+# Causal Reasoning
+{: .no_toc }
 
-> Pearl's 3-rung causal hierarchy fully operational in HirnQL.
+This project is under active development. APIs, on-disk formats, and behaviour may change without notice. Not recommended for production use.
+{: .experimental }
+
+Pearl's 3-rung causal hierarchy, operational in HirnQL.
+
+## Table of contents
+{: .no_toc .text-delta }
+
+1. TOC
+{:toc}
 
 ---
 
-## Table of Contents
+## Why causal reasoning?
 
-1. [Pearl's Causal Hierarchy](#pearls-causal-hierarchy)
-2. [HirnQL Causal Statements](#hirnql-causal-statements)
-3. [Deep Traversal Architecture](#deep-traversal-architecture)
-4. [Causal Graph Model](#causal-graph-model)
-5. [Causal Discovery During Consolidation](#causal-discovery-during-consolidation)
-6. [NLI Contradiction Detection](#nli-contradiction-detection)
-7. [ABA Conflict Resolution](#aba-conflict-resolution)
-8. [Topic Loom](#topic-loom)
-9. [Configuration Reference](#configuration-reference)
+Similarity search answers "what is *like* this?" — but agents constantly need to answer "what
+*caused* this?", "what would happen if I did this?", and "would this still have happened if that
+had not?" Those are three fundamentally different questions, and no amount of nearest-neighbour
+retrieval collapses them into one. Judea Pearl formalised the distinction as the **Ladder of
+Causation** (Pearl, 2009; *The Book of Why*, 2018): three rungs of increasing inferential power,
+each requiring strictly more than the one below. A system that only stores correlations lives on
+rung 1 forever.
+
+Hirn lifts memory onto all three rungs by treating causality as a first-class edge type on the
+property graph rather than something re-derived at query time. Causal edges carry rich metadata —
+strength, confidence, evidence count, confounders, mechanism — so a chain can be *scored*, not just
+traversed. This page covers the three rungs, the HirnQL surface for each, the two-tier traversal
+engine that keeps deep chains fast, and the conflict-resolution machinery (NLI + ABA) that keeps
+the causal graph consistent.
+
+See also: [Cognitive Model](cognitive-model.md), [Architecture](architecture.md), [HirnQL Reference](hirnql-reference.md).
 
 ---
 
 ## Pearl's Causal Hierarchy
 
-Hirn implements Judea Pearl's three rungs of the "Ladder of Causation":
+Hirn implements Judea Pearl's three rungs of the "Ladder of Causation". Each rung asks a strictly
+harder question and, in hirn, compiles to a different traversal over the causal edges:
+
+```mermaid
+flowchart TB
+  subgraph R1["Rung 1 — Association"]
+    a1["<i>What caused X?</i>"] --> a2["EXPLAIN CAUSES<br/>backward BFS over CausedBy edges"]
+  end
+  subgraph R2["Rung 2 — Intervention"]
+    b1["<i>What if I do X?</i>"] --> b2["WHAT_IF<br/>forward BFS over Causes edges<br/>simulates do(X)"]
+  end
+  subgraph R3["Rung 3 — Counterfactual"]
+    c1["<i>What if X had not happened?</i>"] --> c2["COUNTERFACTUAL<br/>P(effects | ¬cause) = 1 − P(cause→effect)"]
+  end
+  R1 --> R2 --> R3
+  classDef s fill:#1a1b26,stroke:#7c9cff,color:#e6e8f0;
+  class a1,a2,b1,b2,c1,c2 s;
+```
+
+Each rung strictly subsumes the one below: intervention needs a causal model that mere association
+cannot provide, and counterfactuals need the interventional model *plus* the observed outcome. Data
+alone never lifts you up a rung — you need the causal structure, which is exactly what hirn's typed
+`Causes` / `CausedBy` edges encode.
+{: .note }
 
 | Rung | Level | Question | HirnQL Statement | Operator |
 |------|-------|----------|-------------------|----------|
@@ -129,7 +176,26 @@ else:
     → hot-tier: causal::causal_chain_backward() on PropertyGraph
 ```
 
+```mermaid
+flowchart TB
+  q["EXPLAIN CAUSES / WHAT_IF / TRAVERSE<br/>with DEPTH N"] --> d{"N > graph_depth_<br/>delegation_threshold?<br/>(default 5)"}
+  d -->|"no"| hot["Hot tier — petgraph PropertyGraph<br/>iterative DFS, cycle detection<br/>~0.5 ms"]
+  d -->|"yes"| cold["Cold tier — PersistentGraph.deep_causal_bfs()<br/>batched Lance BFS, one scan/depth<br/>~2–10 ms"]
+  hot --> res["Scored causal chains"]
+  cold --> res
+  classDef s fill:#1a1b26,stroke:#7c9cff,color:#e6e8f0;
+  class q,d,hot,cold,res s;
+```
+
 This applies to both `EXPLAIN CAUSES` and `TRAVERSE` statements.
+
+**Design rationale — why two tiers?** Shallow causal questions vastly outnumber deep ones, and the
+in-memory petgraph answers them in sub-millisecond time without touching disk. But holding the
+*entire* causal history in RAM does not scale, and deep chains would blow up a naive in-memory DFS.
+Delegating only the deep traversals to a batched Lance BFS — one columnar scan per depth level —
+keeps the common case fast while making the rare deep case *linear in depth* instead of exponential.
+See the next section for why the obvious SQL alternative was rejected.
+{: .note }
 
 ### Why Not UNION ALL of JOINs?
 
@@ -187,14 +253,32 @@ relevance = strength × confidence × ln(1 + evidence_count)
 
 ## Causal Discovery During Consolidation
 
-During the consolidation pipeline, `CausalDiscoveryExec` discovers new causal relationships:
+During the consolidation pipeline, `CausalDiscoveryExec` proposes new causal relationships. The
+discovery signal in force **today** is a temporal co-occurrence heuristic — events that recur within
+a time window, where one consistently precedes the other, produce a candidate edge (labelled
+`temporal_granger`). Discovered edges are written to the graph with initial confidence based on
+evidence strength.
 
-1. **Temporal co-occurrence**: Events that frequently co-occur within a time window
-2. **Granger-style analysis**: Event A consistently precedes event B
-3. **LLM validation**: LLM confirms or denies suspected causal links (when available)
-4. **Bayesian accumulation**: Evidence counts updated incrementally
+Only the temporal co-occurrence heuristic is wired into the automatic pipeline right now. A true
+lagged-predictability **Granger** test, **LLM** validation of suspected links, and **Bayesian**
+evidence accumulation across observations are on the roadmap, not yet active stages. Treat any
+`temporal_granger` edge as a *statistical co-occurrence hint*, not a verified causal claim.
+{: .warning }
 
-Discovered edges are written to the graph with initial confidence based on evidence strength.
+The intended future shape of the discovery pipeline — with the roadmap stages shown dashed — is:
+
+```mermaid
+flowchart LR
+  co["Temporal co-occurrence<br/>heuristic (active)"] --> edge["Candidate causal edge<br/>strength · confidence · evidence_count"]
+  gr["Granger lagged test<br/>(roadmap)"] -.-> edge
+  llm["LLM validation<br/>(roadmap)"] -.-> edge
+  bayes["Bayesian accumulation<br/>(roadmap)"] -.-> edge
+  edge --> graph[("Property graph")]
+  classDef s fill:#1a1b26,stroke:#7c9cff,color:#e6e8f0;
+  classDef road fill:#1a1b26,stroke:#5a5f7a,color:#9aa0b8,stroke-dasharray:4 3;
+  class co,edge,graph s;
+  class gr,llm,bayes road;
+```
 
 ---
 
@@ -217,7 +301,14 @@ Assumption-Based Argumentation resolves contradictions:
 - **Formal argumentation**: Constructs arguments for/against each position
 - **AGM belief revision**: Updates belief state to maintain consistency
 - **Operator**: `AbaReconsolidationExec` in `hirn-exec`
-- **Trigger**: Consolidation pipeline when contradiction density exceeds threshold
+- **Trigger**: contradiction density exceeding threshold within the reconsolidation surface
+
+Both `NliContradictionExec` (DeBERTa-MNLI) and `AbaReconsolidationExec` (ABA + AGM belief revision)
+are **query operators** — an "implemented preview" surface reached explicitly through HirnQL (e.g.
+`WITH CONFLICTS` on `RECALL`). They are **not** stages of the automatic episodic → semantic
+consolidation pipeline. Contradiction *edges* discovered on the write path are separate from running
+these operators.
+{: .important }
 
 ---
 
@@ -230,7 +321,7 @@ RECALL "query" TOPIC "project-alpha"
 ```
 
 - **Operator**: `TopicLoomExec` in `hirn-exec`
-- **Graph clustering**: Leiden algorithm for community detection
+- **Graph clustering**: weighted Louvain-style modularity optimization for community detection (a connectivity post-pass approximates Leiden fidelity — it is **not** a full Leiden refinement)
 - **Branch awareness**: Topics can fork and merge over time
 - **Dataset**: `topic_loom` Lance table for persistent topic associations
 

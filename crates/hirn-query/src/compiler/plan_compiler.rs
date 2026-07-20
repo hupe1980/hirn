@@ -366,6 +366,12 @@ fn recall_schema() -> SchemaRef {
         Field::new("surprise", DataType::Float32, true),
         Field::new("evidence_count", DataType::UInt32, true),
         Field::new("invocation_count", DataType::UInt64, true),
+        // Layer-specific salience fields: `confidence` is only present for
+        // semantic records, `success_rate` only for procedural records.
+        // Rows from other layers carry NULL, which comparison predicates
+        // correctly exclude.
+        Field::new("confidence", DataType::Float32, true),
+        Field::new("success_rate", DataType::Float32, true),
     ]))
 }
 
@@ -647,21 +653,20 @@ fn compile_supported_recall_filter_expr(filter: &TypedFilter) -> Option<datafusi
     };
 
     match filter.field.as_str() {
-        "importance" | "confidence" | "success_rate" => {
+        // Each logical field filters its own physical column. `confidence`
+        // (semantic) and `success_rate` (procedural) are NULL for other
+        // layers, so comparisons exclude records that lack the field.
+        "importance" | "confidence" | "success_rate" | "surprise" => {
             let threshold = match filter.value {
                 super::typed_ast::TypedFilterValue::Float(value) => value as f32,
                 super::typed_ast::TypedFilterValue::Int(value) => value as f32,
                 super::typed_ast::TypedFilterValue::String(_) => return None,
             };
-            Some(binary_expr(col("importance"), operator, lit(threshold)))
-        }
-        "surprise" => {
-            let threshold = match filter.value {
-                super::typed_ast::TypedFilterValue::Float(value) => value as f32,
-                super::typed_ast::TypedFilterValue::Int(value) => value as f32,
-                super::typed_ast::TypedFilterValue::String(_) => return None,
-            };
-            Some(binary_expr(col("surprise"), operator, lit(threshold)))
+            Some(binary_expr(
+                col(filter.field.as_str()),
+                operator,
+                lit(threshold),
+            ))
         }
         "access_count" | "evidence_count" | "invocation_count" => {
             let threshold = match filter.value {
@@ -1072,9 +1077,17 @@ fn semantic_target_to_string(target: TypedSemanticTargetRef) -> String {
 }
 
 /// Compile TRAVERSE to the authoritative graph-read runtime.
+///
+/// WHERE predicates on traversal-output columns and LIMIT stack as standard
+/// Filter/Limit nodes above the scan, mirroring how RECALL applies its row
+/// predicates. Predicates on record fields (e.g. `importance`) cannot be
+/// evaluated on the traversal schema; the engine applies them after hydrating
+/// the traversed records, so they stay out of the plan — and LIMIT is only
+/// pushed down when every predicate was pushed down, since limiting below a
+/// later record-level filter would under-fill the result.
 fn compile_traverse(t: &TypedTraverse) -> HirnResult<LogicalPlan> {
     let schema = dfschema(traversal_schema());
-    Ok(hirn_extension(
+    let scan = hirn_extension(
         HirnOp::TraverseGraph {
             start_id: t.from.to_string(),
             relation_filter: t.via.clone(),
@@ -1085,7 +1098,65 @@ fn compile_traverse(t: &TypedTraverse) -> HirnResult<LogicalPlan> {
         },
         schema,
         vec![],
-    ))
+    );
+
+    let mut builder = LogicalPlanBuilder::new(scan);
+    let mut all_filters_pushed = true;
+    for filter in &t.filters {
+        match compile_traverse_filter_expr(filter) {
+            Some(predicate) => {
+                builder = builder.filter(predicate).map_err(HirnError::storage)?;
+            }
+            None => all_filters_pushed = false,
+        }
+    }
+    if let Some(limit) = t.limit
+        && all_filters_pushed
+    {
+        builder = builder.limit(0, Some(limit)).map_err(HirnError::storage)?;
+    }
+    builder.build().map_err(HirnError::storage)
+}
+
+/// Compile a TRAVERSE WHERE predicate against the traversal output schema.
+///
+/// Returns `None` for fields that are not traversal-output columns; those are
+/// record-level predicates the engine evaluates against hydrated records.
+fn compile_traverse_filter_expr(filter: &TypedFilter) -> Option<datafusion_expr::Expr> {
+    let operator = match filter.op {
+        ast::ComparisonOp::Eq => Operator::Eq,
+        ast::ComparisonOp::Neq => Operator::NotEq,
+        ast::ComparisonOp::Gt => Operator::Gt,
+        ast::ComparisonOp::Gte => Operator::GtEq,
+        ast::ComparisonOp::Lt => Operator::Lt,
+        ast::ComparisonOp::Lte => Operator::LtEq,
+    };
+
+    match filter.field.as_str() {
+        "depth" | "edge_weight" => {
+            let threshold = match filter.value {
+                TypedFilterValue::Float(value) => value,
+                TypedFilterValue::Int(value) => value as f64,
+                TypedFilterValue::String(_) => return None,
+            };
+            Some(binary_expr(
+                cast(col(filter.field.as_str()), DataType::Float64),
+                operator,
+                lit(threshold),
+            ))
+        }
+        "node_id" | "edge_relation" => {
+            let TypedFilterValue::String(value) = &filter.value else {
+                return None;
+            };
+            Some(binary_expr(
+                col(filter.field.as_str()),
+                operator,
+                lit(value.clone()),
+            ))
+        }
+        _ => None,
+    }
 }
 
 /// Schema for SVO event scan results.
@@ -1573,6 +1644,58 @@ mod tests {
         assert!(
             !display.contains("ImperativeBoundary"),
             "compiled traverse should not use an imperative boundary: {display}"
+        );
+    }
+
+    #[test]
+    fn compile_traverse_where_and_limit_stack_above_scan() {
+        let id = hirn_core::id::MemoryId::new();
+        let plan = compile_ql(&format!(
+            r#"TRAVERSE FROM "{}" VIA causes DEPTH 3 WHERE depth < 2 LIMIT 5"#,
+            id
+        ))
+        .unwrap();
+        let display = format!("{plan}");
+        assert!(display.contains("TraverseGraph"), "plan: {display}");
+        assert!(display.contains("Filter"), "plan: {display}");
+        assert!(display.contains("Limit"), "plan: {display}");
+    }
+
+    #[test]
+    fn compile_traverse_record_level_filter_defers_limit_to_engine() {
+        // `importance` is a record field, not a traversal-output column — the
+        // engine evaluates it after hydrating records. LIMIT must not be
+        // pushed below that later filter, or the result would under-fill.
+        let id = hirn_core::id::MemoryId::new();
+        let plan = compile_ql(&format!(
+            r#"TRAVERSE FROM "{}" DEPTH 2 WHERE importance > 0.9 LIMIT 5"#,
+            id
+        ))
+        .unwrap();
+        let display = format!("{plan}");
+        assert!(display.contains("TraverseGraph"), "plan: {display}");
+        assert!(!display.contains("Filter"), "plan: {display}");
+        assert!(!display.contains("Limit"), "plan: {display}");
+    }
+
+    #[test]
+    fn compile_recall_where_maps_each_field_to_its_own_column() {
+        for field in ["importance", "confidence", "success_rate"] {
+            let plan =
+                compile_ql(&format!(r#"RECALL semantic ABOUT "x" WHERE {field} > 0.9"#)).unwrap();
+            let display = format!("{plan}");
+            assert!(
+                display.contains(&format!("{field} > ")),
+                "WHERE {field} should filter the `{field}` column: {display}"
+            );
+        }
+
+        // `confidence` must not silently degrade to an `importance` predicate.
+        let plan = compile_ql(r#"RECALL semantic ABOUT "x" WHERE confidence > 0.9"#).unwrap();
+        let display = format!("{plan}");
+        assert!(
+            !display.contains("importance > "),
+            "WHERE confidence must not compile to an importance filter: {display}"
         );
     }
 

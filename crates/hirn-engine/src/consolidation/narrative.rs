@@ -231,7 +231,9 @@ fn thread_from_segment_group(segments: &[EpisodeSegment], indices: &[usize]) -> 
         let dims = embeddings[0].len();
         let mut mean = vec![0.0f32; dims];
         for emb in &embeddings {
-            for (i, v) in emb.iter().enumerate() {
+            // `.take(dims)` guards against a mixed-dimension embedding indexing
+            // past `mean` and panicking.
+            for (i, v) in emb.iter().take(dims).enumerate() {
                 mean[i] += v;
             }
         }

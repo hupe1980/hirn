@@ -1,8 +1,100 @@
-# Write Guarantees
+---
+title: Write Guarantees
+parent: Advanced
+nav_order: 1
+description: >-
+  How hirn keeps multi-dataset writes crash-consistent: the mutation-contract
+  registry, recoverable envelopes, and every write path's durability promise.
+---
 
-> **⚠️ Experimental:** This project is under active development. APIs, on-disk formats, and behaviour may change without notice. Not recommended for production use.
+# Write Guarantees
+{: .no_toc }
+
+This project is under active development. APIs, on-disk formats, and behaviour may change without notice. Not recommended for production use.
+{: .experimental }
 
 Hirn treats write reliability as a product surface. Every mutating path should fit one of the guarantees below; new mutation paths should not ship without adding themselves to the engine mutation contract registry and this table.
+
+## Table of contents
+{: .no_toc .text-delta }
+
+1. TOC
+{:toc}
+
+## Why Crash-Safety Needs Envelopes
+
+A single logical write in hirn usually fans out into several correlated
+physical mutations. Remembering one episode, for example, appends a durable
+episodic row, inserts a graph node, plans one or more graph edges, captures a
+`TemporalNext` edge, and emits an `EpisodeCreated` event. None of the underlying
+datasets share a cross-table transaction, so a crash between any two of those
+steps could otherwise leave the store in a state no invariant describes: an
+episode with no graph node, an edge pointing at a missing target, or an event
+that references a row that was never committed.
+
+The **recoverable envelope** removes that failure mode. Before any correlated
+side effect runs, hirn writes a single durable *intent* row to
+`_mutation_envelopes`. That row carries everything a repair needs — target ids,
+prior ids, namespace, agent id, planned graph edges, and user-visible event
+previews. If the process dies mid-write, `HirnDB::open` scans for pending
+envelopes and finishes — or explicitly abandons — each one. This is the
+transactional-outbox pattern applied to a multi-dataset cognitive store: record
+enough durable intent *before* the side effects, then make recovery idempotent.
+
+{: .note }
+> The envelope is intent, not a lock. It does not serialize concurrent writers;
+> it guarantees that a crash cannot leave a *partially applied* correlated write
+> that no startup pass can reconcile.
+
+### Three Strengths of Durability
+
+Not every write needs an envelope, and forcing one everywhere would add cost
+without buying safety. Hirn classifies each path into one of three strengths:
+
+- **`recoverable_envelope`** — the write crosses several datasets that must agree
+  (memory rows, graph state, event history, resource heads). A grouped intent
+  row is written first so startup can reconcile the whole set atomically at the
+  logical level. Use this whenever a crash could otherwise strand a half-applied
+  fan-out.
+- **`storage_atomic`** — a *single* durable storage mutation is authoritative and
+  self-describing. There is nothing to group, so no envelope is needed. Startup
+  simply reloads from storage, and any non-durable hot-tier or cache state is
+  rolled back locally on failure. Keyed upserts (agent/namespace rows) fall here
+  because a failed replacement preserves the prior row.
+- **`best_effort`** — a side effect is deliberately non-critical (live watch
+  fan-out, for instance). Its loss, lag, or duplication must never make an
+  accepted durable write appear false. Best-effort work always runs *after* the
+  durable point of no return.
+
+Two further labels round out the vocabulary: `durable_log`, where an append-only
+history is itself the source of truth and consumers must be idempotent, and
+`delegated`, where another node or external owner provides the stronger contract
+on the caller's behalf.
+
+### Mutation Lifecycle
+
+Every `recoverable_envelope` write moves through the same lifecycle. The
+envelope is created `pending`, transitions to `applied` once its correlated
+writes commit or to `failed` when a repair is provably impossible, and is then
+`reconciled` by `HirnDB::open` so no unbounded pending rows survive a restart.
+
+```mermaid
+stateDiagram-v2
+  [*] --> Pending: envelope written before side effects
+  Pending --> Applied: correlated writes committed
+  Pending --> Failed: repair impossible — last_error recorded
+  Applied --> Reconciled: HirnDB::open verifies the group
+  Failed --> Reconciled: marked terminal, kept bounded
+  Reconciled --> [*]: envelope retired
+  classDef s fill:#1a1b26,stroke:#7c9cff,color:#e6e8f0;
+  class Pending,Applied,Failed,Reconciled s
+```
+
+{: .important }
+> Recovery must be idempotent. Startup may replay an envelope whose side effects
+> already partly landed before the crash, so every repair treats
+> already-applied work (an already-deleted memory id, an existing graph node) as
+> success rather than a conflict.
 
 ## Guarantee Vocabulary
 
@@ -57,3 +149,12 @@ This mirrors the standard transactional-outbox and compensating-transaction guid
 ## Known Gaps
 
 Namespace-wide deletion, agent registration/deregistration, and keyed team/namespace metadata updates now have explicit contract coverage with focused fault or replay tests. The remaining hardening work is broader crash/fault-injection coverage across every other `recoverable_envelope` class and applying the same explicit audit-idempotence discipline to any future recovery path that can re-append audit intent after a crash.
+
+## Related
+
+- The memory layers these writes mutate: [Concepts](concepts.md) and
+  [Cognitive Model](cognitive-model.md).
+- What happens at write time before durability: [write-path.md](write-path.md).
+- Auditing why a specific write took the fast or slow path:
+  [explanation-surfaces.md](explanation-surfaces.md).
+- Querying the resulting state: [HirnQL Reference](hirnql-reference.md).

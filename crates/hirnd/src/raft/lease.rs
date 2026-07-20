@@ -26,20 +26,39 @@ impl ConsolidationLease {
     /// Default lease duration: 5 minutes.
     pub const DEFAULT_DURATION_SECS: u64 = 300;
 
-    /// Create a new lease starting now.
-    pub fn new(realm: String, holder: NodeId, duration_secs: u64) -> Self {
-        let now = now_epoch_secs();
+    /// Create a new lease starting at the given epoch timestamp.
+    ///
+    /// The timestamp must be the one stamped into the Raft log entry at
+    /// proposal time — never the local clock — so that every replica applying
+    /// the entry computes the identical `expires_at`.
+    pub fn new(
+        realm: String,
+        holder: NodeId,
+        duration_secs: u64,
+        acquired_at_epoch_secs: u64,
+    ) -> Self {
         Self {
             holder,
-            acquired_at: now,
-            expires_at: now.saturating_add(duration_secs),
+            acquired_at: acquired_at_epoch_secs,
+            expires_at: acquired_at_epoch_secs.saturating_add(duration_secs),
             realm,
         }
     }
 
-    /// Check if the lease has expired.
+    /// Check if the lease has expired relative to an explicit epoch timestamp.
+    ///
+    /// Used during `apply()` with the proposal timestamp carried in the log
+    /// entry so the expiry decision is identical on every replica.
+    pub fn is_expired_at(&self, now_epoch_secs: u64) -> bool {
+        now_epoch_secs >= self.expires_at
+    }
+
+    /// Check if the lease has expired against the local clock.
+    ///
+    /// Query-time only — must not be used inside the Raft state machine's
+    /// `apply()` path, where all inputs have to come from the log entry.
     pub fn is_expired(&self) -> bool {
-        now_epoch_secs() >= self.expires_at
+        self.is_expired_at(now_epoch_secs())
     }
 
     /// Check if a specific node holds this lease (and it hasn't expired).
@@ -47,10 +66,12 @@ impl ConsolidationLease {
         self.holder == node && !self.is_expired()
     }
 
-    /// Renew the lease for an additional duration (only by the holder).
-    pub fn renew(&mut self, duration_secs: u64) {
-        let now = now_epoch_secs();
-        self.expires_at = now.saturating_add(duration_secs);
+    /// Renew the lease from an explicit epoch timestamp (only by the holder).
+    ///
+    /// Like [`ConsolidationLease::new`], the timestamp must come from the log
+    /// entry so renewal produces the same `expires_at` on every replica.
+    pub fn renew_at(&mut self, duration_secs: u64, now_epoch_secs: u64) {
+        self.expires_at = now_epoch_secs.saturating_add(duration_secs);
     }
 
     /// Remaining seconds before expiry.
@@ -60,7 +81,11 @@ impl ConsolidationLease {
     }
 }
 
-fn now_epoch_secs() -> u64 {
+/// Current Unix time in seconds.
+///
+/// Only for proposal sites and query-time checks; `apply()` must use the
+/// timestamp carried in the log entry instead.
+pub fn now_epoch_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock is before UNIX epoch")
@@ -73,10 +98,15 @@ mod tests {
 
     #[test]
     fn lease_creation_and_expiry() {
-        let lease = ConsolidationLease::new("test-realm".into(), 1, 300);
+        let now = now_epoch_secs();
+        let lease = ConsolidationLease::new("test-realm".into(), 1, 300, now);
         assert_eq!(lease.holder, 1);
         assert_eq!(lease.realm, "test-realm");
+        assert_eq!(lease.acquired_at, now);
+        assert_eq!(lease.expires_at, now + 300);
         assert!(!lease.is_expired());
+        assert!(!lease.is_expired_at(now));
+        assert!(lease.is_expired_at(now + 300));
         assert!(lease.is_held_by(1));
         assert!(!lease.is_held_by(2));
         assert!(lease.remaining_secs() > 0);
@@ -97,8 +127,22 @@ mod tests {
 
     #[test]
     fn renewal() {
-        let mut lease = ConsolidationLease::new("r".into(), 1, 10);
-        lease.renew(600);
+        let now = now_epoch_secs();
+        let mut lease = ConsolidationLease::new("r".into(), 1, 10, now);
+        lease.renew_at(600, now + 5);
+        assert_eq!(lease.expires_at, now + 605);
         assert!(lease.remaining_secs() > 500);
+    }
+
+    #[test]
+    fn expiry_is_deterministic_for_a_fixed_timestamp() {
+        // Two leases built from the same entry data must agree on expiry
+        // regardless of when (or where) the check runs.
+        let a = ConsolidationLease::new("r".into(), 1, 300, 1_000);
+        let b = ConsolidationLease::new("r".into(), 1, 300, 1_000);
+        assert_eq!(a.expires_at, b.expires_at);
+        assert!(!a.is_expired_at(1_299));
+        assert!(a.is_expired_at(1_300));
+        assert!(b.is_expired_at(1_300));
     }
 }

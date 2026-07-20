@@ -1,8 +1,24 @@
+---
+title: Cedar Guide
+parent: Security
+nav_order: 1
+description: >-
+  Write authorization policies for hirn with Cedar: the entity model, 18 actions,
+  RBAC and ABAC, realm isolation, and runtime policy management via HirnQL.
+---
+
 # Cedar Policy Guide
+{: .no_toc }
 
 > **⚠️ Experimental:** This project is under active development. APIs, on-disk formats, and behaviour may change without notice. Not recommended for production use.
 
 > How to write authorization policies for hirn using Cedar.
+
+## Table of contents
+{: .no_toc .text-delta }
+
+1. TOC
+{:toc}
 
 hirn uses [Cedar](https://www.cedarpolicy.com/) (`cedar-policy` v4.9.1) for fine-grained authorization. Cedar is an open-source policy language created by AWS and donated to the CNCF. It supports RBAC, ABAC, entity hierarchies, schema validation, and automated reasoning.
 
@@ -45,7 +61,24 @@ Realm
   └── Namespace
 ```
 
-A policy granting access to a `Team` automatically applies to all `Agent` members. A policy granting access to a `Realm` applies to all `Namespace`s within it.
+```mermaid
+graph TD
+  Org[Organization<br/>top-level tenant] --> Team[Team<br/>group of agents]
+  Team --> Agent[Agent<br/>reputation, created_at]
+  Realm[Realm<br/>isolation boundary] --> NS[Namespace<br/>classification]
+  Agent -. principal .-> Act{{Cedar action}}
+  NS -. resource .-> Act
+  classDef s fill:#1a1b26,stroke:#7c9cff,color:#e6e8f0;
+  class Org,Team,Agent,Realm,NS,Act s;
+```
+
+The two trees meet at evaluation time: the **principal** is drawn from the
+`Organization → Team → Agent` tree, and the **resource** from the
+`Realm → Namespace` tree. A policy granting access to a `Team` automatically
+applies to all `Agent` members. A policy granting access to a `Realm` applies to
+all `Namespace`s within it. Because membership is transitive, you write broad
+grants against a parent and narrow with targeted `forbid` policies — `forbid`
+always wins over `permit` in Cedar, which is what makes fail-closed narrowing safe.
 
 ### Actions
 
@@ -88,6 +121,31 @@ brain/
 ---
 
 ## Writing Policies
+
+### RBAC vs ABAC — When to Use Which
+
+Cedar lets you mix two authorization styles in the same policy set, and hirn uses
+both:
+
+- **RBAC (role-based)** — access follows *identity and membership*. "Everyone in
+  the `writers` team may `remember` in `production`." It is easy to audit and
+  maps cleanly onto the entity hierarchy, but it is coarse: the grant is the same
+  for every member.
+- **ABAC (attribute-based)** — access follows *attributes evaluated at decision
+  time*, expressed with a `when { ... }` clause. "Only agents with
+  `reputation >= 80` may touch a `confidential` namespace." It is precise and
+  context-sensitive, at the cost of being harder to reason about at a glance.
+
+A good rule of thumb: use **RBAC for the broad shape** of who can do what, and
+layer **ABAC `forbid` clauses** on top for the exceptions — sensitivity gates,
+reputation thresholds, and classification rules. The two examples below show each
+style; later sections combine them.
+
+{: .note }
+> Cedar evaluation is **deny-by-default and forbid-overrides**: a request is
+> permitted only if some `permit` matches *and* no `forbid` matches. That
+> ordering is why an ABAC `forbid` is the correct tool for carving exceptions out
+> of a broad RBAC `permit`.
 
 ### Basic RBAC — Team-Based Access
 
@@ -335,6 +393,13 @@ hirn = { version = "0.1", default-features = false }
 ```
 
 When the `cedar` feature is off, all requests are allowed without policy evaluation. Treat this as explicit development/test posture rather than a production default.
+
+{: .danger }
+> Building without the `cedar` feature, or opening a brain via
+> `PolicyEngine::open_mode()` / `load_from_brain_insecure_dev_mode()`, disables
+> **all** authorization: every principal can perform every action on every
+> resource. These modes exist for development and testing only. Never run a
+> production deployment in open mode.
 
 ---
 

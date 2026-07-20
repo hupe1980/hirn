@@ -13,6 +13,7 @@ pub mod interner;
 pub mod metadata;
 pub mod namespace;
 pub mod offline;
+pub mod persist;
 pub mod procedural;
 pub mod prospective;
 pub mod provenance;

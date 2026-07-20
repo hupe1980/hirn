@@ -284,9 +284,13 @@ impl<S: PhysicalStore> PhysicalStore for PolicyEnforcedStore<S> {
         filter: &str,
         updates: &[(&str, &str)],
     ) -> Result<u64, HirnDbError> {
-        // Policy enforcement for targeted updates: delegate directly; the filter
-        // and column set are already validated by callers (no namespace exposure).
-        self.inner.update_where(dataset, filter, updates).await
+        // Inject the caller's allowed-namespace predicate into the update filter,
+        // exactly as `delete` does. Without this a principal scoped to one
+        // namespace could target a row id in another namespace and mutate it —
+        // a cross-tenant write primitive. Fail-closed: enforcement must not be
+        // left to callers.
+        let filter = self.enforce_delete_predicate(dataset, filter).await?;
+        self.inner.update_where(dataset, &filter, updates).await
     }
 
     async fn count(&self, dataset: &str, filter: Option<&str>) -> Result<u64, HirnDbError> {

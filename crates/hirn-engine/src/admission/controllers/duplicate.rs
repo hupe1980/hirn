@@ -119,12 +119,18 @@ impl AdmissionController for DuplicateDetector {
     }
 }
 
-/// Extract nearest neighbour distance and id from the result batch.
+/// Extract nearest neighbour distance and id from the result batches.
+///
+/// Scans batches in order and returns the first row that carries both a
+/// `_distance` and an `id`. A leading empty batch (or one missing a column)
+/// must not abort the search — the nearest hit may live in a later batch. The
+/// previous `?`-inside-`for` form returned `None` for the whole function on the
+/// first incomplete batch, silently degrading duplicate admission.
 fn extract_nearest(batches: &[arrow_array::RecordBatch]) -> Option<(f32, MemoryId)> {
     for batch in batches {
-        let distance = extract_distance(batch)?;
-        let id = extract_id(batch)?;
-        return Some((distance, id));
+        if let (Some(distance), Some(id)) = (extract_distance(batch), extract_id(batch)) {
+            return Some((distance, id));
+        }
     }
     None
 }

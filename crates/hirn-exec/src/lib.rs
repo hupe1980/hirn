@@ -24,7 +24,8 @@ pub(crate) mod test_utils;
 pub use extensions::{
     ContextAssemblyRuntime, GraphActivationOutput, GraphCausalChainRow, GraphReadRuntime,
     GraphTraverseRow, HirnSessionExt, QueryReadRuntime, RegisteredContextAssemblyRuntime,
-    RegisteredQueryReadRuntime, register_context_assembly_runtime, register_query_read_runtime,
+    RegisteredQueryReadRuntime, edge_relation_query_str, register_context_assembly_runtime,
+    register_query_read_runtime,
 };
 pub use operators::{
     ActivationMode, CausalChainExec, CausalQueryReadExec, CausalReadKind, ContextAssemblyExec,

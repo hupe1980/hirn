@@ -231,11 +231,7 @@ async fn state_machine_lease_conflict() {
     // Node 1 acquires lease.
     let acquire1 = openraft::Entry::<TypeConfig> {
         log_id: openraft::LogId::new(openraft::CommittedLeaderId::new(1, 0), 1),
-        payload: openraft::EntryPayload::Normal(RaftRequest::AcquireLease {
-            realm: "realm-x".to_string(),
-            holder: 1,
-            duration_secs: 300,
-        }),
+        payload: openraft::EntryPayload::Normal(RaftRequest::acquire_lease("realm-x", 1, 300)),
     };
     let resp = sm_ref.apply(vec![acquire1]).await.unwrap();
     assert!(matches!(resp[0], RaftResponse::Ok));
@@ -247,11 +243,7 @@ async fn state_machine_lease_conflict() {
     // Node 2 tries to acquire — should get conflict.
     let acquire2 = openraft::Entry::<TypeConfig> {
         log_id: openraft::LogId::new(openraft::CommittedLeaderId::new(1, 0), 2),
-        payload: openraft::EntryPayload::Normal(RaftRequest::AcquireLease {
-            realm: "realm-x".to_string(),
-            holder: 2,
-            duration_secs: 300,
-        }),
+        payload: openraft::EntryPayload::Normal(RaftRequest::acquire_lease("realm-x", 2, 300)),
     };
     let resp = sm_ref.apply(vec![acquire2]).await.unwrap();
     match &resp[0] {
@@ -275,11 +267,7 @@ async fn state_machine_lease_conflict() {
     // Node 2 can now acquire.
     let acquire3 = openraft::Entry::<TypeConfig> {
         log_id: openraft::LogId::new(openraft::CommittedLeaderId::new(1, 0), 4),
-        payload: openraft::EntryPayload::Normal(RaftRequest::AcquireLease {
-            realm: "realm-x".to_string(),
-            holder: 2,
-            duration_secs: 300,
-        }),
+        payload: openraft::EntryPayload::Normal(RaftRequest::acquire_lease("realm-x", 2, 300)),
     };
     let resp = sm_ref.apply(vec![acquire3]).await.unwrap();
     assert!(matches!(resp[0], RaftResponse::Ok));
@@ -576,9 +564,18 @@ async fn raft_vote_rejects_stale_term_sender() {
 
 // ─── Consolidation Lease ─────────────────────────────────────
 
+fn epoch_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
 #[test]
 fn consolidation_lease_lifecycle() {
-    let lease = ConsolidationLease::new("realm-a".to_string(), 42, 300);
+    // Lease time is supplied by the proposer (deterministic apply), so the
+    // test stamps its own acquisition instant.
+    let lease = ConsolidationLease::new("realm-a".to_string(), 42, 300, epoch_now_secs());
     assert!(!lease.is_expired());
     assert!(lease.is_held_by(42));
     assert!(!lease.is_held_by(99));
@@ -587,8 +584,9 @@ fn consolidation_lease_lifecycle() {
 
 #[test]
 fn consolidation_lease_renew() {
-    let mut lease = ConsolidationLease::new("realm-b".to_string(), 1, 10);
-    lease.renew(600);
+    let now = epoch_now_secs();
+    let mut lease = ConsolidationLease::new("realm-b".to_string(), 1, 10, now);
+    lease.renew_at(600, now);
     assert!(!lease.is_expired());
     assert!(lease.remaining_secs() > 590);
 }
@@ -811,22 +809,14 @@ async fn state_machine_lease_renewal_fails_for_non_holder() {
     // Node 1 acquires lease.
     let acquire = openraft::Entry::<TypeConfig> {
         log_id: openraft::LogId::new(openraft::CommittedLeaderId::new(1, 0), 1),
-        payload: openraft::EntryPayload::Normal(RaftRequest::AcquireLease {
-            realm: "realm-r".to_string(),
-            holder: 1,
-            duration_secs: 300,
-        }),
+        payload: openraft::EntryPayload::Normal(RaftRequest::acquire_lease("realm-r", 1, 300)),
     };
     sm_ref.apply(vec![acquire]).await.unwrap();
 
     // Node 2 tries to renew — should fail.
     let renew = openraft::Entry::<TypeConfig> {
         log_id: openraft::LogId::new(openraft::CommittedLeaderId::new(1, 0), 2),
-        payload: openraft::EntryPayload::Normal(RaftRequest::RenewLease {
-            realm: "realm-r".to_string(),
-            holder: 2,
-            duration_secs: 600,
-        }),
+        payload: openraft::EntryPayload::Normal(RaftRequest::renew_lease("realm-r", 2, 600)),
     };
     let resp = sm_ref.apply(vec![renew]).await.unwrap();
     match &resp[0] {
@@ -850,21 +840,13 @@ async fn state_machine_lease_renewal_succeeds_for_holder() {
 
     let acquire = openraft::Entry::<TypeConfig> {
         log_id: openraft::LogId::new(openraft::CommittedLeaderId::new(1, 0), 1),
-        payload: openraft::EntryPayload::Normal(RaftRequest::AcquireLease {
-            realm: "realm-s".to_string(),
-            holder: 1,
-            duration_secs: 10,
-        }),
+        payload: openraft::EntryPayload::Normal(RaftRequest::acquire_lease("realm-s", 1, 10)),
     };
     sm_ref.apply(vec![acquire]).await.unwrap();
 
     let renew = openraft::Entry::<TypeConfig> {
         log_id: openraft::LogId::new(openraft::CommittedLeaderId::new(1, 0), 2),
-        payload: openraft::EntryPayload::Normal(RaftRequest::RenewLease {
-            realm: "realm-s".to_string(),
-            holder: 1,
-            duration_secs: 600,
-        }),
+        payload: openraft::EntryPayload::Normal(RaftRequest::renew_lease("realm-s", 1, 600)),
     };
     let resp = sm_ref.apply(vec![renew]).await.unwrap();
     assert!(matches!(resp[0], RaftResponse::Ok));
@@ -872,4 +854,104 @@ async fn state_machine_lease_renewal_succeeds_for_holder() {
     // Verify renewed duration is reflected.
     let lease = sm.active_lease("realm-s").await.unwrap();
     assert!(lease.remaining_secs() > 590);
+}
+
+// ─── Apply Determinism ───────────────────────────────────────
+
+/// Applying the same entry sequence to two fresh state machines must produce
+/// byte-identical state, no matter how much wall-clock time elapses between
+/// the two runs. Lease commands carry their proposal timestamp in the entry,
+/// so `apply()` never consults the local clock.
+#[tokio::test]
+async fn state_machine_apply_is_deterministic_across_replays() {
+    use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
+
+    let proposed_at = hirnd::raft::lease::now_epoch_secs();
+    let make_entries = || {
+        vec![
+            openraft::Entry::<TypeConfig> {
+                log_id: openraft::LogId::new(openraft::CommittedLeaderId::new(1, 0), 1),
+                payload: openraft::EntryPayload::Normal(RaftRequest::RegisterNode {
+                    node_id: 1,
+                    addr: "10.0.0.1:3000".to_string(),
+                }),
+            },
+            openraft::Entry::<TypeConfig> {
+                log_id: openraft::LogId::new(openraft::CommittedLeaderId::new(1, 0), 2),
+                payload: openraft::EntryPayload::Normal(RaftRequest::AssignRealm {
+                    realm: "realm-d".to_string(),
+                    owner_node: 1,
+                }),
+            },
+            openraft::Entry::<TypeConfig> {
+                log_id: openraft::LogId::new(openraft::CommittedLeaderId::new(1, 0), 3),
+                payload: openraft::EntryPayload::Normal(RaftRequest::AcquireLease {
+                    realm: "realm-d".to_string(),
+                    holder: 1,
+                    duration_secs: 300,
+                    proposed_at_epoch_secs: proposed_at,
+                }),
+            },
+            openraft::Entry::<TypeConfig> {
+                log_id: openraft::LogId::new(openraft::CommittedLeaderId::new(1, 0), 4),
+                payload: openraft::EntryPayload::Normal(RaftRequest::RenewLease {
+                    realm: "realm-d".to_string(),
+                    holder: 1,
+                    duration_secs: 600,
+                    proposed_at_epoch_secs: proposed_at + 42,
+                }),
+            },
+            // A competing acquire that must resolve to LeaseConflict on every
+            // replica, based purely on entry data.
+            openraft::Entry::<TypeConfig> {
+                log_id: openraft::LogId::new(openraft::CommittedLeaderId::new(1, 0), 5),
+                payload: openraft::EntryPayload::Normal(RaftRequest::AcquireLease {
+                    realm: "realm-d".to_string(),
+                    holder: 2,
+                    duration_secs: 300,
+                    proposed_at_epoch_secs: proposed_at + 43,
+                }),
+            },
+        ]
+    };
+
+    // Replica A applies immediately.
+    let sm_a = Arc::new(HirnStateMachine::new());
+    let mut sm_a_ref = sm_a.clone();
+    let responses_a = sm_a_ref.apply(make_entries()).await.unwrap();
+
+    // Replica B applies the identical entries after real time has passed,
+    // simulating a lagging follower with a different local clock reading.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let sm_b = Arc::new(HirnStateMachine::new());
+    let mut sm_b_ref = sm_b.clone();
+    let responses_b = sm_b_ref.apply(make_entries()).await.unwrap();
+
+    // Responses (including the conflict expiry timestamp) must match exactly.
+    assert_eq!(responses_a.len(), responses_b.len());
+    for (a, b) in responses_a.iter().zip(responses_b.iter()) {
+        assert_eq!(
+            format!("{a:?}"),
+            format!("{b:?}"),
+            "divergent apply response"
+        );
+    }
+    assert!(
+        matches!(
+            responses_a[4],
+            RaftResponse::LeaseConflict { holder: 1, .. }
+        ),
+        "competing acquire must conflict deterministically: {:?}",
+        responses_a[4]
+    );
+
+    // Full serialized state (realm owners, nodes, leases, last applied log)
+    // must be byte-identical.
+    let snap_a = sm_a.clone().build_snapshot().await.unwrap();
+    let snap_b = sm_b.clone().build_snapshot().await.unwrap();
+    assert_eq!(
+        snap_a.snapshot.into_inner(),
+        snap_b.snapshot.into_inner(),
+        "state machines diverged after applying identical entries"
+    );
 }

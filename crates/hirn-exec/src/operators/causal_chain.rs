@@ -364,6 +364,10 @@ fn recall_causal_schema(include_activation_metadata: bool) -> SchemaRef {
         Field::new("surprise", DataType::Float32, true),
         Field::new("evidence_count", DataType::UInt32, true),
         Field::new("invocation_count", DataType::UInt64, true),
+        // Layer-native salience projections — must mirror the upstream recall
+        // schema so the logical plan's declared columns line up index-for-index.
+        Field::new("confidence", DataType::Float32, true),
+        Field::new("success_rate", DataType::Float32, true),
     ];
 
     if include_activation_metadata {
@@ -500,6 +504,8 @@ async fn build_recall_causal_output_batch(
         .iter()
         .map(|row| row.invocation_count)
         .collect::<Vec<_>>();
+    let confidences = rows.iter().map(RecallRow::confidence).collect::<Vec<_>>();
+    let success_rates = rows.iter().map(RecallRow::success_rate).collect::<Vec<_>>();
 
     let mut columns = vec![
         Arc::new(StringArray::from(ids)) as ArrayRef,
@@ -515,6 +521,8 @@ async fn build_recall_causal_output_batch(
         Arc::new(Float32Array::from(surprises)) as ArrayRef,
         Arc::new(UInt32Array::from(evidence_counts)) as ArrayRef,
         Arc::new(UInt64Array::from(invocation_counts)) as ArrayRef,
+        Arc::new(Float32Array::from(confidences)) as ArrayRef,
+        Arc::new(Float32Array::from(success_rates)) as ArrayRef,
     ];
 
     if include_activation_metadata {

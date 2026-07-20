@@ -2483,9 +2483,7 @@ impl hirn_core::embed::Embedder for FailingThenSucceedingEmbedder {
             .calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if call_num < self.fail_until {
-            Err(hirn_core::HirnError::ProviderError(
-                "simulated embed failure".into(),
-            ))
+            Err(hirn_core::HirnError::provider("simulated embed failure"))
         } else {
             self.inner.embed(texts).await
         }
@@ -2528,9 +2526,7 @@ impl hirn_core::embed::Embedder for FailsSecondBatchChunkEmbedder {
             .calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if call_num == 1 {
-            Err(hirn_core::HirnError::ProviderError(
-                "simulated chunk failure".into(),
-            ))
+            Err(hirn_core::HirnError::provider("simulated chunk failure"))
         } else {
             self.inner.embed(texts).await
         }

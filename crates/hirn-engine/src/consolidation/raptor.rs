@@ -22,7 +22,7 @@ use hirn_core::error::HirnResult;
 use hirn_core::id::MemoryId;
 use hirn_core::metadata::Metadata;
 use hirn_core::semantic::SemanticRecord;
-use hirn_core::types::{AgentId, EdgeRelation, KnowledgeType, Origin};
+use hirn_core::types::{AgentId, EdgeRelation, KnowledgeType, Namespace, Origin};
 use tracing::warn;
 
 use crate::db::HirnDB;
@@ -50,26 +50,31 @@ pub struct RaptorResult {
 
 /// Run RAPTOR hierarchical summarization on existing semantic records.
 ///
-/// Collects all non-RAPTOR semantic records as the leaf level, then recursively
-/// clusters and summarizes them into a tree. Each summary is stored as a
+/// Collects the non-RAPTOR semantic records of a single `namespace` as the
+/// leaf level, then recursively clusters and summarizes them into a tree.
+/// Scoping the tree to one namespace guarantees that a cluster never mixes
+/// records from different namespaces and that every summary is stored in the
+/// same namespace as its sources. Each summary is stored as a
 /// `SemanticRecord` with `KnowledgeType::RaptorSummary` and linked to its
 /// children via `DerivedFrom` / `PartOf` edges.
 pub async fn build_raptor_tree(
     db: &HirnDB,
     llm: &Arc<dyn LlmProvider>,
     config: &ConsolidationConfig,
+    namespace: &Namespace,
 ) -> HirnResult<RaptorResult> {
     let agent = AgentId::new("raptor").unwrap();
     let mut total_summaries = 0;
     let mut total_edges = 0;
     let mut levels_created = 0;
 
-    // Collect leaf nodes: all semantic records that are NOT themselves RAPTOR summaries.
+    // Collect leaf nodes: the namespace's semantic records that are NOT
+    // themselves RAPTOR summaries.
     let all_semantics = db
         .list_semantics(&crate::db::SemanticFilter {
             knowledge_type: None,
             min_confidence: None,
-            namespace: None,
+            namespace: Some(namespace.clone()),
             limit: None,
         })
         .await?;
@@ -95,18 +100,15 @@ pub async fn build_raptor_tree(
         });
     }
 
-    // Delete existing RAPTOR summaries for idempotency (full rebuild).
-    let existing_raptor = db
-        .list_semantics(&crate::db::SemanticFilter {
-            knowledge_type: Some(KnowledgeType::RaptorSummary),
-            min_confidence: None,
-            namespace: None,
-            limit: None,
-        })
-        .await?;
-    for rec in &existing_raptor {
-        db.purge_semantic(rec.id).await?;
-    }
+    // Concept names are generation-tagged: the whole tree is built under a
+    // fresh generation suffix while the previous generation stays live, and
+    // the old generation is swept only after the build fully succeeds. A
+    // crash, error, or consolidation timeout mid-build therefore never leaves
+    // the namespace without a tree — at worst a partial new generation
+    // lingers alongside the old one until the next successful pass sweeps it
+    // (the sweep removes every generation but the freshly built one).
+    let generation = MemoryId::new().to_string().to_lowercase();
+    let mut generation_ids: Vec<MemoryId> = Vec::new();
 
     for level in 0..config.raptor_max_levels {
         if current_level.len() < config.raptor_min_cluster_input {
@@ -143,20 +145,9 @@ pub async fn build_raptor_tree(
                 continue;
             }
 
-            let concept_name = format!("raptor-L{}-C{}", level, cluster_idx);
-
-            // Full rebuild must own the internal RAPTOR concept names.
-            if let Ok(existing) = db.get_semantic_by_concept(&concept_name).await {
-                let reason = if existing.knowledge_type == KnowledgeType::RaptorSummary {
-                    "stale RAPTOR summary survived cleanup"
-                } else {
-                    "non-RAPTOR semantic record collided with reserved RAPTOR concept name"
-                };
-                return Err(hirn_core::HirnError::AlreadyExists(format!(
-                    "RAPTOR full rebuild cannot continue: {reason} `{concept_name}` ({})",
-                    existing.id
-                )));
-            }
+            // Generation-unique name: `parse_raptor_level` keys off the
+            // `raptor-L{level}-` prefix, which is preserved.
+            let concept_name = format!("raptor-L{}-C{}-{}", level, cluster_idx, generation);
 
             // Build LLM prompt from cluster member descriptions.
             let member_text: String = cluster
@@ -238,6 +229,7 @@ pub async fn build_raptor_tree(
                 .confidence(0.75)
                 .agent_id(agent.clone())
                 .origin(Origin::Consolidation)
+                .namespace(namespace.clone())
                 .embedding(embedding.clone());
 
             for &child_id in &child_ids {
@@ -246,27 +238,40 @@ pub async fn build_raptor_tree(
 
             let record = builder.build()?;
             let summary_id = db.store_semantic(record).await?;
+            generation_ids.push(summary_id);
 
             // Create DerivedFrom (summary → child) and PartOf (child → summary) edges.
+            // On edge failure, purge this generation's records before
+            // propagating so the previous generation remains the only live
+            // tree (the failing summary itself is already cleaned up inside
+            // the edge helper).
             for &child_id in &child_ids {
-                connect_raptor_membership_edge(
+                if let Err(error) = connect_raptor_membership_edge(
                     db,
                     summary_id,
                     child_id,
                     EdgeRelation::DerivedFrom,
                     "DerivedFrom",
                 )
-                .await?;
+                .await
+                {
+                    purge_generation(db, &generation_ids).await;
+                    return Err(error);
+                }
                 total_edges += 1;
 
-                connect_raptor_membership_edge(
+                if let Err(error) = connect_raptor_membership_edge(
                     db,
                     child_id,
                     summary_id,
                     EdgeRelation::PartOf,
                     "PartOf",
                 )
-                .await?;
+                .await
+                {
+                    purge_generation(db, &generation_ids).await;
+                    return Err(error);
+                }
                 total_edges += 1;
             }
 
@@ -287,11 +292,68 @@ pub async fn build_raptor_tree(
         current_level = next_level;
     }
 
+    // The new generation is complete — sweep every other generation in this
+    // namespace (previous trees and partial generations left by crashed or
+    // timed-out runs).
+    let suffix = format!("-{generation}");
+    let stale = db
+        .list_semantics(&crate::db::SemanticFilter {
+            knowledge_type: Some(KnowledgeType::RaptorSummary),
+            min_confidence: None,
+            namespace: Some(namespace.clone()),
+            limit: None,
+        })
+        .await?;
+    for rec in &stale {
+        if !rec.concept.ends_with(&suffix) {
+            db.purge_semantic(rec.id).await?;
+        }
+    }
+
     Ok(RaptorResult {
         summaries_stored: total_summaries,
         levels_created,
         edges_created: total_edges,
     })
+}
+
+/// Best-effort removal of a failed generation's summary records so the
+/// previous generation stays the sole live tree.
+async fn purge_generation(db: &HirnDB, generation_ids: &[MemoryId]) {
+    for &id in generation_ids {
+        if let Err(error) = db.purge_semantic(id).await {
+            warn!(%id, %error, "failed to purge partial RAPTOR generation record");
+        }
+    }
+}
+
+/// Enumerate the distinct namespaces that currently hold RAPTOR-eligible
+/// (non-summary) semantic records.
+///
+/// The consolidation pipeline builds one independent RAPTOR tree per returned
+/// namespace so that clustering and summarization never span namespaces.
+/// The result is sorted for deterministic pipeline ordering.
+pub(crate) async fn semantic_leaf_namespaces(db: &HirnDB) -> HirnResult<Vec<Namespace>> {
+    let all_semantics = db
+        .list_semantics(&crate::db::SemanticFilter {
+            knowledge_type: None,
+            min_confidence: None,
+            namespace: None,
+            limit: None,
+        })
+        .await?;
+
+    let mut namespaces: Vec<Namespace> = Vec::new();
+    for record in all_semantics {
+        if record.knowledge_type == KnowledgeType::RaptorSummary {
+            continue;
+        }
+        if !namespaces.contains(&record.namespace) {
+            namespaces.push(record.namespace);
+        }
+    }
+    namespaces.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    Ok(namespaces)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -453,7 +515,9 @@ fn kmeans_cluster(
         for (i, node) in nodes.iter().enumerate() {
             let c = assignments[i];
             counts[c] += 1;
-            for (j, val) in node.embedding.iter().enumerate() {
+            // `.take(dim)` guards against a mixed-dimension node embedding
+            // indexing past the centroid accumulator and panicking.
+            for (j, val) in node.embedding.iter().take(dim).enumerate() {
                 sums[c][j] += val;
             }
         }
@@ -539,7 +603,9 @@ fn cluster_centroid(cluster: &[&RaptorNode]) -> Vec<f32> {
     let dim = cluster[0].embedding.len();
     let mut centroid = vec![0.0_f32; dim];
     for node in cluster {
-        for (j, val) in node.embedding.iter().enumerate() {
+        // `.take(dim)` guards against a mixed-dimension node embedding
+        // indexing past the centroid accumulator and panicking.
+        for (j, val) in node.embedding.iter().take(dim).enumerate() {
             centroid[j] += val;
         }
     }
@@ -609,7 +675,7 @@ mod tests {
         db
     }
 
-    async fn store_leaf_semantics(db: &HirnDB) -> Vec<MemoryId> {
+    async fn store_leaf_semantics_in(db: &HirnDB, namespace: &Namespace) -> Vec<MemoryId> {
         let agent = AgentId::new("test").unwrap();
         let records = vec![
             SemanticRecord::builder()
@@ -620,6 +686,7 @@ mod tests {
                 .confidence(0.8)
                 .agent_id(agent.clone())
                 .origin(Origin::Consolidation)
+                .namespace(namespace.clone())
                 .build()
                 .unwrap(),
             SemanticRecord::builder()
@@ -630,6 +697,7 @@ mod tests {
                 .confidence(0.8)
                 .agent_id(agent.clone())
                 .origin(Origin::Consolidation)
+                .namespace(namespace.clone())
                 .build()
                 .unwrap(),
             SemanticRecord::builder()
@@ -640,6 +708,7 @@ mod tests {
                 .confidence(0.8)
                 .agent_id(agent)
                 .origin(Origin::Consolidation)
+                .namespace(namespace.clone())
                 .build()
                 .unwrap(),
         ];
@@ -649,6 +718,10 @@ mod tests {
             .into_iter()
             .map(|result| result.expect("leaf semantic should store"))
             .collect()
+    }
+
+    async fn store_leaf_semantics(db: &HirnDB) -> Vec<MemoryId> {
+        store_leaf_semantics_in(db, &Namespace::default_ns()).await
     }
 
     fn test_config() -> ConsolidationConfig {
@@ -843,26 +916,51 @@ mod tests {
         assert_eq!(total, 100);
     }
 
+    async fn raptor_summaries_in(
+        db: &HirnDB,
+        namespace: Option<&Namespace>,
+    ) -> Vec<SemanticRecord> {
+        db.list_semantics(&crate::db::SemanticFilter {
+            knowledge_type: Some(KnowledgeType::RaptorSummary),
+            min_confidence: None,
+            namespace: namespace.cloned(),
+            limit: None,
+        })
+        .await
+        .unwrap()
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn build_raptor_tree_rebuilds_stale_summaries() {
         let db = test_db().await;
         let llm: Arc<dyn LlmProvider> = Arc::new(MockRaptorLlm::new("RAPTOR summary"));
         store_leaf_semantics(&db).await;
 
-        let first = build_raptor_tree(&db, &llm, &test_config()).await.unwrap();
+        let namespace = Namespace::default_ns();
+        let first = build_raptor_tree(&db, &llm, &test_config(), &namespace)
+            .await
+            .unwrap();
         assert_eq!(first.summaries_stored, 1);
 
-        let original = db.get_semantic_by_concept("raptor-L0-C0").await.unwrap();
-        assert_eq!(original.knowledge_type, KnowledgeType::RaptorSummary);
+        let originals = raptor_summaries_in(&db, None).await;
+        assert_eq!(originals.len(), 1);
+        let original = &originals[0];
 
-        let second = build_raptor_tree(&db, &llm, &test_config()).await.unwrap();
+        let second = build_raptor_tree(&db, &llm, &test_config(), &namespace)
+            .await
+            .unwrap();
         assert_eq!(second.summaries_stored, 1);
 
-        let rebuilt = db.get_semantic_by_concept("raptor-L0-C0").await.unwrap();
-        assert_eq!(rebuilt.knowledge_type, KnowledgeType::RaptorSummary);
+        let rebuilt_all = raptor_summaries_in(&db, None).await;
+        assert_eq!(rebuilt_all.len(), 1, "old generation must be swept");
+        let rebuilt = &rebuilt_all[0];
         assert_ne!(
             rebuilt.id, original.id,
             "full rebuild should replace stale RAPTOR summary records"
+        );
+        assert_ne!(
+            rebuilt.concept, original.concept,
+            "each rebuild runs under a fresh generation tag"
         );
 
         let raptor_records = db
@@ -882,26 +980,88 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn build_raptor_tree_fails_on_reserved_name_collision() {
+    async fn partial_generation_from_crashed_run_is_swept() {
         let db = test_db().await;
         let llm: Arc<dyn LlmProvider> = Arc::new(MockRaptorLlm::new("RAPTOR summary"));
         store_leaf_semantics(&db).await;
 
-        let collision = SemanticRecord::builder()
-            .concept("raptor-L0-C0")
-            .knowledge_type(KnowledgeType::Propositional)
-            .description("reserved name collision")
+        // Simulate a crashed run's leftover: a summary under a generation
+        // that never completed.
+        let leftover = SemanticRecord::builder()
+            .concept("raptor-L0-C0-deadbeefdeadbeefdeadbeef00")
+            .knowledge_type(KnowledgeType::RaptorSummary)
+            .description("partial generation from a crashed build")
             .embedding(vec![0.0, 1.0, 0.0])
-            .confidence(0.8)
-            .agent_id(AgentId::new("test").unwrap())
+            .confidence(0.75)
+            .agent_id(AgentId::new("raptor").unwrap())
             .origin(Origin::Consolidation)
             .build()
             .unwrap();
-        db.store_semantic(collision).await.unwrap();
+        let leftover_id = db.store_semantic(leftover).await.unwrap();
 
-        let error = build_raptor_tree(&db, &llm, &test_config())
+        let result = build_raptor_tree(&db, &llm, &test_config(), &Namespace::default_ns())
             .await
-            .expect_err("RAPTOR rebuild should fail when its reserved concept name collides with an existing semantic record");
-        assert!(matches!(error, hirn_core::HirnError::AlreadyExists(_)));
+            .unwrap();
+        assert_eq!(result.summaries_stored, 1);
+
+        let remaining = raptor_summaries_in(&db, None).await;
+        assert_eq!(
+            remaining.len(),
+            1,
+            "the crashed generation must be swept by the next successful build"
+        );
+        assert_ne!(remaining[0].id, leftover_id);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn build_raptor_tree_scopes_summaries_to_namespace() {
+        let db = test_db().await;
+        let llm: Arc<dyn LlmProvider> = Arc::new(MockRaptorLlm::new("RAPTOR summary"));
+        let ns_a = Namespace::new("tenant-a").unwrap();
+        let ns_b = Namespace::new("tenant-b").unwrap();
+        let leaves_a = store_leaf_semantics_in(&db, &ns_a).await;
+        let leaves_b = store_leaf_semantics_in(&db, &ns_b).await;
+
+        let result_a = build_raptor_tree(&db, &llm, &test_config(), &ns_a)
+            .await
+            .unwrap();
+        assert_eq!(result_a.summaries_stored, 1);
+
+        // The summary lives in the source namespace, not in "default".
+        let summaries_a = raptor_summaries_in(&db, Some(&ns_a)).await;
+        assert_eq!(summaries_a.len(), 1);
+        let summary_a = &summaries_a[0];
+        assert_eq!(summary_a.namespace, ns_a);
+        assert!(
+            raptor_summaries_in(&db, Some(&Namespace::default_ns()))
+                .await
+                .is_empty(),
+            "RAPTOR summary must not land in the default namespace"
+        );
+
+        // Only tenant-a leaves may feed the tenant-a summary.
+        for source_id in &summary_a.source_episodes {
+            assert!(
+                leaves_a.contains(source_id),
+                "tenant-a summary must not derive from other namespaces"
+            );
+            assert!(!leaves_b.contains(source_id));
+        }
+
+        // Trees are independent per namespace.
+        let result_b = build_raptor_tree(&db, &llm, &test_config(), &ns_b)
+            .await
+            .unwrap();
+        assert_eq!(result_b.summaries_stored, 1);
+        let summaries_b = raptor_summaries_in(&db, Some(&ns_b)).await;
+        assert_eq!(summaries_b.len(), 1);
+        let summary_b = &summaries_b[0];
+        assert_eq!(summary_b.namespace, ns_b);
+        for source_id in &summary_b.source_episodes {
+            assert!(leaves_b.contains(source_id));
+        }
+
+        let namespaces = semantic_leaf_namespaces(&db).await.unwrap();
+        assert_eq!(namespaces, vec![ns_a, ns_b]);
     }
 }

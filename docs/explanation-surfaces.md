@@ -1,8 +1,70 @@
-# Explanation Surfaces
+---
+title: Explanation Surfaces
+parent: Advanced
+nav_order: 3
+description: >-
+  hirn's request-scoped explanation APIs and HirnQL INSPECT/TRACE provenance
+  verbs that make recall, context packing, and writes auditable.
+---
 
-> **⚠️ Experimental:** This project is under active development. APIs, on-disk formats, and behaviour may change without notice. Not recommended for production use.
+# Explanation Surfaces
+{: .no_toc }
+
+This project is under active development. APIs, on-disk formats, and behaviour may change without notice. Not recommended for production use.
+{: .experimental }
 
 hirn exposes structured explanations because state-of-the-art memory systems need more than ranked results. Operators, evaluators, and downstream agents need to know why a memory was returned, why it was suppressed, and why a write was accepted, rejected, or downgraded.
+
+## Table of contents
+{: .no_toc .text-delta }
+
+1. TOC
+{:toc}
+
+## Two Kinds of "Why"
+
+hirn answers two different provenance questions with two different surfaces, and
+knowing which to reach for saves a lot of guesswork:
+
+- **Request-scoped explanations** answer *"why did this particular query or write
+  behave this way?"* They ride along with a single operation via the
+  `execute_with_explanation()` / `remember_with_explanation()` builders and
+  describe scoring, suppression, admission, and routing for that one call.
+- **HirnQL exploration verbs** answer *"what is the standing provenance of this
+  memory?"* `INSPECT` returns a record's semantic revision summary, and `TRACE`
+  walks its provenance chain — trust score, mutation count, source episodes (for
+  records derived from consolidation), and a lineage tree. These are
+  side-effect-free verbs documented in the [HirnQL Reference](hirnql-reference.md).
+
+The diagram below shows how a live request produces a request-scoped explanation
+while the standing record can be interrogated independently with `INSPECT` and
+`TRACE`.
+
+```mermaid
+flowchart TB
+  subgraph Live["Request-scoped explanation"]
+    q[RECALL / THINK] --> rx[RetrievalExplanation<br/>scoring · suppression · policy]
+    w[remember_with_explanation] --> wx[RememberExplanation<br/>admission · RPE · interference]
+  end
+  subgraph Store["Standing record"]
+    rec[(memory revision)]
+    rec --> ins[INSPECT<br/>revision summary]
+    rec --> tr[TRACE<br/>trust · lineage · source episodes]
+  end
+  rx --> rec
+  wx --> rec
+  ins --> aud[Operator console / audit]
+  tr --> aud
+  rx --> aud
+  wx --> aud
+  classDef s fill:#1a1b26,stroke:#7c9cff,color:#e6e8f0;
+  class rec,ins,tr s
+```
+
+{: .tip }
+> Start with the smallest surface that answers the question. Use a request-scoped
+> explanation for a single query or write; reach for `INSPECT`/`TRACE`, metrics,
+> or event history only once the request-scoped answer says the issue is broader.
 
 ## What Is Exposed
 
@@ -164,8 +226,10 @@ println!("fast path: {}", explanation.rpe.is_some_and(|rpe| rpe.is_fast_path));
 
 Related docs:
 
-- [documentation-map.md](documentation-map.md)
+- [Concepts](concepts.md) and [Cognitive Model](cognitive-model.md) — the model these explanations describe
+- [HirnQL Reference](hirnql-reference.md) — `INSPECT`, `TRACE`, `HISTORY`, and `EXPLAIN`
+- [write-guarantees.md](write-guarantees.md) — the durability behind an accepted write
+- [Getting Started](getting-started.md)
 - [getting-started.md](getting-started.md)
-- [hirnql-reference.md](hirnql-reference.md)
 - [offline-intelligence.md](offline-intelligence.md)
 - [benchmarks.md](benchmarks.md)

@@ -1,4 +1,13 @@
+---
+title: Admin Operations
+parent: Deployment & Operations
+nav_order: 2
+description: >-
+  Day-two operations for a hirn database — version-tagged snapshots, compaction, index creation, MCFA pattern management, and graceful shutdown.
+---
+
 # Admin Operations
+{: .no_toc }
 
 > **⚠️ Experimental:** This project is under active development. APIs, on-disk formats, and behaviour may change without notice. Not recommended for production use.
 
@@ -6,6 +15,57 @@ Operational guide for managing a Hirn database: backup and restore, compaction, 
 creation, and MCFA pattern management.
 
 See also: [Architecture](architecture.md), [Performance Tuning](performance-tuning.md), [Deployment](deployment.md)
+
+## Table of contents
+{: .no_toc .text-delta }
+
+1. TOC
+{:toc}
+
+---
+
+## The Operational Model
+
+Every admin operation in hirn is layered on top of Lance's versioned, append-only
+datasets. That single fact shapes the whole runbook: nothing is destructively
+overwritten in place. Snapshots pin *versions*, rollback writes a new `Restore`
+transaction, and compaction rewrites fragments while keeping older versions
+reachable until they are swept. Understanding this lets you reason about what is
+recoverable and what is not.
+
+The maintenance surface splits into two independent background jobs plus a set of
+on-demand admin calls:
+
+- **Compaction** merges small Lance fragments so scans stay fast.
+- **Consolidation** promotes episodic rows into richer semantic structure.
+- **On-demand admin** — snapshots, index (re)builds, MCFA review, statistics,
+  and revision health checks — is invoked by an operator or CI, not scheduled.
+
+```mermaid
+flowchart TD
+    subgraph Scheduled["Scheduled background jobs"]
+        CI[compaction_interval_secs]:::s --> CP[Fragment compaction]:::s
+        CS[consolidation_interval_secs]:::s --> CO[Semantic consolidation]:::s
+    end
+    subgraph OnDemand["On-demand admin"]
+        SN[ADMIN SNAPSHOT]:::s
+        RB[ADMIN ROLLBACK]:::s
+        IX[create / rebuild indexes]:::s
+        MQ[MCFA quarantine review]:::s
+    end
+    CP --> L[(Lance datasets<br/>versioned + append-only)]:::s
+    CO --> L
+    SN --> L
+    RB --> L
+    IX --> L
+    MQ --> L
+    classDef s fill:#1a1b26,stroke:#7c9cff,color:#e6e8f0;
+```
+
+{: .important }
+> Snapshots pin dataset **versions**; they do not copy bytes. A snapshot protects
+> you from logical mistakes (a bad migration), not from losing the storage medium.
+> For disaster recovery you must also back up the Lance directory tree or S3 prefix.
 
 ---
 
@@ -24,6 +84,24 @@ version later.
 - `rollback(tag)` uses Lance's `restore()` to write a new `Restore` transaction on each dataset,
   making the tagged version the new current version. The in-memory `EpochCache` is invalidated so
   subsequent queries see the restored state immediately.
+
+```mermaid
+sequenceDiagram
+    participant Op as Operator / CI
+    participant BK as backup module
+    participant DS as Every Lance dataset
+    participant EC as EpochCache
+    Op->>BK: create_snapshot("pre-migration")
+    BK->>DS: tag current version on each dataset
+    Note over DS: tag present on ALL datasets = complete snapshot
+    Op->>BK: rollback("pre-migration")
+    BK->>DS: restore() → new Restore transaction
+    BK->>EC: invalidate
+    Note over EC: subsequent queries see restored state inline
+```
+
+A tag is only a valid snapshot when it appears on *every* dataset — a partial tag
+left by a crashed snapshot is ignored by `list_snapshots()`.
 
 ### HirnQL
 
@@ -389,6 +467,11 @@ db.close().await?;
 
 The `Drop` impl attempts a best-effort synchronous flush on a helper thread, but this cannot
 complete async operations that are still in flight. Explicit `close()` is always preferred.
+
+{: .danger }
+> Relying on `Drop` alone can silently lose buffered Hebbian edges and access-count
+> updates if the process exits before the helper thread finishes. Always `await`
+> `close()` on a clean shutdown path.
 
 ---
 

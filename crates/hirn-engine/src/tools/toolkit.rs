@@ -5,7 +5,7 @@ use std::sync::Arc;
 use hirn_core::episodic::EpisodicRecord;
 use hirn_core::error::{HirnError, HirnResult};
 use hirn_core::id::MemoryId;
-use hirn_core::types::{AgentId, EventType};
+use hirn_core::types::{AgentId, EventType, Namespace, NamespaceKind};
 
 use crate::db::HirnDB;
 use crate::graph::EdgeId;
@@ -64,7 +64,12 @@ impl MemoryToolkit {
 
         // Cedar enforcement.
         self.db
-            .enforce(agent_id.as_str(), Action::Remember, "default", ns.as_str())
+            .enforce(
+                agent_id.as_str(),
+                Action::Remember,
+                self.db.config().default_realm.as_str(),
+                ns.as_str(),
+            )
             .await?;
 
         // Build record.
@@ -180,7 +185,12 @@ impl MemoryToolkit {
         let ns = existing.namespace;
 
         self.db
-            .enforce(agent_id.as_str(), Action::Remember, "default", ns.as_str())
+            .enforce(
+                agent_id.as_str(),
+                Action::Remember,
+                self.db.config().default_realm.as_str(),
+                ns.as_str(),
+            )
             .await?;
 
         let content = request.content.clone();
@@ -213,7 +223,12 @@ impl MemoryToolkit {
         let ns = existing.namespace;
 
         self.db
-            .enforce(agent_id.as_str(), Action::Forget, "default", ns.as_str())
+            .enforce(
+                agent_id.as_str(),
+                Action::Forget,
+                self.db.config().default_realm.as_str(),
+                ns.as_str(),
+            )
             .await?;
 
         self.db.archive_episode(existing.id).await
@@ -222,11 +237,39 @@ impl MemoryToolkit {
     // ── 5. Link ─────────────────────────────────────────────────────────
 
     /// Create a graph edge between two memories.
+    ///
+    /// Both endpoint records are resolved first; the agent must be a member
+    /// of each record's namespace and pass the Cedar `Connect` check against
+    /// those namespaces (mirroring `AgentContext::connect_with`), not against
+    /// a fixed namespace.
     pub async fn link(&self, agent_id: AgentId, request: LinkRequest) -> HirnResult<EdgeId> {
-        // Default namespace for policy — links cross namespace boundaries.
-        self.db
-            .enforce(agent_id.as_str(), Action::Connect, "default", "default")
+        let source = self.db.get_memory(request.source_id).await?;
+        let target = self.db.get_memory(request.target_id).await?;
+        let source_ns = source.effective_namespace();
+        let target_ns = target.effective_namespace();
+
+        self.check_namespace_membership(&agent_id, &source_ns)
             .await?;
+        self.check_namespace_membership(&agent_id, &target_ns)
+            .await?;
+        self.db
+            .enforce(
+                agent_id.as_str(),
+                Action::Connect,
+                self.db.config().default_realm.as_str(),
+                source_ns.as_str(),
+            )
+            .await?;
+        if target_ns != source_ns {
+            self.db
+                .enforce(
+                    agent_id.as_str(),
+                    Action::Connect,
+                    self.db.config().default_realm.as_str(),
+                    target_ns.as_str(),
+                )
+                .await?;
+        }
 
         let weight = request.weight.unwrap_or(0.5);
         let metadata = request.metadata.unwrap_or_default();
@@ -245,32 +288,67 @@ impl MemoryToolkit {
     // ── 6. Introspect ───────────────────────────────────────────────────
 
     /// Return memory statistics and optionally graph neighborhood for a memory.
+    ///
+    /// Enforcement targets what the call reveals: with a memory id, the agent
+    /// must be a member of that record's namespace and pass the Cedar `Recall`
+    /// check against it, and the returned neighborhood is filtered to edges
+    /// whose far endpoint the agent can also access. Without an id (aggregate
+    /// stats only), `Recall` is enforced against the agent's own private
+    /// namespace rather than a fixed one.
     pub async fn introspect(
         &self,
         agent_id: AgentId,
         id: Option<MemoryId>,
     ) -> HirnResult<IntrospectionResult> {
+        let scope_ns = match id {
+            Some(memory_id) => {
+                let record = self.db.get_memory(memory_id).await?;
+                let ns = record.effective_namespace();
+                self.check_namespace_membership(&agent_id, &ns).await?;
+                ns
+            }
+            None => Namespace::private_for(&agent_id),
+        };
         self.db
-            .enforce(agent_id.as_str(), Action::Recall, "default", "default")
+            .enforce(
+                agent_id.as_str(),
+                Action::Recall,
+                self.db.config().default_realm.as_str(),
+                scope_ns.as_str(),
+            )
             .await?;
 
         let stats = self.db.stats().await?;
 
-        let edges = if let Some(memory_id) = id {
+        let mut edges = Vec::new();
+        if let Some(memory_id) = id {
             let graph = self.db.cached_graph();
             let node_edges = graph.get_edges(memory_id).await?;
-            node_edges
-                .into_iter()
-                .map(|e| EdgeInfo {
-                    source: e.source,
-                    target: e.target,
-                    relation: e.relation.clone(),
-                    weight: e.weight,
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+            for e in node_edges {
+                // Only reveal edges whose far endpoint sits in a namespace the
+                // agent can access; unresolvable endpoints stay hidden.
+                let other = if e.source == memory_id {
+                    e.target
+                } else {
+                    e.source
+                };
+                let visible = match self.db.get_memory(other).await {
+                    Ok(record) => {
+                        self.namespace_accessible(&agent_id, &record.effective_namespace())
+                            .await?
+                    }
+                    Err(_) => false,
+                };
+                if visible {
+                    edges.push(EdgeInfo {
+                        source: e.source,
+                        target: e.target,
+                        relation: e.relation.clone(),
+                        weight: e.weight,
+                    });
+                }
+            }
+        }
 
         Ok(IntrospectionResult {
             total_memories: stats.total_count,
@@ -281,5 +359,43 @@ impl MemoryToolkit {
             edge_count: stats.edge_count,
             edges,
         })
+    }
+
+    // ── Namespace membership ────────────────────────────────────────────
+
+    /// Whether `agent_id` may act on records in `ns`, mirroring the scoping
+    /// `AgentContext` derives from namespace records: shared and the
+    /// single-agent `default` namespace are open (matching `store`, which
+    /// writes to `default` without membership), private namespaces belong to
+    /// their owning agent, and team namespaces require listed membership.
+    async fn namespace_accessible(&self, agent_id: &AgentId, ns: &Namespace) -> HirnResult<bool> {
+        Ok(match ns.kind() {
+            NamespaceKind::Default | NamespaceKind::Shared => true,
+            NamespaceKind::Private => ns.owning_agent().as_ref() == Some(agent_id),
+            NamespaceKind::Team => self
+                .db
+                .get_namespace(ns.as_str())
+                .await
+                .map(|record| record.agent_has_access(agent_id))
+                // An unknown team namespace grants nobody access.
+                .unwrap_or(false),
+        })
+    }
+
+    /// [`Self::namespace_accessible`] as a hard check.
+    async fn check_namespace_membership(
+        &self,
+        agent_id: &AgentId,
+        ns: &Namespace,
+    ) -> HirnResult<()> {
+        if self.namespace_accessible(agent_id, ns).await? {
+            Ok(())
+        } else {
+            Err(HirnError::AccessDenied(format!(
+                "agent '{}' cannot access namespace '{}'",
+                agent_id,
+                ns.as_str()
+            )))
+        }
     }
 }

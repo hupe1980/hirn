@@ -26,6 +26,9 @@ pub fn schema() -> SchemaRef {
         Field::new("event_type", DataType::Utf8, false),
         Field::new("payload", DataType::Binary, false),
         Field::new("hmac", DataType::Utf8, true),
+        // Tag of the preceding event, forming the tamper-evident hash chain.
+        // Nullable and read tolerantly so pre-existing datasets still load.
+        Field::new("prev_hmac", DataType::Utf8, true),
     ]))
 }
 
@@ -40,8 +43,11 @@ pub struct EventRow {
     pub event_type: String,
     /// Bincode-serialized `MemoryEvent`.
     pub payload: Vec<u8>,
-    /// Optional HMAC tag (blake3 keyed hash, hex-encoded).
+    /// Optional HMAC tag (hex-encoded HMAC-SHA256).
     pub hmac: Option<String>,
+    /// Tag of the preceding event in the chain (`None` for the first event or
+    /// when signing is disabled).
+    pub prev_hmac: Option<String>,
 }
 
 /// Convert a slice of event rows to an Arrow `RecordBatch`.
@@ -54,6 +60,7 @@ pub fn to_batch(rows: &[EventRow]) -> Result<RecordBatch, HirnDbError> {
     let event_types: Vec<&str> = rows.iter().map(|r| r.event_type.as_str()).collect();
     let payloads: Vec<&[u8]> = rows.iter().map(|r| r.payload.as_slice()).collect();
     let hmacs: Vec<Option<&str>> = rows.iter().map(|r| r.hmac.as_deref()).collect();
+    let prev_hmacs: Vec<Option<&str>> = rows.iter().map(|r| r.prev_hmac.as_deref()).collect();
 
     RecordBatch::try_new(
         schema(),
@@ -66,6 +73,7 @@ pub fn to_batch(rows: &[EventRow]) -> Result<RecordBatch, HirnDbError> {
             Arc::new(StringArray::from(event_types)),
             Arc::new(BinaryArray::from(payloads)),
             Arc::new(StringArray::from(hmacs)),
+            Arc::new(StringArray::from(prev_hmacs)),
         ],
     )
     .map_err(|e| HirnDbError::InvalidArgument(format!("events to_batch: {e}")))
@@ -125,10 +133,24 @@ pub fn from_batch(batch: &RecordBatch) -> Result<Vec<EventRow>, HirnDbError> {
         .downcast_ref::<BinaryArray>()
         .ok_or_else(|| HirnDbError::InvalidArgument("payload not Binary".into()))?;
 
-    // hmac column is optional (nullable) and may be absent in older datasets.
+    // hmac / prev_hmac columns are optional (nullable) and may be absent in
+    // older datasets.
     let hmacs = batch
         .column_by_name("hmac")
         .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+    let prev_hmacs = batch
+        .column_by_name("prev_hmac")
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+
+    let opt_at = |arr: Option<&StringArray>, i: usize| {
+        arr.and_then(|a| {
+            if a.is_null(i) {
+                None
+            } else {
+                Some(a.value(i).to_string())
+            }
+        })
+    };
 
     for i in 0..n {
         rows.push(EventRow {
@@ -139,13 +161,8 @@ pub fn from_batch(batch: &RecordBatch) -> Result<Vec<EventRow>, HirnDbError> {
             agent_id: agent_ids.value(i).to_string(),
             event_type: event_types.value(i).to_string(),
             payload: payloads.value(i).to_vec(),
-            hmac: hmacs.and_then(|h| {
-                if h.is_null(i) {
-                    None
-                } else {
-                    Some(h.value(i).to_string())
-                }
-            }),
+            hmac: opt_at(hmacs, i),
+            prev_hmac: opt_at(prev_hmacs, i),
         });
     }
 
@@ -159,7 +176,7 @@ mod tests {
     #[test]
     fn schema_has_expected_columns() {
         let s = schema();
-        assert_eq!(s.fields().len(), 8);
+        assert_eq!(s.fields().len(), 9);
         assert!(s.field_with_name("seq").is_ok());
         assert!(s.field_with_name("timestamp_us").is_ok());
         assert!(s.field_with_name("realm").is_ok());
@@ -182,6 +199,7 @@ mod tests {
                 event_type: "episode_created".into(),
                 payload: vec![1, 2, 3],
                 hmac: Some("abc123".into()),
+                prev_hmac: None,
             },
             EventRow {
                 seq: 1,
@@ -192,6 +210,7 @@ mod tests {
                 event_type: "archived".into(),
                 payload: vec![4, 5, 6],
                 hmac: None,
+                prev_hmac: Some("abc123".into()),
             },
         ];
 
@@ -207,5 +226,7 @@ mod tests {
         assert_eq!(decoded[1].agent_id, "agent-2");
         assert_eq!(decoded[0].hmac, Some("abc123".to_string()));
         assert_eq!(decoded[1].hmac, None);
+        assert_eq!(decoded[0].prev_hmac, None);
+        assert_eq!(decoded[1].prev_hmac, Some("abc123".to_string()));
     }
 }

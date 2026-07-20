@@ -1,3 +1,12 @@
+---
+title: Encryption at Rest
+parent: Security
+nav_order: 3
+description: >-
+  hirn delegates encryption at rest to storage and the OS — S3/GCS/Azure SSE and
+  full-disk encryption. Application-level field encryption is roadmap, not shipped.
+---
+
 # Encryption at Rest
 
 > **⚠️ Experimental:** This project is under active development. APIs, on-disk formats, and behaviour may change without notice. Not recommended for production use.
@@ -5,6 +14,29 @@
 hirn delegates encryption at rest to the underlying storage layer. **hirn does
 not implement custom cryptographic primitives.** This document explains how to
 enable encryption for each supported backend.
+
+{: .danger }
+> **Encryption at rest is storage- and OS-delegated only.** hirn does **not**
+> perform application-level encryption today — there is no in-process AES-GCM or
+> field-level AEAD over memory content, embeddings, or graph data before it
+> reaches storage. Confidentiality depends entirely on the backend you configure
+> below (cloud provider SSE/CMK, or OS full-disk encryption). If the storage
+> layer is not encrypted, data is written in the clear.
+
+{: .note }
+> **Field-level AEAD is on the roadmap, not shipped.** Do not design a deployment
+> around per-field application encryption existing yet. Where content
+> confidentiality is a hard requirement, combine backend encryption with
+> [`text_retention`](#text-retention) and Cedar `recall_raw_text` gating to
+> minimize what is stored and who can read it.
+
+The two integrity and confidentiality controls hirn *does* provide in-process are
+distinct from encryption:
+
+| Control | What it provides | What it does **not** provide |
+|---------|------------------|------------------------------|
+| Event-log HMAC hash-chain | Tamper *evidence* for the audit trail | Encryption or tamper *prevention* |
+| `text_retention` + `recall_raw_text` policy | Minimizing and gating raw text | Encryption of what is retained |
 
 ## Cloud Object Storage
 
@@ -98,6 +130,14 @@ for event in &events {
 
 The HMAC covers: sequence number, timestamp, realm, namespace, agent_id, and the
 serialized event payload. Any modification to these fields invalidates the HMAC.
+
+{: .note }
+> The event log is not only per-event signed but also **hash-chained**: each
+> event folds in the previous event's tag (`prev_hmac`), so deletion or
+> truncation is detected in addition to mutation, and the full chain can be
+> verified end-to-end with `EventLog::verify_chain`. See
+> [Security Architecture → HMAC Integrity](security.md#hmac-integrity-hash-chained)
+> for the chain diagram and threat model.
 
 ## Text Retention
 

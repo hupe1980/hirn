@@ -14,6 +14,11 @@ servers:
   - url: http://localhost:3000
     description: Local development server
 
+# All /v1 routes require authentication (API key, JWT, or mTLS) unless the
+# server runs in insecure_dev_mode. /health, /healthz, /readyz stay public.
+security:
+  - bearerAuth: []
+
 tags:
   - name: Memory
     description: Store, recall, and manage memories
@@ -303,7 +308,181 @@ paths:
         "400":
           $ref: "#/components/responses/BadRequest"
 
+  /healthz:
+    get:
+      operationId: healthz
+      summary: Liveness probe (alias of /health)
+      tags: [Ops]
+      responses:
+        "200":
+          description: Process is alive
+
+  /readyz:
+    get:
+      operationId: readyz
+      summary: Readiness probe
+      tags: [Ops]
+      responses:
+        "200":
+          description: Server finished startup and accepts traffic
+        "503":
+          description: Server is still starting up
+
+  /v1/watch:
+    get:
+      operationId: watch
+      summary: Subscribe to memory events (SSE)
+      tags: [Ops]
+      description: |
+        Server-sent-events stream of memory lifecycle events (created, updated,
+        consolidated, conflict), filtered to the namespaces the caller's
+        credential permits.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: SSE event stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+
+  /v1/auth/token:
+    post:
+      operationId: issueToken
+      summary: Mint a scoped JWT for the authenticated principal
+      tags: [Ops]
+      description: |
+        Issues a short-lived token bound to the caller's realm and agent.
+        A caller authenticated by a restricted token may only request a scope
+        that is a subset of its own (no privilege escalation); API-key and
+        mTLS principals may mint any scope within their realm.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                namespaces:
+                  type: array
+                  items: { type: string }
+                  description: Namespace allowlist (empty = private + shared only)
+                operations:
+                  type: array
+                  items: { type: string, enum: [read, write, admin] }
+                  description: Allowed operations (empty = caller's own scope)
+                ttl_secs:
+                  type: integer
+                  description: Custom TTL in seconds
+      responses:
+        "200":
+          description: Issued token and expiry
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string }
+                  expires_at: { type: integer }
+        "403":
+          description: Requested scope exceeds the caller's own scope
+
+  /v1/cluster:
+    get:
+      operationId: clusterStatus
+      summary: Cluster membership and Raft status (admin)
+      tags: [Ops]
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Cluster status document
+
+  /v1/cluster/init:
+    post:
+      operationId: clusterInit
+      summary: Initialize a single-node Raft cluster (admin)
+      tags: [Ops]
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Cluster initialized
+
+  /v1/cluster/join:
+    post:
+      operationId: clusterJoin
+      summary: Add a learner/voter to the Raft cluster (admin)
+      tags: [Ops]
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Node added
+
+  /v1/cluster/metrics:
+    get:
+      operationId: clusterMetrics
+      summary: Raft metrics (admin)
+      tags: [Ops]
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Raft metrics document
+
+  /raft/append:
+    post:
+      operationId: raftAppend
+      summary: "Internal: Raft append-entries RPC (node-to-node only)"
+      tags: [Ops]
+      description: |
+        Authenticated with the shared cluster transport secret plus
+        membership/term validation — not for external clients.
+      responses:
+        "200":
+          description: Raft RPC response
+
+  /raft/vote:
+    post:
+      operationId: raftVote
+      summary: "Internal: Raft vote RPC (node-to-node only)"
+      tags: [Ops]
+      responses:
+        "200":
+          description: Raft RPC response
+
+  /raft/snapshot:
+    post:
+      operationId: raftSnapshot
+      summary: "Internal: Raft install-snapshot RPC (node-to-node only)"
+      tags: [Ops]
+      responses:
+        "200":
+          description: Raft RPC response
+
+  /debug/brain-stats:
+    get:
+      operationId: debugBrainStats
+      summary: Detailed engine statistics (admin)
+      tags: [Ops]
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Engine statistics document
+
 components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        API key or hirnd-minted JWT. Mutual-TLS client certificates are
+        also accepted when the server is configured with a client CA.
   parameters:
     AgentId:
       name: X-Agent-ID

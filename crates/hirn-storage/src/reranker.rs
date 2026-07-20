@@ -291,14 +291,31 @@ fn add_score_column_and_sort(
     RecordBatch::try_new(new_schema, columns).map_err(HirnDbError::ArrowError)
 }
 
-/// Extract scores from a column (either existing `_relevance_score` or `_score`).
+/// Extract relevance scores (higher = better) from a result batch.
+///
+/// `_relevance_score` and `_score` are already similarity-oriented and used
+/// as-is. `_distance` is the opposite — lower means nearer/better — so it must
+/// be converted to a similarity before rank fusion. Returning distances raw
+/// (as an earlier version did) made downstream min-max normalization map the
+/// **farthest** vector hit to the best score, inverting vector rankings. We use
+/// the same `1/(1+d)` mapping as the vector-search path so hybrid and vector
+/// reranking agree.
 fn extract_scores(batch: &RecordBatch) -> Vec<f32> {
-    for col_name in [RELEVANCE_SCORE_COLUMN, "_score", "_distance"] {
+    for col_name in [RELEVANCE_SCORE_COLUMN, "_score"] {
         if let Some(col) = batch.column_by_name(col_name)
             && let Some(arr) = col.as_any().downcast_ref::<Float32Array>()
         {
             return arr.values().to_vec();
         }
+    }
+    if let Some(col) = batch.column_by_name("_distance")
+        && let Some(arr) = col.as_any().downcast_ref::<Float32Array>()
+    {
+        return arr
+            .values()
+            .iter()
+            .map(|d| 1.0 / (1.0 + d.max(0.0)))
+            .collect();
     }
     // Fall back to rank-based scores.
     let n = batch.num_rows();

@@ -571,21 +571,17 @@ impl HirnDB {
             return Ok(());
         }
 
-        let entry = hirn_core::audit::AuditEntry {
-            id: payload.audit_entry_id,
-            timestamp: payload.audit_timestamp,
-            actor: None,
-            action: hirn_core::audit::AuditAction::NamespaceDeleted {
+        let mut entry = hirn_core::audit::AuditEntry::new(
+            None,
+            hirn_core::audit::AuditAction::NamespaceDeleted {
                 namespace: payload.namespace.to_string(),
             },
-        };
-        let batch = hirn_storage::datasets::audit::to_batch(std::slice::from_ref(&entry))
-            .map_err(HirnError::storage)?;
-        self.storage_runtime
-            .append(hirn_storage::datasets::audit::DATASET_NAME, batch)
-            .await
-            .map_err(HirnError::storage)?;
-        Ok(())
+        );
+        entry.id = payload.audit_entry_id;
+        entry.timestamp = payload.audit_timestamp;
+        // Route through the policy runtime so the entry gets a seq and — when
+        // an HMAC secret is configured — joins the audit hash chain.
+        self.policy_runtime().append_audit_entry(entry).await
     }
 
     async fn apply_agent_register_plan(&self, payload: &AgentRegisterEnvelope) -> HirnResult<()> {
@@ -661,21 +657,17 @@ impl HirnDB {
             return Ok(());
         }
 
-        let entry = hirn_core::audit::AuditEntry {
-            id: payload.audit_entry_id,
-            timestamp: payload.audit_timestamp,
-            actor: None,
-            action: hirn_core::audit::AuditAction::AgentRegistered {
+        let mut entry = hirn_core::audit::AuditEntry::new(
+            None,
+            hirn_core::audit::AuditAction::AgentRegistered {
                 agent_id: payload.agent.id,
             },
-        };
-        let batch = hirn_storage::datasets::audit::to_batch(std::slice::from_ref(&entry))
-            .map_err(HirnError::storage)?;
-        self.storage_runtime
-            .append(hirn_storage::datasets::audit::DATASET_NAME, batch)
-            .await
-            .map_err(HirnError::storage)?;
-        Ok(())
+        );
+        entry.id = payload.audit_entry_id;
+        entry.timestamp = payload.audit_timestamp;
+        // Route through the policy runtime so the entry gets a seq and — when
+        // an HMAC secret is configured — joins the audit hash chain.
+        self.policy_runtime().append_audit_entry(entry).await
     }
 
     async fn append_agent_deregister_audit_once(
@@ -695,21 +687,17 @@ impl HirnDB {
             return Ok(());
         }
 
-        let entry = hirn_core::audit::AuditEntry {
-            id: payload.audit_entry_id,
-            timestamp: payload.audit_timestamp,
-            actor: None,
-            action: hirn_core::audit::AuditAction::AgentDeregistered {
+        let mut entry = hirn_core::audit::AuditEntry::new(
+            None,
+            hirn_core::audit::AuditAction::AgentDeregistered {
                 agent_id: payload.agent_id,
             },
-        };
-        let batch = hirn_storage::datasets::audit::to_batch(std::slice::from_ref(&entry))
-            .map_err(HirnError::storage)?;
-        self.storage_runtime
-            .append(hirn_storage::datasets::audit::DATASET_NAME, batch)
-            .await
-            .map_err(HirnError::storage)?;
-        Ok(())
+        );
+        entry.id = payload.audit_entry_id;
+        entry.timestamp = payload.audit_timestamp;
+        // Route through the policy runtime so the entry gets a seq and — when
+        // an HMAC secret is configured — joins the audit hash chain.
+        self.policy_runtime().append_audit_entry(entry).await
     }
 
     async fn delete_episode_if_present(&self, id: MemoryId) -> HirnResult<()> {
@@ -1104,6 +1092,13 @@ impl HirnDB {
         action: hirn_core::audit::AuditAction,
     ) -> HirnResult<()> {
         self.policy_runtime().append_audit(actor, action).await
+    }
+
+    /// Verify the tamper-evident hash chain over the `_audit` dataset.
+    pub(crate) async fn verify_audit_chain(
+        &self,
+    ) -> HirnResult<super::policy_runtime::AuditChainVerification> {
+        self.policy_runtime().verify_audit_chain().await
     }
 
     /// Query the audit log, optionally filtering by time range.

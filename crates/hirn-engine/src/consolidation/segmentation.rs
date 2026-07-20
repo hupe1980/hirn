@@ -49,7 +49,9 @@ impl EpisodeSegment {
             let dims = embeddings[0].len();
             let mut mean = vec![0.0f32; dims];
             for emb in &embeddings {
-                for (i, v) in emb.iter().enumerate() {
+                // `.take(dims)` guards against a mixed-dimension embedding (e.g.
+                // after a model migration) indexing past `mean` and panicking.
+                for (i, v) in emb.iter().take(dims).enumerate() {
                     mean[i] += v;
                 }
             }

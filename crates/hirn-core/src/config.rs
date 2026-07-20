@@ -1307,6 +1307,13 @@ impl HirnConfigBuilder {
         self
     }
 
+    /// Secret for HMAC-signing the event log and audit trail (min 32 bytes).
+    #[must_use]
+    pub fn event_hmac_secret(mut self, secret: impl Into<String>) -> Self {
+        self.0.event_hmac_secret = Some(secret.into());
+        self
+    }
+
     #[must_use]
     pub const fn working_memory_token_limit(mut self, limit: u32) -> Self {
         self.0.working_memory_token_limit = limit;

@@ -62,22 +62,44 @@ where
     }
 }
 
+/// Compute the Ebbinghaus retention score with the default spaced-repetition
+/// coefficient (α = 0.5).
+///
+/// See [`retention_score_with_alpha`] for the formula; the consolidation
+/// pipeline passes the configured `spaced_repetition_alpha` instead.
+pub fn retention_score(hours_since_access: f64, stability: f32, rehearsal_count: u64) -> f32 {
+    retention_score_with_alpha(hours_since_access, stability, rehearsal_count, 0.5)
+}
+
 /// Compute the Ebbinghaus retention score.
 ///
-/// Formula: `R = e^(-t / S)` where `S = stability × (1 + 0.5 × ln(rehearsal_count))`.
+/// Formula: `R = e^(-t / S)` where
+/// `S = stability × (1 + α × ln(rehearsal_count.max(1)))`.
 ///
 /// - `hours_since_access`: time elapsed since last retrieval (hours).
 /// - `stability`: per-record stability value (hours). Higher = slower decay.
 /// - `rehearsal_count`: number of times the memory has been retrieved.
+/// - `alpha`: spaced-repetition boost per log-rehearsal
+///   (`spaced_repetition_alpha` in the consolidation config).
 ///
 /// Returns a value in `(0.0, 1.0]` where 1.0 = just accessed, approaching 0.0 over time.
-pub fn retention_score(hours_since_access: f64, stability: f32, rehearsal_count: u64) -> f32 {
-    let effective_stability = stability as f64 * (1.0 + 0.5 * (rehearsal_count.max(1) as f64).ln());
+pub fn retention_score_with_alpha(
+    hours_since_access: f64,
+    stability: f32,
+    rehearsal_count: u64,
+    alpha: f64,
+) -> f32 {
+    let effective_stability =
+        stability as f64 * (1.0 + alpha * (rehearsal_count.max(1) as f64).ln());
     // Guard against division by zero when stability == 0 and hours == 0
     // (would produce NaN via -0.0/0.0 = NaN, then exp(NaN) = NaN).
     // A stability of ~epsilon ensures the record decays immediately (N-H11).
     let effective_stability = effective_stability.max(f64::EPSILON);
-    (-hours_since_access / effective_stability).exp() as f32
+    // Clamp elapsed time to be non-negative. A `last_accessed > now` (clock
+    // rollback, cross-machine restore) would otherwise give `exp(+h/S) > 1`,
+    // making a record *more* retained than fresh and effectively unarchivable.
+    let hours = hours_since_access.max(0.0);
+    (-hours / effective_stability).exp() as f32
 }
 
 /// Decay Hebbian edge weights and prune those that fall below `threshold` in
@@ -91,9 +113,15 @@ async fn decay_and_prune_hebbian_edges(
     now_dt: chrono::DateTime<chrono::Utc>,
 ) -> HirnResult<usize> {
     let all_edges = graph.maintenance_all_edges().await?;
+    // Only associative (RelatedTo) edges are subject to Hebbian time-decay.
+    // Structural relations — Causes, DerivedFrom, PartOf, Contradicts, … —
+    // carry provenance/causality and must never be silently destroyed just
+    // because they happened to be co-retrieved once and then sat idle.
     let hebbian_edges: Vec<_> = all_edges
         .into_iter()
-        .filter(|e| e.co_retrieval_count > 0)
+        .filter(|e| {
+            e.co_retrieval_count > 0 && e.relation == hirn_core::types::EdgeRelation::RelatedTo
+        })
         .collect();
 
     let mut pruned = 0;
@@ -174,12 +202,27 @@ pub async fn run_forgetting(
         }
 
         // Ebbinghaus retention score: R = e^(-t/S)
-        let retention = retention_score(hours_since_access, ep.stability, ep.access_count);
+        let retention = retention_score_with_alpha(
+            hours_since_access,
+            ep.stability,
+            ep.access_count,
+            config.spaced_repetition_alpha,
+        );
         let effective_importance = ep.importance * retention;
 
-        // Check for purging (already archived + effective importance below purge threshold for grace period).
+        // Check for purging (already archived + effective importance below the
+        // purge threshold for the whole grace period). Grace is measured from
+        // the archival revision (`updated_at`, stamped when `archived` was
+        // set) AND from the last access — measuring from last access alone
+        // let a record archived this very pass be hard-deleted immediately if
+        // it simply hadn't been read for a week, i.e. no post-archival grace
+        // at all.
         if ep.archived && effective_importance < purge_threshold {
-            if hours_since_access > grace_period_hours {
+            let hours_since_archival = now_dt
+                .signed_duration_since(ep.updated_at.as_datetime())
+                .num_hours() as f64;
+            if hours_since_access > grace_period_hours && hours_since_archival > grace_period_hours
+            {
                 db.delete_episode(ep.id).await?;
                 records_purged += 1;
                 continue;
@@ -462,7 +505,27 @@ mod tests {
             .await
             .unwrap();
 
+        // An associative (RelatedTo) edge: the only relation subject to
+        // Hebbian decay/pruning.
         let edge_id = db
+            .cached_graph()
+            .add_edge(
+                source_id,
+                target_id,
+                EdgeRelation::RelatedTo,
+                0.1,
+                Metadata::new(),
+            )
+            .await
+            .unwrap();
+        db.cached_graph()
+            .update_edge_weight(edge_id, 0.1, Some(1))
+            .await
+            .unwrap();
+
+        // A structural causal edge with the same weight and co-retrieval
+        // count: forgetting must never destroy provenance/causality.
+        let causal_edge_id = db
             .cached_graph()
             .add_edge(
                 source_id,
@@ -474,7 +537,7 @@ mod tests {
             .await
             .unwrap();
         db.cached_graph()
-            .update_edge_weight(edge_id, 0.1, Some(1))
+            .update_edge_weight(causal_edge_id, 0.1, Some(1))
             .await
             .unwrap();
 
@@ -498,6 +561,27 @@ mod tests {
                 .unwrap()
                 .iter()
                 .all(|edge| edge.id != edge_id)
+        );
+
+        // The causal edge survived in both tiers despite identical weight and
+        // co-retrieval count.
+        assert!(
+            db.cached_graph()
+                .get_edges(source_id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|edge| edge.id == causal_edge_id),
+            "structural Causes edge must survive Hebbian pruning (hot tier)"
+        );
+        assert!(
+            db.persistent_graph()
+                .get_edges(source_id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|edge| edge.id == causal_edge_id),
+            "structural Causes edge must survive Hebbian pruning (cold tier)"
         );
     }
 }

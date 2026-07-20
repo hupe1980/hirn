@@ -587,6 +587,10 @@ fn build_output_batch(
 
     let include_activation = schema.field_with_name("activation_score").is_ok();
     let include_causal = schema.field_with_name("causal_score").is_ok();
+    // Present when the input is a raw recall batch (search stage output);
+    // graph/causal stages emit their own schemas without these columns.
+    let include_layer_salience = schema.field_with_name("confidence").is_ok()
+        && schema.field_with_name("success_rate").is_ok();
 
     let ids = rows
         .iter()
@@ -651,6 +655,19 @@ fn build_output_batch(
         Arc::new(UInt32Array::from(evidence_counts)) as ArrayRef,
         Arc::new(UInt64Array::from(invocation_counts)) as ArrayRef,
     ];
+
+    if include_layer_salience {
+        columns.push(Arc::new(Float32Array::from(
+            rows.iter()
+                .map(|row| row.base.confidence())
+                .collect::<Vec<_>>(),
+        )) as ArrayRef);
+        columns.push(Arc::new(Float32Array::from(
+            rows.iter()
+                .map(|row| row.base.success_rate())
+                .collect::<Vec<_>>(),
+        )) as ArrayRef);
+    }
 
     if include_activation {
         columns.push(Arc::new(Float32Array::from(

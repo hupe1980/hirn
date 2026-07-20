@@ -1,5 +1,6 @@
 //! AST types produced by the HirnQL parser.
 
+use std::collections::HashMap;
 use std::fmt;
 
 use hirn_core::types::{EdgeRelation, Layer};
@@ -300,6 +301,16 @@ impl SemanticTargetRef {
             Self::Memory(value) | Self::Logical(value) | Self::Revision(value) => value,
         }
     }
+
+    /// Replace the inner value (preserving the variant), used by parameter
+    /// binding to substitute a `$param` target with its concrete id.
+    pub fn set_raw_value(&mut self, new_value: String) {
+        match self {
+            Self::Memory(value) | Self::Logical(value) | Self::Revision(value) => {
+                *value = new_value;
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -536,7 +547,7 @@ impl fmt::Display for ExplainCausesStmt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "EXPLAIN CAUSES \"{}\"", EscapeStr(&self.target))?;
         if let Some(ref ns) = self.namespace {
-            write!(f, " NAMESPACE {ns}")?;
+            write_namespace(f, ns)?;
         }
         if let Some(d) = self.depth {
             write!(f, " DEPTH {d}")?;
@@ -554,7 +565,7 @@ impl fmt::Display for WhatIfStmt {
             EscapeStr(&self.outcome)
         )?;
         if let Some(ref ns) = self.namespace {
-            write!(f, " NAMESPACE {ns}")?;
+            write_namespace(f, ns)?;
         }
         Ok(())
     }
@@ -569,7 +580,7 @@ impl fmt::Display for CounterfactualStmt {
             EscapeStr(&self.consequent)
         )?;
         if let Some(ref ns) = self.namespace {
-            write!(f, " NAMESPACE {ns}")?;
+            write_namespace(f, ns)?;
         }
         Ok(())
     }
@@ -594,56 +605,6 @@ fn display_layer(l: Layer) -> &'static str {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn write_shared_clauses(
-    f: &mut fmt::Formatter<'_>,
-    about: &str,
-    involving: Option<&Vec<String>>,
-    temporal: Option<&TemporalClause>,
-    expand: Option<&ExpandClause>,
-    follow_causes: Option<usize>,
-    where_clauses: &[WhereCondition],
-    output_format: Option<OutputFormat>,
-    budget: Option<usize>,
-    namespace: Option<&String>,
-    consistency: Option<ConsistencyLevel>,
-    limit: Option<usize>,
-) -> fmt::Result {
-    write!(f, " ABOUT \"{}\"", EscapeStr(about))?;
-    if let Some(inv) = involving {
-        write!(f, " INVOLVING ")?;
-        write_string_list(f, inv)?;
-    }
-    if let Some(tc) = temporal {
-        write!(f, " {tc}")?;
-    }
-    if let Some(ex) = expand {
-        write!(f, " {ex}")?;
-    }
-    if let Some(d) = follow_causes {
-        write!(f, " FOLLOW CAUSES DEPTH {d}")?;
-    }
-    for wc in where_clauses {
-        write!(f, " {wc}")?;
-    }
-    if let Some(of) = output_format {
-        write!(f, " AS {of}")?;
-    }
-    if let Some(b) = budget {
-        write!(f, " BUDGET {b}")?;
-    }
-    if let Some(ns) = namespace {
-        write!(f, " NAMESPACE {ns}")?;
-    }
-    if let Some(c) = consistency {
-        write!(f, " CONSISTENCY {c}")?;
-    }
-    if let Some(l) = limit {
-        write!(f, " LIMIT {l}")?;
-    }
-    Ok(())
-}
-
 fn write_string_list(f: &mut fmt::Formatter<'_>, items: &[String]) -> fmt::Result {
     for (i, item) in items.iter().enumerate() {
         if i > 0 {
@@ -652,6 +613,15 @@ fn write_string_list(f: &mut fmt::Formatter<'_>, items: &[String]) -> fmt::Resul
         write!(f, "\"{}\"", EscapeStr(item))?;
     }
     Ok(())
+}
+
+/// Render a ` NAMESPACE "..."` clause with the namespace quoted and escaped.
+///
+/// `namespace_clause` accepts a quoted `string_literal`, so quoting is both
+/// safe (a namespace containing spaces/quotes cannot break out and inject
+/// trailing clauses when a statement is re-serialized) and round-trips.
+fn write_namespace(f: &mut fmt::Formatter<'_>, ns: &str) -> fmt::Result {
+    write!(f, " NAMESPACE \"{}\"", EscapeStr(ns))
 }
 
 fn write_semantic_target_list(
@@ -689,6 +659,23 @@ impl fmt::Display for EscapeStr<'_> {
     }
 }
 
+/// Format a float so it always carries a decimal point. The grammar's
+/// `float_literal` requires a `.`, so a whole-number float like `1.0` must not
+/// serialize as `1` — otherwise it fails to re-parse (or silently re-parses as
+/// an integer) on the prepared-statement round-trip path.
+struct FloatLit(f64);
+
+impl fmt::Display for FloatLit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let v = self.0;
+        if v.is_finite() && v.fract() == 0.0 {
+            write!(f, "{v:.1}")
+        } else {
+            write!(f, "{v}")
+        }
+    }
+}
+
 impl fmt::Display for SemanticTargetRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -701,24 +688,29 @@ impl fmt::Display for SemanticTargetRef {
 
 impl fmt::Display for RecallStmt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Clauses MUST be emitted in exact grammar order (see `recall_stmt` in
+        // hirnql.pest) so the rendered statement re-parses to an equal AST.
         write!(f, "RECALL ")?;
         write_layer_filter(f, &self.layers)?;
-        write_shared_clauses(
-            f,
-            &self.about,
-            self.involving.as_ref(),
-            self.temporal.as_ref(),
-            self.expand.as_ref(),
-            self.follow_causes,
-            &self.where_clauses,
-            self.output_format,
-            self.budget,
-            self.namespace.as_ref(),
-            self.consistency,
-            self.limit,
-        )?;
+        write!(f, " ABOUT \"{}\"", EscapeStr(&self.about))?;
+        if let Some(ref inv) = self.involving {
+            write!(f, " INVOLVING ")?;
+            write_string_list(f, inv)?;
+        }
+        if let Some(ref tc) = self.temporal {
+            write!(f, " {tc}")?;
+        }
         if let Some(ref snapshot) = self.as_of {
             write!(f, " AS OF {snapshot}")?;
+        }
+        if let Some(ref ex) = self.expand {
+            write!(f, " {ex}")?;
+        }
+        if let Some(d) = self.follow_causes {
+            write!(f, " FOLLOW CAUSES DEPTH {d}")?;
+        }
+        for wc in &self.where_clauses {
+            write!(f, " {wc}")?;
         }
         for sf in &self.subquery_filters {
             write!(f, " WHERE {} IN ({})", sf.field, sf.subquery)?;
@@ -734,15 +726,6 @@ impl fmt::Display for RecallStmt {
         }
         if let Some(ref artifact_kinds) = self.artifact_kinds {
             write!(f, " ARTIFACT {}", artifact_kinds.join(", "))?;
-        }
-        if let Some(ref gb) = self.group_by {
-            write!(f, " GROUP BY {} {}", gb.field, gb.function)?;
-        }
-        if let Some(ref proj) = self.projection {
-            write!(f, " SELECT {}", proj.join(", "))?;
-        }
-        if let Some(ref rf) = self.result_format {
-            write!(f, " FORMAT {rf}")?;
         }
         if let Some(dm) = self.depth_mode {
             write!(f, " DEPTH {dm}")?;
@@ -762,6 +745,24 @@ impl fmt::Display for RecallStmt {
         if let Some(pd) = self.provenance_depth {
             write!(f, " WITH PROVENANCE DEPTH {pd}")?;
         }
+        if let Some(ref gb) = self.group_by {
+            write!(f, " GROUP BY {} {}", gb.field, gb.function)?;
+        }
+        if let Some(ref proj) = self.projection {
+            write!(f, " SELECT {}", proj.join(", "))?;
+        }
+        if let Some(of) = self.output_format {
+            write!(f, " AS {of}")?;
+        }
+        if let Some(ref rf) = self.result_format {
+            write!(f, " FORMAT {rf}")?;
+        }
+        if let Some(b) = self.budget {
+            write!(f, " BUDGET {b}")?;
+        }
+        if let Some(ref ns) = self.namespace {
+            write_namespace(f, ns)?;
+        }
         if let Some(ref realms) = self.from_realms {
             write!(f, " FROM REALM ")?;
             for (i, r) in realms.iter().enumerate() {
@@ -770,6 +771,12 @@ impl fmt::Display for RecallStmt {
                 }
                 write!(f, "\"{}\"", EscapeStr(r))?;
             }
+        }
+        if let Some(c) = self.consistency {
+            write!(f, " CONSISTENCY {c}")?;
+        }
+        if let Some(l) = self.limit {
+            write!(f, " LIMIT {l}")?;
         }
         if self.hybrid {
             write!(f, " HYBRID")?;
@@ -785,13 +792,16 @@ impl fmt::Display for RecallEventsStmt {
             write!(f, " FOR \"{}\"", EscapeStr(entity))?;
         }
         for wc in &self.where_clauses {
-            write!(f, " WHERE {wc}")?;
+            // `WhereCondition::Display` already emits the `WHERE` keyword; an
+            // extra one here produced `WHERE WHERE …`, which fails to re-parse
+            // on the prepared-statement round-trip path.
+            write!(f, " {wc}")?;
         }
         if let Some(ref tc) = self.temporal {
             write!(f, " {tc}")?;
         }
         if let Some(ref ns) = self.namespace {
-            write!(f, " NAMESPACE {ns}")?;
+            write_namespace(f, ns)?;
         }
         if let Some(l) = self.limit {
             write!(f, " LIMIT {l}")?;
@@ -802,35 +812,27 @@ impl fmt::Display for RecallEventsStmt {
 
 impl fmt::Display for ThinkStmt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Exact grammar order per `think_stmt` in hirnql.pest.
         write!(f, "THINK")?;
         if self.mode == RetrievalMode::Global {
             write!(f, " GLOBAL")?;
         }
-        write_shared_clauses(
-            f,
-            &self.about,
-            self.involving.as_ref(),
-            self.temporal.as_ref(),
-            self.expand.as_ref(),
-            self.follow_causes,
-            &self.where_clauses,
-            self.output_format,
-            self.budget,
-            self.namespace.as_ref(),
-            self.consistency,
-            self.limit,
-        )?;
-        match self.mode {
-            RetrievalMode::Hybrid => write!(f, " MODE hybrid")?,
-            RetrievalMode::Raptor => write!(f, " MODE raptor")?,
-            RetrievalMode::Adaptive => write!(f, " MODE adaptive")?,
-            RetrievalMode::Iterative => {
-                write!(f, " MODE iterative")?;
-                if let Some(mh) = self.max_hops {
-                    write!(f, " MAX_HOPS {mh}")?;
-                }
-            }
-            _ => {}
+        write!(f, " ABOUT \"{}\"", EscapeStr(&self.about))?;
+        if let Some(ref inv) = self.involving {
+            write!(f, " INVOLVING ")?;
+            write_string_list(f, inv)?;
+        }
+        if let Some(ref tc) = self.temporal {
+            write!(f, " {tc}")?;
+        }
+        if let Some(ref ex) = self.expand {
+            write!(f, " {ex}")?;
+        }
+        if let Some(d) = self.follow_causes {
+            write!(f, " FOLLOW CAUSES DEPTH {d}")?;
+        }
+        for wc in &self.where_clauses {
+            write!(f, " {wc}")?;
         }
         if let Some(dm) = self.depth_mode {
             write!(f, " DEPTH {dm}")?;
@@ -843,6 +845,33 @@ impl fmt::Display for ThinkStmt {
         }
         if let Some(pd) = self.provenance_depth {
             write!(f, " WITH PROVENANCE DEPTH {pd}")?;
+        }
+        if let Some(of) = self.output_format {
+            write!(f, " AS {of}")?;
+        }
+        if let Some(b) = self.budget {
+            write!(f, " BUDGET {b}")?;
+        }
+        if let Some(ref ns) = self.namespace {
+            write_namespace(f, ns)?;
+        }
+        if let Some(c) = self.consistency {
+            write!(f, " CONSISTENCY {c}")?;
+        }
+        if let Some(l) = self.limit {
+            write!(f, " LIMIT {l}")?;
+        }
+        match self.mode {
+            RetrievalMode::Hybrid => write!(f, " MODE hybrid")?,
+            RetrievalMode::Raptor => write!(f, " MODE raptor")?,
+            RetrievalMode::Adaptive => write!(f, " MODE adaptive")?,
+            RetrievalMode::Iterative => {
+                write!(f, " MODE iterative")?;
+                if let Some(mh) = self.max_hops {
+                    write!(f, " MAX_HOPS {mh}")?;
+                }
+            }
+            _ => {}
         }
         if let Some(depth) = self.community_depth {
             write!(f, " COMMUNITY_DEPTH {depth}")?;
@@ -863,11 +892,11 @@ impl fmt::Display for SetAssignment {
 impl fmt::Display for SetValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Float(v) => write!(f, "{v}"),
+            Self::Float(v) => write!(f, "{}", FloatLit(*v)),
             Self::Int(v) => write!(f, "{v}"),
-            Self::String(v) => write!(f, "\"{v}\""),
-            Self::Max(field, val) => write!(f, "MAX({field}, {val})"),
-            Self::Min(field, val) => write!(f, "MIN({field}, {val})"),
+            Self::String(v) => write!(f, "\"{}\"", EscapeStr(v)),
+            Self::Max(field, val) => write!(f, "MAX({field}, {})", FloatLit(*val)),
+            Self::Min(field, val) => write!(f, "MIN({field}, {})", FloatLit(*val)),
         }
     }
 }
@@ -891,7 +920,7 @@ impl fmt::Display for CorrectStmt {
             write!(f, " CAUSED BY \"{}\"", EscapeStr(caused_by))?;
         }
         if let Some(ref namespace) = self.namespace {
-            write!(f, " NAMESPACE {namespace}")?;
+            write_namespace(f, namespace)?;
         }
         Ok(())
     }
@@ -916,7 +945,7 @@ impl fmt::Display for SupersedeStmt {
             write!(f, " CAUSED BY \"{}\"", EscapeStr(caused_by))?;
         }
         if let Some(ref namespace) = self.namespace {
-            write!(f, " NAMESPACE {namespace}")?;
+            write_namespace(f, namespace)?;
         }
         Ok(())
     }
@@ -946,7 +975,7 @@ impl fmt::Display for MergeMemoryStmt {
             write!(f, " CAUSED BY \"{}\"", EscapeStr(caused_by))?;
         }
         if let Some(ref namespace) = self.namespace {
-            write!(f, " NAMESPACE {namespace}")?;
+            write_namespace(f, namespace)?;
         }
         Ok(())
     }
@@ -965,7 +994,7 @@ impl fmt::Display for RetractStmt {
             write!(f, " CAUSED BY \"{}\"", EscapeStr(caused_by))?;
         }
         if let Some(ref namespace) = self.namespace {
-            write!(f, " NAMESPACE {namespace}")?;
+            write_namespace(f, namespace)?;
         }
         Ok(())
     }
@@ -981,7 +1010,7 @@ impl fmt::Display for HistoryStmt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "HISTORY {}", self.target)?;
         if let Some(ref namespace) = self.namespace {
-            write!(f, " NAMESPACE {namespace}")?;
+            write_namespace(f, namespace)?;
         }
         Ok(())
     }
@@ -996,9 +1025,16 @@ impl fmt::Display for TraceStmt {
 impl fmt::Display for TemporalClause {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::After(ts) => write!(f, "AFTER \"{ts}\""),
-            Self::Before(ts) => write!(f, "BEFORE \"{ts}\""),
-            Self::Between { start, end } => write!(f, "BETWEEN \"{start}\" AND \"{end}\""),
+            Self::After(ts) => write!(f, "AFTER \"{}\"", EscapeStr(ts)),
+            Self::Before(ts) => write!(f, "BEFORE \"{}\"", EscapeStr(ts)),
+            Self::Between { start, end } => {
+                write!(
+                    f,
+                    "BETWEEN \"{}\" AND \"{}\"",
+                    EscapeStr(start),
+                    EscapeStr(end)
+                )
+            }
         }
     }
 }
@@ -1007,7 +1043,7 @@ impl fmt::Display for ExpandClause {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "EXPAND GRAPH DEPTH {}", self.depth)?;
         if let Some(mw) = self.min_weight {
-            write!(f, " MIN_WEIGHT {mw}")?;
+            write!(f, " MIN_WEIGHT {}", FloatLit(f64::from(mw)))?;
         }
         if let Some(am) = self.activation {
             write!(f, " ACTIVATION {am}")?;
@@ -1043,7 +1079,7 @@ impl fmt::Display for ComparisonOp {
 impl fmt::Display for ConditionValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Float(value) => write!(f, "{value}"),
+            Self::Float(value) => write!(f, "{}", FloatLit(*value)),
             Self::Int(value) => write!(f, "{value}"),
             Self::String(value) => write!(f, "\"{}\"", EscapeStr(value)),
             Self::Param(value) => write!(f, "{value}"),
@@ -1097,7 +1133,7 @@ impl fmt::Display for Subquery {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "RECALL ")?;
         write_layer_filter(f, &self.layers)?;
-        write!(f, " ABOUT \"{}\"", self.about)?;
+        write!(f, " ABOUT \"{}\"", EscapeStr(&self.about))?;
         if let Some(ref inv) = self.involving {
             write!(f, " INVOLVING ")?;
             write_string_list(f, inv)?;
@@ -1131,11 +1167,11 @@ impl fmt::Display for TraverseStmt {
             write!(f, " VIA {}", via.join(", "))?;
         }
         write!(f, " DEPTH {}", self.depth)?;
-        if let Some(ref ns) = self.namespace {
-            write!(f, " NAMESPACE \"{}\"", EscapeStr(ns))?;
-        }
         for wc in &self.where_clauses {
             write!(f, " {wc}")?;
+        }
+        if let Some(ref ns) = self.namespace {
+            write_namespace(f, ns)?;
         }
         if let Some(n) = self.limit {
             write!(f, " LIMIT {n}")?;
@@ -1340,8 +1376,10 @@ pub enum TierPolicyValue {
 impl fmt::Display for TierPolicyValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Str(s) => write!(f, "'{s}'"),
-            Self::Float(v) => write!(f, "{v}"),
+            // Rendered double-quoted (a valid `string_literal`) with the same
+            // escaping as every other string clause, so it round-trips cleanly.
+            Self::Str(s) => write!(f, "\"{}\"", EscapeStr(s)),
+            Self::Float(v) => write!(f, "{}", FloatLit(*v)),
             Self::Int(v) => write!(f, "{v}"),
         }
     }
@@ -1358,12 +1396,7 @@ pub struct SetTierPolicyStmt {
 
 impl fmt::Display for SetTierPolicyStmt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "SET TIER_POLICY {} = ", self.field)?;
-        match &self.value {
-            TierPolicyValue::Str(s) => write!(f, "'{}'", EscapeStr(s)),
-            TierPolicyValue::Float(v) => write!(f, "{v}"),
-            TierPolicyValue::Int(v) => write!(f, "{v}"),
-        }
+        write!(f, "SET TIER_POLICY {} = {}", self.field, self.value)
     }
 }
 
@@ -1402,10 +1435,22 @@ pub fn collect_parameters(stmt: &Statement) -> Vec<String> {
     match stmt {
         Statement::Recall(r) => {
             check(&r.about, &mut params);
+            if let Some(ref topic) = r.topic {
+                check(topic, &mut params);
+            }
+            if let Some(ref ns) = r.namespace {
+                check(ns, &mut params);
+            }
+            for sf in &r.subquery_filters {
+                check(&sf.subquery.about, &mut params);
+            }
             check_wheres(&r.where_clauses, &mut params);
         }
         Statement::Think(t) => {
             check(&t.about, &mut params);
+            if let Some(ref ns) = t.namespace {
+                check(ns, &mut params);
+            }
             check_wheres(&t.where_clauses, &mut params);
         }
         Statement::Correct(c) => {
@@ -1461,13 +1506,21 @@ pub fn collect_parameters(stmt: &Statement) -> Vec<String> {
         }
         Statement::Traverse(t) => {
             check(&t.from, &mut params);
+            if let Some(ref ns) = t.namespace {
+                check(ns, &mut params);
+            }
             check_wheres(&t.where_clauses, &mut params);
         }
         Statement::Inspect(i) => check(i.target.raw_value(), &mut params),
         Statement::History(h) => check(h.target.raw_value(), &mut params),
         Statement::Trace(t) => check(t.target.raw_value(), &mut params),
         Statement::Explain(e) => return collect_parameters(&e.inner),
-        Statement::RecallEvents(r) => check_wheres(&r.where_clauses, &mut params),
+        Statement::RecallEvents(r) => {
+            if let Some(ref entity) = r.entity_filter {
+                check(entity, &mut params);
+            }
+            check_wheres(&r.where_clauses, &mut params);
+        }
         Statement::CreateRealm(_)
         | Statement::DropRealm(_)
         | Statement::Grant(_)
@@ -1491,9 +1544,247 @@ pub fn collect_parameters(stmt: &Statement) -> Vec<String> {
     params
 }
 
+/// Bind parameter values into a statement **at the AST level**.
+///
+/// `values` maps parameter names (with `$` prefix) to their string
+/// representations. Each `$param` placeholder in a string field is replaced
+/// with its value, and each `ConditionValue::Param` becomes a typed value
+/// (integer, float, or string, inferred from the value).
+///
+/// This is the safe alternative to textual substitution on the query source:
+/// because values are placed into typed AST nodes (not spliced into the query
+/// text), a value can never break out of a string literal to inject trailing
+/// clauses, and there is no `$t` / `$t2` prefix-collision hazard.
+///
+/// Returns the sorted list of parameter names that had no provided value.
+pub fn bind_parameters(stmt: &mut Statement, values: &HashMap<String, String>) -> Vec<String> {
+    let mut missing = Vec::new();
+
+    // Substitute a raw-`$name` string field.
+    fn subst(s: &mut String, values: &HashMap<String, String>, missing: &mut Vec<String>) {
+        if is_param(s) {
+            match values.get(s.as_str()) {
+                Some(v) => *s = v.clone(),
+                None => {
+                    if !missing.contains(s) {
+                        missing.push(s.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    fn subst_wheres(
+        wcs: &mut [WhereCondition],
+        values: &HashMap<String, String>,
+        missing: &mut Vec<String>,
+    ) {
+        for wc in wcs {
+            if let ConditionValue::Param(name) = &wc.value {
+                match values.get(name) {
+                    Some(v) => wc.value = bound_condition_value(v),
+                    None => {
+                        if !missing.contains(name) {
+                            missing.push(name.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    match stmt {
+        Statement::Recall(r) => {
+            subst(&mut r.about, values, &mut missing);
+            if let Some(ref mut topic) = r.topic {
+                subst(topic, values, &mut missing);
+            }
+            if let Some(ref mut ns) = r.namespace {
+                subst(ns, values, &mut missing);
+            }
+            for sf in &mut r.subquery_filters {
+                subst(&mut sf.subquery.about, values, &mut missing);
+            }
+            subst_wheres(&mut r.where_clauses, values, &mut missing);
+        }
+        Statement::Think(t) => {
+            subst(&mut t.about, values, &mut missing);
+            if let Some(ref mut ns) = t.namespace {
+                subst(ns, values, &mut missing);
+            }
+            subst_wheres(&mut t.where_clauses, values, &mut missing);
+        }
+        Statement::Correct(c) => {
+            subst_target(&mut c.target, values, &mut missing);
+            subst_opt(&mut c.reason, values, &mut missing);
+            subst_opt(&mut c.observed_at, values, &mut missing);
+            subst_opt(&mut c.caused_by, values, &mut missing);
+        }
+        Statement::Supersede(s) => {
+            subst_target(&mut s.target, values, &mut missing);
+            subst_opt(&mut s.reason, values, &mut missing);
+            subst_opt(&mut s.observed_at, values, &mut missing);
+            subst_opt(&mut s.caused_by, values, &mut missing);
+        }
+        Statement::MergeMemory(m) => {
+            for source in &mut m.sources {
+                subst_target(source, values, &mut missing);
+            }
+            subst_target(&mut m.target, values, &mut missing);
+            subst_opt(&mut m.reason, values, &mut missing);
+            subst_opt(&mut m.observed_at, values, &mut missing);
+            subst_opt(&mut m.caused_by, values, &mut missing);
+        }
+        Statement::Retract(r) => {
+            subst_target(&mut r.target, values, &mut missing);
+            subst_opt(&mut r.reason, values, &mut missing);
+            subst_opt(&mut r.observed_at, values, &mut missing);
+            subst_opt(&mut r.caused_by, values, &mut missing);
+        }
+        Statement::Traverse(t) => {
+            subst(&mut t.from, values, &mut missing);
+            if let Some(ref mut ns) = t.namespace {
+                subst(ns, values, &mut missing);
+            }
+            subst_wheres(&mut t.where_clauses, values, &mut missing);
+        }
+        Statement::Inspect(i) => subst_target(&mut i.target, values, &mut missing),
+        Statement::History(h) => subst_target(&mut h.target, values, &mut missing),
+        Statement::Trace(t) => subst_target(&mut t.target, values, &mut missing),
+        Statement::Explain(e) => return bind_parameters(&mut e.inner, values),
+        Statement::RecallEvents(r) => {
+            if let Some(ref mut entity) = r.entity_filter {
+                subst(entity, values, &mut missing);
+            }
+            subst_wheres(&mut r.where_clauses, values, &mut missing);
+        }
+        Statement::ExplainCauses(e) => subst(&mut e.target, values, &mut missing),
+        Statement::WhatIf(w) => {
+            subst(&mut w.intervention, values, &mut missing);
+            subst(&mut w.outcome, values, &mut missing);
+        }
+        Statement::Counterfactual(c) => {
+            subst(&mut c.antecedent, values, &mut missing);
+            subst(&mut c.consequent, values, &mut missing);
+        }
+        Statement::CreateRealm(_)
+        | Statement::DropRealm(_)
+        | Statement::Grant(_)
+        | Statement::Revoke(_)
+        | Statement::ShowPolicies(_)
+        | Statement::ExplainPolicy(_)
+        | Statement::ShowCluster
+        | Statement::SetTierPolicy(_) => {}
+    }
+
+    missing.sort();
+    missing
+}
+
+fn subst_opt(
+    field: &mut Option<String>,
+    values: &HashMap<String, String>,
+    missing: &mut Vec<String>,
+) {
+    if let Some(s) = field {
+        if is_param(s) {
+            match values.get(s.as_str()) {
+                Some(v) => *s = v.clone(),
+                None => {
+                    if !missing.contains(s) {
+                        missing.push(s.clone());
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn subst_target(
+    target: &mut SemanticTargetRef,
+    values: &HashMap<String, String>,
+    missing: &mut Vec<String>,
+) {
+    let raw = target.raw_value().to_string();
+    if is_param(&raw) {
+        match values.get(&raw) {
+            Some(v) => target.set_raw_value(v.clone()),
+            None => {
+                if !missing.contains(&raw) {
+                    missing.push(raw);
+                }
+            }
+        }
+    }
+}
+
+/// Infer a typed `ConditionValue` from a bound parameter's string value:
+/// integer, then float, otherwise a string.
+fn bound_condition_value(v: &str) -> ConditionValue {
+    if let Ok(i) = v.parse::<i64>() {
+        ConditionValue::Int(i)
+    } else if let Ok(fl) = v.parse::<f64>() {
+        ConditionValue::Float(fl)
+    } else {
+        ConditionValue::String(v.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parse;
+
+    #[test]
+    fn bind_parameters_substitutes_into_ast_and_resists_injection() {
+        // A value crafted to break out of the string literal and inject a
+        // trailing clause (`" NAMESPACE evil ...`). AST-level binding must place
+        // it into the `about` node verbatim — it can never become a clause.
+        let mut stmt = parse(r#"RECALL episodic ABOUT $q LIMIT 5"#).unwrap();
+        let mut values = HashMap::new();
+        values.insert(
+            "$q".to_string(),
+            r#"hello" NAMESPACE "attacker"#.to_string(),
+        );
+        let missing = bind_parameters(&mut stmt, &values);
+        assert!(missing.is_empty(), "no missing params, got {missing:?}");
+
+        // Re-serialize and re-parse: the injected text is still just the ABOUT
+        // value, and the namespace was NOT set from the payload.
+        let rendered = stmt.to_string();
+        let reparsed = parse(&rendered).unwrap();
+        match reparsed {
+            Statement::Recall(r) => {
+                assert_eq!(r.about, r#"hello" NAMESPACE "attacker"#);
+                assert_eq!(r.namespace, None, "payload must not become a namespace");
+                assert_eq!(r.limit, Some(5));
+            }
+            other => panic!("expected Recall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bind_parameters_reports_missing() {
+        let mut stmt = parse(r#"RECALL episodic ABOUT $q WHERE importance > $t"#).unwrap();
+        let values = HashMap::new();
+        let mut missing = bind_parameters(&mut stmt, &values);
+        missing.sort();
+        assert_eq!(missing, vec!["$q".to_string(), "$t".to_string()]);
+    }
+
+    #[test]
+    fn bind_parameters_typed_where_value() {
+        let mut stmt = parse(r#"RECALL episodic ABOUT "x" WHERE importance > $t"#).unwrap();
+        let mut values = HashMap::new();
+        values.insert("$t".to_string(), "0.75".to_string());
+        assert!(bind_parameters(&mut stmt, &values).is_empty());
+        match stmt {
+            Statement::Recall(r) => {
+                assert_eq!(r.where_clauses[0].value, ConditionValue::Float(0.75));
+            }
+            _ => panic!("expected Recall"),
+        }
+    }
 
     #[test]
     fn display_recall() {

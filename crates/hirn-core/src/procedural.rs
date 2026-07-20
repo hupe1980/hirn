@@ -95,7 +95,11 @@ pub struct ProceduralRecord {
     pub success_count: u64,
     /// How often this procedure has been invoked (success + failure).
     pub invocation_count: u64,
-    /// Success rate = `success_count` / `invocation_count` (cached).
+    /// Cached success rate in `[0, 1]`. For the first
+    /// `SUCCESS_RATE_EMA_WARMUP` invocations this is the exact
+    /// `success_count` / `invocation_count` ratio; afterwards it is a
+    /// recency-weighted exponential moving average (α = 0.1). Updated by
+    /// [`ProceduralRecord::record_success`] / [`record_failure`].
     pub success_rate: f32,
     /// Source episodes that contributed to learning this procedure.
     pub source_episodes: Vec<MemoryId>,
@@ -137,25 +141,47 @@ impl ProceduralRecord {
     /// Record a successful invocation.
     ///
     /// F-81: Uses an exponential moving average (EMA) with α=0.1 so recent
-    /// outcomes are weighted more heavily than ancient history. The all-time
-    /// `success_count`/`invocation_count` ratio is still available via those
-    /// fields for long-term analytics.
+    /// outcomes are weighted more heavily than ancient history — but only
+    /// **after a warmup window**. During the first
+    /// [`SUCCESS_RATE_EMA_WARMUP`](Self::SUCCESS_RATE_EMA_WARMUP) invocations the
+    /// rate is the exact `success_count`/`invocation_count` ratio, so a freshly
+    /// learned skill with a perfect 3/3 record reports 1.0 (not 0.271) and is
+    /// not demoted below `tier_procedural_min_success_rate` before it has had a
+    /// fair chance. The all-time counts remain available for analytics.
     pub fn record_success(&mut self) {
         self.invocation_count += 1;
         self.success_count += 1;
-        // EMA: rate = α·outcome + (1-α)·rate, α = 0.1
-        self.success_rate = 0.1_f32
-            .mul_add(1.0, 0.9 * self.success_rate)
-            .clamp(0.0, 1.0);
+        self.recompute_success_rate(true);
         self.updated_at = Timestamp::now();
     }
 
     /// Record a failed invocation.
     pub fn record_failure(&mut self) {
         self.invocation_count += 1;
-        // EMA: rate = α·outcome + (1-α)·rate, outcome = 0.0
-        self.success_rate = (0.9 * self.success_rate).clamp(0.0, 1.0);
+        self.recompute_success_rate(false);
         self.updated_at = Timestamp::now();
+    }
+
+    /// Number of invocations during which `success_rate` tracks the exact
+    /// count ratio before switching to the EMA. Chosen so that a small handful
+    /// of early outcomes is reflected faithfully, avoiding the cold-start bias
+    /// where `1 − 0.9ⁿ` keeps a perfect new skill under the retention threshold.
+    pub const SUCCESS_RATE_EMA_WARMUP: u64 = 5;
+
+    /// Update `success_rate` given the latest `outcome` (true = success),
+    /// counts already incremented. Ratio during warmup, EMA afterwards.
+    fn recompute_success_rate(&mut self, outcome: bool) {
+        if self.invocation_count <= Self::SUCCESS_RATE_EMA_WARMUP {
+            // Exact ratio while we have too little history for the EMA to be fair.
+            self.success_rate =
+                (self.success_count as f32 / self.invocation_count as f32).clamp(0.0, 1.0);
+        } else {
+            // EMA: rate = α·outcome + (1-α)·rate, α = 0.1.
+            let sample = if outcome { 1.0_f32 } else { 0.0_f32 };
+            self.success_rate = 0.1_f32
+                .mul_add(sample, 0.9 * self.success_rate)
+                .clamp(0.0, 1.0);
+        }
     }
 
     /// Whether this revision is a retraction/tombstone.
@@ -368,8 +394,44 @@ mod tests {
         record.record_failure();
         assert_eq!(record.invocation_count, 3);
         assert_eq!(record.success_count, 2);
-        // F-81: EMA with α=0.1: 0.0 → 0.1 → 0.19 → 0.171
-        assert!((record.success_rate - 0.171).abs() < 0.001);
+        // Within the warmup window the rate is the exact ratio 2/3, not the
+        // cold-start-biased EMA value 0.171.
+        assert!((record.success_rate - 2.0 / 3.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn fresh_skill_with_perfect_record_is_not_cold_start_biased() {
+        // Three consecutive successes must report 1.0, not the old
+        // `1 − 0.9³ = 0.271` which sat below the default retention threshold
+        // (0.3) and got a perfect new skill pruned.
+        let agent = AgentId::new("agent_a").unwrap();
+        let mut record = ProceduralRecord::builder()
+            .name("p")
+            .description("d")
+            .agent_id(agent)
+            .build()
+            .unwrap();
+        record.record_success();
+        record.record_success();
+        record.record_success();
+        assert!((record.success_rate - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn success_rate_switches_to_ema_after_warmup() {
+        let agent = AgentId::new("agent_a").unwrap();
+        let mut record = ProceduralRecord::builder()
+            .name("p")
+            .description("d")
+            .agent_id(agent)
+            .build()
+            .unwrap();
+        for _ in 0..ProceduralRecord::SUCCESS_RATE_EMA_WARMUP {
+            record.record_success();
+        }
+        assert!((record.success_rate - 1.0).abs() < f32::EPSILON);
+        record.record_failure();
+        assert!((record.success_rate - 0.9).abs() < 0.001);
     }
 
     #[test]

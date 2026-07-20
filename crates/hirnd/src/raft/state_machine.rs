@@ -100,6 +100,12 @@ impl HirnStateMachine {
     ///
     /// Takes `&mut StateMachineData` directly to avoid re-acquiring the write lock.
     /// The caller (`apply()`) holds the lock for the duration of the entire entry.
+    ///
+    /// This function must be a pure function of the entry data: no local
+    /// clocks, randomness, or other node-local state. Time-dependent commands
+    /// (lease acquire/renew) carry a `proposed_at_epoch_secs` stamp from the
+    /// proposal site, so replicas applying the same log converge on identical
+    /// state even under clock skew.
     fn apply_request(data: &mut StateMachineData, req: &RaftRequest) -> RaftResponse {
         match req {
             RaftRequest::AssignRealm { realm, owner_node } => {
@@ -119,10 +125,16 @@ impl HirnStateMachine {
                 realm,
                 holder,
                 duration_secs,
+                proposed_at_epoch_secs,
             } => {
-                // Check for existing unexpired lease.
+                // Check for existing unexpired lease. Expiry is evaluated
+                // against the proposal timestamp carried in the entry — never
+                // the local clock — so every replica reaches the same
+                // Ok-vs-LeaseConflict decision for this entry.
                 if let Some(existing) = data.leases.get(realm) {
-                    if !existing.is_expired() && existing.holder != *holder {
+                    if !existing.is_expired_at(*proposed_at_epoch_secs)
+                        && existing.holder != *holder
+                    {
                         debug!(
                             realm = %realm,
                             current_holder = existing.holder,
@@ -135,7 +147,12 @@ impl HirnStateMachine {
                         };
                     }
                 }
-                let lease = ConsolidationLease::new(realm.clone(), *holder, *duration_secs);
+                let lease = ConsolidationLease::new(
+                    realm.clone(),
+                    *holder,
+                    *duration_secs,
+                    *proposed_at_epoch_secs,
+                );
                 info!(realm = %realm, holder = holder, duration = duration_secs, "lease acquired");
                 data.leases.insert(realm.clone(), lease);
                 RaftResponse::Ok
@@ -160,10 +177,13 @@ impl HirnStateMachine {
                 realm,
                 holder,
                 duration_secs,
+                proposed_at_epoch_secs,
             } => {
                 if let Some(lease) = data.leases.get_mut(realm) {
                     if lease.holder == *holder {
-                        lease.renew(*duration_secs);
+                        // Renewal extends from the proposal timestamp so all
+                        // replicas store the same expiry.
+                        lease.renew_at(*duration_secs, *proposed_at_epoch_secs);
                         debug!(realm = %realm, holder = holder, "lease renewed");
                         return RaftResponse::Ok;
                     }

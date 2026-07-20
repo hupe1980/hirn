@@ -1,8 +1,10 @@
 //! Shared conformance test suite for `PhysicalStore` implementations.
 //!
-//! Uses a macro to run identical tests against any backend.
-//! Currently exercised with `MemoryStore`; LancePhysicalStore uses
-//! the same helpers in `lance_integration.rs`.
+//! The `conformance_tests!` macro runs an identical battery of tests against a
+//! store produced by the given expression. It is instantiated for **both**
+//! backends — the in-memory `MemoryStore` (fast, used everywhere in unit tests)
+//! and the real `LancePhysicalStore` (the production backend) — so the two can
+//! never silently diverge on the paths recall depends on.
 
 use std::sync::Arc;
 
@@ -13,9 +15,23 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
 use hirn_core::{HydrationMode, ModalityProfile, ResourceLocation, ResourceObject};
+use hirn_storage::lance_store::LancePhysicalStore;
 use hirn_storage::memory_store::MemoryStore;
+use hirn_storage::namespace::NamespaceConfig;
 use hirn_storage::resource_ops::{fetch_resource, persist_resource};
 use hirn_storage::store::*;
+
+/// Build a real `LancePhysicalStore` on a fresh temp directory for conformance.
+///
+/// The temp directory is intentionally leaked (`into_path`) so its files
+/// outlive the test, which only holds the store — the OS reclaims them when the
+/// short-lived test process exits.
+async fn lance_conformance_store() -> LancePhysicalStore {
+    let tmpdir = tempfile::TempDir::new().unwrap();
+    let root = tmpdir.keep().to_str().unwrap().to_string();
+    let ns = NamespaceConfig::local(&root).connect().await.unwrap();
+    LancePhysicalStore::new(root, ns)
+}
 
 // ── Test data helpers ──
 
@@ -507,6 +523,22 @@ macro_rules! conformance_tests {
             );
             store.append("docs", batch).await.unwrap();
 
+            // A full-text index is required for FTS on the Lance backend (a
+            // no-op on the in-memory store). Creating it keeps the test
+            // backend-agnostic.
+            store
+                .create_index(
+                    "docs",
+                    IndexConfig {
+                        columns: vec!["text".to_string()],
+                        index_type: IndexType::Bm25,
+                        params: IndexParams::default(),
+                        replace: false,
+                    },
+                )
+                .await
+                .unwrap();
+
             let results = store
                 .fts_search(
                     "docs",
@@ -548,6 +580,20 @@ macro_rules! conformance_tests {
                 ],
             );
             store.append("hybrid_ds", batch).await.unwrap();
+
+            // FTS half of the hybrid query needs an inverted index on Lance.
+            store
+                .create_index(
+                    "hybrid_ds",
+                    IndexConfig {
+                        columns: vec!["text".to_string()],
+                        index_type: IndexType::Bm25,
+                        params: IndexParams::default(),
+                        replace: false,
+                    },
+                )
+                .await
+                .unwrap();
 
             let results = store
                 .hybrid_search(
@@ -673,25 +719,11 @@ macro_rules! conformance_tests {
             assert!(names.contains(&"ds_two"));
         }
 
-        // ── Namespace Management ──
-
-        #[tokio::test(flavor = "multi_thread")]
-        async fn conform_namespace_crud() {
-            let store = $store_fn;
-
-            store.create_namespace("ns_alpha").await.unwrap();
-            store.create_namespace("ns_beta").await.unwrap();
-
-            let namespaces = store.list_namespaces().await.unwrap();
-            assert!(namespaces.contains(&"ns_alpha".to_string()));
-            assert!(namespaces.contains(&"ns_beta".to_string()));
-
-            store.drop_namespace("ns_alpha").await.unwrap();
-
-            let namespaces = store.list_namespaces().await.unwrap();
-            assert!(!namespaces.contains(&"ns_alpha".to_string()));
-            assert!(namespaces.contains(&"ns_beta".to_string()));
-        }
+        // Explicit namespace CRUD (create/list/drop) is intentionally NOT part
+        // of the shared suite: it is a MemoryStore in-process registry feature.
+        // The Lance dir-backend does not support named-namespace CRUD the same
+        // way (it auto-creates datasets on append), a divergence this harness
+        // surfaced. It is covered by `memory_store_namespace_crud` below.
 
         // ── Schema Evolution ──
 
@@ -809,10 +841,9 @@ macro_rules! conformance_tests {
         async fn conform_full_lifecycle() {
             let store = $store_fn;
 
-            // 1. Create namespace
-            store.create_namespace("lifecycle_ns").await.unwrap();
-
-            // 2. Append data
+            // 1. Append data (datasets are created implicitly on first append on
+            //    both backends; explicit namespace CRUD is covered separately as
+            //    it is a MemoryStore-registry feature, not a Lance dir-backend one).
             let batch = vector_batch(
                 &[1, 2, 3, 4, 5],
                 &["alpha", "beta", "gamma", "delta", "epsilon"],
@@ -825,6 +856,20 @@ macro_rules! conformance_tests {
                 ],
             );
             store.append("lifecycle_ds", batch).await.unwrap();
+
+            // FTS on Lance needs an inverted index (no-op on MemoryStore).
+            store
+                .create_index(
+                    "lifecycle_ds",
+                    IndexConfig {
+                        columns: vec!["text".to_string()],
+                        index_type: IndexType::Bm25,
+                        params: IndexParams::default(),
+                        replace: false,
+                    },
+                )
+                .await
+                .unwrap();
 
             // 3. Verify count
             let count = store.count("lifecycle_ds", None).await.unwrap();
@@ -910,4 +955,31 @@ mod memory_store_conformance {
     use super::*;
 
     conformance_tests!(MemoryStore::new());
+}
+
+// ── Run the identical conformance suite for the real Lance backend ──
+
+mod lance_store_conformance {
+    use super::*;
+
+    conformance_tests!(lance_conformance_store().await);
+}
+
+// ── MemoryStore-only: explicit named-namespace CRUD registry ──
+
+#[tokio::test(flavor = "multi_thread")]
+async fn memory_store_namespace_crud() {
+    let store = MemoryStore::new();
+    store.create_namespace("ns_alpha").await.unwrap();
+    store.create_namespace("ns_beta").await.unwrap();
+
+    let namespaces = store.list_namespaces().await.unwrap();
+    assert!(namespaces.contains(&"ns_alpha".to_string()));
+    assert!(namespaces.contains(&"ns_beta".to_string()));
+
+    store.drop_namespace("ns_alpha").await.unwrap();
+
+    let namespaces = store.list_namespaces().await.unwrap();
+    assert!(!namespaces.contains(&"ns_alpha".to_string()));
+    assert!(namespaces.contains(&"ns_beta".to_string()));
 }

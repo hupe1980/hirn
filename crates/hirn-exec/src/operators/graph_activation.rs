@@ -33,7 +33,7 @@ use crate::extensions::HirnSessionExt;
 use crate::operators::lance_hybrid_search::{RecallRow, fetch_recall_rows_by_ids};
 
 /// Activation mode for the graph traversal.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActivationMode {
     /// One-hop static neighborhood expansion.
     Static,
@@ -60,6 +60,8 @@ pub struct GraphActivationExec {
     max_depth: u32,
     epsilon: f32,
     inhibition_mu: f32,
+    /// Minimum edge weight for activation propagation (EXPAND … MIN_WEIGHT).
+    min_weight: Option<f32>,
     preserve_recall_rows: bool,
 }
 
@@ -71,6 +73,7 @@ impl GraphActivationExec {
         max_depth: u32,
         epsilon: f32,
         inhibition_mu: f32,
+        min_weight: Option<f32>,
     ) -> Result<Self> {
         let seed_limit = seed_limit.max(1);
         let config = ActivationConfig {
@@ -108,6 +111,7 @@ impl GraphActivationExec {
             max_depth,
             epsilon,
             inhibition_mu,
+            min_weight,
             preserve_recall_rows,
         })
     }
@@ -141,6 +145,10 @@ impl GraphActivationExec {
         self.inhibition_mu
     }
 
+    pub fn min_weight(&self) -> Option<f32> {
+        self.min_weight
+    }
+
     pub fn preserves_recall_rows(&self) -> bool {
         self.preserve_recall_rows
     }
@@ -150,8 +158,13 @@ impl DisplayAs for GraphActivationExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "GraphActivationExec: seed_limit={}, mode={:?}, depth={}, ε={}, µ={}",
-            self.seed_limit, self.mode, self.max_depth, self.epsilon, self.inhibition_mu
+            "GraphActivationExec: seed_limit={}, mode={:?}, depth={}, ε={}, µ={}, min_weight={:?}",
+            self.seed_limit,
+            self.mode,
+            self.max_depth,
+            self.epsilon,
+            self.inhibition_mu,
+            self.min_weight
         )
     }
 }
@@ -194,6 +207,7 @@ impl ExecutionPlan for GraphActivationExec {
             self.max_depth,
             self.epsilon,
             self.inhibition_mu,
+            self.min_weight,
         )?))
     }
 
@@ -208,6 +222,7 @@ impl ExecutionPlan for GraphActivationExec {
         let max_depth = self.max_depth;
         let epsilon = self.epsilon;
         let inhibition_mu = self.inhibition_mu;
+        let min_weight = self.min_weight;
         let mode = self.mode;
         let preserve_recall_rows = self.preserve_recall_rows;
         let seed_limit = self.seed_limit;
@@ -318,13 +333,14 @@ impl ExecutionPlan for GraphActivationExec {
             };
             let (ids, scores, depths) = {
                 let output = runtime
-                    .activate_graph(
+                    .activate_graph_min_weight(
                         &seeds,
                         mode,
                         None,
                         max_depth,
                         epsilon,
                         inhibition_mu,
+                        min_weight,
                         delegation_threshold,
                         allowed_namespaces.as_deref(),
                     )
@@ -489,6 +505,11 @@ fn recall_activation_schema(_input_schema: SchemaRef) -> SchemaRef {
         Field::new("surprise", DataType::Float32, true),
         Field::new("evidence_count", DataType::UInt32, true),
         Field::new("invocation_count", DataType::UInt64, true),
+        // Layer-native salience projections (semantic confidence, procedural
+        // success rate) — must mirror the upstream recall schema so the
+        // logical plan's declared columns line up index-for-index.
+        Field::new("confidence", DataType::Float32, true),
+        Field::new("success_rate", DataType::Float32, true),
         Field::new("activation_score", DataType::Float32, false),
         Field::new("depth", DataType::UInt32, false),
     ]))
@@ -584,6 +605,8 @@ async fn build_recall_activation_output_batch(
         .iter()
         .map(|row| row.invocation_count)
         .collect::<Vec<_>>();
+    let confidences = rows.iter().map(RecallRow::confidence).collect::<Vec<_>>();
+    let success_rates = rows.iter().map(RecallRow::success_rate).collect::<Vec<_>>();
 
     RecordBatch::try_new(
         schema,
@@ -601,6 +624,8 @@ async fn build_recall_activation_output_batch(
             Arc::new(Float32Array::from(surprises)) as ArrayRef,
             Arc::new(UInt32Array::from(evidence_counts)) as ArrayRef,
             Arc::new(UInt64Array::from(invocation_counts)) as ArrayRef,
+            Arc::new(Float32Array::from(confidences)) as ArrayRef,
+            Arc::new(Float32Array::from(success_rates)) as ArrayRef,
             Arc::new(Float32Array::from(activation_values)) as ArrayRef,
             Arc::new(UInt32Array::from(depth_values)) as ArrayRef,
         ],
@@ -854,7 +879,8 @@ mod tests {
         let input = MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None).unwrap();
 
         let exec =
-            GraphActivationExec::new(input, 10, ActivationMode::Spreading, 3, 0.001, 0.1).unwrap();
+            GraphActivationExec::new(input, 10, ActivationMode::Spreading, 3, 0.001, 0.1, None)
+                .unwrap();
 
         let ctx = SessionContext::new();
         register_graph_runtime(graph, &ctx);
@@ -896,7 +922,8 @@ mod tests {
         let input = MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None).unwrap();
 
         let exec =
-            GraphActivationExec::new(input, 10, ActivationMode::Spreading, 3, 0.001, 0.1).unwrap();
+            GraphActivationExec::new(input, 10, ActivationMode::Spreading, 3, 0.001, 0.1, None)
+                .unwrap();
         let ctx = SessionContext::new();
         let mut stream = exec.execute(0, ctx.task_ctx()).unwrap();
 
@@ -914,7 +941,8 @@ mod tests {
         let input = MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None).unwrap();
 
         let exec =
-            GraphActivationExec::new(input, 10, ActivationMode::Spreading, 3, 0.001, 0.1).unwrap();
+            GraphActivationExec::new(input, 10, ActivationMode::Spreading, 3, 0.001, 0.1, None)
+                .unwrap();
         let ctx = SessionContext::new();
         let mut stream = exec.execute(0, ctx.task_ctx()).unwrap();
 
@@ -1078,9 +1106,10 @@ mod tests {
         }
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Default)]
     struct RecordingGraphReadRuntime {
         seen_seeds: Arc<Mutex<Vec<MemoryId>>>,
+        seen_min_weight: Arc<Mutex<Option<f32>>>,
     }
 
     #[async_trait]
@@ -1102,6 +1131,32 @@ mod tests {
                 scores: vec![1.0; seeds.len()],
                 depths: vec![0; seeds.len()],
             })
+        }
+
+        async fn activate_graph_min_weight(
+            &self,
+            seeds: &[MemoryId],
+            mode: ActivationMode,
+            ppr_config: Option<&hirn_graph::PprConfig>,
+            max_depth: u32,
+            epsilon: f32,
+            inhibition_mu: f32,
+            min_weight: Option<f32>,
+            delegation_threshold: usize,
+            allowed_namespaces: Option<&[Namespace]>,
+        ) -> HirnResult<GraphActivationOutput> {
+            *self.seen_min_weight.lock().expect("lock should succeed") = min_weight;
+            self.activate_graph(
+                seeds,
+                mode,
+                ppr_config,
+                max_depth,
+                epsilon,
+                inhibition_mu,
+                delegation_threshold,
+                allowed_namespaces,
+            )
+            .await
         }
 
         async fn causal_chain(
@@ -1137,7 +1192,8 @@ mod tests {
         let input = MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None).unwrap();
 
         let exec =
-            GraphActivationExec::new(input, 10, ActivationMode::Spreading, 6, 0.001, 0.1).unwrap();
+            GraphActivationExec::new(input, 10, ActivationMode::Spreading, 6, 0.001, 0.1, None)
+                .unwrap();
         let ctx = SessionContext::new();
         let config = hirn_core::HirnConfig::builder()
             .db_path(std::path::Path::new("/tmp/test"))
@@ -1186,7 +1242,8 @@ mod tests {
         let schema = batch.schema();
         let input = MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None).unwrap();
         let exec_spread =
-            GraphActivationExec::new(input, 10, ActivationMode::Spreading, 3, 0.001, 0.0).unwrap();
+            GraphActivationExec::new(input, 10, ActivationMode::Spreading, 3, 0.001, 0.0, None)
+                .unwrap();
         let ctx_s = SessionContext::new();
         register_graph_runtime(graph.clone(), &ctx_s);
 
@@ -1204,7 +1261,7 @@ mod tests {
         let schema = batch.schema();
         let input = MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None).unwrap();
         let exec_ppr =
-            GraphActivationExec::new(input, 10, ActivationMode::Ppr, 3, 0.001, 0.0).unwrap();
+            GraphActivationExec::new(input, 10, ActivationMode::Ppr, 3, 0.001, 0.0, None).unwrap();
         let ctx_p = SessionContext::new();
         register_graph_runtime(graph, &ctx_p);
 
@@ -1286,7 +1343,8 @@ mod tests {
         let schema = batch.schema();
         let input = MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None).unwrap();
         let exec =
-            GraphActivationExec::new(input, 10, ActivationMode::Spreading, 3, 0.001, 0.0).unwrap();
+            GraphActivationExec::new(input, 10, ActivationMode::Spreading, 3, 0.001, 0.0, None)
+                .unwrap();
         let ctx_no_inh = SessionContext::new();
         register_graph_runtime(graph.clone(), &ctx_no_inh);
 
@@ -1304,7 +1362,8 @@ mod tests {
         let schema = batch.schema();
         let input = MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None).unwrap();
         let exec =
-            GraphActivationExec::new(input, 10, ActivationMode::Spreading, 3, 0.001, 0.5).unwrap();
+            GraphActivationExec::new(input, 10, ActivationMode::Spreading, 3, 0.001, 0.5, None)
+                .unwrap();
         let ctx_inh = SessionContext::new();
         register_graph_runtime(graph, &ctx_inh);
 
@@ -1334,7 +1393,8 @@ mod tests {
         let input = MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None).unwrap();
 
         let exec =
-            GraphActivationExec::new(input, 10, ActivationMode::Spreading, 3, 0.001, 0.1).unwrap();
+            GraphActivationExec::new(input, 10, ActivationMode::Spreading, 3, 0.001, 0.1, None)
+                .unwrap();
         let ctx = SessionContext::new();
         register_graph_runtime(graph, &ctx);
 
@@ -1366,7 +1426,8 @@ mod tests {
         let input = MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None).unwrap();
 
         let exec =
-            GraphActivationExec::new(input, 2, ActivationMode::Spreading, 3, 0.001, 0.1).unwrap();
+            GraphActivationExec::new(input, 2, ActivationMode::Spreading, 3, 0.001, 0.1, None)
+                .unwrap();
         let seen_seeds = Arc::new(Mutex::new(Vec::new()));
         let ctx = SessionContext::new();
         let config = hirn_core::HirnConfig::builder()
@@ -1381,6 +1442,7 @@ mod tests {
         )
         .with_graph_read_runtime(Arc::new(RecordingGraphReadRuntime {
             seen_seeds: seen_seeds.clone(),
+            ..Default::default()
         }))
         .register(&ctx)
         .expect("register should succeed");
@@ -1390,6 +1452,50 @@ mod tests {
 
         let recorded = seen_seeds.lock().expect("lock should succeed").clone();
         assert_eq!(recorded, ids[..2].to_vec());
+    }
+
+    #[tokio::test]
+    async fn forwards_min_weight_to_graph_runtime() {
+        let id = MemoryId::new();
+        let id_str = id.to_string();
+        let batch = seed_batch(&[&id_str]);
+        let schema = batch.schema();
+        let input = MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None).unwrap();
+
+        let exec = GraphActivationExec::new(
+            input,
+            10,
+            ActivationMode::Spreading,
+            3,
+            0.001,
+            0.1,
+            Some(0.4),
+        )
+        .unwrap();
+        let seen_min_weight = Arc::new(Mutex::new(None));
+        let ctx = SessionContext::new();
+        let config = hirn_core::HirnConfig::builder()
+            .db_path(std::path::Path::new("/tmp/test"))
+            .build()
+            .unwrap();
+
+        HirnSessionExt::new(
+            Arc::new(()) as Arc<dyn Any + Send + Sync>,
+            Arc::new(config),
+            None,
+        )
+        .with_graph_read_runtime(Arc::new(RecordingGraphReadRuntime {
+            seen_min_weight: seen_min_weight.clone(),
+            ..Default::default()
+        }))
+        .register(&ctx)
+        .expect("register should succeed");
+
+        let mut stream = exec.execute(0, ctx.task_ctx()).unwrap();
+        let _ = stream.next().await.unwrap().unwrap();
+
+        let recorded = *seen_min_weight.lock().expect("lock should succeed");
+        assert_eq!(recorded, Some(0.4), "min_weight should reach the runtime");
     }
 
     #[tokio::test]
@@ -1435,7 +1541,8 @@ mod tests {
         let schema = batch.schema();
         let input = MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None).unwrap();
         let exec =
-            GraphActivationExec::new(input, 1, ActivationMode::Spreading, 3, 0.001, 0.1).unwrap();
+            GraphActivationExec::new(input, 1, ActivationMode::Spreading, 3, 0.001, 0.1, None)
+                .unwrap();
 
         let seen_seeds = Arc::new(Mutex::new(Vec::new()));
         let ctx = SessionContext::new();
@@ -1451,6 +1558,7 @@ mod tests {
         )
         .with_graph_read_runtime(Arc::new(RecordingGraphReadRuntime {
             seen_seeds: seen_seeds.clone(),
+            ..Default::default()
         }))
         .register(&ctx)
         .expect("register should succeed");
@@ -1480,8 +1588,9 @@ mod tests {
         let schema = batch.schema();
         let input = MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None).unwrap();
 
-        let err = GraphActivationExec::new(input, 10, ActivationMode::Spreading, 0, 0.001, 0.1)
-            .unwrap_err();
+        let err =
+            GraphActivationExec::new(input, 10, ActivationMode::Spreading, 0, 0.001, 0.1, None)
+                .unwrap_err();
         assert!(err.to_string().contains("invalid graph activation config"));
     }
 }

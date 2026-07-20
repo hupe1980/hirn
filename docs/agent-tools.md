@@ -1,10 +1,70 @@
-# Agent Tools
+---
+title: Agent Tools
+parent: Advanced
+nav_order: 4
+description: >-
+  The 6-function MemoryToolkit that lets LLM agents self-manage cognitive
+  memory over MCP and gRPC, plus the autonomous MemoryAgent maintenance loop.
+---
 
-> **⚠️ Experimental:** This project is under active development. APIs, on-disk formats, and behaviour may change without notice. Not recommended for production use.
+# Agent Tools
+{: .no_toc }
+
+This project is under active development. APIs, on-disk formats, and behaviour may change without notice. Not recommended for production use.
+{: .experimental }
 
 Hirn exposes a 6-function **MemoryToolkit** for AI agents to self-manage cognitive memory, plus a **MemoryAgent** for autonomous background maintenance. Both are available via MCP and gRPC.
 
----
+## Table of contents
+{: .no_toc .text-delta }
+
+1. TOC
+{:toc}
+
+## How an Agent Drives hirn
+
+The MemoryToolkit is deliberately small — six verbs an LLM can reason about
+without a manual — but every call still passes through the full engine: input
+validation, Cedar authorization keyed on the caller's agent identity, and
+delegation to `HirnDB`. The same six functions are surfaced over two transports
+(MCP for tool-using LLM clients, gRPC for services), so the identity and
+authorization story is identical regardless of how the agent connects.
+
+The sequence below traces one `memory_store` call from an MCP client through to
+a durable write. Authorization happens *before* any mutation, and the write
+itself follows the [recoverable-envelope contract](write-guarantees.md) so a
+crash mid-store cannot strand a half-applied memory.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant A as LLM Agent
+  participant M as hirnd (MCP server)
+  participant T as MemoryToolkit
+  participant C as Cedar engine
+  participant DB as HirnDB
+  A->>M: tools/call memory_store (content, x-agent-id)
+  M->>T: store(request)
+  T->>T: validate input (size, fields)
+  T->>C: authorize(agent, action=remember, resource)
+  alt permitted
+    C-->>T: allow
+    T->>DB: remember_episode(record)
+    DB->>DB: RPE admission + recoverable envelope
+    DB-->>T: MemoryId
+    T-->>M: Ok(MemoryId)
+    M-->>A: tools/result { memory_id }
+  else denied
+    C-->>T: deny
+    T-->>M: Err(Unauthorized)
+    M-->>A: tools/error
+  end
+```
+
+{: .note }
+> Over MCP the agent identity travels in the tool arguments (`agent_id`); over
+> gRPC it travels in the `x-agent-id` metadata header. Either way, Cedar sees
+> the same principal and the same action.
 
 ## MemoryToolkit — 6 Functions
 
@@ -264,3 +324,13 @@ The six toolkit functions stay intentionally small. When an agent needs richer i
 - **explanation surfaces:** `RecallBuilder::execute_with_explanation()`, `ThinkBuilder::execute_with_explanation()`, `remember_with_explanation()`
 
 That split is deliberate: the toolkit stays protocol-friendly, while the database handle exposes the stateful operator workflow needed for best-in-class auditability.
+
+## Related
+
+- The memory model these tools operate on: [Concepts](concepts.md) and
+  [Cognitive Model](cognitive-model.md).
+- The durability each write path promises: [write-guarantees.md](write-guarantees.md).
+- The background cognition `schedule_offline_job(...)` drives:
+  [offline-intelligence.md](offline-intelligence.md).
+- Auditing recall and write decisions: [explanation-surfaces.md](explanation-surfaces.md).
+- The query language behind these operators: [HirnQL Reference](hirnql-reference.md).

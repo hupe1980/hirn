@@ -83,7 +83,10 @@ impl CachedGraphStore {
     /// Fetches all nodes and edges from the persistent graph and inserts
     /// them into the in-memory property graph.
     pub async fn load_from_cold(&self) -> HirnResult<()> {
-        let all_edges = self.cold.all_edges().await?;
+        // Load only currently-active edges, verbatim (see `insert_edge_raw`
+        // below). `all_edges()` would also return soft-expired edges and drop
+        // them back into the hot tier as live.
+        let all_edges = self.cold.active_edges().await?;
         let all_node_ids = self.cold.node_ids().await?;
 
         // Fetch all node data from cold tier *before* acquiring the write lock,
@@ -109,21 +112,14 @@ impl CachedGraphStore {
         }
 
         for edge in all_edges {
-            // Ensure both endpoints exist in hot tier.
-            if !graph.has_node(edge.source) {
-                graph.add_node(edge.source, Layer::Episodic, 0.5, edge.created_at);
-            }
-            if !graph.has_node(edge.target) {
-                graph.add_node(edge.target, Layer::Episodic, 0.5, edge.created_at);
-            }
-            // add_edge_one_dir to avoid double-reverse (edges already stored in both dirs).
-            let _ = graph.add_edge(
-                edge.source,
-                edge.target,
-                edge.relation,
-                edge.weight,
-                edge.metadata.clone(),
-            );
+            // Restore each stored edge verbatim: preserve its `EdgeId`, causal
+            // data, bi-temporal validity, co-retrieval count, and `created_at`.
+            // Cold storage already holds both directions of bidirectional
+            // relations, so a verbatim single insert per stored edge reproduces
+            // the graph exactly — using `add_edge` here would mint fresh ids
+            // (breaking later `remove_edge`), drop causal/temporal state, and
+            // double the reverse edges.
+            graph.insert_edge_raw(edge);
         }
 
         tracing::info!(
@@ -245,6 +241,22 @@ impl CachedGraphStore {
         Ok(())
     }
 
+    /// Mirror fan-out-cap evictions to cold storage. Without this, edges the
+    /// hot tier evicted keep accumulating in the durable tier and resurrect
+    /// on the next reload — which 512 edges survive would then depend on
+    /// reload order rather than weight.
+    async fn mirror_evictions_to_cold(&self, evicted: Vec<hirn_graph::EdgeId>) {
+        for edge_id in evicted {
+            if let Err(error) = self.cold.remove_edge(edge_id).await {
+                tracing::warn!(
+                    %edge_id,
+                    %error,
+                    "CachedGraphStore: failed to mirror fan-out eviction to cold tier"
+                );
+            }
+        }
+    }
+
     fn created_edges_from_hot(
         graph: &PropertyGraph,
         edge_id: EdgeId,
@@ -300,7 +312,7 @@ impl CachedGraphStore {
             return Ok(Vec::new());
         }
 
-        let (created, created_edges, rollback_edge_ids, fatal_error) = {
+        let (created, created_edges, rollback_edge_ids, fatal_error, evicted) = {
             let mut graph = self.hot.write();
             let mut created = Vec::with_capacity(requests.len());
             let mut created_edges = Vec::with_capacity(requests.len() * 2);
@@ -346,13 +358,20 @@ impl CachedGraphStore {
                 }
             }
 
-            (created, created_edges, rollback_edge_ids, fatal_error)
+            (
+                created,
+                created_edges,
+                rollback_edge_ids,
+                fatal_error,
+                graph.take_evicted_edges(),
+            )
         };
 
         if let Some(error) = fatal_error {
             self.rollback_hot_edges(&rollback_edge_ids);
             return Err(error);
         }
+        self.mirror_evictions_to_cold(evicted).await;
 
         if !created_edges.is_empty() {
             if let Err(error) = self.cold.add_edges(&created_edges).await {
@@ -416,6 +435,46 @@ impl GraphReadRuntime for CachedGraphStore {
             inhibition_mu,
             allowed_namespaces,
         )
+    }
+
+    async fn activate_graph_min_weight(
+        &self,
+        seeds: &[MemoryId],
+        mode: ExecActivationMode,
+        ppr_config: Option<&hirn_graph::PprConfig>,
+        max_depth: u32,
+        epsilon: f32,
+        inhibition_mu: f32,
+        min_weight: Option<f32>,
+        delegation_threshold: usize,
+        allowed_namespaces: Option<&[Namespace]>,
+    ) -> HirnResult<GraphActivationOutput> {
+        let output = self
+            .activate_graph(
+                seeds,
+                mode,
+                ppr_config,
+                max_depth,
+                epsilon,
+                inhibition_mu,
+                delegation_threshold,
+                allowed_namespaces,
+            )
+            .await?;
+
+        let Some(min_weight) = min_weight.filter(|weight| *weight > 0.0) else {
+            return Ok(output);
+        };
+        let delegated = max_depth as usize > delegation_threshold;
+        self.apply_activation_min_weight(
+            output,
+            seeds,
+            max_depth,
+            min_weight,
+            delegated,
+            allowed_namespaces,
+        )
+        .await
     }
 
     async fn causal_chain(
@@ -508,6 +567,107 @@ impl GraphReadRuntime for CachedGraphStore {
 }
 
 impl CachedGraphStore {
+    /// Restrict an activation result to nodes reachable from the seeds via
+    /// edges whose weight is at least `min_weight` (EXPAND … MIN_WEIGHT).
+    ///
+    /// The activation algorithms themselves have no edge-weight cutoff, so
+    /// this applies the cutoff as a reachability constraint: seeds always
+    /// survive; expanded nodes survive only when a path of edges ≥ min_weight
+    /// leads to them within `max_depth` hops.
+    async fn apply_activation_min_weight(
+        &self,
+        output: GraphActivationOutput,
+        seeds: &[MemoryId],
+        max_depth: u32,
+        min_weight: f32,
+        delegated: bool,
+        allowed_namespaces: Option<&[Namespace]>,
+    ) -> HirnResult<GraphActivationOutput> {
+        let mut allowed_ids: HashSet<MemoryId> = seeds.iter().copied().collect();
+        if delegated {
+            self.collect_persistent_reachable(
+                seeds,
+                max_depth,
+                min_weight,
+                allowed_namespaces,
+                &mut allowed_ids,
+            )
+            .await?;
+        } else {
+            let graph = self.hot.read();
+            for &seed in seeds {
+                allowed_ids.extend(graph.get_neighbors_filtered(
+                    seed,
+                    max_depth as usize,
+                    min_weight,
+                    allowed_namespaces,
+                ));
+            }
+        }
+
+        let mut ids = Vec::with_capacity(output.ids.len());
+        let mut scores = Vec::with_capacity(output.scores.len());
+        let mut depths = Vec::with_capacity(output.depths.len());
+        for ((id, score), depth) in output.ids.into_iter().zip(output.scores).zip(output.depths) {
+            let keep = MemoryId::parse(&id).is_ok_and(|parsed| allowed_ids.contains(&parsed));
+            if keep {
+                ids.push(id);
+                scores.push(score);
+                depths.push(depth);
+            }
+        }
+
+        Ok(GraphActivationOutput {
+            ids,
+            scores,
+            depths,
+        })
+    }
+
+    /// BFS over the cold tier collecting nodes reachable through edges with
+    /// weight ≥ `min_weight`, mirroring `PropertyGraph::get_neighbors_filtered`.
+    async fn collect_persistent_reachable(
+        &self,
+        seeds: &[MemoryId],
+        max_depth: u32,
+        min_weight: f32,
+        allowed_namespaces: Option<&[Namespace]>,
+        reachable: &mut HashSet<MemoryId>,
+    ) -> HirnResult<()> {
+        let mut visited: HashSet<MemoryId> = seeds.iter().copied().collect();
+        let mut frontier = seeds.to_vec();
+
+        for _ in 0..max_depth {
+            if frontier.is_empty() {
+                break;
+            }
+
+            let edges = self.cold().batch_adjacency_read(&frontier).await?;
+            let mut next_frontier = Vec::new();
+            for edge in edges {
+                if edge.weight < min_weight {
+                    continue;
+                }
+                if let Some(allowed_namespaces) = allowed_namespaces {
+                    let Some(namespace) = self.cold().node_namespace(edge.target).await? else {
+                        continue;
+                    };
+                    if !allowed_namespaces.contains(&namespace) {
+                        continue;
+                    }
+                }
+                if visited.insert(edge.target) {
+                    next_frontier.push(edge.target);
+                    reachable.insert(edge.target);
+                }
+            }
+
+            frontier = next_frontier;
+        }
+
+        Ok(())
+    }
+
     fn activate_via_hot_graph(
         &self,
         seeds: &[MemoryId],
@@ -864,7 +1024,7 @@ impl CachedGraphStore {
 
             let mut next_frontier = Vec::new();
             for node_id in frontier {
-                for (target, _weight, relation) in graph.outgoing_weighted(node_id) {
+                for (target, weight, relation) in graph.outgoing_weighted(node_id) {
                     if relation_filter.is_some_and(|relations| !relations.contains(&relation)) {
                         continue;
                     }
@@ -881,6 +1041,10 @@ impl CachedGraphStore {
                         rows.push(GraphTraverseRow {
                             node_id: target.to_string(),
                             depth: depth + 1,
+                            edge_relation: Some(
+                                hirn_exec::edge_relation_query_str(relation).to_string(),
+                            ),
+                            edge_weight: Some(weight),
                         });
                     }
                 }
@@ -935,6 +1099,10 @@ impl CachedGraphStore {
                     rows.push(GraphTraverseRow {
                         node_id: edge.target.to_string(),
                         depth: depth + 1,
+                        edge_relation: Some(
+                            hirn_exec::edge_relation_query_str(edge.relation).to_string(),
+                        ),
+                        edge_weight: Some(edge.weight),
                     });
                 }
             }
@@ -1101,13 +1269,14 @@ impl GraphStore for CachedGraphStore {
         metadata: Metadata,
     ) -> HirnResult<EdgeId> {
         // Write-through: hot first, then cold.
-        let (edge_id, created_edges) = {
+        let (edge_id, created_edges, evicted) = {
             let mut graph = self.hot.write();
             let edge_id = graph.add_edge(source, target, relation, weight, metadata)?;
             let created_edges =
                 Self::created_edges_from_hot(&graph, edge_id, source, target, relation)?;
-            (edge_id, created_edges)
+            (edge_id, created_edges, graph.take_evicted_edges())
         };
+        self.mirror_evictions_to_cold(evicted).await;
 
         if let Err(error) = self.cold.add_edges(&created_edges).await {
             for edge in &created_edges {
@@ -1131,14 +1300,15 @@ impl GraphStore for CachedGraphStore {
         causal: hirn_graph::CausalEdgeData,
     ) -> HirnResult<EdgeId> {
         // Write-through: hot first, then cold.
-        let (edge_id, created_edges) = {
+        let (edge_id, created_edges, evicted) = {
             let mut graph = self.hot.write();
             let edge_id =
                 graph.add_causal_edge(source, target, relation, weight, metadata, causal)?;
             let created_edges =
                 Self::created_edges_from_hot(&graph, edge_id, source, target, relation)?;
-            (edge_id, created_edges)
+            (edge_id, created_edges, graph.take_evicted_edges())
         };
+        self.mirror_evictions_to_cold(evicted).await;
 
         if let Err(error) = self.cold.add_edges(&created_edges).await {
             for edge in &created_edges {
@@ -1587,6 +1757,101 @@ mod tests {
         assert!(cold.has_node(a).await.unwrap());
     }
 
+    /// Graph: seed → strong (weight 0.9), seed → weak (weight 0.1).
+    async fn min_weight_fixture() -> (CachedGraphStore, MemoryId, MemoryId, MemoryId) {
+        let cold = test_cold().await;
+        let cached = CachedGraphStore::new(cold);
+
+        let seed = MemoryId::new();
+        let strong = MemoryId::new();
+        let weak = MemoryId::new();
+        let ns = Namespace::default();
+        for id in [seed, strong, weak] {
+            cached
+                .add_node(id, Layer::Episodic, 0.5, Timestamp::now(), ns)
+                .await
+                .unwrap();
+        }
+        cached
+            .add_edge(seed, strong, EdgeRelation::RelatedTo, 0.9, Metadata::new())
+            .await
+            .unwrap();
+        cached
+            .add_edge(seed, weak, EdgeRelation::RelatedTo, 0.1, Metadata::new())
+            .await
+            .unwrap();
+
+        (cached, seed, strong, weak)
+    }
+
+    #[tokio::test]
+    async fn activation_min_weight_excludes_weak_edge_neighbors_hot_tier() {
+        let (cached, seed, strong, weak) = min_weight_fixture().await;
+
+        let output = cached
+            .activate_graph_min_weight(
+                &[seed],
+                ExecActivationMode::Spreading,
+                None,
+                2,
+                0.001,
+                0.0,
+                Some(0.5),
+                usize::MAX,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            output.ids.contains(&seed.to_string()),
+            "seed must survive the min_weight cutoff: {:?}",
+            output.ids
+        );
+        assert!(
+            output.ids.contains(&strong.to_string()),
+            "strong-edge neighbor must survive: {:?}",
+            output.ids
+        );
+        assert!(
+            !output.ids.contains(&weak.to_string()),
+            "weak-edge neighbor must be excluded: {:?}",
+            output.ids
+        );
+    }
+
+    #[tokio::test]
+    async fn activation_min_weight_excludes_weak_edge_neighbors_persistent_tier() {
+        let (cached, seed, strong, weak) = min_weight_fixture().await;
+
+        // delegation_threshold 0 forces the persistent-tier path.
+        let output = cached
+            .activate_graph_min_weight(
+                &[seed],
+                ExecActivationMode::Spreading,
+                None,
+                2,
+                0.001,
+                0.0,
+                Some(0.5),
+                0,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            output.ids.contains(&strong.to_string()),
+            "strong-edge neighbor must survive: {:?}",
+            output.ids
+        );
+        assert!(
+            !output.ids.contains(&weak.to_string()),
+            "weak-edge neighbor must be excluded: {:?}",
+            output.ids
+        );
+    }
+
     #[tokio::test]
     async fn batch_add_nodes_rolls_back_hot_tier_when_cold_persist_fails() {
         let (cold, storage) = fault_injecting_cold().await;
@@ -1777,6 +2042,50 @@ mod tests {
 
         let path = cached.shortest_path(a, b).await.unwrap();
         assert!(path.is_some());
+    }
+
+    #[tokio::test]
+    async fn traverse_via_hot_graph_skips_soft_expired_edges() {
+        let cold = test_cold().await;
+        let cached = CachedGraphStore::new(cold);
+
+        let a = MemoryId::new();
+        let b = MemoryId::new();
+        let c = MemoryId::new();
+        let ns = Namespace::default();
+
+        for id in [a, b, c] {
+            cached
+                .add_node(id, Layer::Episodic, 0.5, Timestamp::now(), ns.clone())
+                .await
+                .unwrap();
+        }
+        cached
+            .add_edge(a, b, EdgeRelation::Causes, 0.8, Metadata::new())
+            .await
+            .unwrap();
+        cached
+            .add_edge(b, c, EdgeRelation::Causes, 0.8, Metadata::new())
+            .await
+            .unwrap();
+
+        // Sanity: both hops are reachable while the edges are live.
+        let rows = cached.traverse_via_hot_graph(&[a], 2, None, None).unwrap();
+        let reached: Vec<String> = rows.into_iter().map(|r| r.node_id).collect();
+        assert!(reached.contains(&b.to_string()));
+        assert!(reached.contains(&c.to_string()));
+
+        // Retract b: soft-expire its edges in the hot tier (kept for audit).
+        {
+            let mut hot = cached.hot_graph_mut();
+            hot.expire_edges_for_node(b, Timestamp::from_millis(0));
+        }
+
+        let rows = cached.traverse_via_hot_graph(&[a], 2, None, None).unwrap();
+        assert!(
+            rows.is_empty(),
+            "traversal must not follow soft-expired edges: {rows:?}"
+        );
     }
 
     #[tokio::test]

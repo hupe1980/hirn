@@ -1,3 +1,11 @@
+---
+title: Glossary
+nav_order: 9
+description: >-
+  Operational definitions of core hirn terms — consolidation, graph activation,
+  MCFA, realms, namespaces, RPE, RAPTOR, and the four memory layers.
+---
+
 # Glossary
 
 > **⚠️ Experimental:** This project is under active development. APIs, on-disk formats, and behaviour may change without notice. Not recommended for production use.

@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use async_trait::async_trait;
 use dashmap::DashMap;
 use hirn_core::circuit_breaker::CircuitBreaker;
-use hirn_core::embed::{Embedder, Embedding};
+use hirn_core::embed::{Embedder, Embedding, MultivectorEmbedding};
 use hirn_core::{HirnError, HirnResult, PartialEmbeddingBatch};
 use hirn_storage::datasets::embed_cache;
 use hirn_storage::embed_cache_ops;
@@ -131,7 +131,11 @@ impl<E: Embedder> PersistentCachedEmbedder<E> {
     // ── Internal helpers ────────────────────────────────────────────
 
     fn cache_key(&self, text: &str) -> String {
-        embed_cache::cache_key(self.inner.model_id(), text)
+        // Key on the full embedding-space id (model + dims + input type), not
+        // just the model name. Two embedders that produce different vectors for
+        // the same text under the same model name (e.g. a Cohere document
+        // encoder vs. a query encoder) must not share cache entries.
+        embed_cache::cache_key(&self.inner.embedding_space_id(), text)
     }
 
     fn next_access_tick(&self) -> u64 {
@@ -193,7 +197,9 @@ impl<E: Embedder> Embedder for PersistentCachedEmbedder<E> {
         for (i, &text) in texts.iter().enumerate() {
             let key = self.cache_key(text);
 
-            // L1: in-memory check.
+            // L1: in-memory check. The cache key includes the embedding-space
+            // id (model + dims + input type), so a hit is already guaranteed to
+            // be dimension- and space-compatible.
             if let Some(vector) = self.get_l1(&key) {
                 self.hits.fetch_add(1, Ordering::Relaxed);
                 results[i] = Some(Embedding {
@@ -290,7 +296,7 @@ impl<E: Embedder> Embedder for PersistentCachedEmbedder<E> {
                         if !l2_texts.is_empty() {
                             if let Err(e) = embed_cache_ops::put_cached_embeddings(
                                 self.store.as_ref(),
-                                self.inner.model_id(),
+                                &self.inner.embedding_space_id(),
                                 &l2_texts,
                                 &l2_embeddings,
                             )
@@ -313,7 +319,7 @@ impl<E: Embedder> Embedder for PersistentCachedEmbedder<E> {
                     // Batch write to L2 (Lance).
                     if let Err(e) = embed_cache_ops::put_cached_embeddings(
                         self.store.as_ref(),
-                        self.inner.model_id(),
+                        &self.inner.embedding_space_id(),
                         &l2_texts,
                         &l2_embeddings,
                     )
@@ -383,7 +389,7 @@ impl<E: Embedder> Embedder for PersistentCachedEmbedder<E> {
                     if !l2_texts.is_empty() {
                         if let Err(write_error) = embed_cache_ops::put_cached_embeddings(
                             self.store.as_ref(),
-                            self.inner.model_id(),
+                            &self.inner.embedding_space_id(),
                             &l2_texts,
                             &l2_embeddings,
                         )
@@ -415,8 +421,24 @@ impl<E: Embedder> Embedder for PersistentCachedEmbedder<E> {
         self.inner.model_id()
     }
 
+    fn embedding_space_id(&self) -> String {
+        self.inner.embedding_space_id()
+    }
+
     fn max_input_tokens(&self) -> usize {
         self.inner.max_input_tokens()
+    }
+
+    // Multivector embeddings are passed through uncached: the cache schema
+    // stores one vector per entry, and token-level output is too large to be
+    // worth persisting. Forwarding keeps the inner embedder's capability
+    // visible through the wrapper.
+    async fn embed_multivec(&self, texts: &[&str]) -> HirnResult<Vec<MultivectorEmbedding>> {
+        self.inner.embed_multivec(texts).await
+    }
+
+    fn supports_multivec(&self) -> bool {
+        self.inner.supports_multivec()
     }
 }
 
@@ -632,6 +654,19 @@ mod tests {
         );
         assert!(partial.embeddings[1].is_none());
         assert_eq!(partial.failures[0].index, 1);
+    }
+
+    #[tokio::test]
+    async fn multivec_forwards_to_inner_without_caching() {
+        let store = test_store();
+        let cache = PersistentCachedEmbedder::with_store(PseudoEmbedder::new(16), store);
+
+        assert!(cache.supports_multivec());
+        let result = cache.embed_multivec(&["hello"]).await.unwrap();
+        assert_eq!(result.len(), 1);
+        // Pass-through: no cache accounting and no L1 entries.
+        assert_eq!(cache.hits() + cache.misses(), 0);
+        assert_eq!(cache.l1_size(), 0);
     }
 
     #[tokio::test]

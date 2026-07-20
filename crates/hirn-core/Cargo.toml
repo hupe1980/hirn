@@ -22,6 +22,7 @@ futures = { workspace = true }
 blake3 = { workspace = true }
 dashmap = { workspace = true }
 parking_lot = { workspace = true }
+unicode-security = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

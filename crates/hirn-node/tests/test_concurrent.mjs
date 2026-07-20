@@ -11,7 +11,7 @@ const { HirnBridge } = require('../bridge.js');
 async function main() {
   console.log('Testing 50 concurrent HirnBridge.remember...');
   const dir = mkdtempSync(join(tmpdir(), 'hirn-test-'));
-  const db = HirnBridge.open(join(dir, 'test.hirn'), 64);
+  const db = await HirnBridge.open(join(dir, 'test.hirn'), 64);
   await db.registerAgent('agent-1', 'Test Agent');
   await db.remember('agent-1', 'seed', new Array(64).fill(0.1));
   

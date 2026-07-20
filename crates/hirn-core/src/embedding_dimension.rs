@@ -19,8 +19,13 @@ use crate::error::HirnError;
 /// Stored as a `u32` — larger than the largest production embedding models
 /// (OpenAI text-embedding-3-large: 3072 dims) while still fitting in `u16`
 /// if ever needed.
+// `try_from`/`into` (not `transparent`) so that deserialization — including the
+// TOML config path, which `HirnConfig::validate()` deliberately skips on the
+// assumption that this type self-validates — runs the `1..=65_535` range check.
+// A `transparent` derive would forward straight to `u32` and let
+// `embedding_dimensions = 0` through, propagating a zero-width vector schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
+#[serde(try_from = "u32", into = "u32")]
 pub struct EmbeddingDimension(u32);
 
 impl EmbeddingDimension {
@@ -155,5 +160,13 @@ mod tests {
         assert_eq!(json, "384");
         let back: EmbeddingDimension = serde_json::from_str(&json).unwrap();
         assert_eq!(back, d);
+    }
+
+    #[test]
+    fn deserialize_zero_is_rejected() {
+        // The `transparent` derive used to let `0` through on every
+        // deserialization path (including TOML config).
+        assert!(serde_json::from_str::<EmbeddingDimension>("0").is_err());
+        assert!(serde_json::from_str::<EmbeddingDimension>("65536").is_err());
     }
 }

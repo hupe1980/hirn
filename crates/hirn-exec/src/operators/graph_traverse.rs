@@ -212,8 +212,13 @@ fn build_output_batch(schema: SchemaRef, rows: &[GraphTraverseRow]) -> Result<Re
             .collect::<Vec<_>>(),
     );
     let depths = UInt32Array::from(rows.iter().map(|row| row.depth).collect::<Vec<_>>());
-    let edge_relations = StringArray::from(vec![None::<&str>; rows.len()]);
-    let edge_weights = Float32Array::from(vec![None::<f32>; rows.len()]);
+    let edge_relations = StringArray::from(
+        rows.iter()
+            .map(|row| row.edge_relation.as_deref())
+            .collect::<Vec<_>>(),
+    );
+    let edge_weights =
+        Float32Array::from(rows.iter().map(|row| row.edge_weight).collect::<Vec<_>>());
 
     Ok(RecordBatch::try_new(
         schema,
@@ -224,4 +229,174 @@ fn build_output_batch(schema: SchemaRef, rows: &[GraphTraverseRow]) -> Result<Re
             Arc::new(edge_weights),
         ],
     )?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use datafusion::execution::SessionStateBuilder;
+    use datafusion::prelude::SessionContext;
+    use hirn_core::HirnResult;
+
+    use crate::extensions::{GraphActivationOutput, GraphCausalChainRow, GraphReadRuntime};
+    use crate::operators::ActivationMode;
+
+    /// Runtime that returns a fixed traversal: three neighbors at depths 1, 2, 3.
+    #[derive(Debug)]
+    struct FixedTraverseRuntime {
+        rows: Vec<GraphTraverseRow>,
+    }
+
+    #[async_trait]
+    impl GraphReadRuntime for FixedTraverseRuntime {
+        async fn activate_graph(
+            &self,
+            _seeds: &[MemoryId],
+            _mode: ActivationMode,
+            _ppr_config: Option<&hirn_graph::PprConfig>,
+            _max_depth: u32,
+            _epsilon: f32,
+            _inhibition_mu: f32,
+            _delegation_threshold: usize,
+            _allowed_namespaces: Option<&[Namespace]>,
+        ) -> HirnResult<GraphActivationOutput> {
+            Ok(GraphActivationOutput {
+                ids: Vec::new(),
+                scores: Vec::new(),
+                depths: Vec::new(),
+            })
+        }
+
+        async fn causal_chain(
+            &self,
+            _start_ids: &[MemoryId],
+            _max_depth: u32,
+            _confidence_threshold: f32,
+            _delegation_threshold: usize,
+            _relation: EdgeRelation,
+            _allowed_namespaces: Option<&[Namespace]>,
+        ) -> HirnResult<Vec<GraphCausalChainRow>> {
+            Ok(Vec::new())
+        }
+
+        async fn traverse_graph(
+            &self,
+            _start_ids: &[MemoryId],
+            _max_depth: u32,
+            _delegation_threshold: usize,
+            _relation_filter: Option<&[EdgeRelation]>,
+            _allowed_namespaces: Option<&[Namespace]>,
+        ) -> HirnResult<Vec<GraphTraverseRow>> {
+            Ok(self.rows.clone())
+        }
+    }
+
+    fn traverse_row(depth: u32, weight: f32) -> GraphTraverseRow {
+        GraphTraverseRow {
+            node_id: MemoryId::new().to_string(),
+            depth,
+            edge_relation: Some("related_to".to_string()),
+            edge_weight: Some(weight),
+        }
+    }
+
+    fn session_with_runtime(rows: Vec<GraphTraverseRow>) -> SessionContext {
+        let state = SessionStateBuilder::new_with_default_features()
+            .with_query_planner(Arc::new(crate::HirnQueryPlanner))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        let config = hirn_core::HirnConfig::builder()
+            .db_path(std::path::Path::new("/tmp/test"))
+            .build()
+            .unwrap();
+        HirnSessionExt::new(
+            Arc::new(()) as Arc<dyn Any + Send + Sync>,
+            Arc::new(config),
+            None,
+        )
+        .with_graph_read_runtime(Arc::new(FixedTraverseRuntime { rows }))
+        .register(&ctx)
+        .expect("register should succeed");
+        ctx
+    }
+
+    #[tokio::test]
+    async fn compiled_where_and_limit_bound_traverse_output() {
+        let rows = vec![
+            traverse_row(1, 0.9),
+            traverse_row(2, 0.8),
+            traverse_row(2, 0.7),
+            traverse_row(3, 0.6),
+        ];
+        let ctx = session_with_runtime(rows);
+
+        let start = MemoryId::new();
+        let pipeline = hirn_query::QueryPipeline::new(hirn_query::AnalyzeContext::default());
+        let compiled = pipeline
+            .compile(&format!(
+                r#"TRAVERSE FROM "{start}" DEPTH 3 WHERE depth < 3 LIMIT 2"#
+            ))
+            .unwrap();
+
+        let physical = ctx
+            .state()
+            .create_physical_plan(&compiled.plan)
+            .await
+            .unwrap();
+        let batches = datafusion::physical_plan::collect(physical, ctx.task_ctx())
+            .await
+            .unwrap();
+
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total_rows, 2, "LIMIT 2 must bound the traversal output");
+        for batch in &batches {
+            let depths = batch
+                .column_by_name("depth")
+                .and_then(|column| column.as_any().downcast_ref::<UInt32Array>())
+                .expect("depth column");
+            for row in 0..batch.num_rows() {
+                assert!(
+                    depths.value(row) < 3,
+                    "WHERE depth < 3 must filter traversal rows"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn traverse_emits_edge_relation_and_weight() {
+        let rows = vec![traverse_row(1, 0.9)];
+        let ctx = session_with_runtime(rows);
+
+        let start = MemoryId::new();
+        let pipeline = hirn_query::QueryPipeline::new(hirn_query::AnalyzeContext::default());
+        let compiled = pipeline
+            .compile(&format!(r#"TRAVERSE FROM "{start}" DEPTH 1"#))
+            .unwrap();
+
+        let physical = ctx
+            .state()
+            .create_physical_plan(&compiled.plan)
+            .await
+            .unwrap();
+        let batches = datafusion::physical_plan::collect(physical, ctx.task_ctx())
+            .await
+            .unwrap();
+
+        let batch = batches
+            .iter()
+            .find(|batch| batch.num_rows() > 0)
+            .expect("one non-empty batch");
+        let relations = batch
+            .column_by_name("edge_relation")
+            .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+            .expect("edge_relation column");
+        let weights = batch
+            .column_by_name("edge_weight")
+            .and_then(|column| column.as_any().downcast_ref::<Float32Array>())
+            .expect("edge_weight column");
+        assert_eq!(relations.value(0), "related_to");
+        assert!((weights.value(0) - 0.9).abs() < f32::EPSILON);
+    }
 }

@@ -424,6 +424,13 @@ impl LancePhysicalStore {
         }
 
         scanner.filter(&filter).map_err(HirnDbError::from)?;
+        // Apply the filter BEFORE the ANN search rather than after it. With the
+        // default post-filter, ANN retrieves the global top-`limit` rows and
+        // then drops the ones the predicate excludes — so a caller whose
+        // namespace predicate matches only a small share of rows (multi-tenant
+        // isolation via PolicyEnforcedStore) gets far fewer than `limit`
+        // results, often zero, despite many matching vectors existing.
+        scanner.prefilter(true);
 
         let stream = scanner.try_into_stream().await.map_err(HirnDbError::from)?;
         let stream: RecordBatchStream = Box::pin(stream.map_err(HirnDbError::from));
@@ -750,6 +757,17 @@ impl LancePhysicalStore {
             return Ok(Box::new(Self::build_vector_index_params(config)));
         }
 
+        // The inverted (BM25 full-text) index needs a tokenizer configuration;
+        // the generic `ScalarIndexParams::for_builtin(Inverted)` omits the
+        // `base_tokenizer`, so index construction fails with a missing-field
+        // error. Build dedicated `InvertedIndexParams` (default = "simple"
+        // tokenizer, English stemming) instead.
+        if matches!(config.index_type, IndexType::Bm25) {
+            return Ok(Box::new(
+                lance_index::scalar::inverted::tokenizer::InvertedIndexParams::default(),
+            ));
+        }
+
         let builtin_index_type = lance_type.try_into().map_err(|_| {
             HirnDbError::InvalidArgument(format!(
                 "unsupported scalar index type: {:?}",
@@ -956,7 +974,7 @@ impl PhysicalStore for LancePhysicalStore {
         // before we do CPU-intensive snapshot construction (PERF-1 fix).
         // Returns (old_version, new_version, pre_existing_snapshot) so the caller
         // can extend the snapshot outside the lock.
-        let (new_version, existing_snapshot) = {
+        let (new_version, existing_snapshot, dataset_was_empty) = {
             let _guard = lock.lock().await;
 
             match self.open_dataset(dataset).await {
@@ -964,6 +982,11 @@ impl PhysicalStore for LancePhysicalStore {
                     // Capture the version before the write so we can locate the existing
                     // snapshot cache entry for the incremental proactive update below.
                     let old_version = ds.version().version;
+                    // Whether the dataset was empty *before* this append. If it had
+                    // rows and we don't hold the prior snapshot, the new batches are
+                    // only a partial view and must not become the cached snapshot
+                    // (that would make flat vector search return the new rows only).
+                    let dataset_was_empty = ds.count_rows(None).await.unwrap_or(usize::MAX) == 0;
                     let reader = Self::record_batch_reader(&batches);
 
                     // Clone the cached dataset (cheap: all Arc fields) instead of reopening from disk.
@@ -985,7 +1008,7 @@ impl PhysicalStore for LancePhysicalStore {
                     self.invalidate_dataset_caches(dataset);
 
                     // _guard dropped here — write lock released.
-                    Ok((new_version, existing))
+                    Ok((new_version, existing, dataset_was_empty))
                 }
                 Err(error) if is_missing_dataset_error(&error) => {
                     let dataset_handle = self.open_or_create_batches(dataset, &batches).await?;
@@ -995,8 +1018,9 @@ impl PhysicalStore for LancePhysicalStore {
                         .await?;
                     self.datasets.put(dataset.to_string(), Arc::new(ds_mut));
                     self.invalidate_dataset_caches(dataset);
-                    // _guard dropped here.
-                    Ok((new_version, None))
+                    // _guard dropped here. A freshly created dataset was empty, so
+                    // the new batches ARE the whole dataset — a snapshot is valid.
+                    Ok((new_version, None, true))
                 }
                 Err(e) => Err(e),
             }
@@ -1005,8 +1029,14 @@ impl PhysicalStore for LancePhysicalStore {
         // Post-lock: build the proactive snapshot (schema normalization + null
         // filtering) now that the write lock has been released.  Readers that arrive
         // in this brief window fall back to a Lance scan, the pre-regression behavior.
-        if let Some((key, snapshot)) =
-            self.build_proactive_snapshot(dataset, new_version, existing_snapshot, &batches)
+        //
+        // Only build when the snapshot would be COMPLETE: either we hold the full
+        // prior snapshot to extend, or the dataset was empty before this write.
+        // Otherwise the partial snapshot would silently drop pre-existing rows
+        // from every flat vector search until the next cache invalidation.
+        if (existing_snapshot.is_some() || dataset_was_empty)
+            && let Some((key, snapshot)) =
+                self.build_proactive_snapshot(dataset, new_version, existing_snapshot, &batches)
         {
             self.flat_vector_snapshot_cache.insert(key, snapshot);
         }
@@ -1620,6 +1650,8 @@ impl PhysicalStore for LancePhysicalStore {
         Ok(CompactResult {
             fragments_removed: metrics.fragments_removed as u64,
             fragments_added: metrics.fragments_added as u64,
+            // Lance's CompactionMetrics carries no row-level count (only
+            // fragment/file deltas), so there is nothing real to report here.
             rows_removed: 0,
         })
     }

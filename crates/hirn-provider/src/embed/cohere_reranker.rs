@@ -13,7 +13,7 @@ use crate::metrics::record_invalid_reranker_score;
 use super::error::{EmbedError, parse_retry_after};
 
 /// Default request timeout for HTTP calls.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const REQUEST_TIMEOUT: Duration = Duration::from_mins(1);
 /// Default connection timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 

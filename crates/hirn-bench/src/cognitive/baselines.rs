@@ -1,14 +1,18 @@
 //! HIRN-Bench baselines and SOTA targets (RFC §10).
 //!
-//! F-83 FIX: Real published scores from competitor systems (Mem0, MemGPT, Zep,
-//! TraceMem, ActMem). No placeholder 0.0 values remain.
+//! Reference baselines are conservative **estimated floors** for a simple
+//! "Vector DB + RAG" pipeline (cosine recall over a vector database, no graph,
+//! no temporal filtering, no multi-agent isolation), reported in the *same*
+//! `containment` metric hirn measures so the comparison is apples-to-apples.
+//! They provide a floor, not a measured head-to-head against a specific
+//! competitor.
 //!
-//! Reference baselines come from published benchmarks and estimated "Vector DB +
-//! RAG" scores. Baselines marked "estimated" are conservative projections for a
-//! simple cosine-recall pipeline over a vector database (no graph, no temporal
-//! filtering, no multi-agent isolation). They provide a floor rather than a
-//! measured comparison. Published scores from competitor systems are included
-//! where available.
+//! We deliberately do **not** hardcode published scores from named competitor
+//! systems here: those numbers are measured on different datasets with
+//! different metrics (e.g. DMR accuracy, LoCoMo F1) and cannot be placed in the
+//! same column as hirn's containment without misleading the reader. Cross-system
+//! comparison belongs in the documentation, with explicit metric/dataset
+//! provenance, not in the runtime harness output.
 
 use super::Benchmark;
 
@@ -35,54 +39,24 @@ pub struct Target {
 /// Get reference baselines for a suite.
 pub fn baselines(benchmark: Benchmark) -> Vec<Baseline> {
     match benchmark {
-        Benchmark::H1Retrieval => vec![
-            Baseline {
-                system: "Vector DB + RAG (estimated)",
-                score: 0.75,
-                metric_name: "containment",
-                source: "Estimated: cosine-recall baseline without reranking",
-            },
-            Baseline {
-                system: "Zep/Graphiti",
-                score: 0.948,
-                metric_name: "DMR accuracy",
-                source: "Zep DMR benchmark (2024)",
-            },
-            Baseline {
-                system: "MemGPT/Letta",
-                score: 0.934,
-                metric_name: "DMR accuracy",
-                source: "MemGPT DMR benchmark (2024)",
-            },
-        ],
-        Benchmark::H2Temporal => vec![
-            Baseline {
-                system: "Vector DB + RAG (estimated)",
-                score: 0.50,
-                metric_name: "containment",
-                source: "Estimated: no temporal filtering or recency weighting",
-            },
-            Baseline {
-                system: "TraceMem",
-                score: 0.72,
-                metric_name: "LoCoMo",
-                source: "Maharana et al. 2024 — LoCoMo temporal F1 (Table 3)",
-            },
-        ],
-        Benchmark::H3Graph => vec![
-            Baseline {
-                system: "Vector DB + RAG (estimated)",
-                score: 0.40,
-                metric_name: "containment",
-                source: "Estimated: no graph traversal or causal reasoning",
-            },
-            Baseline {
-                system: "ActMem",
-                score: 0.68,
-                metric_name: "causal accuracy",
-                source: "Plausible causal baseline from graph-based LLM memory (2024)",
-            },
-        ],
+        Benchmark::H1Retrieval => vec![Baseline {
+            system: "Vector DB + RAG (estimated)",
+            score: 0.75,
+            metric_name: "containment",
+            source: "Estimated: cosine-recall baseline without reranking",
+        }],
+        Benchmark::H2Temporal => vec![Baseline {
+            system: "Vector DB + RAG (estimated)",
+            score: 0.50,
+            metric_name: "containment",
+            source: "Estimated: no temporal filtering or recency weighting",
+        }],
+        Benchmark::H3Graph => vec![Baseline {
+            system: "Vector DB + RAG (estimated)",
+            score: 0.40,
+            metric_name: "containment",
+            source: "Estimated: no graph traversal or causal reasoning",
+        }],
         Benchmark::H4Agent => vec![Baseline {
             system: "Vector DB + RAG (estimated)",
             score: 0.60,

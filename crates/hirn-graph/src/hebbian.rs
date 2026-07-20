@@ -165,35 +165,52 @@ const fn decay_multiplier_for_relation(relation: hirn_core::types::EdgeRelation)
 /// Default flush threshold: every 16 recall operations.
 const DEFAULT_FLUSH_THRESHOLD: u64 = 16;
 
+/// Default hard cap on buffered events. When callers honor the flush signal
+/// the queue stays near `flush_threshold` entries; this cap only guards
+/// against a path that pushes without ever flushing, so it can be generous.
+const DEFAULT_MAX_BUFFERED_EVENTS: u64 = 16 * 1024;
+
 /// Lock-free buffer for co-retrieval events.
 ///
 /// Push operations use [`SegQueue`] and never block. The [`flush`](Self::flush)
 /// method drains the queue and applies all accumulated co-retrieval + decay
 /// updates to the graph in a single batch.
+///
+/// The queue is bounded: once `max_buffered` events are pending, each new
+/// push evicts the oldest event so memory stays bounded even if no flush
+/// ever happens.
 pub struct HebbianBuffer {
     queue: SegQueue<Vec<MemoryId>>,
     push_count: AtomicU64,
+    queue_len: AtomicU64,
+    dropped: AtomicU64,
     flush_threshold: u64,
+    max_buffered: u64,
 }
 
 impl HebbianBuffer {
     /// Create a new buffer with the default flush threshold (16).
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            queue: SegQueue::new(),
-            push_count: AtomicU64::new(0),
-            flush_threshold: DEFAULT_FLUSH_THRESHOLD,
-        }
+        Self::with_limits(DEFAULT_FLUSH_THRESHOLD, DEFAULT_MAX_BUFFERED_EVENTS)
     }
 
     /// Create a new buffer with a custom flush threshold.
     #[must_use]
     pub fn with_threshold(threshold: u64) -> Self {
+        Self::with_limits(threshold, DEFAULT_MAX_BUFFERED_EVENTS)
+    }
+
+    /// Create a new buffer with a custom flush threshold and event cap.
+    #[must_use]
+    pub fn with_limits(threshold: u64, max_buffered: u64) -> Self {
         Self {
             queue: SegQueue::new(),
             push_count: AtomicU64::new(0),
+            queue_len: AtomicU64::new(0),
+            dropped: AtomicU64::new(0),
             flush_threshold: threshold,
+            max_buffered: max_buffered.max(1),
         }
     }
 
@@ -201,8 +218,23 @@ impl HebbianBuffer {
     ///
     /// Returns `true` if the push count has reached the flush threshold,
     /// signaling that the caller should call [`flush`](Self::flush).
+    ///
+    /// When the buffer is at capacity the oldest pending event is dropped to
+    /// make room, so the freshest co-retrieval signals are the ones kept.
     pub fn push(&self, retrieved_ids: Vec<MemoryId>) -> bool {
+        if self.queue_len.load(Ordering::Relaxed) >= self.max_buffered {
+            if self.queue.pop().is_some() {
+                self.queue_len.fetch_sub(1, Ordering::Relaxed);
+            }
+            let dropped = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            tracing::debug!(
+                dropped_total = dropped,
+                max_buffered = self.max_buffered,
+                "hebbian buffer at capacity, dropping oldest co-retrieval event"
+            );
+        }
         self.queue.push(retrieved_ids);
+        self.queue_len.fetch_add(1, Ordering::Relaxed);
         let count = self.push_count.fetch_add(1, Ordering::Relaxed) + 1;
         count >= self.flush_threshold
     }
@@ -219,6 +251,7 @@ impl HebbianBuffer {
         };
 
         while let Some(ids) = self.queue.pop() {
+            self.queue_len.fetch_sub(1, Ordering::Relaxed);
             let result = hebbian_update(graph, &ids, config);
             total.strengthened += result.strengthened;
             total.decayed += result.decayed;
@@ -232,9 +265,23 @@ impl HebbianBuffer {
         self.push_count.load(Ordering::Relaxed)
     }
 
+    /// Number of events currently buffered. Approximate under concurrency.
+    pub fn buffered_len(&self) -> u64 {
+        self.queue_len.load(Ordering::Relaxed)
+    }
+
+    /// Total number of events dropped due to the buffer being at capacity.
+    pub fn dropped_count(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
     /// Pop a single event from the queue, for callers that drain manually.
     pub fn pop(&self) -> Option<Vec<MemoryId>> {
-        self.queue.pop()
+        let popped = self.queue.pop();
+        if popped.is_some() {
+            self.queue_len.fetch_sub(1, Ordering::Relaxed);
+        }
+        popped
     }
 
     /// Reset the push counter to zero (e.g. before manual drain).
@@ -558,5 +605,45 @@ mod tests {
         let buf = HebbianBuffer::new();
         assert_eq!(buf.flush_threshold, DEFAULT_FLUSH_THRESHOLD);
         assert_eq!(buf.flush_threshold, 16);
+    }
+
+    #[test]
+    fn buffer_capacity_drops_oldest_events() {
+        let buf = HebbianBuffer::with_limits(u64::MAX, 4);
+
+        let ids: Vec<MemoryId> = (0..10).map(|_| MemoryId::new()).collect();
+        for &id in &ids {
+            buf.push(vec![id]);
+            assert!(
+                buf.buffered_len() <= 4,
+                "buffer must never exceed its cap, got {}",
+                buf.buffered_len()
+            );
+        }
+
+        assert_eq!(buf.buffered_len(), 4);
+        assert_eq!(buf.dropped_count(), 6, "6 oldest events should be dropped");
+
+        // Drain: only the newest 4 events survive.
+        let mut drained = Vec::new();
+        while let Some(event) = buf.pop() {
+            drained.push(event[0]);
+        }
+        assert_eq!(drained, ids[6..].to_vec());
+        assert_eq!(buf.buffered_len(), 0);
+    }
+
+    #[test]
+    fn buffer_flush_resets_buffered_len() {
+        let mut pg = PropertyGraph::new();
+        let buf = HebbianBuffer::with_threshold(100);
+        for _ in 0..5 {
+            buf.push(vec![MemoryId::new()]);
+        }
+        assert_eq!(buf.buffered_len(), 5);
+
+        buf.flush(&mut pg, &HebbianConfig::default());
+        assert_eq!(buf.buffered_len(), 0);
+        assert_eq!(buf.dropped_count(), 0);
     }
 }

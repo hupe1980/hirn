@@ -144,7 +144,8 @@ mod tests {
     fn simple_prunes_graph_activation() {
         let leaf = leaf_plan();
         let graph = Arc::new(
-            GraphActivationExec::new(leaf, 10, ActivationMode::Spreading, 2, 0.01, 0.1).unwrap(),
+            GraphActivationExec::new(leaf, 10, ActivationMode::Spreading, 2, 0.01, 0.1, None)
+                .unwrap(),
         ) as Arc<dyn ExecutionPlan>;
 
         let rule = DepthSchedulingRule::with_complexity(Complexity::Simple);
@@ -204,7 +205,8 @@ mod tests {
     fn medium_keeps_graph_activation() {
         let leaf = leaf_plan();
         let graph = Arc::new(
-            GraphActivationExec::new(leaf, 10, ActivationMode::Spreading, 2, 0.01, 0.1).unwrap(),
+            GraphActivationExec::new(leaf, 10, ActivationMode::Spreading, 2, 0.01, 0.1, None)
+                .unwrap(),
         ) as Arc<dyn ExecutionPlan>;
 
         let rule = DepthSchedulingRule::with_complexity(Complexity::Medium);
@@ -242,7 +244,8 @@ mod tests {
     fn complex_keeps_all() {
         let leaf = leaf_plan();
         let graph = Arc::new(
-            GraphActivationExec::new(leaf, 10, ActivationMode::Spreading, 2, 0.01, 0.1).unwrap(),
+            GraphActivationExec::new(leaf, 10, ActivationMode::Spreading, 2, 0.01, 0.1, None)
+                .unwrap(),
         ) as Arc<dyn ExecutionPlan>;
 
         let rule = DepthSchedulingRule::with_complexity(Complexity::Complex);
@@ -263,7 +266,8 @@ mod tests {
         // Default rule acts as no-op (Complex classification).
         let leaf = leaf_plan();
         let graph = Arc::new(
-            GraphActivationExec::new(leaf, 10, ActivationMode::Spreading, 2, 0.01, 0.1).unwrap(),
+            GraphActivationExec::new(leaf, 10, ActivationMode::Spreading, 2, 0.01, 0.1, None)
+                .unwrap(),
         ) as Arc<dyn ExecutionPlan>;
 
         let rule = DepthSchedulingRule::new();

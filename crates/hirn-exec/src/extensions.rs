@@ -54,6 +54,31 @@ pub struct GraphCausalChainRow {
 pub struct GraphTraverseRow {
     pub node_id: String,
     pub depth: u32,
+    /// Relation of the edge this node was first discovered through
+    /// (HirnQL snake_case form, e.g. `related_to`); `None` for start nodes.
+    pub edge_relation: Option<String>,
+    /// Weight of the edge this node was first discovered through.
+    pub edge_weight: Option<f32>,
+}
+
+/// The HirnQL string form of an edge relation, matching what TRAVERSE `VIA`
+/// and `WHERE edge_relation = '…'` accept.
+#[must_use]
+pub const fn edge_relation_query_str(relation: EdgeRelation) -> &'static str {
+    match relation {
+        EdgeRelation::RelatedTo => "related_to",
+        EdgeRelation::Causes => "causes",
+        EdgeRelation::CausedBy => "caused_by",
+        EdgeRelation::DerivedFrom => "derived_from",
+        EdgeRelation::Contradicts => "contradicts",
+        EdgeRelation::Supports => "supports",
+        EdgeRelation::TemporalNext => "temporal_next",
+        EdgeRelation::PartOf => "part_of",
+        EdgeRelation::InstanceOf => "instance_of",
+        EdgeRelation::SimilarTo => "similar_to",
+        EdgeRelation::Inhibits => "inhibits",
+        EdgeRelation::ParticipatesIn => "participates_in",
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -82,6 +107,41 @@ pub trait GraphReadRuntime: Send + Sync {
         delegation_threshold: usize,
         allowed_namespaces: Option<&[Namespace]>,
     ) -> HirnResult<GraphActivationOutput>;
+
+    /// Activation with an edge-weight cutoff (EXPAND … MIN_WEIGHT).
+    ///
+    /// The default implementation refuses a requested cutoff rather than
+    /// ignoring it — silently dropping the clause would widen the result set.
+    /// Runtimes with edge-weight access override this to apply the cutoff.
+    async fn activate_graph_min_weight(
+        &self,
+        seeds: &[MemoryId],
+        mode: ActivationMode,
+        ppr_config: Option<&PprConfig>,
+        max_depth: u32,
+        epsilon: f32,
+        inhibition_mu: f32,
+        min_weight: Option<f32>,
+        delegation_threshold: usize,
+        allowed_namespaces: Option<&[Namespace]>,
+    ) -> HirnResult<GraphActivationOutput> {
+        if min_weight.is_some_and(|weight| weight > 0.0) {
+            return Err(hirn_core::HirnError::InvalidInput(
+                "this graph runtime does not support MIN_WEIGHT activation cutoffs".into(),
+            ));
+        }
+        self.activate_graph(
+            seeds,
+            mode,
+            ppr_config,
+            max_depth,
+            epsilon,
+            inhibition_mu,
+            delegation_threshold,
+            allowed_namespaces,
+        )
+        .await
+    }
 
     async fn causal_chain(
         &self,

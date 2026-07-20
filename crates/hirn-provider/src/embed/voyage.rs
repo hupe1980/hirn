@@ -13,7 +13,7 @@ use tracing::debug;
 use super::error::{EmbedError, parse_retry_after};
 
 /// Default request timeout for HTTP calls.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const REQUEST_TIMEOUT: Duration = Duration::from_mins(1);
 /// Default connection timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -243,6 +243,17 @@ impl Embedder for VoyageEmbedder {
 
     fn model_id(&self) -> &str {
         &self.model
+    }
+
+    fn embedding_space_id(&self) -> String {
+        // Voyage is asymmetric (document vs query input types produce different
+        // vectors); include the input type in the cache-space identity.
+        format!(
+            "{}:{}:{}",
+            self.model,
+            self.dimensions,
+            self.input_type.as_str()
+        )
     }
 
     fn max_input_tokens(&self) -> usize {
@@ -505,8 +516,11 @@ mod tests {
                     "usage": { "total_tokens": expected_count * 5 }
                 });
                 let body_str = response_body.to_string();
+                // Connection: close forces the client to open a fresh
+                // connection for the second chunk instead of reusing this
+                // socket, which is dropped at the end of the iteration.
                 let http_response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body_str.len(),
                     body_str
                 );

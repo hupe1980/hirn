@@ -128,8 +128,14 @@ pub enum HirnError {
     RateLimited(String),
 
     /// An external AI provider (embedder, reranker, LLM) returned an error.
-    #[error("provider error: {0}")]
-    ProviderError(String),
+    ///
+    /// `retryable` is decided where the error is constructed — the only place
+    /// the HTTP status / failure cause is known. Transient failures (timeouts,
+    /// 5xx, connection resets) set it true; contract violations (wrong result
+    /// count, malformed response) set it false so retry loops don't hammer a
+    /// misbehaving provider.
+    #[error("provider error: {message}")]
+    ProviderError { message: String, retryable: bool },
 
     /// A batched embedding operation completed only partially.
     #[error("partial embedding failure: {completed}/{total} embeddings succeeded, {failed} failed")]
@@ -184,9 +190,23 @@ impl HirnError {
         Self::InvalidInput(msg.into())
     }
 
-    /// Create a `ProviderError` for AI provider failures.
+    /// Create a retryable `ProviderError` for transient AI provider failures
+    /// (network errors, 5xx responses, resets).
     pub fn provider(msg: impl Into<String>) -> Self {
-        Self::ProviderError(msg.into())
+        Self::ProviderError {
+            message: msg.into(),
+            retryable: true,
+        }
+    }
+
+    /// Create a non-retryable `ProviderError` for provider contract violations
+    /// (wrong result count, malformed response) where retrying would repeat
+    /// the same failure.
+    pub fn provider_permanent(msg: impl Into<String>) -> Self {
+        Self::ProviderError {
+            message: msg.into(),
+            retryable: false,
+        }
     }
 
     /// Create a structured partial embedding failure.
@@ -231,13 +251,23 @@ impl HirnError {
     /// True if retrying this operation might succeed.
     ///
     /// Transient errors include timeouts, rate limits, and provider errors
-    /// with retriable status codes (5xx).
+    /// flagged retryable at construction (5xx, network resets). A partial
+    /// embedding failure is retryable when every per-index failure it carries
+    /// is itself retryable (and there is at least one) — retrying then repeats
+    /// only transient work. A single non-retryable failure (auth, invalid
+    /// input, contract violation, …) makes the whole batch non-retryable,
+    /// since retrying would fail again.
     #[must_use]
-    pub const fn is_retryable(&self) -> bool {
-        matches!(
-            self,
-            Self::Timeout(_) | Self::RateLimited(_) | Self::ProviderError(_)
-        )
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::Timeout(_) | Self::RateLimited(_) => true,
+            Self::ProviderError { retryable, .. } => *retryable,
+            Self::PartialEmbeddingFailure { partial, .. } => {
+                !partial.failures.is_empty()
+                    && partial.failures.iter().all(|failure| failure.retryable)
+            }
+            _ => false,
+        }
     }
 }
 
@@ -278,12 +308,45 @@ mod tests {
     }
 
     #[test]
+    fn provider_error_retryability_is_explicit() {
+        assert!(HirnError::provider("503 from upstream").is_retryable());
+        assert!(
+            !HirnError::provider_permanent("returned 2 embeddings for 1 input").is_retryable(),
+            "contract violations must not be retried"
+        );
+    }
+
+    #[test]
     fn partial_embedding_failure_exposes_payload() {
         let partial = PartialEmbeddingBatch::new(2);
         let err = HirnError::partial_embedding_failure(partial.clone());
 
         assert_eq!(err.partial_embedding_batch(), Some(&partial));
         assert_eq!(err.into_partial_embedding_batch(), Some(partial));
+    }
+
+    #[test]
+    fn partial_embedding_failure_with_all_retryable_failures_is_retryable() {
+        let mut partial = PartialEmbeddingBatch::new(3);
+        partial.push_failure(0, true, "timeout");
+        partial.push_failure(1, true, "rate limited");
+
+        assert!(HirnError::partial_embedding_failure(partial).is_retryable());
+    }
+
+    #[test]
+    fn partial_embedding_failure_with_non_retryable_failure_is_not_retryable() {
+        let mut partial = PartialEmbeddingBatch::new(3);
+        partial.push_failure(0, true, "timeout");
+        partial.push_failure(1, false, "auth failed");
+
+        assert!(!HirnError::partial_embedding_failure(partial).is_retryable());
+    }
+
+    #[test]
+    fn partial_embedding_failure_without_failures_is_not_retryable() {
+        let partial = PartialEmbeddingBatch::new(2);
+        assert!(!HirnError::partial_embedding_failure(partial).is_retryable());
     }
 
     #[test]

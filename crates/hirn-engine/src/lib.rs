@@ -66,15 +66,16 @@ pub use consolidation::{
     ConsolidationConfig, ConsolidationResult, ConsolidationSchedule, ConsolidationScheduler,
     ConsolidationStatus, DetectedPatterns, DreamCycleConfig, DreamCycleResult, DreamHypothesis,
     DreamPhase, EpisodeSegment, ForgettingResult, NarrativeThread, Pattern, PhaseResult,
-    ReconsolidationTracker, ReconsolidationUpdate, execute_dream_cycle,
+    ReconsolidationTracker, ReconsolidationUpdate, community_concept_name, execute_dream_cycle,
     generate_community_summaries, retention_score,
 };
 pub use db::{
-    AdminView, CausalView, CrossAgentConsolidationResult, DbStats, EpisodicFilter, EpisodicView,
-    GraphView, HirnDB, LayerCounts, MutationWriteContract, MutationWriteGuarantee, NamespaceView,
-    PolicyView, PrefetchStats, ProceduralView, PurgeReport, QueryView, RecallView, SemanticFilter,
-    SemanticMerge, SemanticMergeOutcome, SemanticOverride, SemanticRetraction,
-    SemanticSupersession, SemanticUpdate, SemanticView, WorkingView, mutation_write_contracts,
+    AdminView, AuditChainVerification, CausalView, CrossAgentConsolidationResult, DbStats,
+    EpisodicFilter, EpisodicView, GraphView, HirnDB, LayerCounts, MutationWriteContract,
+    MutationWriteGuarantee, NamespaceView, PolicyView, PrefetchStats, ProceduralView, PurgeReport,
+    QueryView, RecallView, SemanticFilter, SemanticMerge, SemanticMergeOutcome, SemanticOverride,
+    SemanticRetraction, SemanticSupersession, SemanticUpdate, SemanticView, WorkingView,
+    mutation_write_contracts,
 };
 pub use diagnostics::{QueryDiagnostics, QueryId};
 pub use error::StoreError;

@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use hirn_core::circuit_breaker::CircuitBreaker;
-use hirn_core::embed::{Embedder, Embedding};
+use hirn_core::embed::{Embedder, Embedding, MultivectorEmbedding};
 use hirn_core::{HirnError, HirnResult};
 
 use super::error::EmbedError;
@@ -66,8 +66,28 @@ impl<E: Embedder> Embedder for CircuitBreakerEmbedder<E> {
         self.inner.model_id()
     }
 
+    fn embedding_space_id(&self) -> String {
+        self.inner.embedding_space_id()
+    }
+
     fn max_input_tokens(&self) -> usize {
         self.inner.max_input_tokens()
+    }
+
+    // Multivector calls hit the same provider endpoint budget as single-vector
+    // calls, so they share the breaker state.
+    async fn embed_multivec(&self, texts: &[&str]) -> HirnResult<Vec<MultivectorEmbedding>> {
+        self.check_breaker()?;
+        let result = self.inner.embed_multivec(texts).await;
+        match &result {
+            Ok(_) => self.breaker.record_success(),
+            Err(_) => self.breaker.record_failure(),
+        }
+        result
+    }
+
+    fn supports_multivec(&self) -> bool {
+        self.inner.supports_multivec()
     }
 }
 
@@ -105,6 +125,33 @@ mod tests {
 
         let result = embedder.embed(&["test"]).await.unwrap();
         assert_eq!(result.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn multivec_forwards_to_inner() {
+        let breaker = CircuitBreaker::new("mock", CircuitBreakerConfig::default());
+        let embedder = CircuitBreakerEmbedder::new(PseudoEmbedder::new(16), breaker);
+
+        assert!(embedder.supports_multivec());
+        let result = embedder.embed_multivec(&["test"]).await.unwrap();
+        assert_eq!(result.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn open_breaker_rejects_embed_multivec() {
+        let breaker = CircuitBreaker::new(
+            "mock",
+            CircuitBreakerConfig {
+                failure_threshold: 1,
+                recovery_timeout: Duration::from_mins(1),
+                success_threshold: 1,
+            },
+        );
+        let embedder = CircuitBreakerEmbedder::new(PseudoEmbedder::new(16), breaker);
+
+        embedder.circuit_breaker().record_failure();
+        let result = embedder.embed_multivec(&["test"]).await;
+        assert!(result.unwrap_err().to_string().contains("circuit open"));
     }
 
     #[tokio::test]

@@ -598,35 +598,164 @@ permit(
     // PATH 7: THINK MODE RAPTOR — namespace isolation on RAPTOR summaries
     // ════════════════════════════════════════════════════════════════════
 
+    /// Minimal LLM stub so consolidation can run its real summarization path.
+    struct StaticSummaryLlm;
+
+    #[async_trait::async_trait]
+    impl hirn_core::embed::LlmProvider for StaticSummaryLlm {
+        async fn generate_text(
+            &self,
+            _messages: &[hirn_core::embed::ChatMessage],
+            _options: &hirn_core::embed::LlmOptions,
+        ) -> hirn_core::HirnResult<String> {
+            Ok("Consolidated summary.".to_string())
+        }
+
+        fn model_id(&self) -> &str {
+            "static-summary"
+        }
+    }
+
+    /// Policy engine with the internal consolidation writer agents registered,
+    /// so the real RAPTOR / community summarization code can store its
+    /// derived records under Cedar enforcement.
+    fn create_policy_engine_with_consolidators() -> PolicyEngine {
+        let engine = create_policy_engine();
+        engine
+            .register_agent("raptor", 100, "2025-01-01T00:00:00Z", &["admins"])
+            .unwrap();
+        engine
+            .register_agent("community", 100, "2025-01-01T00:00:00Z", &["admins"])
+            .unwrap();
+        engine
+    }
+
+    fn make_semantic_leaf(
+        concept: &str,
+        description: &str,
+        seed: u128,
+        ns_str: &str,
+    ) -> SemanticRecord {
+        SemanticRecord::builder()
+            .concept(concept)
+            .description(description)
+            .knowledge_type(KnowledgeType::Propositional)
+            .agent_id(AgentId::new("full-access").unwrap())
+            .confidence(0.9)
+            .embedding(rand_vec(DIM, seed))
+            .namespace(ns(ns_str))
+            .build()
+            .unwrap()
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn path7_think_raptor_respects_namespace() {
-        let engine = create_policy_engine();
+        let engine = create_policy_engine_with_consolidators();
         let (db, _dir) = create_test_db(engine).await;
 
-        // Store RAPTOR summaries in different namespaces
-        let raptor_alpha = SemanticRecord::builder()
-            .concept("raptor-alpha-l0-0")
-            .description("RAPTOR leaf summary for alpha namespace content")
-            .knowledge_type(KnowledgeType::RaptorSummary)
-            .agent_id(AgentId::new("full-access").unwrap())
-            .confidence(0.9)
-            .embedding(rand_vec(DIM, 300))
-            .namespace(ns("ns_alpha"))
-            .build()
-            .unwrap();
-        db.semantic().store(raptor_alpha).await.unwrap();
+        // Leaf semantic records in two namespaces — the raw material the real
+        // RAPTOR consolidation clusters and summarizes.
+        for i in 0u128..3 {
+            let leaf = make_semantic_leaf(
+                &format!("alpha-leaf-{i}"),
+                &format!("alpha namespace content item {i}"),
+                300 + i,
+                "ns_alpha",
+            );
+            db.semantic().store(leaf).await.unwrap();
+        }
+        for i in 0u128..3 {
+            let leaf = make_semantic_leaf(
+                &format!("beta-leaf-{i}"),
+                &format!("beta namespace secret item {i}"),
+                310 + i,
+                "ns_beta",
+            );
+            db.semantic().store(leaf).await.unwrap();
+        }
 
-        let raptor_beta = SemanticRecord::builder()
-            .concept("raptor-beta-l0-0")
-            .description("RAPTOR leaf summary for beta namespace secrets")
-            .knowledge_type(KnowledgeType::RaptorSummary)
-            .agent_id(AgentId::new("full-access").unwrap())
-            .confidence(0.9)
-            .embedding(rand_vec(DIM, 301))
-            .namespace(ns("ns_beta"))
-            .build()
+        // Run the real RAPTOR tree build per namespace, as the consolidation
+        // pipeline does.
+        let llm: Arc<dyn hirn_core::embed::LlmProvider> = Arc::new(StaticSummaryLlm);
+        let config = hirn_engine::ConsolidationConfig {
+            raptor_enabled: true,
+            raptor_max_levels: 1,
+            raptor_cluster_size: 3,
+            raptor_min_cluster_input: 3,
+            raptor_min_cluster_size: 3,
+            ..Default::default()
+        };
+        for ns_name in ["ns_alpha", "ns_beta"] {
+            let result =
+                hirn_engine::consolidation::build_raptor_tree(&db, &llm, &config, &ns(ns_name))
+                    .await
+                    .unwrap();
+            assert!(
+                result.summaries_stored >= 1,
+                "RAPTOR should produce at least one summary for {ns_name}"
+            );
+        }
+
+        // Every derived summary must sit in its sources' namespace — never in
+        // "default", and never blending namespaces.
+        let summaries = db
+            .semantic()
+            .list(&hirn_engine::SemanticFilter {
+                knowledge_type: Some(KnowledgeType::RaptorSummary),
+                min_confidence: None,
+                namespace: None,
+                limit: None,
+            })
+            .await
             .unwrap();
-        db.semantic().store(raptor_beta).await.unwrap();
+        assert!(!summaries.is_empty(), "expected RAPTOR summaries");
+        let mut beta_summary_ids = Vec::new();
+        for summary in &summaries {
+            assert_ne!(
+                summary.namespace,
+                Namespace::default_ns(),
+                "RAPTOR summary must not land in the default namespace"
+            );
+            for &source_id in &summary.source_episodes {
+                let source = db.semantic().get(source_id).await.unwrap();
+                assert_eq!(
+                    source.namespace, summary.namespace,
+                    "RAPTOR summary namespace must match its source records"
+                );
+            }
+            if summary.namespace == ns("ns_beta") {
+                beta_summary_ids.push(summary.id);
+            }
+        }
+        assert!(
+            !beta_summary_ids.is_empty(),
+            "expected a RAPTOR summary derived from ns_beta"
+        );
+
+        // Recall scoped to ns_alpha (reader-agent has no business in ns_beta
+        // data) must never surface a summary derived from ns_beta records.
+        let query = rand_vec(DIM, 310);
+        let results = db
+            .recall_view()
+            .query(query)
+            .agent_id("reader-agent")
+            .namespace(ns("ns_alpha"))
+            .limit(20)
+            .execute()
+            .await
+            .unwrap();
+        for r in &results {
+            let record_ns = record_ns(&r.record);
+            assert_ne!(
+                record_ns,
+                ns("ns_beta"),
+                "recall must not leak ns_beta records"
+            );
+            assert!(
+                !beta_summary_ids.contains(&r.record.id()),
+                "recall must not surface a summary derived from ns_beta records"
+            );
+        }
 
         // THINK MODE RAPTOR NAMESPACE ns_alpha
         let result = db
@@ -649,6 +778,140 @@ permit(
                 }
             }
             _ => {} // aggregated or empty is fine
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // PATH 7a: Community consolidation — summaries stay in member namespace
+    // ════════════════════════════════════════════════════════════════════
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn path7a_community_summaries_respect_namespace() {
+        let engine = create_policy_engine_with_consolidators();
+        let (db, _dir) = create_test_db(engine).await;
+
+        // A graph community whose members span two namespaces (community
+        // detection is topology-only, so this happens in practice).
+        let mut alpha_members = Vec::new();
+        let mut beta_members = Vec::new();
+        for i in 0u128..2 {
+            let rec = make_episode(
+                "full-access",
+                &format!("alpha private note {i}"),
+                400 + i,
+                "ns_alpha",
+            );
+            alpha_members.push(db.episodic().remember(rec).await.unwrap());
+        }
+        for i in 0u128..2 {
+            let rec = make_episode(
+                "full-access",
+                &format!("beta private note {i}"),
+                410 + i,
+                "ns_beta",
+            );
+            beta_members.push(db.episodic().remember(rec).await.unwrap());
+        }
+
+        let all_members: Vec<_> = alpha_members
+            .iter()
+            .chain(beta_members.iter())
+            .copied()
+            .collect();
+        let mut node_to_community = std::collections::HashMap::new();
+        for &id in &all_members {
+            node_to_community.insert(id, 0);
+        }
+        let communities = hirn_engine::CommunityResult {
+            levels: vec![vec![hirn_engine::Community {
+                level: 0,
+                index: 0,
+                members: all_members,
+                parent: None,
+                children: vec![],
+            }]],
+            node_to_community,
+            total_communities: 1,
+        };
+
+        // Run the real summary generation per namespace, as the pipeline does.
+        let llm: Arc<dyn hirn_core::embed::LlmProvider> = Arc::new(StaticSummaryLlm);
+        for ns_name in ["ns_alpha", "ns_beta"] {
+            let result = hirn_engine::generate_community_summaries(
+                &db,
+                &llm,
+                &communities,
+                50,
+                std::time::Duration::from_secs(30),
+                &ns(ns_name),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.summaries_stored, 1);
+        }
+
+        // Each namespace's summary derives only from its own members and no
+        // summary lands in the default namespace.
+        let summary_alpha = db
+            .semantic()
+            .get_by_concept_ns(
+                &hirn_engine::community_concept_name(&communities.levels[0][0]),
+                &ns("ns_alpha"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(summary_alpha.namespace, ns("ns_alpha"));
+        for source_id in &summary_alpha.source_episodes {
+            assert!(
+                alpha_members.contains(source_id),
+                "ns_alpha community summary must not derive from other namespaces"
+            );
+        }
+
+        let summary_beta = db
+            .semantic()
+            .get_by_concept_ns(
+                &hirn_engine::community_concept_name(&communities.levels[0][0]),
+                &ns("ns_beta"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(summary_beta.namespace, ns("ns_beta"));
+        for source_id in &summary_beta.source_episodes {
+            assert!(
+                beta_members.contains(source_id),
+                "ns_beta community summary must not derive from other namespaces"
+            );
+        }
+
+        assert!(
+            db.semantic()
+                .get_by_concept(&hirn_engine::community_concept_name(
+                    &communities.levels[0][0]
+                ))
+                .await
+                .is_err(),
+            "community summary must not land in the default namespace"
+        );
+
+        // Recall scoped to ns_alpha must never surface the beta-derived summary.
+        let query = rand_vec(DIM, 410);
+        let results = db
+            .recall_view()
+            .query(query)
+            .agent_id("reader-agent")
+            .namespace(ns("ns_alpha"))
+            .limit(20)
+            .execute()
+            .await
+            .unwrap();
+        for r in &results {
+            assert_ne!(
+                record_ns(&r.record),
+                ns("ns_beta"),
+                "recall must not leak the ns_beta community summary"
+            );
+            assert_ne!(r.record.id(), summary_beta.id);
         }
     }
 
@@ -1108,5 +1371,68 @@ permit(
             }
             other => panic!("expected Records result, got: {other:?}"),
         }
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // Agent-scoped graph connect enforces the Cedar `connect` action
+    // (previously only the MCP toolkit enforced it; the direct
+    // AgentContext path did namespace scoping only).
+    // ════════════════════════════════════════════════════════════════════
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_context_connect_enforces_cedar_connect_action() {
+        use hirn_core::metadata::Metadata;
+        use hirn_core::types::EdgeRelation;
+
+        let engine = create_policy_engine();
+        let (db, _dir) = create_test_db(engine).await;
+
+        let writer_id = AgentId::new("full-access").unwrap();
+        let reader_id = AgentId::new("reader-agent").unwrap();
+        db.register_agent(&writer_id, "Writer").await.unwrap();
+        db.register_agent(&reader_id, "Reader").await.unwrap();
+
+        // A team namespace (registered in the production realm via the policy
+        // engine already) that both agents belong to, so `as_agent` grants each
+        // access to it. Connect authorization then hinges purely on the Cedar
+        // `connect` action, not on namespace membership.
+        db.namespaces()
+            .create(
+                "ns_alpha",
+                hirn_core::types::NamespaceKind::Team,
+                vec![writer_id.clone(), reader_id.clone()],
+            )
+            .await
+            .unwrap();
+
+        // Memories authored by the writer (who may `remember`) in that namespace.
+        let id1 = db
+            .episodic()
+            .remember(make_episode("full-access", "node one", 1, "ns_alpha"))
+            .await
+            .unwrap();
+        let id2 = db
+            .episodic()
+            .remember(make_episode("full-access", "node two", 2, "ns_alpha"))
+            .await
+            .unwrap();
+
+        // Writer (writers team) is permitted `connect` in production → succeeds.
+        let writer = db.as_agent(&writer_id).await.unwrap();
+        writer
+            .connect_with(id1, id2, EdgeRelation::RelatedTo, 1.0, Metadata::default())
+            .await
+            .expect("writer must be allowed to connect");
+
+        // Reader (readers team) has namespace access but the readers policy has
+        // no `connect` action → denied by the engine-side Cedar choke point.
+        let reader = db.as_agent(&reader_id).await.unwrap();
+        let denied = reader
+            .connect_with(id1, id2, EdgeRelation::RelatedTo, 1.0, Metadata::default())
+            .await;
+        assert!(
+            matches!(denied, Err(HirnError::AccessDenied(_))),
+            "reader-agent must be denied the connect action, got: {denied:?}"
+        );
     }
 }

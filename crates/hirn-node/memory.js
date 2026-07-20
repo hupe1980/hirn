@@ -130,7 +130,7 @@ function isAlreadyRegisteredError(error) {
  * ```js
  * const { Memory } = require('@hupe1980/hirn');
  *
- * const mem = Memory.open('./brain.hirn');
+ * const mem = await Memory.open('./brain.hirn');
  * try {
  *   const id = await mem.remember('User prefers dark mode');
  *   const ctx = await mem.think('preferences?');
@@ -168,9 +168,9 @@ class Memory {
    * @param {string} [options.agentId='anonymous']
    * @param {number} [options.tokenBudget=4096]
    * @param {string} [options.tokenizerName] - Rust tokenizer registry name.
-   * @returns {Memory}
+   * @returns {Promise<Memory>}
    */
-  static open(path, options = {}) {
+  static async open(path, options = {}) {
     const {
       embeddings: embeddingsOpt,
       agentId = 'anonymous',
@@ -184,7 +184,9 @@ class Memory {
     }
 
     const { HirnBridge } = require('./bridge');
-    const hirn = HirnBridge.open(path, embeddings.dimensions, tokenBudget, tokenizerName);
+    // The native open is async so the database open does not block the
+    // Node.js event loop.
+    const hirn = await HirnBridge.open(path, embeddings.dimensions, tokenBudget, tokenizerName);
     return new Memory(hirn, embeddings, agentId);
   }
 
@@ -465,11 +467,11 @@ class Memory {
 
   /**
    * Get database statistics.
-   * @returns {import('./index').Stats}
+   * @returns {Promise<import('./index').Stats>}
    */
-  stats() {
+  async stats() {
     if (!this._hirn) throw new Error('memory is closed');
-    return this._hirn.stats();
+    return this._call(() => this._hirn.stats());
   }
 
   /**
@@ -525,7 +527,7 @@ class Memory {
   }
 
   /**
-   * Support `using mem = Memory.open(...)` (TC39 Explicit Resource Management).
+   * Support `using mem = await Memory.open(...)` (TC39 Explicit Resource Management).
    */
   [Symbol.dispose]() {
     this.close();

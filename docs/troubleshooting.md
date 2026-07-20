@@ -1,10 +1,56 @@
+---
+title: Troubleshooting
+parent: Deployment & Operations
+nav_order: 5
+description: >-
+  Diagnose operator-facing hirn failures — config errors, HTTP status mapping, rate limits, Cedar denials, provider partial failures, and offline job stalls.
+---
+
 # Troubleshooting
+{: .no_toc }
 
 > **⚠️ Experimental:** This project is under active development. APIs, on-disk formats, and behaviour may change without notice. Not recommended for production use.
 
 This guide covers the operator-facing failures that are surfaced by the live codebase today: config validation errors, daemon HTTP status mapping, rate limiting, forwarding timeouts, Cedar denials, provider-side partial failures, offline job stalls, explanation redaction surprises, and resource hydration confusion.
 
-If you are not sure which guide you should be using yet, start with [documentation-map.md](documentation-map.md).
+If you are not sure which guide you should be using yet, start with [Getting Started](getting-started.md).
+
+## Table of contents
+{: .no_toc .text-delta }
+
+1. TOC
+{:toc}
+
+---
+
+## Start Here: Triage Decision Tree
+
+Most hirn failures fall into a small number of classes, and the right first move
+depends almost entirely on *where* the error surfaced and *whether it is
+retryable*. Work the decision tree below before reaching for logs — it routes you
+to the section that matches your symptom in one or two hops.
+
+```mermaid
+flowchart TD
+    S[Error observed]:::s --> Q1{Startup or config load?}:::s
+    Q1 -->|yes| CFG[Config validation<br/>fix field, restart]:::s
+    Q1 -->|no| Q2{HTTP status?}:::s
+    Q2 -->|403| CED[Cedar / token-scope denial<br/>EXPLAIN POLICY]:::s
+    Q2 -->|429| RL[Route-class throttle<br/>back off + retry]:::s
+    Q2 -->|404 / 409| ID[Check id / namespace / realm]:::s
+    Q2 -->|500 / other| Q3{Provider involved?}:::s
+    Q3 -->|yes| PRV[Provider error / timeout /<br/>partial embedding failure]:::s
+    Q3 -->|no| Q4{Offline job?}:::s
+    Q4 -->|yes| OFF[Separate queueing /<br/>execution / review]:::s
+    Q4 -->|no| ESC[Escalation checklist]:::s
+    classDef s fill:#1a1b26,stroke:#7c9cff,color:#e6e8f0;
+```
+
+{: .note }
+> The daemon marks errors with a `retryable` flag. Today that flag is set for HTTP
+> `5xx` responses and explicit throttling (`429`) responses — those are the ones
+> worth retrying with backoff. Client errors (`4xx` other than `429`) are not
+> retryable; fix the request instead.
 
 ## Quick Triage
 
@@ -55,6 +101,12 @@ Operational advice:
 
 If you receive `access denied: ...` or a `403` from `hirnd`, do not start by changing headers. The authoritative decision comes from Cedar policy and authenticated token metadata, not from client-supplied namespace hints.
 
+{: .important }
+> The authenticated identity — not a request header — drives authorization. Under
+> mTLS the identity comes from the server-verified client-certificate CN, which is
+> why `[auth.client_certs]` requires `tls.client_ca_path`. A `x-client-cert-cn`
+> header on its own is never trusted. See [Security](security.md).
+
 Recommended checks:
 
 1. Run `EXPLAIN POLICY` for the principal, action, and resource in question.
@@ -94,6 +146,24 @@ Recovery procedure:
 ## Offline Jobs Stuck, Skipped, Or Waiting For Review
 
 The offline scheduler is explicit by design, so most offline cognition issues are visible if you separate queueing, execution, and review.
+
+The single most common mistake is collapsing three distinct stages into one
+"stuck" bucket. A job can be *queued but not running*, *running but failing*, *skipped
+by budget or policy*, or *completed but awaiting review*. Each has a different fix.
+
+```mermaid
+flowchart LR
+    SUB[Submitted]:::s --> QUE[Queued]:::s
+    QUE -->|budget / policy| SKIP[Skipped<br/>not a failure]:::s
+    QUE --> RUN[Running]:::s
+    RUN -->|error| FAIL[Failed]:::s
+    RUN --> DONE[Completed]:::s
+    DONE --> REV{Needs review?}:::s
+    REV -->|yes| QUAR[Quarantined<br/>not yet active truth]:::s
+    REV -->|no| ACT[Active cognition]:::s
+    QUAR -->|approved| ACT
+    classDef s fill:#1a1b26,stroke:#7c9cff,color:#e6e8f0;
+```
 
 Common symptoms:
 
@@ -229,7 +299,7 @@ Recovery procedure:
 - [observability.md](observability.md)
 - [offline-intelligence.md](offline-intelligence.md)
 - [explanation-surfaces.md](explanation-surfaces.md)
-- [documentation-map.md](documentation-map.md)
+- [Getting Started](getting-started.md)
 
 ## Escalation Checklist
 

@@ -297,6 +297,7 @@ traverse_stmt = {
     ~ via_clause?
     ~ ^"depth" ~ integer_literal
     ~ where_clause*
+    ~ namespace_clause?
     ~ limit_clause?
 }
 

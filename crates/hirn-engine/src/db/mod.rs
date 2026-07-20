@@ -27,6 +27,7 @@ pub use graph_runtime::PrefetchStats;
 pub use mutation_contract::{
     MutationWriteContract, MutationWriteGuarantee, mutation_write_contracts,
 };
+pub use policy_runtime::AuditChainVerification;
 pub use services::{
     AdminView, CausalView, EpisodicView, GraphView, NamespaceView, PolicyView, ProceduralView,
     QueryView, RecallView, SemanticView, WorkingView,
@@ -408,7 +409,10 @@ impl HirnDB {
         }
         let admission_runtime = AdmissionRuntime::new();
         let graph_runtime = GraphRuntime::new(storage.clone());
-        let policy_runtime = PolicyRuntime::new(storage.clone());
+        // The audit trail reuses the event-log HMAC secret (with a
+        // domain-separated derived key) so a single configured secret makes
+        // both the `events` and `_audit` datasets tamper-evident.
+        let policy_runtime = PolicyRuntime::open(storage.clone(), config.event_hmac_key()).await?;
         let provider_runtime = ProviderRuntime::new(config.embedding_dimensions.as_usize());
         let query_runtime = QueryRuntime::new(
             graph_runtime.cached_graph(),
@@ -419,7 +423,15 @@ impl HirnDB {
         let storage_runtime =
             StorageRuntime::new(path, storage, config.resource_quota_policy.clone());
         let event_runtime = EventRuntime::new();
-        let event_log = Arc::new(EventLog::open(storage_runtime.storage_arc()).await?);
+        // When an event-HMAC secret is configured, open the event log in signed
+        // mode so every event on the production emit path is HMAC-signed and
+        // hash-chained (tamper-evident). Otherwise events are unsigned.
+        let event_log = Arc::new(match config.event_hmac_key() {
+            Some(secret) => {
+                EventLog::open_signed(storage_runtime.storage_arc(), secret.to_vec()).await?
+            }
+            None => EventLog::open(storage_runtime.storage_arc()).await?,
+        });
         event_runtime.set_event_log(event_log);
         let write_runtime = WriteRuntime::new(config.default_realm.clone());
         // Restore RPE population stats from the previous session so novelty

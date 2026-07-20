@@ -113,13 +113,34 @@ pub fn classify_query(
         "how", "what are", "describe", "list", "when did", "where", "who", "which",
     ];
 
+    // Match phrases on word boundaries, not raw substrings: "how" must not
+    // fire inside "shower"/"however", "who" inside "whole", "where" inside
+    // "everywhere" — substring hits routed benign queries to heavier
+    // retrieval modes.
+    let contains_phrase = |phrase: &str| -> bool {
+        lower.match_indices(phrase).any(|(start, matched)| {
+            let before_ok = start == 0
+                || lower[..start]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|c| !c.is_alphanumeric());
+            let end = start + matched.len();
+            let after_ok = end == lower.len()
+                || lower[end..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !c.is_alphanumeric());
+            before_ok && after_ok
+        })
+    };
+
     let complex_hits = complex_patterns
         .iter()
-        .filter(|p| lower.contains(*p))
+        .filter(|p| contains_phrase(p))
         .count();
     let moderate_hits = moderate_patterns
         .iter()
-        .filter(|p| lower.contains(*p))
+        .filter(|p| contains_phrase(p))
         .count();
 
     score += (complex_hits as u32) * 2;
@@ -151,6 +172,22 @@ pub fn classify_query(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn substring_homonyms_do_not_inflate_complexity() {
+        // "shower" contains "how", "whole" contains "who", "nowhere" contains
+        // "where" — none may count as an interrogative pattern hit.
+        let a = classify_query(
+            "the shower in the whole nowhere annex",
+            0,
+            0,
+            false,
+            false,
+            false,
+        );
+        let b = classify_query("the sink in the main annex", 0, 0, false, false, false);
+        assert_eq!(a, b, "embedded substrings must not change routing");
+    }
 
     #[test]
     fn simple_factoid_query() {

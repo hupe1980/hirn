@@ -94,11 +94,15 @@ impl From<MemoryEvent> for JsWatchEvent {
 #[napi]
 pub struct WatchStream {
     rx: Arc<parking_lot::Mutex<Option<tokio::sync::mpsc::Receiver<MemoryEvent>>>>,
-    /// Set to `true` by `unsubscribe()` to signal that `next()` should bail out
-    /// after its `recv().await` returns. Without this flag, the take/restore
-    /// pattern on `rx` cannot distinguish "we took it ourselves" from
-    /// "unsubscribe() set it to None".
+    /// Set to `true` by `unsubscribe()` to signal that `next()` should bail out.
+    /// Without this flag, the take/restore pattern on `rx` cannot distinguish
+    /// "we took it ourselves" from "unsubscribe() set it to None".
     cancelled: Arc<std::sync::atomic::AtomicBool>,
+    /// Wakes an in-flight `next()` when `unsubscribe()` is called, so a pending
+    /// promise resolves to `null` immediately instead of waiting for the next
+    /// event. `notify_one()` stores a permit, so the wakeup is not lost even if
+    /// `unsubscribe()` runs before `next()` starts waiting.
+    cancel_notify: Arc<tokio::sync::Notify>,
     filter_layer: Option<String>,
 }
 
@@ -109,6 +113,10 @@ impl WatchStream {
     pub async fn next(&self, filter_type: Option<String>) -> napi::Result<Option<JsWatchEvent>> {
         let filter_layer = self.filter_layer.clone();
         loop {
+            if self.cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                return Ok(None);
+            }
+
             // Temporarily take the receiver so we can call recv().await without
             // holding the Mutex across the await point.
             let mut rx = {
@@ -119,7 +127,14 @@ impl WatchStream {
                 }
             };
 
-            let event = rx.recv().await;
+            let event = tokio::select! {
+                event = rx.recv() => event,
+                _ = self.cancel_notify.notified() => {
+                    // unsubscribe() was called while we were waiting. Drop the
+                    // receiver — the stream is done.
+                    return Ok(None);
+                }
+            };
 
             // Check if unsubscribe() was called while we awaited.
             if self.cancelled.load(std::sync::atomic::Ordering::Acquire) {
@@ -160,11 +175,13 @@ impl WatchStream {
         }
     }
 
-    /// Unsubscribe from the event stream.
+    /// Unsubscribe from the event stream. Wakes any pending `next()` call.
     #[napi]
     pub fn unsubscribe(&self) {
         self.cancelled
             .store(true, std::sync::atomic::Ordering::Release);
+        // Wake an in-flight next() so its promise resolves to null now.
+        self.cancel_notify.notify_one();
         let mut guard = self.rx.lock();
         *guard = None;
     }
@@ -172,13 +189,28 @@ impl WatchStream {
 
 // ─── Error Mapping ───────────────────────────────────────────
 
+/// Stable machine-readable discriminator prefixed to error messages.
+///
+/// napi's JS `code` property mirrors the `napi::Status` name (`InvalidArg`,
+/// `GenericFailure`, ...) and cannot carry custom values, so the extra
+/// discriminator lives at the start of the message. JS consumers can branch on
+/// `err.message.startsWith('NOT_FOUND:')` (see `errors.js`).
+const ERR_PREFIX_NOT_FOUND: &str = "NOT_FOUND";
+/// Stable prefix for query-shaped failures that are not caller input errors.
+const ERR_PREFIX_QUERY: &str = "QUERY";
+
 fn to_napi_err(e: hirn::HirnError) -> napi::Error {
-    let status = match &e {
-        hirn::HirnError::NotFound(_) => napi::Status::GenericFailure,
-        hirn::HirnError::InvalidInput(_) => napi::Status::InvalidArg,
-        _ => napi::Status::GenericFailure,
-    };
-    napi::Error::new(status, e.to_string())
+    match &e {
+        hirn::HirnError::NotFound(_) => napi::Error::new(
+            napi::Status::GenericFailure,
+            format!("{ERR_PREFIX_NOT_FOUND}: {e}"),
+        ),
+        // Caller input errors keep InvalidArg so `err.code === 'InvalidArg'`.
+        hirn::HirnError::InvalidInput(_) => {
+            napi::Error::new(napi::Status::InvalidArg, e.to_string())
+        }
+        _ => napi::Error::new(napi::Status::GenericFailure, e.to_string()),
+    }
 }
 
 // ─── Helpers ─────────────────────────────────────────────────
@@ -310,14 +342,6 @@ fn parse_optional_evidence_count(value: Option<i64>) -> napi::Result<Option<u32>
         .transpose()
 }
 
-fn runtime_handle() -> tokio::runtime::Handle {
-    tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
-        static RT: std::sync::LazyLock<tokio::runtime::Runtime> =
-            std::sync::LazyLock::new(|| tokio::runtime::Runtime::new().expect("tokio runtime"));
-        RT.handle().clone()
-    })
-}
-
 fn resolve_registry_tokenizer(tokenizer_name: &str) -> napi::Result<Arc<dyn Tokenizer>> {
     let registry = ProviderRegistry::from_env();
     registry.tokenizer_by_name(tokenizer_name).ok_or_else(|| {
@@ -342,14 +366,14 @@ fn authoritative_working_token_count(
 
 // ─── QueryResult to JSON ─────────────────────────────────────
 
-fn query_result_to_json(result: &hirn::ql::QueryResult) -> serde_json::Value {
+fn query_result_to_json(result: &hirn::ql::QueryResult) -> napi::Result<serde_json::Value> {
     use hirn::ql::QueryResult;
 
     if let Some(json) = hirn::ql::revision_query_result_to_json(result) {
-        return json;
+        return Ok(json);
     }
 
-    match result {
+    Ok(match result {
         QueryResult::Records(r) => {
             let records = r
                 .records
@@ -471,8 +495,19 @@ fn query_result_to_json(result: &hirn::ql::QueryResult) -> serde_json::Value {
         | QueryResult::Superseded(_)
         | QueryResult::Merged(_)
         | QueryResult::Retracted(_)
-        | QueryResult::History(_) => unreachable!("handled by revision_query_result_to_json"),
-    }
+        | QueryResult::History(_) => {
+            // These variants are serialized by revision_query_result_to_json
+            // above. Reaching this arm means that helper and this match have
+            // drifted apart — surface a handled error instead of aborting.
+            return Err(napi::Error::new(
+                napi::Status::GenericFailure,
+                format!(
+                    "{ERR_PREFIX_QUERY}: revision query result variant was not \
+                     serialized by revision_query_result_to_json"
+                ),
+            ));
+        }
+    })
 }
 
 #[cfg(test)]
@@ -534,7 +569,7 @@ mod tests {
             panic!("expected Records query result");
         };
 
-        let json_val = query_result_to_json(&result);
+        let json_val = query_result_to_json(&result).unwrap();
 
         assert_eq!(json_val["type"], "records");
         assert_eq!(json_val["records_returned"], 1);
@@ -553,7 +588,7 @@ mod tests {
         let bridge = Hirn {
             db: Some(Arc::new(db)),
         };
-        let db = bridge.db().unwrap().clone();
+        let db = bridge.db_owned().unwrap();
         let ctx = db.as_agent(&agent()).await.unwrap();
 
         let id = ctx
@@ -621,7 +656,7 @@ mod tests {
         let bridge = Hirn {
             db: Some(Arc::new(db)),
         };
-        let db = bridge.db().unwrap().clone();
+        let db = bridge.db_owned().unwrap();
         let ctx = db.as_agent(&agent()).await.unwrap();
 
         let left_id = ctx
@@ -687,7 +722,7 @@ mod tests {
         let bridge = Hirn {
             db: Some(Arc::new(db)),
         };
-        let db = bridge.db().unwrap().clone();
+        let db = bridge.db_owned().unwrap();
         let ctx = db.as_agent(&agent()).await.unwrap();
 
         let left_id = ctx
@@ -755,7 +790,7 @@ mod tests {
         let bridge = Hirn {
             db: Some(Arc::new(db)),
         };
-        let db = bridge.db().unwrap().clone();
+        let db = bridge.db_owned().unwrap();
         let ctx = db.as_agent(&agent()).await.unwrap();
 
         let left_id = ctx
@@ -822,7 +857,7 @@ mod tests {
         let bridge = Hirn {
             db: Some(Arc::new(db)),
         };
-        let db = bridge.db().unwrap().clone();
+        let db = bridge.db_owned().unwrap();
         let ctx = db.as_agent(&agent()).await.unwrap();
 
         let original_about = "lease authority";
@@ -1021,10 +1056,10 @@ fn recall_result_to_js(result: &hirn::query::RecallResult) -> JsRecallResult {
 ///
 /// ```js
 /// const { HirnBridge } = require('./bridge');
-/// const db = HirnBridge.open('path/to.hirn');
+/// const db = await HirnBridge.open('path/to.hirn');
 /// try {
-///   db.registerAgent('agent-1', 'My Agent');
-///   const id = db.remember('agent-1', 'Hello world', { embedding: new Array(768).fill(0.1) });
+///   await db.registerAgent('agent-1', 'My Agent');
+///   const id = await db.remember('agent-1', 'Hello world', new Array(768).fill(0.1));
 /// } finally {
 ///   db.close();
 /// }
@@ -1038,12 +1073,15 @@ pub struct Hirn {
 impl Hirn {
     /// Open a hirn database at the given path.
     ///
+    /// Async factory: the open runs on napi's tokio runtime instead of
+    /// blocking the Node.js event loop.
+    ///
     /// @param path - File system path to the database file.
     /// @param embeddingDimensions - Dimension of embedding vectors (default: 768).
     /// @param tokenBudget - Token budget for context assembly (default: 4096).
     /// @param tokenizerName - Optional Rust tokenizer registry name.
     #[napi(factory)]
-    pub fn open(
+    pub async fn open(
         path: String,
         embedding_dimensions: Option<u32>,
         token_budget: Option<u32>,
@@ -1057,15 +1095,14 @@ impl Hirn {
             .token_budget(budget)
             .build()
             .map_err(to_napi_err)?;
-        let rt = runtime_handle();
         let lance_dir = std::path::Path::new(&path).join("lance");
         let storage_config = HirnDbConfig::local(lance_dir.to_string_lossy());
-        let storage: Arc<dyn hirn_storage::PhysicalStore> = rt
-            .block_on(HirnDb::open(storage_config))
+        let storage: Arc<dyn hirn_storage::PhysicalStore> = HirnDb::open(storage_config)
+            .await
             .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("storage: {e}")))?
             .store_arc();
-        let db = rt
-            .block_on(hirn::HirnDB::open_with_config(config, storage))
+        let db = hirn::HirnDB::open_with_config(config, storage)
+            .await
             .map_err(to_napi_err)?;
         if let Some(tokenizer_name) = tokenizer_name.as_deref() {
             db.set_tokenizer(resolve_registry_tokenizer(tokenizer_name)?);
@@ -1076,15 +1113,27 @@ impl Hirn {
     }
 
     /// Close the database. Should be called when done.
+    ///
+    /// In-flight async operations hold their own `Arc` clone of the database
+    /// (see `db_owned`), so they complete safely against the still-live
+    /// instance; only new calls observe the closed state.
     #[napi]
     pub fn close(&mut self) -> napi::Result<()> {
         self.db = None;
         Ok(())
     }
 
-    fn db(&self) -> napi::Result<&Arc<hirn::HirnDB>> {
+    /// Return an owned handle to the database.
+    ///
+    /// Async methods must clone the `Arc` up front instead of borrowing
+    /// `self.db` across an `.await`: napi re-borrows the wrapped struct on
+    /// every JS call, so `close()` can run (and drop `self.db`) while an async
+    /// method is suspended. An owned clone keeps the database alive for the
+    /// duration of the operation.
+    fn db_owned(&self) -> napi::Result<Arc<hirn::HirnDB>> {
         self.db
             .as_ref()
+            .cloned()
             .ok_or_else(|| napi::Error::new(napi::Status::GenericFailure, "database is closed"))
     }
 
@@ -1094,7 +1143,7 @@ impl Hirn {
     /// @param displayName - Human-readable name for the agent.
     #[napi]
     pub async fn register_agent(&self, agent_id: String, display_name: String) -> napi::Result<()> {
-        let db = self.db()?;
+        let db = self.db_owned()?;
         let aid = parse_agent_id(&agent_id)?;
         db.register_agent(&aid, &display_name)
             .await
@@ -1115,7 +1164,7 @@ impl Hirn {
         embedding: Option<Vec<f64>>,
         importance: Option<f64>,
     ) -> napi::Result<String> {
-        let db = self.db()?;
+        let db = self.db_owned()?;
         let aid = parse_agent_id(&agent_id)?;
         let imp = importance.unwrap_or(0.5) as f32;
 
@@ -1153,7 +1202,7 @@ impl Hirn {
         as_of: Option<String>,
         snapshot_kind: Option<String>,
     ) -> napi::Result<Vec<JsRecallResult>> {
-        let db = self.db()?;
+        let db = self.db_owned()?;
         let aid = parse_agent_id(&agent_id)?;
         let emb = to_f32_vec(&query)?;
         let snapshot = parse_optional_recall_snapshot(as_of.as_deref(), snapshot_kind.as_deref())?;
@@ -1184,7 +1233,7 @@ impl Hirn {
         query: Vec<f64>,
         budget: Option<u32>,
     ) -> napi::Result<JsContext> {
-        let db = self.db()?;
+        let db = self.db_owned()?;
         let aid = parse_agent_id(&agent_id)?;
         let emb = to_f32_vec(&query)?;
 
@@ -1214,7 +1263,7 @@ impl Hirn {
     /// @param id - ULID string of the memory to forget.
     #[napi]
     pub async fn forget(&self, agent_id: String, id: String) -> napi::Result<()> {
-        let db = self.db()?;
+        let db = self.db_owned()?;
         let aid = parse_agent_id(&agent_id)?;
         let mid = parse_memory_id(&id)?;
         let ctx = db.as_agent(&aid).await.map_err(to_napi_err)?;
@@ -1228,12 +1277,12 @@ impl Hirn {
     /// @returns QueryResult with the result type and data.
     #[napi]
     pub async fn execute(&self, agent_id: String, query: String) -> napi::Result<JsQueryResult> {
-        let db = self.db()?;
+        let db = self.db_owned()?;
         let aid = parse_agent_id(&agent_id)?;
         let ctx = db.as_agent(&aid).await.map_err(to_napi_err)?;
         let result = ctx.execute_ql(&query).await.map_err(to_napi_err)?;
 
-        let json_val = query_result_to_json(&result);
+        let json_val = query_result_to_json(&result)?;
         let result_type = json_val["type"].as_str().unwrap_or("unknown").to_string();
         Ok(JsQueryResult {
             r#type: result_type,
@@ -1248,7 +1297,7 @@ impl Hirn {
     /// @returns QueryResult with inspection details.
     #[napi]
     pub async fn inspect(&self, agent_id: String, id: String) -> napi::Result<JsQueryResult> {
-        let db = self.db()?;
+        let db = self.db_owned()?;
         let aid = parse_agent_id(&agent_id)?;
         let mid = parse_memory_id(&id)?;
         let ctx = db.as_agent(&aid).await.map_err(to_napi_err)?;
@@ -1269,7 +1318,7 @@ impl Hirn {
     /// @returns QueryResult with trace/provenance details.
     #[napi]
     pub async fn trace(&self, agent_id: String, id: String) -> napi::Result<JsQueryResult> {
-        let db = self.db()?;
+        let db = self.db_owned()?;
         let aid = parse_agent_id(&agent_id)?;
         let mid = parse_memory_id(&id)?;
         let ctx = db.as_agent(&aid).await.map_err(to_napi_err)?;
@@ -1286,10 +1335,9 @@ impl Hirn {
     ///
     /// @returns Stats object with record counts and file size.
     #[napi]
-    pub fn stats(&self) -> napi::Result<JsStats> {
-        let db = self.db()?;
-        let rt = runtime_handle();
-        let s = rt.block_on(db.admin().stats()).map_err(to_napi_err)?;
+    pub async fn stats(&self) -> napi::Result<JsStats> {
+        let db = self.db_owned()?;
+        let s = db.admin().stats().await.map_err(to_napi_err)?;
         Ok(JsStats {
             // F-73: Safe u64→i64 conversion (saturate at i64::MAX).
             working_count: i64::try_from(s.working_count).unwrap_or(i64::MAX),
@@ -1319,7 +1367,7 @@ impl Hirn {
         embedding: Option<Vec<f64>>,
         confidence: Option<f64>,
     ) -> napi::Result<String> {
-        let db = self.db()?;
+        let db = self.db_owned()?;
         let aid = parse_agent_id(&agent_id)?;
         let mut builder = SemanticRecord::builder()
             .agent_id(aid)
@@ -1349,7 +1397,7 @@ impl Hirn {
         observed_at: Option<String>,
         caused_by: Option<String>,
     ) -> napi::Result<JsQueryResult> {
-        let db = self.db()?;
+        let db = self.db_owned()?;
         let aid = parse_agent_id(&agent_id)?;
         let mid = parse_memory_id(&id)?;
         let causation_id = caused_by
@@ -1404,7 +1452,7 @@ impl Hirn {
         observed_at: Option<String>,
         caused_by: Option<String>,
     ) -> napi::Result<JsQueryResult> {
-        let db = self.db()?;
+        let db = self.db_owned()?;
         let aid = parse_agent_id(&agent_id)?;
         let mid = parse_memory_id(&id)?;
         let causation_id = caused_by
@@ -1457,7 +1505,7 @@ impl Hirn {
         observed_at: Option<String>,
         caused_by: Option<String>,
     ) -> napi::Result<JsQueryResult> {
-        let db = self.db()?;
+        let db = self.db_owned()?;
         let aid = parse_agent_id(&agent_id)?;
         let mid = parse_memory_id(&id)?;
         let causation_id = caused_by
@@ -1511,7 +1559,7 @@ impl Hirn {
         description: String,
         embedding: Option<Vec<f64>>,
     ) -> napi::Result<String> {
-        let db = self.db()?;
+        let db = self.db_owned()?;
         let aid = parse_agent_id(&agent_id)?;
         let mut builder = ProceduralRecord::builder()
             .agent_id(aid)
@@ -1539,9 +1587,9 @@ impl Hirn {
         content: String,
         token_count: Option<u32>,
     ) -> napi::Result<String> {
-        let db = self.db()?;
+        let db = self.db_owned()?;
         let aid = parse_agent_id(&agent_id)?;
-        let effective_token_count = authoritative_working_token_count(db, &content, token_count);
+        let effective_token_count = authoritative_working_token_count(&db, &content, token_count);
         let entry = WorkingMemoryEntry::builder()
             .agent_id(aid)
             .content(&content)
@@ -1557,7 +1605,7 @@ impl Hirn {
     /// @param id - ULID string of the working memory entry.
     #[napi]
     pub async fn defocus(&self, id: String) -> napi::Result<()> {
-        let db = self.db()?;
+        let db = self.db_owned()?;
         let mid = parse_memory_id(&id)?;
         db.working().defocus(mid).await.map_err(to_napi_err)
     }
@@ -1567,7 +1615,7 @@ impl Hirn {
     /// @returns Number of records processed.
     #[napi]
     pub async fn consolidate(&self) -> napi::Result<i64> {
-        let db = self.db()?;
+        let db = self.db_owned()?;
         let report = db
             .admin()
             .consolidate()
@@ -1583,7 +1631,7 @@ impl Hirn {
     /// @param target - ULID string of the target memory.
     #[napi]
     pub async fn connect(&self, source: String, target: String) -> napi::Result<()> {
-        let db = self.db()?;
+        let db = self.db_owned()?;
         let src = parse_memory_id(&source)?;
         let tgt = parse_memory_id(&target)?;
         db.graph_view()
@@ -1599,7 +1647,7 @@ impl Hirn {
     /// @returns A WatchStream whose `next()` method yields events.
     #[napi]
     pub async fn watch(&self, filter_layer: Option<String>) -> napi::Result<WatchStream> {
-        let db = self.db()?;
+        let db = self.db_owned()?;
         let mut broadcast_rx = db.subscribe();
         let (async_tx, async_rx) = tokio::sync::mpsc::channel(4096);
 
@@ -1631,6 +1679,7 @@ impl Hirn {
         Ok(WatchStream {
             rx: Arc::new(parking_lot::Mutex::new(Some(async_rx))),
             cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cancel_notify: Arc::new(tokio::sync::Notify::new()),
             filter_layer,
         })
     }

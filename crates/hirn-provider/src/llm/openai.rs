@@ -11,7 +11,7 @@ use std::time::Duration;
 use super::error::{LlmError, parse_retry_after};
 
 /// Default request timeout for HTTP calls.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+const REQUEST_TIMEOUT: Duration = Duration::from_mins(5);
 /// Default connection timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -73,11 +73,21 @@ struct ChatMsg<'a> {
     content: &'a str,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Debug, serde::Serialize)]
 struct ResponseFormatPayload<'a> {
     r#type: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    json_schema: Option<&'a serde_json::value::RawValue>,
+    json_schema: Option<JsonSchemaPayload<'a>>,
+}
+
+/// OpenAI expects the schema wrapped in a named envelope:
+/// `{"name": ..., "strict": ..., "schema": {...}}` — sending the bare schema
+/// is rejected by the API.
+#[derive(Debug, serde::Serialize)]
+struct JsonSchemaPayload<'a> {
+    name: &'a str,
+    strict: bool,
+    schema: &'a serde_json::value::RawValue,
 }
 
 #[derive(serde::Deserialize)]
@@ -108,19 +118,30 @@ struct UsageResponse {
 fn build_response_format<'a>(
     format: &'a ResponseFormat,
     schema_raw: &'a mut Option<Box<serde_json::value::RawValue>>,
-) -> Option<ResponseFormatPayload<'a>> {
+) -> HirnResult<Option<ResponseFormatPayload<'a>>> {
     match format {
-        ResponseFormat::Text => None,
-        ResponseFormat::JsonObject => Some(ResponseFormatPayload {
+        ResponseFormat::Text => Ok(None),
+        ResponseFormat::JsonObject => Ok(Some(ResponseFormatPayload {
             r#type: "json_object",
             json_schema: None,
-        }),
+        })),
         ResponseFormat::JsonSchema(schema) => {
-            *schema_raw = serde_json::value::RawValue::from_string(schema.clone()).ok();
-            Some(ResponseFormatPayload {
+            let raw = serde_json::value::RawValue::from_string(schema.clone()).map_err(|e| {
+                hirn_core::HirnError::InvalidInput(format!(
+                    "response_format JSON schema is not valid JSON: {e}"
+                ))
+            })?;
+            *schema_raw = Some(raw);
+            Ok(Some(ResponseFormatPayload {
                 r#type: "json_schema",
-                json_schema: schema_raw.as_deref(),
-            })
+                json_schema: schema_raw.as_deref().map(|schema| JsonSchemaPayload {
+                    // Callers pass a bare schema without a name, so use a
+                    // stable default.
+                    name: "response",
+                    strict: true,
+                    schema,
+                }),
+            }))
         }
     }
 }
@@ -143,14 +164,19 @@ impl LlmProvider for OpenAILlmProvider {
         let url = format!("{}/chat/completions", self.base_url);
         let model = options.model_override.as_deref().unwrap_or(&self.model);
 
-        if let Some(max) = super::error::max_tokens_for_model(model) {
-            if options.max_tokens > max {
-                return Err(LlmError::TokenLimitExceeded {
-                    requested: options.max_tokens,
-                    max,
-                }
-                .into());
-            }
+        // Advisory only: the table below inevitably lags model releases, so a
+        // hard pre-flight reject turns table rot into spurious failures for
+        // valid requests. The provider API remains the authority.
+        if let Some(max) = super::error::max_tokens_for_model(model)
+            && options.max_tokens > max
+        {
+            tracing::warn!(
+                model,
+                requested = options.max_tokens,
+                known_max = max,
+                "requested max_tokens exceeds the last known limit for this model; \
+                 sending anyway — the provider will reject it if truly unsupported"
+            );
         }
 
         let msgs: Vec<ChatMsg<'_>> = messages
@@ -162,7 +188,7 @@ impl LlmProvider for OpenAILlmProvider {
             .collect();
 
         let mut schema_raw = None;
-        let response_format = build_response_format(&options.response_format, &mut schema_raw);
+        let response_format = build_response_format(&options.response_format, &mut schema_raw)?;
 
         let body = ChatRequest {
             model,
@@ -310,6 +336,50 @@ mod tests {
             .with_base_url("http://localhost:8080")
             .expect("loopback http endpoint should be accepted");
         assert_eq!(p.base_url, "http://localhost:8080");
+    }
+
+    #[test]
+    fn json_schema_response_format_has_named_envelope() {
+        let format = ResponseFormat::JsonSchema(
+            r#"{"type":"object","properties":{"name":{"type":"string"}}}"#.to_owned(),
+        );
+        let mut schema_raw = None;
+        let payload = build_response_format(&format, &mut schema_raw)
+            .unwrap()
+            .expect("json_schema format should produce a payload");
+
+        let value = serde_json::to_value(&payload).unwrap();
+        assert_eq!(value["type"], "json_schema");
+        assert_eq!(value["json_schema"]["name"], "response");
+        assert_eq!(value["json_schema"]["strict"], true);
+        assert_eq!(value["json_schema"]["schema"]["type"], "object");
+        assert_eq!(
+            value["json_schema"]["schema"]["properties"]["name"]["type"],
+            "string"
+        );
+    }
+
+    #[test]
+    fn json_object_response_format_omits_schema() {
+        let mut schema_raw = None;
+        let payload = build_response_format(&ResponseFormat::JsonObject, &mut schema_raw)
+            .unwrap()
+            .expect("json_object format should produce a payload");
+
+        let value = serde_json::to_value(&payload).unwrap();
+        assert_eq!(value["type"], "json_object");
+        assert!(value.get("json_schema").is_none());
+    }
+
+    #[test]
+    fn invalid_json_schema_returns_error() {
+        let format = ResponseFormat::JsonSchema("{not valid json".to_owned());
+        let mut schema_raw = None;
+        let err = build_response_format(&format, &mut schema_raw).unwrap_err();
+        assert!(
+            err.to_string().contains("not valid JSON"),
+            "expected schema validation error: {err}"
+        );
     }
 
     #[test]

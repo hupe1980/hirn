@@ -20,7 +20,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use hirn_core::HirnResult;
-use hirn_core::embed::{Embedder, Embedding};
+use hirn_core::embed::{Embedder, Embedding, MultivectorEmbedding};
 
 /// Configuration for retry behaviour.
 #[derive(Debug, Clone)]
@@ -85,17 +85,21 @@ impl<E: Embedder> RetryingEmbedder<E> {
         self.deterministic_jitter_seed
             .unwrap_or_else(random_retry_seed)
     }
-}
 
-#[async_trait]
-impl<E: Embedder> Embedder for RetryingEmbedder<E> {
-    async fn embed(&self, texts: &[&str]) -> HirnResult<Vec<Embedding>> {
+    /// Run `attempt_op` under the configured retry policy.
+    ///
+    /// Shared by [`Embedder::embed`] and [`Embedder::embed_multivec`] so both
+    /// request shapes get identical backoff behaviour.
+    async fn retry_with_backoff<T, Fut>(&self, mut attempt_op: impl FnMut() -> Fut) -> HirnResult<T>
+    where
+        Fut: std::future::Future<Output = HirnResult<T>>,
+    {
         let mut last_error = None;
         let start = Instant::now();
         let jitter_seed = self.request_jitter_seed();
 
         for attempt in 0..=self.config.max_retries {
-            match self.inner.embed(texts).await {
+            match attempt_op().await {
                 Ok(result) => return Ok(result),
                 Err(e) if e.is_retryable() => {
                     tracing::warn!(attempt, %e, "transient embedding failure, will retry");
@@ -129,8 +133,24 @@ impl<E: Embedder> Embedder for RetryingEmbedder<E> {
         }
 
         Err(last_error.unwrap_or_else(|| {
-            hirn_core::HirnError::ProviderError("retry loop exited without an attempt".into())
+            hirn_core::HirnError::provider_permanent("retry loop exited without an attempt")
         }))
+    }
+}
+
+#[async_trait]
+impl<E: Embedder> Embedder for RetryingEmbedder<E> {
+    async fn embed(&self, texts: &[&str]) -> HirnResult<Vec<Embedding>> {
+        self.retry_with_backoff(|| self.inner.embed(texts)).await
+    }
+
+    async fn embed_multivec(&self, texts: &[&str]) -> HirnResult<Vec<MultivectorEmbedding>> {
+        self.retry_with_backoff(|| self.inner.embed_multivec(texts))
+            .await
+    }
+
+    fn supports_multivec(&self) -> bool {
+        self.inner.supports_multivec()
     }
 
     fn dimensions(&self) -> usize {
@@ -139,6 +159,10 @@ impl<E: Embedder> Embedder for RetryingEmbedder<E> {
 
     fn model_id(&self) -> &str {
         self.inner.model_id()
+    }
+
+    fn embedding_space_id(&self) -> String {
+        self.inner.embedding_space_id()
     }
 
     fn max_input_tokens(&self) -> usize {
@@ -317,6 +341,97 @@ mod tests {
         );
         let err = embedder.embed(&["hello"]).await.unwrap_err();
         assert!(matches!(err, HirnError::AccessDenied(_)));
+    }
+
+    /// Fails N times with a partial embedding failure, then succeeds.
+    ///
+    /// When `transient_only` is false, one of the per-index failures is marked
+    /// non-retryable, which must make the whole partial failure non-retryable.
+    struct PartialFailNTimes {
+        inner: PseudoEmbedder,
+        remaining_failures: AtomicU32,
+        calls: AtomicU32,
+        transient_only: bool,
+    }
+
+    impl PartialFailNTimes {
+        fn new(dims: usize, fail_count: u32, transient_only: bool) -> Self {
+            Self {
+                inner: PseudoEmbedder::new(dims),
+                remaining_failures: AtomicU32::new(fail_count),
+                calls: AtomicU32::new(0),
+                transient_only,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Embedder for PartialFailNTimes {
+        async fn embed(&self, texts: &[&str]) -> HirnResult<Vec<Embedding>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let remaining = self.remaining_failures.load(Ordering::Relaxed);
+            if remaining > 0 {
+                self.remaining_failures
+                    .store(remaining - 1, Ordering::Relaxed);
+                let mut partial = hirn_core::PartialEmbeddingBatch::new(texts.len());
+                partial.push_failure(0, true, "timeout");
+                if !self.transient_only {
+                    partial.push_failure(1, false, "auth failed");
+                }
+                return Err(HirnError::partial_embedding_failure(partial));
+            }
+            self.inner.embed(texts).await
+        }
+
+        fn dimensions(&self) -> usize {
+            self.inner.dimensions()
+        }
+
+        fn model_id(&self) -> &str {
+            self.inner.model_id()
+        }
+
+        fn max_input_tokens(&self) -> usize {
+            self.inner.max_input_tokens()
+        }
+    }
+
+    #[tokio::test]
+    async fn retries_partial_failure_with_only_transient_causes() {
+        let embedder = RetryingEmbedder::new(
+            PartialFailNTimes::new(16, 2, true),
+            RetryConfig {
+                max_retries: 3,
+                base_backoff: Duration::from_millis(1),
+                max_cumulative_timeout: Duration::from_secs(1),
+            },
+        );
+        let result = embedder.embed(&["a", "b"]).await.unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(embedder.inner.calls.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn partial_failure_with_non_transient_cause_is_not_retried() {
+        let embedder = RetryingEmbedder::new(
+            PartialFailNTimes::new(16, 5, false),
+            RetryConfig {
+                max_retries: 3,
+                base_backoff: Duration::from_millis(1),
+                max_cumulative_timeout: Duration::from_secs(1),
+            },
+        );
+        let err = embedder.embed(&["a", "b"]).await.unwrap_err();
+        assert!(matches!(err, HirnError::PartialEmbeddingFailure { .. }));
+        assert_eq!(embedder.inner.calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn multivec_forwards_to_inner() {
+        let embedder = RetryingEmbedder::new(PseudoEmbedder::new(16), RetryConfig::default());
+        assert!(embedder.supports_multivec());
+        let result = embedder.embed_multivec(&["hello"]).await.unwrap();
+        assert_eq!(result.len(), 1);
     }
 
     #[test]

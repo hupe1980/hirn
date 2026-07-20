@@ -8,7 +8,7 @@ use std::time::Duration;
 use super::error::EmbedError;
 
 /// Default request timeout for HTTP calls.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const REQUEST_TIMEOUT: Duration = Duration::from_mins(1);
 /// Default connection timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 

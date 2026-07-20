@@ -13,7 +13,7 @@ use tracing::debug;
 use super::error::{EmbedError, parse_retry_after};
 
 /// Default request timeout for HTTP calls.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const REQUEST_TIMEOUT: Duration = Duration::from_mins(1);
 /// Default connection timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -236,6 +236,18 @@ impl Embedder for CohereEmbedder {
         &self.model
     }
 
+    fn embedding_space_id(&self) -> String {
+        // Cohere is asymmetric: the same model+text yields different vectors for
+        // `search_document` vs `search_query`. The input type MUST be part of the
+        // cache-space identity so the two encoders never share cache entries.
+        format!(
+            "{}:{}:{}",
+            self.model,
+            self.dimensions,
+            self.input_type.as_str()
+        )
+    }
+
     fn max_input_tokens(&self) -> usize {
         self.max_tokens
     }
@@ -256,6 +268,26 @@ mod tests {
         assert_eq!(e.max_input_tokens(), 512);
         assert_eq!(e.input_type, CohereInputType::SearchDocument);
         assert_eq!(e.base_url, "https://api.cohere.com/v2");
+    }
+
+    #[test]
+    fn document_and_query_embedders_have_distinct_cache_spaces() {
+        // The load-bearing regression for the persistent-cache cross-poisoning
+        // fix: a document encoder and a query encoder share the same model id but
+        // produce different vectors, so their `embedding_space_id` (the cache-key
+        // component) MUST differ or one would poison the other's cache.
+        let doc = CohereEmbedder::new("k", "embed-english-v3.0", 1024)
+            .unwrap()
+            .with_input_type(CohereInputType::SearchDocument);
+        let query = CohereEmbedder::new("k", "embed-english-v3.0", 1024)
+            .unwrap()
+            .with_input_type(CohereInputType::SearchQuery);
+        assert_eq!(doc.model_id(), query.model_id());
+        assert_ne!(
+            doc.embedding_space_id(),
+            query.embedding_space_id(),
+            "asymmetric input types must map to different cache spaces"
+        );
     }
 
     #[test]

@@ -820,9 +820,15 @@ fn extract_int(pair: pest::iterators::Pair<'_, Rule>) -> Result<usize, ParseErro
         .into_inner()
         .find(|p| p.as_rule() == Rule::integer_literal || p.as_rule() == Rule::parameter)
         .ok_or_else(|| ParseError::simple("expected integer literal"))?;
-    // Parameters use a placeholder value; the real value is substituted after bind().
+    // A parameter in an integer position (LIMIT/BUDGET/DEPTH) cannot be
+    // preserved through the AST (the field is a plain `usize`), so it was
+    // previously coerced to `0` — silently making the query return nothing.
+    // Reject it with a clear message instead: integer clauses take literals.
     if p.as_rule() == Rule::parameter {
-        return Ok(0);
+        return Err(ParseError::simple(format!(
+            "parameter '{}' is not allowed here — LIMIT/BUDGET/DEPTH require an integer literal",
+            p.as_str()
+        )));
     }
     let text = p.as_str();
     text.parse::<usize>()
@@ -1281,10 +1287,12 @@ fn build_traverse(pair: pest::iterators::Pair<'_, Rule>) -> Result<TraverseStmt,
     let mut depth = 1;
     let mut where_clauses = vec![];
     let mut limit = None;
+    let mut namespace = None;
 
     for inner in pair.into_inner() {
         match inner.as_rule() {
             Rule::string_literal => from = extract_string_value(inner)?,
+            Rule::namespace_clause => namespace = Some(extract_namespace(inner)),
             Rule::via_clause => {
                 let mut rels = vec![];
                 for child in inner.into_inner() {
@@ -1315,7 +1323,7 @@ fn build_traverse(pair: pest::iterators::Pair<'_, Rule>) -> Result<TraverseStmt,
         depth,
         where_clauses,
         limit,
-        namespace: None,
+        namespace,
     })
 }
 

@@ -191,14 +191,14 @@ fn authoritative_working_token_count(
 
 // ─── QueryResult to JSON ─────────────────────────────────────
 
-fn query_result_to_json(result: &hirn::ql::QueryResult) -> serde_json::Value {
+fn query_result_to_json(result: &hirn::ql::QueryResult) -> PyResult<serde_json::Value> {
     use hirn::ql::QueryResult;
 
     if let Some(json) = hirn::ql::revision_query_result_to_json(result) {
-        return json;
+        return Ok(json);
     }
 
-    match result {
+    Ok(match result {
         QueryResult::Records(r) => {
             let records = r
                 .records
@@ -320,8 +320,16 @@ fn query_result_to_json(result: &hirn::ql::QueryResult) -> serde_json::Value {
         | QueryResult::Superseded(_)
         | QueryResult::Merged(_)
         | QueryResult::Retracted(_)
-        | QueryResult::History(_) => unreachable!("handled by revision_query_result_to_json"),
-    }
+        | QueryResult::History(_) => {
+            // These variants are serialized by revision_query_result_to_json
+            // above. Reaching this arm means that helper and this match have
+            // drifted apart — surface a handled error instead of aborting.
+            return Err(QueryError::new_err(
+                "revision query result variant was not serialized by \
+                 revision_query_result_to_json",
+            ));
+        }
+    })
 }
 
 fn json_to_pyobj(py: Python<'_>, val: &serde_json::Value) -> PyResult<Py<PyAny>> {
@@ -554,12 +562,14 @@ impl QueryResult {
 ///
 /// The public package root exposes the high-level ``Memory`` API instead.
 ///
-/// Use as a context manager::
+/// Use as a context manager:
 ///
-///     from hirn._hirn import HirnBridge
+/// ```python
+/// from hirn._hirn import HirnBridge
 ///
-///     with HirnBridge.open("path/to.hirn") as h:
-///         h.remember("agent", "content", embedding=[0.1] * 64)
+/// with HirnBridge.open("path/to.hirn") as h:
+///     h.remember("agent", "content", embedding=[0.1] * 64)
+/// ```
 #[pyclass(name = "HirnBridge")]
 struct Hirn {
     db: Option<Arc<hirn::HirnDB>>,
@@ -587,6 +597,7 @@ impl Hirn {
     #[staticmethod]
     #[pyo3(signature = (path, *, embedding_dimensions=768, token_budget=4096, tokenizer_name=None))]
     fn open(
+        py: Python<'_>,
         path: &str,
         embedding_dimensions: u32,
         token_budget: u32,
@@ -598,9 +609,19 @@ impl Hirn {
             .token_budget(token_budget)
             .build()
             .map_err(to_py_err)?;
-        let storage = block_on(open_lance_storage(path))
-            .map_err(|e| PyRuntimeError::new_err(format!("storage: {e}")))?;
-        let db = block_on(hirn::HirnDB::open_with_config(config, storage)).map_err(to_py_err)?;
+        // Release the GIL while blocking on the runtime so other Python
+        // threads keep running (and callbacks into Python cannot deadlock).
+        let path = path.to_owned();
+        let db = py.detach(move || {
+            block_on(async {
+                let storage = open_lance_storage(&path)
+                    .await
+                    .map_err(|e| PyRuntimeError::new_err(format!("storage: {e}")))?;
+                hirn::HirnDB::open_with_config(config, storage)
+                    .await
+                    .map_err(to_py_err)
+            })
+        })?;
         if let Some(tokenizer_name) = tokenizer_name {
             db.set_tokenizer(resolve_registry_tokenizer(tokenizer_name)?);
         }
@@ -634,10 +655,12 @@ impl Hirn {
     /// Args:
     ///     agent_id: Unique agent identifier.
     ///     display_name: Human-readable name for the agent.
-    fn register_agent(&self, agent_id: &str, display_name: &str) -> PyResult<()> {
-        let db = self.db()?;
+    fn register_agent(&self, py: Python<'_>, agent_id: &str, display_name: &str) -> PyResult<()> {
+        let db = self.db()?.clone();
         let aid = parse_agent_id(agent_id)?;
-        block_on(db.register_agent(&aid, display_name)).map_err(to_py_err)
+        let display_name = display_name.to_owned();
+        py.detach(move || block_on(db.register_agent(&aid, &display_name)))
+            .map_err(to_py_err)
     }
 
     /// Store an episodic memory.
@@ -673,8 +696,15 @@ impl Hirn {
         }
 
         let record = builder.build().map_err(to_py_err)?;
-        let ctx = block_on(db.as_agent(&aid)).map_err(to_py_err)?;
-        let id = block_on(ctx.remember(record)).map_err(to_py_err)?;
+        // Release the GIL for the blocking DB round-trip so other Python
+        // threads keep running (mirrors `watch` and the async API).
+        let db = db.clone();
+        let id = py
+            .detach(move || {
+                let ctx = block_on(db.as_agent(&aid))?;
+                block_on(ctx.remember(record))
+            })
+            .map_err(to_py_err)?;
         Ok(id.to_string())
     }
 
@@ -706,16 +736,20 @@ impl Hirn {
         let emb = extract_embedding(py, query)?;
         let snapshot = parse_optional_recall_snapshot(as_of, snapshot_kind)?;
 
-        let ctx = block_on(db.as_agent(&aid)).map_err(to_py_err)?;
-        let mut builder = ctx.recall(emb).limit(limit);
-        if let Some(t) = threshold {
-            builder = builder.threshold(t);
-        }
-        if let Some(snapshot) = snapshot {
-            builder = builder.snapshot(snapshot);
-        }
-
-        let results = block_on(builder.execute()).map_err(to_py_err)?;
+        let db = db.clone();
+        let results = py
+            .detach(move || {
+                let ctx = block_on(db.as_agent(&aid))?;
+                let mut builder = ctx.recall(emb).limit(limit);
+                if let Some(t) = threshold {
+                    builder = builder.threshold(t);
+                }
+                if let Some(snapshot) = snapshot {
+                    builder = builder.snapshot(snapshot);
+                }
+                block_on(builder.execute())
+            })
+            .map_err(to_py_err)?;
         Ok(results.iter().map(recall_result_from_runtime).collect())
     }
 
@@ -740,8 +774,13 @@ impl Hirn {
         let aid = parse_agent_id(agent_id)?;
         let emb = extract_embedding(py, query)?;
 
-        let ctx = block_on(db.as_agent(&aid)).map_err(to_py_err)?;
-        let result = block_on(ctx.think(emb).budget(budget).execute()).map_err(to_py_err)?;
+        let db = db.clone();
+        let result = py
+            .detach(move || {
+                let ctx = block_on(db.as_agent(&aid))?;
+                block_on(ctx.think(emb).budget(budget).execute())
+            })
+            .map_err(to_py_err)?;
 
         Ok(Context {
             context: result.context,
@@ -760,12 +799,15 @@ impl Hirn {
     /// Args:
     ///     agent_id: The agent performing the forget.
     ///     id: ULID string of the memory to forget.
-    fn forget(&self, agent_id: &str, id: &str) -> PyResult<()> {
-        let db = self.db()?;
+    fn forget(&self, py: Python<'_>, agent_id: &str, id: &str) -> PyResult<()> {
+        let db = self.db()?.clone();
         let aid = parse_agent_id(agent_id)?;
         let mid = parse_memory_id(id)?;
-        let ctx = block_on(db.as_agent(&aid)).map_err(to_py_err)?;
-        block_on(ctx.archive_episode(mid)).map_err(to_py_err)
+        py.detach(move || {
+            let ctx = block_on(db.as_agent(&aid))?;
+            block_on(ctx.archive_episode(mid))
+        })
+        .map_err(to_py_err)
     }
 
     /// Execute a HirnQL query.
@@ -776,13 +818,18 @@ impl Hirn {
     ///
     /// Returns:
     ///     QueryResult with the result as a JSON-accessible dict.
-    fn execute(&self, agent_id: &str, query: &str) -> PyResult<QueryResult> {
-        let db = self.db()?;
+    fn execute(&self, py: Python<'_>, agent_id: &str, query: &str) -> PyResult<QueryResult> {
+        let db = self.db()?.clone();
         let aid = parse_agent_id(agent_id)?;
-        let ctx = block_on(db.as_agent(&aid)).map_err(to_py_err)?;
-        let result = block_on(ctx.execute_ql(query)).map_err(to_py_err)?;
+        let query = query.to_owned();
+        let result = py
+            .detach(move || {
+                let ctx = block_on(db.as_agent(&aid))?;
+                block_on(ctx.execute_ql(&query))
+            })
+            .map_err(to_py_err)?;
 
-        let json_val = query_result_to_json(&result);
+        let json_val = query_result_to_json(&result)?;
         let result_type = json_val["type"].as_str().unwrap_or("unknown").to_string();
         Ok(QueryResult {
             result_type,
@@ -798,12 +845,16 @@ impl Hirn {
     ///
     /// Returns:
     ///     QueryResult with inspection details.
-    fn inspect(&self, agent_id: &str, id: &str) -> PyResult<QueryResult> {
-        let db = self.db()?;
+    fn inspect(&self, py: Python<'_>, agent_id: &str, id: &str) -> PyResult<QueryResult> {
+        let db = self.db()?.clone();
         let aid = parse_agent_id(agent_id)?;
         let mid = parse_memory_id(id)?;
-        let ctx = block_on(db.as_agent(&aid)).map_err(to_py_err)?;
-        let result = block_on(ctx.inspect(mid)).map_err(to_py_err)?;
+        let result = py
+            .detach(move || {
+                let ctx = block_on(db.as_agent(&aid))?;
+                block_on(ctx.inspect(mid))
+            })
+            .map_err(to_py_err)?;
 
         let json_val = inspected_result_to_json(&result);
         let result_type = json_val["type"].as_str().unwrap_or("unknown").to_string();
@@ -821,12 +872,16 @@ impl Hirn {
     ///
     /// Returns:
     ///     QueryResult with trace/provenance details.
-    fn trace(&self, agent_id: &str, id: &str) -> PyResult<QueryResult> {
-        let db = self.db()?;
+    fn trace(&self, py: Python<'_>, agent_id: &str, id: &str) -> PyResult<QueryResult> {
+        let db = self.db()?.clone();
         let aid = parse_agent_id(agent_id)?;
         let mid = parse_memory_id(id)?;
-        let ctx = block_on(db.as_agent(&aid)).map_err(to_py_err)?;
-        let result = block_on(ctx.trace(mid)).map_err(to_py_err)?;
+        let result = py
+            .detach(move || {
+                let ctx = block_on(db.as_agent(&aid))?;
+                block_on(ctx.trace(mid))
+            })
+            .map_err(to_py_err)?;
 
         let json_val = trace_result_to_json(&result);
         Ok(QueryResult {
@@ -839,9 +894,11 @@ impl Hirn {
     ///
     /// Returns:
     ///     Stats object with record counts and file size.
-    fn stats(&self) -> PyResult<Stats> {
-        let db = self.db()?;
-        let s = block_on(db.admin().stats()).map_err(to_py_err)?;
+    fn stats(&self, py: Python<'_>) -> PyResult<Stats> {
+        let db = self.db()?.clone();
+        let s = py
+            .detach(move || block_on(db.admin().stats()))
+            .map_err(to_py_err)?;
         Ok(Stats {
             working_count: s.working_count,
             episodic_count: s.episodic_count,
@@ -874,10 +931,14 @@ impl Hirn {
         embedding: Option<&Bound<'_, PyAny>>,
         confidence: f32,
     ) -> PyResult<String> {
-        let db = self.db()?;
+        let db = self.db()?.clone();
         let aid = parse_agent_id(agent_id)?;
+        // Route through the agent context so Cedar authorization applies and
+        // the record lands in the agent's private namespace — matching the
+        // Node binding instead of writing straight past policy enforcement.
         let mut builder = SemanticRecord::builder()
             .agent_id(aid)
+            .namespace(Namespace::private_for(&aid))
             .concept(concept)
             .description(description)
             .confidence(confidence);
@@ -885,7 +946,12 @@ impl Hirn {
             builder = builder.embedding(extract_embedding(py, emb_obj)?);
         }
         let record = builder.build().map_err(to_py_err)?;
-        let id = block_on(db.semantic().store(record)).map_err(to_py_err)?;
+        let id = py
+            .detach(move || {
+                let ctx = block_on(db.as_agent(&aid))?;
+                block_on(ctx.store_semantic(record))
+            })
+            .map_err(to_py_err)?;
         Ok(id.to_string())
     }
 
@@ -918,7 +984,10 @@ impl Hirn {
             builder = builder.embedding(extract_embedding(py, emb_obj)?);
         }
         let record = builder.build().map_err(to_py_err)?;
-        let id = block_on(db.procedural().store(record)).map_err(to_py_err)?;
+        let db = db.clone();
+        let id = py
+            .detach(move || block_on(db.procedural().store(record)))
+            .map_err(to_py_err)?;
         Ok(id.to_string())
     }
 
@@ -933,17 +1002,25 @@ impl Hirn {
     /// Returns:
     ///     The ULID string of the new working memory entry.
     #[pyo3(signature = (agent_id, content, *, token_count=None))]
-    fn focus(&self, agent_id: &str, content: &str, token_count: Option<u32>) -> PyResult<String> {
-        let db = self.db()?;
+    fn focus(
+        &self,
+        py: Python<'_>,
+        agent_id: &str,
+        content: &str,
+        token_count: Option<u32>,
+    ) -> PyResult<String> {
+        let db = self.db()?.clone();
         let aid = parse_agent_id(agent_id)?;
-        let effective_token_count = authoritative_working_token_count(db, content, token_count);
+        let effective_token_count = authoritative_working_token_count(&db, content, token_count);
         let entry = WorkingMemoryEntry::builder()
             .agent_id(aid)
             .content(content)
             .token_count(effective_token_count)
             .build()
             .map_err(to_py_err)?;
-        let id = block_on(db.working().focus(entry)).map_err(to_py_err)?;
+        let id = py
+            .detach(move || block_on(db.working().focus(entry)))
+            .map_err(to_py_err)?;
         Ok(id.to_string())
     }
 
@@ -951,16 +1028,19 @@ impl Hirn {
     ///
     /// Args:
     ///     id: ULID string of the working memory entry to remove.
-    fn defocus(&self, id: &str) -> PyResult<()> {
-        let db = self.db()?;
+    fn defocus(&self, py: Python<'_>, id: &str) -> PyResult<()> {
+        let db = self.db()?.clone();
         let mid = parse_memory_id(id)?;
-        block_on(db.working().defocus(mid)).map_err(to_py_err)
+        py.detach(move || block_on(db.working().defocus(mid)))
+            .map_err(to_py_err)
     }
 
     /// Run the consolidation pipeline.
-    fn consolidate(&self) -> PyResult<u64> {
-        let db = self.db()?;
-        let report = block_on(db.admin().consolidate().execute()).map_err(to_py_err)?;
+    fn consolidate(&self, py: Python<'_>) -> PyResult<u64> {
+        let db = self.db()?.clone();
+        let report = py
+            .detach(move || block_on(db.admin().consolidate().execute()))
+            .map_err(to_py_err)?;
         Ok(report.records_processed as u64)
     }
 
@@ -972,11 +1052,13 @@ impl Hirn {
     ///
     /// Returns:
     ///     The edge ID string.
-    fn connect(&self, source: &str, target: &str) -> PyResult<String> {
-        let db = self.db()?;
+    fn connect(&self, py: Python<'_>, source: &str, target: &str) -> PyResult<String> {
+        let db = self.db()?.clone();
         let src = parse_memory_id(source)?;
         let tgt = parse_memory_id(target)?;
-        let edge_id = block_on(db.graph_view().connect(src, tgt)).map_err(to_py_err)?;
+        let edge_id = py
+            .detach(move || block_on(db.graph_view().connect(src, tgt)))
+            .map_err(to_py_err)?;
         Ok(format!("{edge_id:?}"))
     }
 
@@ -1028,12 +1110,14 @@ impl Hirn {
 ///
 /// The public package root exposes the high-level ``AsyncMemory`` API instead.
 ///
-/// Usage::
+/// Usage:
 ///
-///     from hirn._hirn import AsyncHirnBridge
+/// ```python
+/// from hirn._hirn import AsyncHirnBridge
 ///
-///     async with AsyncHirnBridge.open("path/to.hirn") as h:
-///         await h.remember("agent", "content", embedding=[0.1] * 64)
+/// async with AsyncHirnBridge.open("path/to.hirn") as h:
+///     await h.remember("agent", "content", embedding=[0.1] * 64)
+/// ```
 #[pyclass(name = "AsyncHirnBridge")]
 struct AsyncHirn {
     db: Option<Arc<hirn::HirnDB>>,
@@ -1263,7 +1347,7 @@ impl AsyncHirn {
                 let aid = parse_agent_id(&agent_id)?;
                 let ctx = block_on(db.as_agent(&aid)).map_err(to_py_err)?;
                 let result = block_on(ctx.execute_ql(&query)).map_err(to_py_err)?;
-                let json_val = query_result_to_json(&result);
+                let json_val = query_result_to_json(&result)?;
                 let result_type = json_val["type"].as_str().unwrap_or("unknown").to_string();
                 Ok(QueryResult {
                     result_type,
@@ -1343,10 +1427,12 @@ impl AsyncHirn {
 
     /// Subscribe to memory events and return a WatchStream.
     ///
-    /// Usage::
+    /// Usage:
     ///
-    ///     stream = await db.watch()
-    ///     # stream.next() to poll, stream.cancel() to stop
+    /// ```python
+    /// stream = await db.watch()
+    /// # stream.next() to poll, stream.cancel() to stop
+    /// ```
     fn watch<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let db = self.db()?.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -1366,12 +1452,14 @@ impl AsyncHirn {
 /// Supports Python's ``async for`` protocol via PyO3's ``__anext__`` slot.
 /// Events are dicts with variant-specific fields.
 ///
-/// Usage::
+/// Usage:
 ///
-///     stream = await db.watch()
-///     async for event in stream:
-///         print(event)
-///     # or: stream.cancel() to stop early
+/// ```python
+/// stream = await db.watch()
+/// async for event in stream:
+///     print(event)
+/// # or: stream.cancel() to stop early
+/// ```
 #[pyclass]
 struct WatchStream {
     rx: Arc<tokio::sync::Mutex<tokio::sync::broadcast::Receiver<MemoryEvent>>>,
@@ -1559,7 +1647,7 @@ mod tests {
             panic!("expected Records query result");
         };
 
-        let json_val = query_result_to_json(&result);
+        let json_val = query_result_to_json(&result).expect("records convert to json");
 
         assert_eq!(json_val["type"], "records");
         assert_eq!(json_val["records_returned"], 1);
@@ -1626,12 +1714,15 @@ mod tests {
                 )
             });
 
-        let result = bridge
-            .execute(
-                &agent_id,
-                &format!(r#"HISTORY LOGICAL "{}""#, logical_memory_id),
-            )
-            .unwrap();
+        let result = Python::attach(|py| {
+            bridge
+                .execute(
+                    py,
+                    &agent_id,
+                    &format!(r#"HISTORY LOGICAL "{}""#, logical_memory_id),
+                )
+                .unwrap()
+        });
 
         assert_eq!(result.result_type, "history");
         assert_eq!(
@@ -1709,7 +1800,7 @@ mod tests {
             (bridge, dir, agent().to_string(), left_head_id.to_string())
         });
 
-        let result = bridge.inspect(&agent_id, &left_id).unwrap();
+        let result = Python::attach(|py| bridge.inspect(py, &agent_id, &left_id).unwrap());
 
         assert_eq!(result.result_type, "inspected");
         assert_eq!(result.json_val["layer"], "Semantic");
@@ -1783,7 +1874,7 @@ mod tests {
             (bridge, dir, agent().to_string(), left_head_id.to_string())
         });
 
-        let result = bridge.trace(&agent_id, &left_id).unwrap();
+        let result = Python::attach(|py| bridge.trace(py, &agent_id, &left_id).unwrap());
 
         assert_eq!(result.result_type, "traced");
         assert_eq!(result.json_val["layer"], "Semantic");
@@ -1859,9 +1950,11 @@ mod tests {
             (bridge, dir, agent().to_string(), left_head_id.to_string())
         });
 
-        let result = bridge
-            .execute(&agent_id, &format!(r#"TRACE "{}""#, left_id))
-            .unwrap();
+        let result = Python::attach(|py| {
+            bridge
+                .execute(py, &agent_id, &format!(r#"TRACE "{}""#, left_id))
+                .unwrap()
+        });
 
         assert_eq!(result.result_type, "traced");
         assert_eq!(result.json_val["layer"], "Semantic");

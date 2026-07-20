@@ -83,6 +83,13 @@ pub struct EventLog {
     next_seq: AtomicU64,
     /// Broadcast channel for real-time push to WATCH subscribers.
     tx: tokio::sync::broadcast::Sender<EventEnvelope>,
+    /// HMAC secret. When `Some`, the production append paths sign every event
+    /// and chain it to the previous one, producing a tamper-evident log.
+    hmac_secret: Option<Vec<u8>>,
+    /// Tag of the most recently appended event — the head of the hash chain.
+    /// Held behind an async mutex so signed appends serialize their
+    /// sign-and-chain critical section, keeping the chain gap-free and ordered.
+    chain_head: tokio::sync::Mutex<Option<String>>,
 }
 
 impl EventLog {
@@ -91,16 +98,73 @@ impl EventLog {
     /// Scans the existing `events` dataset (if any) to recover the next
     /// sequence number, ensuring gap-free continuation after restart.
     pub async fn open(storage: Arc<dyn PhysicalStore>) -> HirnResult<Self> {
+        Self::open_inner(storage, None).await
+    }
+
+    /// Open an event log that signs and hash-chains every appended event with
+    /// `secret`, making the log tamper-evident. Recovers the chain head from the
+    /// existing dataset so the chain continues unbroken across restarts.
+    pub async fn open_signed(storage: Arc<dyn PhysicalStore>, secret: Vec<u8>) -> HirnResult<Self> {
+        Self::open_inner(storage, Some(secret)).await
+    }
+
+    async fn open_inner(
+        storage: Arc<dyn PhysicalStore>,
+        hmac_secret: Option<Vec<u8>>,
+    ) -> HirnResult<Self> {
         let (tx, _) = tokio::sync::broadcast::channel(4096);
 
         // Recover next seq from existing events.
         let next_seq = Self::recover_next_seq(&*storage).await?;
+        // Recover the chain head (hmac of the max-seq event) so signed appends
+        // continue the existing chain rather than forking a new one.
+        let chain_head = if hmac_secret.is_some() {
+            Self::recover_chain_head(&*storage).await?
+        } else {
+            None
+        };
 
         Ok(Self {
             storage,
             next_seq: AtomicU64::new(next_seq),
             tx,
+            hmac_secret,
+            chain_head: tokio::sync::Mutex::new(chain_head),
         })
+    }
+
+    /// Recover the hmac of the highest-seq event (the current chain head).
+    async fn recover_chain_head(storage: &dyn PhysicalStore) -> HirnResult<Option<String>> {
+        use arrow_array::Array;
+        if !storage.exists(DATASET_NAME).await? {
+            return Ok(None);
+        }
+        if storage.count(DATASET_NAME, None).await? == 0 {
+            return Ok(None);
+        }
+        let mut batches = storage
+            .scan_stream(
+                DATASET_NAME,
+                ScanOptions {
+                    columns: Some(vec!["seq".into(), "hmac".into()]),
+                    filter: None,
+                    exact_filter: None,
+                    order_by: Some(vec![ScanOrdering::desc("seq")]),
+                    limit: Some(1),
+                    offset: None,
+                },
+            )
+            .await?;
+        if let Some(batch) = batches.try_next().await? {
+            if let Some(col) = batch.column_by_name("hmac") {
+                if let Some(arr) = col.as_any().downcast_ref::<arrow_array::StringArray>() {
+                    if arr.len() > 0 && !arr.is_null(0) {
+                        return Ok(Some(arr.value(0).to_string()));
+                    }
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Recover the next sequence number by finding the max seq in the dataset.
@@ -211,13 +275,53 @@ impl EventLog {
         agent_id: impl Into<String>,
         event: MemoryEvent,
     ) -> HirnResult<EventEnvelope> {
-        let seq = self.next_seq.fetch_add(1, Ordering::AcqRel);
-        let envelope = EventEnvelope::new(seq, realm, namespace, agent_id, event);
+        let envelope = if let Some(secret) = self.hmac_secret.as_deref() {
+            // Allocate the seq *inside* the chain-head critical section so that
+            // seq order == chain-link order == persist order. Allocating the seq
+            // before taking the lock lets two concurrent appends acquire the lock
+            // in the opposite order to their seq numbers, which makes each
+            // event's `prev_hmac` link to the wrong predecessor and causes
+            // `verify_chain` (which walks seq-ascending) to report a false
+            // tamper on a log that was never touched. The head advances only
+            // after the durable write so a failed write never orphans the chain.
+            let mut head = self.chain_head.lock().await;
+            let seq = self.next_seq.fetch_add(1, Ordering::AcqRel);
+            let mut envelope = EventEnvelope::new(seq, realm, namespace, agent_id, event);
+            envelope.sign_chained(secret, head.clone());
+            self.persist_one(&envelope).await?;
+            head.clone_from(&envelope.hmac);
+            envelope
+        } else {
+            let seq = self.next_seq.fetch_add(1, Ordering::AcqRel);
+            let envelope = EventEnvelope::new(seq, realm, namespace, agent_id, event);
+            self.persist_one(&envelope).await?;
+            envelope
+        };
 
-        let payload = bincode::serialize(&envelope.event)
-            .map_err(|e| hirn_core::HirnError::storage(format!("event serialize: {e}")))?;
+        // Best-effort broadcast (receivers may be lagging — that's OK).
+        let _ = self.tx.send(envelope.clone());
 
-        let row = EventRow {
+        Ok(envelope)
+    }
+
+    /// Serialize one envelope to a single-row batch and append it.
+    async fn persist_one(&self, envelope: &EventEnvelope) -> HirnResult<()> {
+        let row = Self::row_for(envelope)?;
+        let batch = events::to_batch(std::slice::from_ref(&row))?;
+        self.storage.append(DATASET_NAME, batch).await?;
+        Ok(())
+    }
+
+    /// Build the storage row for an envelope.
+    ///
+    /// The payload column is version-prefixed (see `hirn_core::persist`) so a
+    /// future change to `MemoryEvent`'s shape becomes an explicit migration
+    /// instead of making old rows undecodable. The HMAC canonicalization in
+    /// `event.rs` serializes the in-memory event independently, so the stored
+    /// encoding is free to evolve without affecting chain verification.
+    fn row_for(envelope: &EventEnvelope) -> HirnResult<EventRow> {
+        let payload = hirn_core::persist::to_versioned_bytes(&envelope.event)?;
+        Ok(EventRow {
             seq: envelope.seq,
             timestamp_us: envelope.timestamp_us,
             realm: envelope.realm.clone(),
@@ -226,15 +330,8 @@ impl EventLog {
             event_type: envelope.event_type().to_string(),
             payload,
             hmac: envelope.hmac.clone(),
-        };
-
-        let batch = events::to_batch(std::slice::from_ref(&row))?;
-        self.storage.append(DATASET_NAME, batch).await?;
-
-        // Best-effort broadcast (receivers may be lagging — that's OK).
-        let _ = self.tx.send(envelope.clone());
-
-        Ok(envelope)
+            prev_hmac: envelope.prev_hmac.clone(),
+        })
     }
 
     /// Append a single event with HMAC signing.
@@ -250,26 +347,17 @@ impl EventLog {
         agent_id: impl Into<String>,
         secret: &[u8],
     ) -> HirnResult<EventEnvelope> {
+        // Chain under the head lock so this explicit-secret path also forms a
+        // continuous chain with the surrounding signed appends. The seq is
+        // allocated inside the critical section so seq order matches chain order
+        // even under concurrent appends (see `append`).
+        let mut head = self.chain_head.lock().await;
         let seq = self.next_seq.fetch_add(1, Ordering::AcqRel);
         let mut envelope = EventEnvelope::new(seq, realm, namespace, agent_id, event);
-        envelope.sign(secret);
-
-        let payload = bincode::serialize(&envelope.event)
-            .map_err(|e| hirn_core::HirnError::storage(format!("event serialize: {e}")))?;
-
-        let row = EventRow {
-            seq: envelope.seq,
-            timestamp_us: envelope.timestamp_us,
-            realm: envelope.realm.clone(),
-            namespace: envelope.namespace.clone(),
-            agent_id: envelope.agent_id.clone(),
-            event_type: envelope.event_type().to_string(),
-            payload,
-            hmac: envelope.hmac.clone(),
-        };
-
-        let batch = events::to_batch(std::slice::from_ref(&row))?;
-        self.storage.append(DATASET_NAME, batch).await?;
+        envelope.sign_chained(secret, head.clone());
+        self.persist_one(&envelope).await?;
+        head.clone_from(&envelope.hmac);
+        drop(head);
 
         let _ = self.tx.send(envelope.clone());
 
@@ -290,36 +378,45 @@ impl EventLog {
             return Ok(vec![]);
         }
 
+        // When signing, hold the chain-head lock for the whole batch so every
+        // event chains to its predecessor (across and within the batch). The seq
+        // block is allocated *inside* the critical section so seq order matches
+        // chain-link order even when other appends race this one (see `append`).
+        let mut head_guard = if self.hmac_secret.is_some() {
+            Some(self.chain_head.lock().await)
+        } else {
+            None
+        };
         let base_seq = self
             .next_seq
             .fetch_add(events_in.len() as u64, Ordering::AcqRel);
 
         let mut envelopes = Vec::with_capacity(events_in.len());
         let mut rows = Vec::with_capacity(events_in.len());
+        let mut running_prev: Option<String> = head_guard.as_ref().and_then(|g| (**g).clone());
 
         for (i, event) in events_in.into_iter().enumerate() {
             let seq = base_seq + i as u64;
-            let envelope = EventEnvelope::new(seq, realm, namespace, agent_id, event);
+            let mut envelope = EventEnvelope::new(seq, realm, namespace, agent_id, event);
 
-            let payload = bincode::serialize(&envelope.event)
-                .map_err(|e| hirn_core::HirnError::storage(format!("event serialize: {e}")))?;
+            if let Some(secret) = self.hmac_secret.as_deref() {
+                envelope.sign_chained(secret, running_prev.clone());
+                running_prev = envelope.hmac.clone();
+            }
 
-            rows.push(EventRow {
-                seq: envelope.seq,
-                timestamp_us: envelope.timestamp_us,
-                realm: envelope.realm.clone(),
-                namespace: envelope.namespace.clone(),
-                agent_id: envelope.agent_id.clone(),
-                event_type: envelope.event_type().to_string(),
-                payload,
-                hmac: envelope.hmac.clone(),
-            });
-
+            rows.push(Self::row_for(&envelope)?);
             envelopes.push(envelope);
         }
 
         let batch = events::to_batch(&rows)?;
         self.storage.append(DATASET_NAME, batch).await?;
+
+        // Advance the chain head to the last event's tag only after a durable
+        // write, then release the lock.
+        if let Some(ref mut head) = head_guard {
+            **head = running_prev;
+        }
+        drop(head_guard);
 
         // Broadcast all envelopes.
         for env in &envelopes {
@@ -414,6 +511,46 @@ impl EventLog {
         Ok(failures)
     }
 
+    /// Verify the full tamper-evident chain: every event's own HMAC, the
+    /// `prev_hmac` linkage between consecutive events, and gap-free `seq`
+    /// contiguity. Unlike [`Self::verify_integrity`], this also detects
+    /// *deleted* or *truncated* events (a removed event breaks its successor's
+    /// linkage or leaves a seq gap), which per-event tags alone cannot catch.
+    ///
+    /// Returns `Ok(())` if the chain is intact, or an error describing the first
+    /// break (bad tag, broken linkage, or seq gap).
+    pub async fn verify_chain(&self, secret: &[u8]) -> HirnResult<()> {
+        let events = self.read_all().await?;
+        let mut prev_seq: Option<u64> = None;
+        let mut prev_tag: Option<String> = None;
+        for env in &events {
+            if let Some(ps) = prev_seq {
+                if env.seq != ps + 1 {
+                    return Err(hirn_core::HirnError::storage(format!(
+                        "audit chain seq gap: {ps} → {} (missing events)",
+                        env.seq
+                    )));
+                }
+            }
+            if !env.verify_hmac(secret) {
+                return Err(hirn_core::HirnError::storage(format!(
+                    "audit chain: event seq {} has an invalid or missing HMAC",
+                    env.seq
+                )));
+            }
+            if env.prev_hmac != prev_tag {
+                return Err(hirn_core::HirnError::storage(format!(
+                    "audit chain: event seq {} does not link to its predecessor \
+                     (expected prev_hmac {:?}, found {:?})",
+                    env.seq, prev_tag, env.prev_hmac
+                )));
+            }
+            prev_seq = Some(env.seq);
+            prev_tag.clone_from(&env.hmac);
+        }
+        Ok(())
+    }
+
     /// Replay events from a specific seq onward.
     pub async fn replay_from<F>(&self, from_seq: u64, mut handler: F) -> HirnResult<u64>
     where
@@ -472,12 +609,13 @@ impl EventLog {
         while let Some(batch) = batches.try_next().await? {
             let rows = events::from_batch(&batch)?;
             for row in rows {
-                let event: MemoryEvent = bincode::deserialize(&row.payload).map_err(|e| {
-                    hirn_core::HirnError::storage(format!(
-                        "event deserialize at seq {}: {e}",
-                        row.seq
-                    ))
-                })?;
+                let event: MemoryEvent = hirn_core::persist::from_versioned_bytes(&row.payload)
+                    .map_err(|e| {
+                        hirn_core::HirnError::storage(format!(
+                            "event deserialize at seq {}: {e}",
+                            row.seq
+                        ))
+                    })?;
 
                 envelopes.push(EventEnvelope {
                     seq: row.seq,
@@ -487,6 +625,7 @@ impl EventLog {
                     agent_id: row.agent_id,
                     event: event,
                     hmac: row.hmac,
+                    prev_hmac: row.prev_hmac,
                 });
             }
         }
@@ -728,6 +867,67 @@ mod tests {
         assert_eq!(e2.seq, 1);
 
         assert_eq!(log.next_seq(), 2);
+    }
+
+    #[tokio::test]
+    async fn signed_log_produces_valid_chain() {
+        let secret = b"a-32-byte-secret-key-for-testing".to_vec();
+        let log = EventLog::open_signed(null_storage(), secret.clone())
+            .await
+            .unwrap();
+        for _ in 0..5 {
+            log.append(
+                "r",
+                "ns",
+                "a",
+                MemoryEvent::WorkingPushed {
+                    id: hirn_core::id::MemoryId::new(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        // Every event signed, chained, and gap-free.
+        log.verify_chain(&secret).await.unwrap();
+        assert!(log.verify_integrity(&secret).await.unwrap().is_empty());
+
+        // Each event (after the first) links to its predecessor's tag.
+        let events = log.read_all().await.unwrap();
+        assert_eq!(events.len(), 5);
+        assert!(events[0].prev_hmac.is_none());
+        for w in events.windows(2) {
+            assert_eq!(w[1].prev_hmac, w[0].hmac);
+        }
+    }
+
+    #[tokio::test]
+    async fn deleting_an_event_breaks_the_chain() {
+        let secret = b"a-32-byte-secret-key-for-testing".to_vec();
+        let storage = null_storage();
+        let log = EventLog::open_signed(storage.clone(), secret.clone())
+            .await
+            .unwrap();
+        for _ in 0..4 {
+            log.append(
+                "r",
+                "ns",
+                "a",
+                MemoryEvent::WorkingPushed {
+                    id: hirn_core::id::MemoryId::new(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        log.verify_chain(&secret).await.unwrap();
+
+        // Excise a middle event directly from storage (an attacker with store
+        // access). Per-event tags still verify, but the chain must not.
+        storage.delete(DATASET_NAME, "seq = 2").await.unwrap();
+        assert!(
+            log.verify_chain(&secret).await.is_err(),
+            "removing an event must break the hash chain"
+        );
     }
 
     #[tokio::test]

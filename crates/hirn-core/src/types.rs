@@ -192,7 +192,9 @@ impl Namespace {
     #[must_use]
     pub fn private_for(agent_id: &AgentId) -> Self {
         let name = format!("private:{}", agent_id.as_str());
-        // AgentId is already validated; intern() is safe here.
+        // `AgentId::new` reserved this exact string in the namespace interner
+        // when the id was constructed, so this always hits the already-interned
+        // fast path — capacity exhaustion cannot panic here.
         Self(namespace_interner().intern(&name))
     }
 
@@ -308,7 +310,13 @@ impl AgentId {
                 "invalid agent_id: '{id}' (only ASCII alphanumeric, underscore, dot, hyphen allowed)"
             )));
         }
-        Ok(Self(agent_id_interner().try_intern(&id)?))
+        let handle = agent_id_interner().try_intern(&id)?;
+        // Reserve the agent's private namespace now, while we can still fail
+        // cleanly. Every constructed AgentId (including deserialized ones)
+        // passes through here, so `Namespace::private_for` is guaranteed an
+        // already-interned fast path and can never hit the capacity panic.
+        crate::interner::namespace_interner().try_intern(&format!("private:{id}"))?;
+        Ok(Self(handle))
     }
 
     /// Return the underlying string slice.
@@ -340,6 +348,25 @@ impl<'de> Deserialize<'de> for AgentId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_id_new_reserves_private_namespace() {
+        // Constructing the id must pre-intern its private namespace so that
+        // `private_for` is infallible afterwards.
+        let agent = AgentId::new("reservation_check_agent").unwrap();
+        let ns = Namespace::private_for(&agent);
+        assert_eq!(ns.as_str(), "private:reservation_check_agent");
+    }
+
+    #[test]
+    fn interner_capacity_errors_surface_at_agent_id_construction() {
+        // A bounded interner rejects interning past its cap with an error, not
+        // a panic — AgentId::new is the boundary where that error must land.
+        let small = crate::interner::StringInterner::with_max(1);
+        small.try_intern("first").unwrap();
+        let err = small.try_intern("second").unwrap_err();
+        assert!(err.to_string().contains("capacity exhausted"));
+    }
 
     #[test]
     fn priority_ordering() {

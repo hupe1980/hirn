@@ -243,7 +243,7 @@ mod tests {
         );
 
         match result.unwrap_err() {
-            HirnError::ProviderError(message) => {
+            HirnError::ProviderError { message, .. } => {
                 assert!(message.contains("openai"));
             }
             other => panic!("expected provider error, got {other:?}"),

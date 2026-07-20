@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    - cron: "0 4 * * 1" # weekly, enables the fuzz smoke job
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -53,6 +56,105 @@ jobs:
         run: cargo clippy --workspace --all-targets
       - name: Test
         run: cargo test --workspace --lib --bins --tests
+      # --lib/--bins/--tests skips doctests, so run them explicitly. Feature-
+      # gated doc examples (e.g. hirn-provider) are covered by the explicit
+      # provider-features test step below.
+      - name: Doctests
+        run: cargo test --workspace --doc
+      # hirn-provider has default = [], so the feature-gated provider modules
+      # are invisible to the workspace-wide runs above and must be built and
+      # tested explicitly. cross-encoder is left out because it pulls in the
+      # ONNX runtime, which is too heavy for CI.
+      - name: Clippy (provider features)
+        if: runner.os == 'Linux'
+        run: cargo clippy -p hirn-provider --all-targets --features openai,anthropic,cohere,voyage,ollama
+      - name: Test (provider features)
+        run: cargo test -p hirn-provider --features openai,anthropic,cohere,voyage,ollama
+
+  bindings:
+    name: Bindings (Python & Node)
+    runs-on: ubuntu-latest
+    continue-on-error: false
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          sudo apt-get clean
+          df -h
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install protobuf
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # maturin develop requires an active virtualenv; export it for later steps.
+      - name: Set up Python venv
+        run: |
+          python -m venv .venv
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+          echo "VIRTUAL_ENV=$PWD/.venv" >> "$GITHUB_ENV"
+      - name: Install Python tooling
+        run: pip install maturin pytest numpy
+      - name: Build Python bindings
+        run: maturin develop --manifest-path crates/hirn-python/Cargo.toml
+      - name: Test Python bindings
+        run: pytest crates/hirn-python/tests -x
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      # `npm run build` = cargo build -p hirn-node --release + stage the
+      # .node binary next to index.js (see crates/hirn-node/package.json).
+      - name: Build Node bindings
+        working-directory: crates/hirn-node
+        run: npm run build
+      - name: Test Node bindings
+        working-directory: crates/hirn-node
+        run: node --test tests/
+
+  msrv:
+    name: MSRV (1.91.1)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          sudo apt-get clean
+          df -h
+      # Pin the exact patch release: aws-types 1.3.14 requires rustc 1.91.1,
+      # so 1.91.0 fails dependency resolution.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.91.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Install protobuf
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Check (rust-version floor)
+        run: cargo check --workspace
+
+  # Build-only smoke test for the fuzz targets. Nightly + scheduled/dispatch
+  # only, to keep PR CI fast.
+  fuzz-smoke:
+    name: Fuzz Build Smoke
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          sudo apt-get clean
+          df -h
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+      - name: Build fuzz targets
+        run: cargo fuzz build
 
   audit:
     name: Security Audit

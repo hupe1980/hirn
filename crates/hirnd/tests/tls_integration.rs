@@ -97,7 +97,11 @@ async fn start_tls_http_server(tls_config: &TlsConfig) -> (u16, TempDir) {
     let port = listener.local_addr().unwrap().port();
 
     tokio::spawn(async move {
-        hirnd::http::serve_http_tls(listener, router, acceptor)
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+        // Keep the sender alive for the server's lifetime so the accept loop
+        // never observes a spurious shutdown.
+        std::mem::forget(_shutdown_tx);
+        hirnd::http::serve_http_tls(listener, router, acceptor, shutdown_rx)
             .await
             .unwrap();
     });
@@ -450,7 +454,11 @@ async fn start_mtls_server(
     let port = listener.local_addr().unwrap().port();
 
     tokio::spawn(async move {
-        hirnd::http::serve_http_tls(listener, router, acceptor)
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+        // Keep the sender alive for the server's lifetime so the accept loop
+        // never observes a spurious shutdown.
+        std::mem::forget(_shutdown_tx);
+        hirnd::http::serve_http_tls(listener, router, acceptor, shutdown_rx)
             .await
             .unwrap();
     });

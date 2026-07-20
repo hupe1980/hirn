@@ -135,7 +135,10 @@ impl From<LlmError> for hirn_core::HirnError {
             // Non-transient provider errors (4xx client errors) must NOT be retried.
             // Map them to InvalidInput so HirnError::is_retryable() returns false (N-L02).
             _ if !err.is_transient() => Self::InvalidInput(err.to_string()),
-            _ => Self::ProviderError(err.to_string()),
+            _ => Self::ProviderError {
+                message: err.to_string(),
+                retryable: true,
+            },
         }
     }
 }
@@ -151,7 +154,8 @@ pub(crate) fn parse_retry_after(value: &str) -> Option<Duration> {
 
 /// Known model **output** token limits for pre-flight validation.
 ///
-/// Returns `None` for unknown model families (no limit is enforced).
+/// Returns `None` for unknown model families. Advisory only — callers log a
+/// warning and still send the request; the provider API is the authority.
 #[cfg(any(feature = "openai", feature = "anthropic"))]
 pub(crate) fn max_tokens_for_model(model: &str) -> Option<u32> {
     match model {
@@ -162,7 +166,8 @@ pub(crate) fn max_tokens_for_model(model: &str) -> Option<u32> {
         m if m.starts_with("gpt-3.5") => Some(4_096),
         m if m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4") => Some(100_000),
         // Anthropic — https://docs.anthropic.com/en/docs/about-claude/models
-        m if m.contains("claude-sonnet-4") || m.contains("claude-3-5-sonnet") => Some(16_384),
+        m if m.contains("claude-sonnet-4") => Some(64_000),
+        m if m.contains("claude-3-5-sonnet") => Some(16_384),
         m if m.contains("claude-3-5-haiku") || m.contains("claude-haiku") => Some(8_192),
         m if m.contains("claude-3-opus") || m.contains("claude-opus-4") => Some(32_000),
         m if m.contains("claude") => Some(8_192),
@@ -323,7 +328,7 @@ mod tests {
     fn max_tokens_claude() {
         assert_eq!(
             max_tokens_for_model("claude-sonnet-4-20250514"),
-            Some(16_384)
+            Some(64_000)
         );
         assert_eq!(
             max_tokens_for_model("claude-3-5-sonnet-20241022"),

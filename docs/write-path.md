@@ -1,14 +1,76 @@
+---
+title: Write-Path Intelligence
+parent: Concepts
+nav_order: 4
+description: >-
+  What hirn does at write time — RPE-gated admission, prospective indexing, SVO
+  extraction, interference tracking, and multimodal resource routing.
+---
+
 # Write-Path Intelligence
+{: .no_toc }
 
-> **⚠️ Experimental:** This project is under active development. APIs, on-disk formats, and behaviour may change without notice. Not recommended for production use.
+This project is under active development. APIs, on-disk formats, and behaviour may change without notice. Not recommended for production use.
+{: .experimental }
 
-> RPE-gated admission, prospective indexing, SVO extraction, and adaptive consolidation.
+RPE-gated admission, prospective indexing, SVO extraction, and adaptive consolidation.
 
-hirn's write path is not just "store a vector." Every incoming memory passes through an intelligent admission pipeline that decides how much processing to invest based on novelty.
+## Table of contents
+{: .no_toc .text-delta }
+
+1. TOC
+{:toc}
+
+---
+
+## Why an intelligent write path?
+
+In a naive vector store, "remember" means one thing: embed the text and append a row. hirn treats
+the write path as the moment where most of memory's long-term value is created or lost. The guiding
+principle is **asymmetric investment**: the system should spend richly on encoding the *few* writes
+that carry genuinely new information, and spend almost nothing on the *many* that restate what it
+already knows.
+
+This mirrors how biological memory works. Encoding in the brain is not uniform — the dopaminergic
+reward-prediction-error signal (Schultz, Dayan & Montague, 1997) modulates how deeply a stimulus is
+laid down, which is why surprising events are recalled far better than routine ones. hirn's write
+path implements the same economics with **RPE-gated admission**: a cheap novelty score routes each
+write to a fast path (store + cheap heuristics) or a slow path (full enrichment — prospective
+indexing, SVO extraction, interference tracking, graph structure).
+
+On top of that admission gate, the write path does three things a plain vector store cannot: it
+generates *prospective* index entries (anticipated future questions) so recall can short-circuit; it
+extracts *structured* Subject–Verb–Object events for temporal querying; and it promotes non-text
+payloads into first-class, separately-versioned **resources** with explicit evidence links. This
+page walks through each stage.
+
+The RPE routing described below only activates when `rpe_enabled = true`. With the default
+(`false`), every write takes the slow path. See the [Cognitive Model](cognitive-model.md#rpe-reward-prediction-error--the-admission-gate)
+for the neuroscience behind the gate.
+{: .note }
+
+See also: [Cognitive Model](cognitive-model.md), [Architecture](architecture.md), [HirnQL Reference](hirnql-reference.md).
 
 ---
 
 ## Architecture Overview
+
+At a glance, every `remember()` embeds the content, scores its novelty, and branches on that score:
+
+```mermaid
+flowchart TB
+  rem["remember(content)"] --> emb["Embed content<br/>(fallback: store without embedding)"]
+  emb --> rpe["RPE score<br/>1 − max_sim, z-scored (Welford)"]
+  rpe --> gate{"RPE < rpe_fast_<br/>path_threshold?<br/>(default 0.3)"}
+  gate -->|"yes — routine"| fast["Fast path<br/>· heuristic importance 0.3 + 0.2·rpe<br/>· skip LLM / prospective / SVO<br/>· store + auto similarity edges"]
+  gate -->|"no — novel"| slow["Slow path<br/>· full importance scoring<br/>· prospective indexing (Kumiho)<br/>· SVO extraction (Chronos)<br/>· interference check<br/>· store + graph edges"]
+  fast --> store[("Lance + property graph")]
+  slow --> store
+  classDef s fill:#1a1b26,stroke:#7c9cff,color:#e6e8f0;
+  class rem,emb,rpe,gate,fast,slow,store s;
+```
+
+The original ASCII sketch of the same routing:
 
 ```
   ┌──────────┐
@@ -108,6 +170,30 @@ RECALL "project status" WITH PROSPECTIVE OFF;
 ```
 
 When `PROSPECTIVE ON`, the logical plan inserts `ProspectiveSearch`, which compiles to `ProspectiveShortCircuitExec`. That operator checks `prospective_implications` first and can skip the full vector scan if a high-confidence prospective hit is found.
+
+```mermaid
+sequenceDiagram
+  participant A as Agent
+  participant W as Write path (Kumiho)
+  participant P as prospective_implications
+  participant R as Recall
+  A->>W: remember("Alice deployed v2.3")
+  W->>W: generate anticipated questions<br/>from templates
+  W->>P: embed + store questions<br/>(FK to source memory)
+  Note over A,R: ...later...
+  A->>R: RECALL "who deployed v2.3?" WITH PROSPECTIVE ON
+  R->>P: match query against prospective embeddings
+  P-->>R: high-confidence hit → source memory
+  R-->>A: short-circuit, skip full vector scan
+```
+
+**Design rationale — anticipate, don't just index.** A memory written as a *statement* ("Alice
+deployed v2.3") and a query written as a *question* ("who deployed v2.3?") can sit surprisingly far
+apart in embedding space. By pre-generating the questions a memory could answer *at write time* and
+embedding those, hirn closes the statement-question gap before it ever costs a recall. This trades a
+little write-time work (and storage) for faster, higher-recall reads — a good bargain for
+write-once/read-many agent memory.
+{: .tip }
 
 ---
 

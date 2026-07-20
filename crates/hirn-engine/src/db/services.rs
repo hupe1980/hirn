@@ -537,6 +537,19 @@ impl<'a> AdminView<'a> {
         self.0.audit_log(after, before).await
     }
 
+    /// Verify the tamper-evident hash chain over the `_audit` dataset.
+    ///
+    /// When an HMAC secret is configured, every audit entry is signed and
+    /// chained to its predecessor; this checks every entry's tag, the
+    /// chain linkage, and gap-free sequence numbers, detecting mutation,
+    /// deletion, and truncation. Returns
+    /// [`AuditChainVerification::Unsigned`](super::AuditChainVerification::Unsigned)
+    /// when no secret is configured.
+    #[inline]
+    pub async fn verify_audit_chain(&self) -> HirnResult<super::AuditChainVerification> {
+        self.0.verify_audit_chain().await
+    }
+
     /// Consolidate semantic records across agents in a namespace.
     #[inline]
     pub async fn cross_agent_consolidate(

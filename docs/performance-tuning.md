@@ -1,4 +1,13 @@
+---
+title: Performance Tuning
+parent: Deployment & Operations
+nav_order: 4
+description: >-
+  Tune the knobs that move hirn in production — RPE routing, quality-gate escalation, consolidation pressure, graph activation, and provider runtime protections.
+---
+
 # Performance Tuning
+{: .no_toc }
 
 > **⚠️ Experimental:** This project is under active development. APIs, on-disk formats, and behaviour may change without notice. Not recommended for production use.
 
@@ -11,6 +20,32 @@ See also:
 - [Architecture](architecture.md)
 - [Benchmarks](benchmarks.md)
 - [Cedar Policy Guide](cedar-guide.md)
+
+## Table of contents
+{: .no_toc .text-delta }
+
+1. TOC
+{:toc}
+
+---
+
+## How To Read This Guide
+
+hirn's performance profile is governed by a handful of thresholds that trade
+**cost** against **cognitive richness**. Almost every knob below sits on that
+spectrum: raise it and you spend less compute per write or query but capture less
+structure; lower it and you enrich more aggressively at higher latency and
+provider spend. There is no globally correct setting — only the setting that
+matches your workload's ingest rate, query mix, and provider budget.
+
+Because these knobs interact, change one group at a time and re-measure. The
+defaults are chosen to be safe middles, not performance ceilings, so treat every
+change as a hypothesis you confirm against a replayable workload.
+
+{: .warning }
+> `rpe_enabled = false` does **not** make writes cheaper. It bypasses the
+> fast/slow router, leaving every write on the fully enriched slow path. If you
+> are tuning for write cost, enabling RPE is the first move, not the last.
 
 ## Tuning Workflow
 
@@ -45,6 +80,22 @@ RPE routing decides whether a new memory takes the fast path or the enriched slo
 
 - **Fast path**: lower write latency, skips prospective indexing and SVO extraction.
 - **Slow path**: higher write cost, richer downstream recall and structured events.
+
+```mermaid
+flowchart TD
+    W[Incoming REMEMBER]:::s --> EN{rpe_enabled?}:::s
+    EN -->|false| SLOW[Slow path<br/>full enrichment]:::s
+    EN -->|true| SC[Compute RPE score]:::s
+    SC --> TH{score &lt; rpe_fast_path_threshold?}:::s
+    TH -->|yes, routine| FAST[Fast path<br/>skip prospective + SVO]:::s
+    TH -->|no, novel| SLOW
+    FAST --> ST[(Storage)]:::s
+    SLOW --> ST
+    classDef s fill:#1a1b26,stroke:#7c9cff,color:#e6e8f0;
+```
+
+Raising `rpe_fast_path_threshold` widens the fast-path band, so more routine
+memories skip enrichment; lowering it forces more writes onto the slow path.
 
 ### Defaults and Guardrails
 
@@ -119,6 +170,34 @@ The quality gate scores retrieval output on coverage, confidence, coherence, and
 ### What It Controls
 
 Consolidation moves information from episodic rows into richer semantic structure. Hirn can trigger it periodically or by accumulated interference from the write path.
+
+There are two independent triggers feeding one consolidation pass. The periodic
+timer fires on a fixed cadence; the interference trigger fires when accumulated
+write-path conflict crosses a threshold, but only after a cooldown has elapsed
+since the last interference-driven run. The cooldown prevents a bursty write
+workload from firing consolidation continuously.
+
+```mermaid
+flowchart TD
+    subgraph Triggers["Consolidation triggers"]
+        T1[Periodic timer<br/>consolidation_interval_secs]:::s
+        T2[Write-path interference]:::s
+    end
+    T1 --> RUN[Run consolidation pass]:::s
+    T2 --> CK{interference &gt;=<br/>interference_consolidation_threshold?}:::s
+    CK -->|no| SKIP[No run]:::s
+    CK -->|yes| CD{cooldown elapsed?<br/>interference_consolidation_cooldown_secs}:::s
+    CD -->|no| SKIP
+    CD -->|yes| RUN
+    RUN --> BATCH[Process up to<br/>consolidation_batch_size episodes]:::s
+    BATCH --> SEM[(Semantic structure)]:::s
+    classDef s fill:#1a1b26,stroke:#7c9cff,color:#e6e8f0;
+```
+
+{: .tip }
+> Compaction and consolidation are **not** interchangeable. Compaction merges
+> Lance fragments for scan speed; consolidation reshapes episodic memory into
+> semantic structure. Tune them independently.
 
 ### Defaults and Guardrails
 

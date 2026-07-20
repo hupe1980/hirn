@@ -1,10 +1,74 @@
+---
+title: HirnQL Reference
+nav_order: 4
+description: >-
+  Complete reference for HirnQL — the declarative, injection-safe query language
+  for storing, recalling, reasoning over, and administering cognitive memory.
+---
+
 # HirnQL Reference
+{: .no_toc }
 
 > **⚠️ Experimental:** This project is under active development. APIs, on-disk formats, and behaviour may change without notice. Not recommended for production use.
 
 > Domain-specific query language for cognitive memory operations.
 
+## Table of contents
+{: .no_toc .text-delta }
+
+1. TOC
+{:toc}
+
+---
+
+## Language Philosophy
+
 HirnQL is to hirn what SQL is to PostgreSQL — a declarative language for storing, querying, reasoning over, and managing cognitive memory. It is case-insensitive, whitespace-tolerant, and supports `--` line comments.
+
+The design leans on three convictions:
+
+- **Declarative over imperative.** You describe *what* memory you want — "recall episodic memories about deployment issues, expand the graph two hops, keep the top five" — and the planner decides how to execute it. The same statement runs whether hirn is embedded in your process or fronted by the `hirnd` daemon, so query intent is portable across deployments.
+- **Cognition as first-class verbs.** SQL has `SELECT`; HirnQL adds verbs that only make sense for a memory system: `THINK` assembles a budget-bounded context, `TRACE` and `HISTORY` walk provenance and revision chains, `TRAVERSE` walks the property graph, and `WATCH` streams live memory events. Retrieval, reasoning, and administration share one grammar instead of a patchwork of APIs.
+- **Safety by construction.** Parameters are bound at the AST level rather than substituted as text, so a value can never break out of a string literal to inject trailing clauses. Clause order is enforced by the grammar, and unsupported fields raise errors instead of being silently ignored — the language fails loudly rather than doing something surprising.
+
+Every HirnQL statement travels the same short compilation pipeline before it touches storage. Understanding those stages makes the error messages in [Appendix C](#appendix-c-error-messages) far easier to read:
+
+```mermaid
+flowchart LR
+  SRC["Source text<br/>RECALL episodic ABOUT ..."]
+  P["Parse<br/>PEG grammar (pest)<br/>clause order enforced"]
+  A["Typed AST<br/>+ parameter binding<br/>(injection-safe)"]
+  PL["Plan<br/>cost-based clause reorder<br/>ns → temporal → FTS → vector"]
+  EX["Execute<br/>compiled DataFusion path<br/>or direct engine helper"]
+  SRC --> P --> A --> PL --> EX
+  classDef s fill:#1a1b26,stroke:#7c9cff,color:#e6e8f0;
+  class SRC,P,A,PL,EX s;
+```
+
+A parameter placed in a value position is bound into the typed node at the AST stage; a parameter placed where the grammar expects an integer literal — inside `LIMIT`, `BUDGET`, or `DEPTH` — is rejected at the parse stage instead. That is why those clauses require literals: the check happens before binding, by design.
+{: .note }
+
+The verbs group into a handful of intent families. This map is a fast way to find the right statement before diving into its section:
+
+```mermaid
+flowchart TB
+  ROOT["HirnQL"]
+  Q["Query<br/>read memory"]
+  M["Mutation<br/>change memory"]
+  X["Exploration<br/>inspect provenance"]
+  AD["Admin<br/>realms & consolidation"]
+  AU["Authorization + Audit<br/>policy & events"]
+  ROOT --> Q & M & X & AD & AU
+  Q --> QV["RECALL · THINK<br/>WATCH · EXPLAIN"]
+  M --> MV["REMEMBER · FORGET · CORRECT<br/>SUPERSEDE · MERGE MEMORY<br/>RETRACT · CONNECT"]
+  X --> XV["INSPECT · HISTORY<br/>TRACE · TRAVERSE"]
+  AD --> ADV["CONSOLIDATE<br/>CREATE / DROP REALM"]
+  AU --> AUV["GRANT · REVOKE · SHOW POLICIES<br/>EXPLAIN POLICY · RECALL EVENTS"]
+  classDef s fill:#1a1b26,stroke:#7c9cff,color:#e6e8f0;
+  class ROOT,Q,M,X,AD,AU,QV,MV,XV,ADV,AUV s;
+```
+
+For the ideas the verbs operate on — the four memory layers, the property graph, consolidation, and causal reasoning — see [Concepts](concepts.md) and the [Cognitive Model](cognitive-model.md). For authorization semantics behind `GRANT`/`REVOKE`, see the [Security Architecture](security.md); for running HirnQL against a daemon, see [Deployment & Operations](operations.md).
 
 ---
 
@@ -594,6 +658,7 @@ TRAVERSE FROM <id>
     [VIA <relation>, ...]
     DEPTH <n>
     [WHERE <condition>]*
+    [NAMESPACE "<ns>"]
     [LIMIT <n>]
 ```
 
@@ -606,9 +671,9 @@ TRAVERSE FROM "01HXYZ..." DEPTH 3
 -- Follow only causal edges
 TRAVERSE FROM "01HXYZ..." VIA Causes DEPTH 5
 
--- Traverse with weight filter
+-- Traverse with weight filter, scoped to a namespace
 TRAVERSE FROM "01HXYZ..." VIA Causes, RelatedTo DEPTH 3
-    WHERE weight > 0.5 LIMIT 20
+    WHERE weight > 0.5 NAMESPACE "team_ns" LIMIT 20
 ```
 
 ---
@@ -878,15 +943,37 @@ Returns `{"mode": "standalone"}`.
 
 ## Parameterized Queries
 
-HirnQL supports `$`-prefixed parameters for safe value injection:
+HirnQL supports `$`-prefixed parameters for safe value injection. Parameters can
+be positional (`$1`, `$2`) or named (`$query`, `$threshold`).
 
 ```sql
-RECALL episodic ABOUT $query WHERE importance > $min_imp LIMIT $limit
-REMEMBER episode CONTENT $content TYPE observation IMPORTANCE $imp
-THINK ABOUT $question BUDGET $budget
+RECALL episodic ABOUT $query WHERE importance > $min_imp
+THINK ABOUT $question WHERE confidence > $c
+CORRECT $target SET description = $new_text
 ```
 
-Parameters can be positional (`$1`, `$2`) or named (`$query`, `$budget`).
+**Binding is performed at the AST level, not by string substitution.** A bound
+value is placed into the parsed statement's typed node, so a value can never
+break out of a string literal to inject trailing clauses — parameterized queries
+are injection-safe regardless of the value's contents.
+
+Parameters are accepted in value positions: `ABOUT`, `TOPIC`, `WHERE`
+comparison values, `NAMESPACE`, mutation targets, and `REASON`/`OBSERVED AT`/
+`CAUSED BY`. **Integer clauses — `LIMIT`, `BUDGET`, and `DEPTH` — take integer
+literals only**, not parameters (a parameter there is a parse error rather than
+silently returning nothing).
+
+```sql
+-- Parameters in allowed value positions; integer clauses stay literal
+RECALL episodic ABOUT $topic NAMESPACE $ns LIMIT 10
+CORRECT $target SET description = $new_text REASON $why
+```
+
+> **Warning:** `LIMIT $n`, `BUDGET $b`, and `DEPTH $d` are **parse errors**, not
+> empty results. Because binding happens after parsing, the grammar rejects a
+> parameter in an integer-literal slot before any value is ever bound. Keep those
+> clauses as whole-number literals and parameterize the value clauses instead.
+{: .warning }
 
 ---
 
@@ -998,7 +1085,7 @@ CONNECT <id> TO <id> AS <relation> [WEIGHT <float>]
 ### TRAVERSE clause order
 
 ```
-TRAVERSE FROM <id> [VIA <relations>] DEPTH n [WHERE <condition>]... [LIMIT n]
+TRAVERSE FROM <id> [VIA <relations>] DEPTH n [WHERE <condition>]... [NAMESPACE "<ns>"] [LIMIT n]
 ```
 
 ---

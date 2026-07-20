@@ -331,25 +331,51 @@ async fn execute_consolidation_pipeline_inner(
     // 4.6. Generate community summaries (Stage 3.6) if LLM is available.
     // F-058 FIX: Use incremental path when a previous community result is cached,
     // skipping LLM summarization for unchanged communities.
+    // Communities are detected on graph topology alone and may span namespaces,
+    // so summaries are generated once per member namespace: each summary only
+    // aggregates records from a single namespace and is stored in that
+    // namespace. The previous result's namespaces are included so stale
+    // summaries are cleaned up even when a namespace lost all its members.
     let (community_summaries_stored, community_edges_created) = if let Some(llm) = llm {
         let prev = db.take_cached_community_result();
-        let summary_result = if let Some(ref prev) = prev {
-            generate_community_summaries_incremental(
-                db,
-                llm,
-                prev,
-                &community_result,
-                50,
-                config.llm_timeout,
-            )
-            .await?
-        } else {
-            generate_community_summaries(db, llm, &community_result, 50, config.llm_timeout).await?
-        };
-        (
-            summary_result.summaries_stored,
-            summary_result.edges_created,
-        )
+        let mut namespaces = leaf_member_namespaces(db, &community_result).await;
+        if let Some(ref prev) = prev {
+            for namespace in leaf_member_namespaces(db, prev).await {
+                if !namespaces.contains(&namespace) {
+                    namespaces.push(namespace);
+                }
+            }
+        }
+
+        let mut summaries_stored = 0;
+        let mut edges_created = 0;
+        for namespace in &namespaces {
+            let summary_result = if let Some(ref prev) = prev {
+                generate_community_summaries_incremental(
+                    db,
+                    llm,
+                    prev,
+                    &community_result,
+                    50,
+                    config.llm_timeout,
+                    namespace,
+                )
+                .await?
+            } else {
+                generate_community_summaries(
+                    db,
+                    llm,
+                    &community_result,
+                    50,
+                    config.llm_timeout,
+                    namespace,
+                )
+                .await?
+            };
+            summaries_stored += summary_result.summaries_stored;
+            edges_created += summary_result.edges_created;
+        }
+        (summaries_stored, edges_created)
     } else {
         (0, 0)
     };
@@ -358,16 +384,23 @@ async fn execute_consolidation_pipeline_inner(
     db.set_cached_community_result(community_result);
 
     // 4.7. RAPTOR hierarchical summarization (R-008).
-    // Build a multi-level summary tree over semantic records for top-down retrieval.
+    // Build a multi-level summary tree over semantic records for top-down
+    // retrieval. One independent tree is built per namespace so clusters and
+    // summaries never mix records from different namespaces.
     let (raptor_summaries_stored, raptor_levels_created, raptor_edges_created) =
         if config.raptor_enabled {
             if let Some(llm) = llm {
-                let raptor_result = build_raptor_tree(db, llm, config).await?;
-                (
-                    raptor_result.summaries_stored,
-                    raptor_result.levels_created,
-                    raptor_result.edges_created,
-                )
+                let mut summaries_stored = 0;
+                let mut levels_created = 0;
+                let mut edges_created = 0;
+                for namespace in semantic_leaf_namespaces(db).await? {
+                    let raptor_result = build_raptor_tree(db, llm, config, &namespace).await?;
+                    summaries_stored += raptor_result.summaries_stored;
+                    // Trees are independent per namespace; report the deepest.
+                    levels_created = levels_created.max(raptor_result.levels_created);
+                    edges_created += raptor_result.edges_created;
+                }
+                (summaries_stored, levels_created, edges_created)
             } else {
                 (0, 0, 0)
             }
@@ -959,13 +992,21 @@ mod tests {
             );
 
             // Verify at least one community record exists in semantic store.
-            let stored = db.get_semantic_by_concept("community-0-0").await;
+            // Concept names are content-derived (member-set hash), so look up
+            // by knowledge type rather than a positional name.
+            let stored = db
+                .list_semantics(&crate::db::SemanticFilter {
+                    knowledge_type: Some(KnowledgeType::Community),
+                    min_confidence: None,
+                    namespace: None,
+                    limit: None,
+                })
+                .await
+                .unwrap();
             assert!(
-                stored.is_ok(),
-                "community-0-0 should exist in semantic store"
+                stored.iter().any(|r| r.concept.starts_with("community-")),
+                "a community summary should exist in the semantic store"
             );
-            let record = stored.unwrap();
-            assert_eq!(record.knowledge_type, KnowledgeType::Community);
         }
     }
 

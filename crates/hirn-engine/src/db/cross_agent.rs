@@ -211,8 +211,9 @@ impl HirnDB {
         }
 
         let id = record.id;
-        let record_bytes =
-            bincode::serialize(record).map_err(|e| StoreError::Serialization(e.to_string()))?;
+        // Version-prefixed so a future field addition on the record types is a
+        // migration, not a silent decode failure on old quarantine rows.
+        let record_bytes = hirn_core::persist::to_versioned_bytes(record)?;
 
         let row = hirn_storage::datasets::quarantine::QuarantineRow {
             memory_id: id,
@@ -381,8 +382,8 @@ impl HirnDB {
 
         let outcome = match row.record_kind {
             hirn_core::QuarantinedRecordKind::Episodic => {
-                let record: EpisodicRecord = bincode::deserialize(&row.record_bytes)
-                    .map_err(|e| StoreError::Serialization(e.to_string()))?;
+                let record: EpisodicRecord =
+                    hirn_core::persist::from_versioned_bytes(&row.record_bytes)?;
                 let applied_id = self.remember(record).await?;
                 crate::security::QuarantineApprovalOutcome {
                     approved_entry_id: id,
@@ -392,8 +393,8 @@ impl HirnDB {
                 }
             }
             hirn_core::QuarantinedRecordKind::Semantic => {
-                let record: SemanticRecord = bincode::deserialize(&row.record_bytes)
-                    .map_err(|e| StoreError::Serialization(e.to_string()))?;
+                let record: SemanticRecord =
+                    hirn_core::persist::from_versioned_bytes(&row.record_bytes)?;
                 self.approve_quarantined_semantic(
                     id,
                     record,
@@ -860,33 +861,82 @@ impl HirnDB {
 
     // ── GDPR / Privacy: Right to Erasure ────────────────────────────────
 
-    /// Purge all data associated with an agent: episodic, semantic, procedural
-    /// records in the agent's private namespace, plus graph edges and
-    /// quarantine entries. Also clears corruption defense state.
+    /// Purge all data associated with an agent: everything in the agent's
+    /// private namespace, every episodic/semantic/procedural record the agent
+    /// authored in shared or team namespaces, the agent's working memory, its
+    /// incident graph edges, and its quarantine entries. Also clears
+    /// corruption defense state.
+    ///
+    /// Delete failures are propagated (never silently swallowed) and the
+    /// report counts only deletions that actually succeeded. Re-running for
+    /// the same agent succeeds with zero counts.
     ///
     /// This implements GDPR Article 17 "Right to Erasure".
     pub(crate) async fn purge_agent(&self, agent_id: &AgentId) -> HirnResult<PurgeReport> {
         let private_ns = Namespace::private_for(agent_id);
 
-        // 1. Collect IDs of all records in the agent's private namespace.
-        let episodic_ids = self.list_episodic_ids_in_namespace(&private_ns).await?;
-        let semantic_ids = self.list_semantic_ids_in_namespace(&private_ns).await?;
-        let procedural_ids = self.list_procedural_ids_in_namespace(&private_ns).await?;
+        // 1. Collect IDs to erase: everything in the private namespace plus
+        //    everything the agent authored elsewhere (shared/team namespaces).
+        let episodic_ids = dedup_ids(
+            self.list_episodic_ids_in_namespace(&private_ns).await?,
+            self.list_episodic_ids_authored_by(agent_id).await?,
+        );
+        let semantic_ids = dedup_ids(
+            self.list_semantic_ids_in_namespace(&private_ns).await?,
+            self.list_ids_authored_by(hirn_storage::datasets::semantic::DATASET_NAME, agent_id)
+                .await?,
+        );
+        let procedural_ids = dedup_ids(
+            self.list_procedural_ids_in_namespace(&private_ns).await?,
+            self.list_ids_authored_by(hirn_storage::datasets::procedural::DATASET_NAME, agent_id)
+                .await?,
+        );
 
-        // 2. Delete episodic records (also removes graph nodes).
+        // 2. Count the distinct graph edges incident to the records before
+        //    deletion — node removal cleans edges up as a side effect without
+        //    reporting how many were dropped.
+        let edges_removed = self
+            .count_incident_edges(
+                episodic_ids
+                    .iter()
+                    .chain(&semantic_ids)
+                    .chain(&procedural_ids),
+            )
+            .await;
+
+        // 3. Delete records. Each delete removes the record's full logical
+        //    revision chain, so later IDs from the same chain come back
+        //    NotFound — that is expected and not a failure. Any other error
+        //    aborts the purge so it can be retried.
+        let mut episodic_deleted = 0usize;
         for id in &episodic_ids {
-            let _ = self.delete_episode(*id).await; // ignore NotFound if already cleaned
+            match self.delete_episode(*id).await {
+                Ok(()) => episodic_deleted += 1,
+                Err(HirnError::NotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
         }
 
-        // 3. Delete semantic records.
+        let mut semantic_deleted = 0usize;
         for id in &semantic_ids {
-            let _ = self.purge_semantic(*id).await;
+            match self.purge_semantic(*id).await {
+                Ok(()) => semantic_deleted += 1,
+                Err(HirnError::NotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
         }
 
-        // 4. Delete procedural records.
+        let mut procedural_deleted = 0usize;
         for id in &procedural_ids {
-            let _ = self.delete_procedural(*id).await;
+            match self.delete_procedural(*id).await {
+                Ok(()) => procedural_deleted += 1,
+                Err(HirnError::NotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
         }
+
+        // 4. Erase the agent's working memory (all revisions, hard delete).
+        let working_deleted = self.purge_working_memory_for_agent(agent_id).await?;
 
         // 5. Remove any quarantined entries from this agent.
         let quarantine_removed = self.purge_quarantine_for_agent(agent_id).await?;
@@ -894,14 +944,12 @@ impl HirnDB {
         // 6. Clear corruption defense state.
         self.admission_runtime().clear_agent(agent_id);
 
-        // 7. Count graph edges removed (they were removed by delete_episode/delete_semantic).
-        let edges_removed = 0usize; // edges removed as side-effect of node deletion
-
         let report = PurgeReport {
             agent_id: agent_id.clone(),
-            episodic_deleted: episodic_ids.len(),
-            semantic_deleted: semantic_ids.len(),
-            procedural_deleted: procedural_ids.len(),
+            episodic_deleted,
+            semantic_deleted,
+            procedural_deleted,
+            working_deleted,
             quarantine_removed,
             edges_removed,
         };
@@ -921,49 +969,490 @@ impl HirnDB {
         Ok(report)
     }
 
+    /// List episodic record IDs authored by an agent, across all namespaces.
+    ///
+    /// The episodic dataset carries the author in the `agent_id` column, so
+    /// this pushes the filter down to the scan.
+    async fn list_episodic_ids_authored_by(&self, agent_id: &AgentId) -> HirnResult<Vec<MemoryId>> {
+        use arrow_array::Array;
+
+        let filter = format!("agent_id = '{}'", agent_id.as_str().replace('\'', "''"));
+        let opts = hirn_storage::store::ScanOptions {
+            filter: Some(filter),
+            columns: Some(vec!["id".to_string()]),
+            ..Default::default()
+        };
+        let batches = self
+            .storage_runtime
+            .scan(hirn_storage::datasets::episodic::DATASET_NAME, opts)
+            .await
+            .map_err(HirnError::storage)?;
+
+        let mut ids = Vec::new();
+        for batch in &batches {
+            let id_col = batch
+                .column_by_name("id")
+                .and_then(|c| c.as_any().downcast_ref::<arrow_array::StringArray>());
+            if let Some(col) = id_col {
+                for i in 0..col.len() {
+                    let id = MemoryId::parse(col.value(i))
+                        .map_err(|e| HirnError::InvalidInput(e.to_string()))?;
+                    ids.push(id);
+                }
+            }
+        }
+        Ok(ids)
+    }
+
+    /// List record IDs authored by an agent in a dataset that stores its
+    /// provenance as a JSON blob (semantic, procedural). Authorship is not a
+    /// scannable column there, so this scans `id` + `provenance_json` and
+    /// filters on the decoded `created_by`.
+    async fn list_ids_authored_by(
+        &self,
+        dataset: &str,
+        agent_id: &AgentId,
+    ) -> HirnResult<Vec<MemoryId>> {
+        use arrow_array::Array;
+
+        let opts = hirn_storage::store::ScanOptions {
+            columns: Some(vec!["id".to_string(), "provenance_json".to_string()]),
+            ..Default::default()
+        };
+        let batches = self
+            .storage_runtime
+            .scan(dataset, opts)
+            .await
+            .map_err(HirnError::storage)?;
+
+        let mut ids = Vec::new();
+        for batch in &batches {
+            let id_col = batch
+                .column_by_name("id")
+                .and_then(|c| c.as_any().downcast_ref::<arrow_array::StringArray>())
+                .ok_or_else(|| HirnError::storage(format!("{dataset}: missing id column")))?;
+            let prov_col = batch
+                .column_by_name("provenance_json")
+                .and_then(|c| c.as_any().downcast_ref::<arrow_array::BinaryArray>())
+                .ok_or_else(|| {
+                    HirnError::storage(format!("{dataset}: missing provenance_json column"))
+                })?;
+            for i in 0..batch.num_rows() {
+                let provenance: hirn_core::provenance::Provenance =
+                    serde_json::from_slice(prov_col.value(i)).map_err(|e| {
+                        HirnError::storage(format!("{dataset}: provenance decode: {e}"))
+                    })?;
+                if provenance.created_by == *agent_id {
+                    let id = MemoryId::parse(id_col.value(i))
+                        .map_err(|e| HirnError::InvalidInput(e.to_string()))?;
+                    ids.push(id);
+                }
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Count the distinct graph edges incident to the given nodes.
+    ///
+    /// Edge IDs are deduplicated so an edge between two purged nodes is
+    /// counted once. Best-effort: nodes absent from the graph contribute zero.
+    async fn count_incident_edges(&self, ids: impl Iterator<Item = &MemoryId>) -> usize {
+        let mut edge_ids = std::collections::HashSet::new();
+        for id in ids {
+            let edges = self.cached_graph().get_edges(*id).await.unwrap_or_default();
+            for edge in edges {
+                edge_ids.insert(edge.id);
+            }
+        }
+        edge_ids.len()
+    }
+
+    /// Hard-delete every working memory revision belonging to an agent and
+    /// drop the agent's entries from the L0 head cache so reads cannot
+    /// resurrect them. Returns the number of rows deleted.
+    async fn purge_working_memory_for_agent(&self, agent_id: &AgentId) -> HirnResult<usize> {
+        let filter = format!("agent_id = '{}'", agent_id.as_str().replace('\'', "''"));
+        let deleted = self
+            .storage_runtime
+            .delete(hirn_storage::datasets::working::DATASET_NAME, &filter)
+            .await
+            .map_err(HirnError::storage)?;
+        self.write_runtime
+            .working_heads
+            .retain(|_, entry| entry.agent_id != *agent_id);
+        Ok(deleted as usize)
+    }
+
     /// Remove all quarantine entries belonging to a specific agent.
+    ///
+    /// Returns the number of entries actually deleted. A quarantine row whose
+    /// embedded record cannot be decoded is an error — skipping it would leave
+    /// the agent's data behind.
     async fn purge_quarantine_for_agent(&self, agent_id: &AgentId) -> HirnResult<usize> {
         let opts = hirn_storage::store::ScanOptions::default();
         let batches = self
             .storage_runtime
             .scan(hirn_storage::datasets::quarantine::DATASET_NAME, opts)
             .await
-            .map_err(|e| HirnError::storage(e))?;
+            .map_err(HirnError::storage)?;
 
         let mut to_remove: Vec<MemoryId> = Vec::new();
         for batch in &batches {
             let rows = hirn_storage::datasets::quarantine::from_batch(batch)
-                .map_err(|e| HirnError::storage(e))?;
+                .map_err(HirnError::storage)?;
             for row in rows {
-                // Try to deserialize the embedded record to check the agent.
-                if let Ok(rec) = bincode::deserialize::<EpisodicRecord>(&row.record_bytes) {
-                    if rec.provenance.created_by == *agent_id {
-                        to_remove.push(row.memory_id);
+                // Decode the embedded record according to its stored kind to
+                // recover the author.
+                let created_by = match row.record_kind {
+                    hirn_core::QuarantinedRecordKind::Episodic => {
+                        hirn_core::persist::from_versioned_bytes::<EpisodicRecord>(
+                            &row.record_bytes,
+                        )
+                        .map(|rec| rec.provenance.created_by)
                     }
+                    hirn_core::QuarantinedRecordKind::Semantic => {
+                        hirn_core::persist::from_versioned_bytes::<SemanticRecord>(
+                            &row.record_bytes,
+                        )
+                        .map(|rec| rec.provenance.created_by)
+                    }
+                }
+                .map_err(|e| {
+                    HirnError::from(StoreError::Serialization(format!(
+                        "quarantine entry {}: {e}",
+                        row.memory_id
+                    )))
+                })?;
+                if created_by == *agent_id {
+                    to_remove.push(row.memory_id);
                 }
             }
         }
 
-        let count = to_remove.len();
+        let mut removed = 0usize;
         for mid in to_remove {
-            let filter = format!("memory_id = '{mid}'");
-            let _ = self
+            let filter = quarantine_filter(mid);
+            removed += self
                 .storage_runtime
                 .delete(hirn_storage::datasets::quarantine::DATASET_NAME, &filter)
-                .await;
+                .await
+                .map_err(HirnError::storage)? as usize;
         }
 
-        Ok(count)
+        Ok(removed)
+    }
+}
+
+/// Merge two ID lists, preserving first-seen order and dropping duplicates.
+fn dedup_ids(primary: Vec<MemoryId>, secondary: Vec<MemoryId>) -> Vec<MemoryId> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(primary.len() + secondary.len());
+    for id in primary.into_iter().chain(secondary) {
+        if seen.insert(id) {
+            out.push(id);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use hirn_core::HirnConfig;
+    use hirn_core::types::EventType;
+    use hirn_core::working::WorkingMemoryEntry;
+    use hirn_storage::memory_store::MemoryStore;
+
+    use super::*;
+
+    async fn temp_db() -> (HirnDB, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = HirnConfig::builder()
+            .db_path(dir.path().join("purge-db"))
+            .working_memory_token_limit(1000)
+            .build()
+            .unwrap();
+        let db = HirnDB::open_with_config(config, Arc::new(MemoryStore::new()))
+            .await
+            .unwrap();
+        (db, dir)
+    }
+
+    fn agent(name: &str) -> AgentId {
+        AgentId::new(name).unwrap()
+    }
+
+    fn episode(author: &AgentId, ns: Namespace, content: &str) -> EpisodicRecord {
+        EpisodicRecord::builder()
+            .content(content)
+            .agent_id(author.clone())
+            .event_type(EventType::Observation)
+            .namespace(ns)
+            .build()
+            .unwrap()
+    }
+
+    fn semantic(author: &AgentId, ns: Namespace, concept: &str) -> SemanticRecord {
+        SemanticRecord::builder()
+            .concept(concept)
+            .description(format!("about {concept}"))
+            .agent_id(author.clone())
+            .namespace(ns)
+            .build()
+            .unwrap()
+    }
+
+    fn quarantine_row(
+        memory_id: MemoryId,
+        kind: hirn_core::QuarantinedRecordKind,
+        record_bytes: Vec<u8>,
+    ) -> hirn_storage::datasets::quarantine::QuarantineRow {
+        hirn_storage::datasets::quarantine::QuarantineRow {
+            memory_id,
+            record_kind: kind,
+            record_bytes,
+            anomaly_score: 0.9,
+            reason: "test quarantine".into(),
+            status: hirn_storage::datasets::quarantine::QuarantineStatus::Pending,
+            created_at: Timestamp::now(),
+            reviewed_by: None,
+            reviewed_at: None,
+            generated_review: None,
+        }
+    }
+
+    async fn insert_quarantine_row(
+        db: &HirnDB,
+        row: &hirn_storage::datasets::quarantine::QuarantineRow,
+    ) {
+        let batch =
+            hirn_storage::datasets::quarantine::to_batch(std::slice::from_ref(row)).unwrap();
+        db.storage_runtime
+            .append(hirn_storage::datasets::quarantine::DATASET_NAME, batch)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn purge_erases_private_and_authored_shared_records() {
+        let (db, _dir) = temp_db().await;
+        let agent_a = agent("agent_a");
+        let agent_b = agent("agent_b");
+        db.register_agent(&agent_a, "A").await.unwrap();
+        db.register_agent(&agent_b, "B").await.unwrap();
+
+        let private_ns = Namespace::private_for(&agent_a);
+        let ep_private = db
+            .remember(episode(&agent_a, private_ns, "private note"))
+            .await
+            .unwrap();
+        // Authored by agent_a but living in the shared namespace — must be
+        // erased even though it is outside the private namespace.
+        let ep_shared = db
+            .remember(episode(&agent_a, Namespace::shared(), "shared note"))
+            .await
+            .unwrap();
+        let sem_shared = db
+            .store_semantic(semantic(&agent_a, Namespace::shared(), "concept_a"))
+            .await
+            .unwrap();
+        // Another agent's shared record must survive.
+        let sem_other = db
+            .store_semantic(semantic(&agent_b, Namespace::shared(), "concept_b"))
+            .await
+            .unwrap();
+
+        let report = db.purge_agent(&agent_a).await.unwrap();
+        assert_eq!(report.episodic_deleted, 2);
+        assert_eq!(report.semantic_deleted, 1);
+
+        for id in [ep_private, ep_shared, sem_shared] {
+            assert!(
+                matches!(db.get_memory(id).await, Err(HirnError::NotFound(_))),
+                "record {id} should be erased"
+            );
+        }
+        assert!(
+            db.get_memory(sem_other).await.is_ok(),
+            "another agent's record must survive the purge"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn purge_erases_working_memory() {
+        let (db, _dir) = temp_db().await;
+        let agent_a = agent("agent_a");
+        let agent_b = agent("agent_b");
+        db.register_agent(&agent_a, "A").await.unwrap();
+        db.register_agent(&agent_b, "B").await.unwrap();
+
+        db.focus(
+            WorkingMemoryEntry::builder()
+                .content("a's scratch thought")
+                .agent_id(agent_a.clone())
+                .build()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        db.focus(
+            WorkingMemoryEntry::builder()
+                .content("b's scratch thought")
+                .agent_id(agent_b.clone())
+                .build()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let report = db.purge_agent(&agent_a).await.unwrap();
+        assert!(report.working_deleted >= 1);
+
+        let remaining = db.working_memory().await.unwrap();
+        assert!(
+            remaining.iter().all(|e| e.agent_id != agent_a),
+            "agent_a working memory must be erased"
+        );
+        assert!(
+            remaining.iter().any(|e| e.agent_id == agent_b),
+            "agent_b working memory must survive"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn purge_removes_semantic_quarantine_entries() {
+        let (db, _dir) = temp_db().await;
+        let agent_a = agent("agent_a");
+        let agent_b = agent("agent_b");
+        db.register_agent(&agent_a, "A").await.unwrap();
+        db.register_agent(&agent_b, "B").await.unwrap();
+
+        let sem_a = semantic(&agent_a, Namespace::shared(), "quarantined_a");
+        let sem_b = semantic(&agent_b, Namespace::shared(), "quarantined_b");
+        insert_quarantine_row(
+            &db,
+            &quarantine_row(
+                sem_a.id,
+                hirn_core::QuarantinedRecordKind::Semantic,
+                hirn_core::persist::to_versioned_bytes(&sem_a).unwrap(),
+            ),
+        )
+        .await;
+        insert_quarantine_row(
+            &db,
+            &quarantine_row(
+                sem_b.id,
+                hirn_core::QuarantinedRecordKind::Semantic,
+                hirn_core::persist::to_versioned_bytes(&sem_b).unwrap(),
+            ),
+        )
+        .await;
+
+        let report = db.purge_agent(&agent_a).await.unwrap();
+        assert_eq!(report.quarantine_removed, 1);
+
+        let remaining = db.review_quarantine().await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].memory_id, sem_b.id);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn purge_propagates_undecodable_quarantine_entry() {
+        let (db, _dir) = temp_db().await;
+        let agent_a = agent("agent_a");
+        db.register_agent(&agent_a, "A").await.unwrap();
+
+        // A quarantine row whose embedded record cannot be decoded must fail
+        // the purge instead of being silently skipped — otherwise the agent's
+        // data could survive an erasure that reported success.
+        insert_quarantine_row(
+            &db,
+            &quarantine_row(
+                MemoryId::new(),
+                hirn_core::QuarantinedRecordKind::Semantic,
+                vec![0xde, 0xad, 0xbe, 0xef],
+            ),
+        )
+        .await;
+
+        assert!(db.purge_agent(&agent_a).await.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn purge_counts_incident_edges() {
+        let (db, _dir) = temp_db().await;
+        let agent_a = agent("agent_a");
+        db.register_agent(&agent_a, "A").await.unwrap();
+
+        let private_ns = Namespace::private_for(&agent_a);
+        let id_1 = db
+            .remember(episode(&agent_a, private_ns, "cause"))
+            .await
+            .unwrap();
+        let id_2 = db
+            .remember(episode(&agent_a, private_ns, "effect"))
+            .await
+            .unwrap();
+        db.connect_with(id_1, id_2, EdgeRelation::Causes, 1.0, Metadata::default())
+            .await
+            .unwrap();
+
+        let report = db.purge_agent(&agent_a).await.unwrap();
+        assert_eq!(report.episodic_deleted, 2);
+        assert!(
+            report.edges_removed >= 1,
+            "the edge between the purged records must be counted"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn purge_is_idempotent() {
+        let (db, _dir) = temp_db().await;
+        let agent_a = agent("agent_a");
+        db.register_agent(&agent_a, "A").await.unwrap();
+
+        let private_ns = Namespace::private_for(&agent_a);
+        db.remember(episode(&agent_a, private_ns, "note"))
+            .await
+            .unwrap();
+        db.focus(
+            WorkingMemoryEntry::builder()
+                .content("scratch")
+                .agent_id(agent_a.clone())
+                .build()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let first = db.purge_agent(&agent_a).await.unwrap();
+        assert!(first.episodic_deleted >= 1);
+        assert!(first.working_deleted >= 1);
+
+        let second = db.purge_agent(&agent_a).await.unwrap();
+        assert_eq!(second.episodic_deleted, 0);
+        assert_eq!(second.semantic_deleted, 0);
+        assert_eq!(second.procedural_deleted, 0);
+        assert_eq!(second.working_deleted, 0);
+        assert_eq!(second.quarantine_removed, 0);
+        assert_eq!(second.edges_removed, 0);
     }
 }
 
 /// Result of a GDPR agent data purge.
+///
+/// All counts reflect deletions that actually succeeded, not deletions that
+/// were merely attempted.
 #[derive(Debug, Clone)]
 pub struct PurgeReport {
     pub agent_id: AgentId,
     pub episodic_deleted: usize,
     pub semantic_deleted: usize,
     pub procedural_deleted: usize,
+    /// Working memory rows (all revisions) hard-deleted for the agent.
+    pub working_deleted: usize,
     pub quarantine_removed: usize,
+    /// Distinct graph edges incident to the purged records.
     pub edges_removed: usize,
 }

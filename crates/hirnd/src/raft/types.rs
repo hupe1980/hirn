@@ -20,6 +20,11 @@ pub enum RaftRequest {
         realm: String,
         holder: NodeId,
         duration_secs: u64,
+        /// Proposer's clock at proposal time (Unix epoch seconds).
+        ///
+        /// `apply()` must derive all expiry math from this value so every
+        /// replica computes the same lease state regardless of local clocks.
+        proposed_at_epoch_secs: u64,
     },
     /// Release a consolidation lease.
     ReleaseLease { realm: String, holder: NodeId },
@@ -28,11 +33,40 @@ pub enum RaftRequest {
         realm: String,
         holder: NodeId,
         duration_secs: u64,
+        /// Proposer's clock at proposal time (Unix epoch seconds); see
+        /// [`RaftRequest::AcquireLease`].
+        proposed_at_epoch_secs: u64,
     },
     /// Register a new node in the cluster metadata.
     RegisterNode { node_id: NodeId, addr: String },
     /// Deregister a node from the cluster metadata.
     DeregisterNode { node_id: NodeId },
+}
+
+impl RaftRequest {
+    /// Build an `AcquireLease` command stamped with the proposer's clock.
+    ///
+    /// Use this at the proposal site (before `client_write`); the timestamp is
+    /// captured exactly once here so the state machine never has to consult a
+    /// local clock while applying the entry.
+    pub fn acquire_lease(realm: impl Into<String>, holder: NodeId, duration_secs: u64) -> Self {
+        Self::AcquireLease {
+            realm: realm.into(),
+            holder,
+            duration_secs,
+            proposed_at_epoch_secs: crate::raft::lease::now_epoch_secs(),
+        }
+    }
+
+    /// Build a `RenewLease` command stamped with the proposer's clock.
+    pub fn renew_lease(realm: impl Into<String>, holder: NodeId, duration_secs: u64) -> Self {
+        Self::RenewLease {
+            realm: realm.into(),
+            holder,
+            duration_secs,
+            proposed_at_epoch_secs: crate::raft::lease::now_epoch_secs(),
+        }
+    }
 }
 
 /// Response from applying a [`RaftRequest`].

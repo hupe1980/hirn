@@ -455,9 +455,17 @@ impl HirnDB {
         let asm_start = std::time::Instant::now();
         async {
             // F-S1: Buffer Hebbian co-retrieval events (lock-free push).
+            // When the buffer signals its flush threshold, apply the batch
+            // inline: it is small (≈ flush_threshold events), and flushing
+            // here keeps edge weights evolving during long-lived operation
+            // instead of only at close()/drop.
             if scored.len() > 1 {
                 let retrieved_ids: Vec<MemoryId> = scored.iter().map(|r| r.record.id()).collect();
-                let _ = self.graph_runtime().push_hebbian(retrieved_ids);
+                if self.graph_runtime().push_hebbian(retrieved_ids)
+                    && let Err(e) = self.flush_hebbian().await
+                {
+                    tracing::warn!(error = %e, "hebbian flush after recall failed");
+                }
             }
 
             // Predictive prefetch: warm cache for graph neighbors of returned results.
@@ -1541,6 +1549,68 @@ mod tests {
 
     async fn temp_db() -> (HirnDB, tempfile::TempDir) {
         temp_db_with_storage(Arc::new(MemoryStore::new())).await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hebbian_threshold_flushes_without_close() {
+        let (db, _dir) = temp_db().await;
+
+        // Two records with the same embedding so every recall co-retrieves both.
+        let emb = vec![1.0, 0.0, 0.0, 0.0];
+        let mut ids = Vec::new();
+        for name in ["hebb flush a", "hebb flush b"] {
+            let id = db
+                .remember(
+                    EpisodicRecord::builder()
+                        .event_type(EventType::Observation)
+                        .content(name)
+                        .summary(name)
+                        .embedding(emb.clone())
+                        .importance(0.8)
+                        .agent_id(agent())
+                        .build()
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            ids.push(id);
+        }
+
+        db.graph_view()
+            .connect_with(
+                ids[0],
+                ids[1],
+                EdgeRelation::RelatedTo,
+                0.5,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+
+        let edge_weight = |db: &HirnDB| {
+            let graph = db.cached_graph().hot_graph();
+            graph
+                .get_edges_between(ids[0], ids[1])
+                .iter()
+                .find(|e| e.relation == EdgeRelation::RelatedTo)
+                .expect("RelatedTo edge must exist")
+                .weight
+        };
+        let initial_weight = edge_weight(&db);
+
+        // The default flush threshold is 16 pushes; run more recalls than that
+        // so the buffer trips its threshold and flushes inline on the recall
+        // path — no close()/drop involved.
+        for _ in 0..20 {
+            let _ = db.recall(emb.clone()).limit(10).execute().await.unwrap();
+        }
+
+        let final_weight = edge_weight(&db);
+        assert!(
+            final_weight > initial_weight,
+            "threshold-driven flush must strengthen co-retrieved edge during \
+             operation: initial={initial_weight}, final={final_weight}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

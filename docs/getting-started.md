@@ -1,3 +1,11 @@
+---
+title: Getting Started
+nav_order: 2
+description: >-
+  Install hirn and go from an empty brain to working cognitive memory in five
+  minutes — remember, recall, and think in Rust, Python, or Node.js.
+---
+
 # Getting Started with hirn
 
 > **⚠️ Experimental:** This project is under active development. APIs, on-disk formats, and behaviour may change without notice. Not recommended for production use.
@@ -5,6 +13,24 @@
 > 5 minutes to working cognitive memory — Rust, Python, or Node.js.
 
 hirn is a cognitive memory engine that gives your AI agents persistent, structured memory with automatic consolidation, graph reasoning, and multi-agent isolation.
+
+Think of it as the layer that turns a stateless LLM into an agent that *remembers*. Instead of stuffing an ever-growing transcript back into every prompt, you write facts and events into a "brain" once, and hirn decides — at query time — which of them are worth surfacing. It embeds text for semantic search, extracts entities into a property graph so related memories can pull each other into view, and consolidates raw events into durable knowledge in the background. The result is retrieval that behaves less like a keyword index and more like recall.
+
+The fastest path to an intuition for the API is three calls: **install** the SDK for your language, **remember** a few things, then **recall** them with a natural-language question.
+
+```mermaid
+flowchart LR
+  I["1 · Install<br/>cargo / pip / npm<br/>add the SDK"]
+  O["2 · Open a brain<br/>Memory.open(./brain)<br/>on-disk datasets"]
+  R["3 · Remember<br/>mem.remember(text)<br/>auto-embed + extract"]
+  C["4 · Recall / Think<br/>mem.recall(q) · mem.think(q, budget)<br/>semantic + graph retrieval"]
+  I --> O --> R --> C
+  classDef s fill:#1a1b26,stroke:#7c9cff,color:#e6e8f0;
+  class I,O,R,C s;
+```
+
+If you have used a vector database before, the mental model is familiar but wider: `remember` is your write, `recall` is your similarity search, and `think` is the piece a plain vector store does not give you — a budget-bounded context assembler that blends direct hits with graph- and causally-connected memories.
+{: .tip }
 
 Before you dive into the examples, keep the runtime model in mind:
 
@@ -14,7 +40,7 @@ Before you dive into the examples, keep the runtime model in mind:
 
 ## Choose Your Route
 
-If you are skimming for the right surface instead of reading this guide front to back, use [documentation-map.md](documentation-map.md). The short version:
+If you are skimming for the right surface instead of reading this guide front to back, use the navigation sidebar. The short version:
 
 | Goal | Open next |
 |------|-----------|
@@ -133,7 +159,7 @@ Semantic search finds memories relevant to your query:
 ```rust
 let results = memory.recall("What happened with the deployment?", 5).await?;
 for r in &results {
-    println!("[{:.2}] {}", r.similarity, r.content);
+    println!("[{:.2}] {}", r.similarity, r.record.content());
 }
 ```
 
@@ -241,7 +267,7 @@ assert!(preview.artifacts.iter().any(|artifact| {
 }));
 ```
 
-See [resource_memory.rs](../crates/hirn/examples/resource_memory.rs) for the full runnable workflow.
+See [resource_memory.rs](https://github.com/hupe1980/hirn/blob/main/crates/hirn/examples/resource_memory.rs) for the full runnable workflow.
 
 Hydration modes are intentionally explicit:
 
@@ -364,19 +390,41 @@ mem.close();
 
 ## Next Steps
 
-- **[Documentation Map](documentation-map.md)** — task-oriented guide to the rest of the docs
+Now that the core loop works, the docs fan out in a few directions depending on what you are building:
+
+- **[Concepts](concepts.md)** — the ideas behind hirn: the four-layer memory model, storage architecture, and the write path
+- **[Cognitive Model](cognitive-model.md)** — why working, episodic, semantic, and procedural memory are separate tiers, and what fires the transitions between them
+- **[Deployment & Operations](operations.md)** — running embedded, as the `hirnd` daemon, or as a cluster
 - **[HirnQL Reference](hirnql-reference.md)** — full query language documentation
+- **[Security Architecture](security.md)** — the defense-in-depth model, MCFA injection defense, and namespace isolation
 - **[Cedar Policy Guide](cedar-guide.md)** — authorization policies for multi-agent/multi-tenant setups
 - **[Architecture Guide](architecture.md)** — deep dive into hirn's internals
 - **[Offline Intelligence](offline-intelligence.md)** — scheduler, budgets, dream/reconcile/plan workflow
 - **[Explanation Surfaces](explanation-surfaces.md)** — retrieval and write-path reasoning surfaces
 - **[Benchmarks](benchmarks.md)** — H1–H6 cognitive benchmark results
-- **[Examples](../crates/hirn/examples/)** — runnable example projects
-- **[Resource Memory Example](../crates/hirn/examples/resource_memory.rs)** — end-to-end resource ingest, recall, and preview hydration
+- **[Examples](https://github.com/hupe1980/hirn/blob/main/crates/hirn/examples/)** — runnable example projects
+- **[Resource Memory Example](https://github.com/hupe1980/hirn/blob/main/crates/hirn/examples/resource_memory.rs)** — end-to-end resource ingest, recall, and preview hydration
+
+A good next reading order for most people is [Concepts](concepts.md) → [Cognitive Model](cognitive-model.md) → [HirnQL Reference](hirnql-reference.md), then [Deployment & Operations](operations.md) once you are ready to run hirn beyond a single process.
+{: .note }
 
 ### Deployment
 
-For production deployments, start with [deployment.md](deployment.md), then wire in [observability.md](observability.md) and keep [troubleshooting.md](troubleshooting.md) nearby. The [README](../README.md#deployment-modes) also summarizes the deployment modes:
+Everything above runs **embedded** — hirn lives inside your process and reads and writes a local brain directory. That is the right default for a single application, a notebook, or a CLI agent. When you need multiple processes, other languages, or network access to the same memory, you promote the same brain to a **standalone** daemon (`hirnd`) that speaks HTTP, gRPC, and MCP. The memory model and HirnQL semantics are identical across both modes; only the transport and ownership boundaries change.
+
+```mermaid
+flowchart TD
+  Q{"How many<br/>processes need<br/>the same brain?"}
+  Q -->|"one app,<br/>local disk"| E["Embedded<br/>Memory.open() in-process<br/>lowest latency, no network"]
+  Q -->|"many clients,<br/>other languages,<br/>remote access"| D["Standalone<br/>hirnd HTTP / gRPC / MCP<br/>realm routing + admin boundaries"]
+  E -.->|"grow into"| D
+  classDef s fill:#1a1b26,stroke:#7c9cff,color:#e6e8f0;
+  class Q,E,D s;
+```
+
+For production deployments, start with [deployment.md](deployment.md) and [operations.md](operations.md), then wire in [observability.md](observability.md) and keep [troubleshooting.md](troubleshooting.md) nearby. The [README](https://github.com/hupe1980/hirn/blob/main/README.md#deployment-modes) also summarizes the deployment modes:
 
 - **Embedded** — `HirnMemory::open()` in your process
 - **Standalone** — `hirnd` HTTP/gRPC/MCP daemon
+
+> **Note:** Distributed and admin operations — realm routing, cross-realm recall, and cluster ownership — live on the daemon surface, not in embedded HirnQL. See [HirnQL Reference](hirnql-reference.md) for the exact embedded runtime boundary.

@@ -3005,7 +3005,6 @@ async fn normalize_compiled_scored_recall_results(
                 resource_evidence,
                 resource_preview_packages,
                 resource_score_attribution,
-                presentation: _,
                 ..
             } = result;
             ScoredMemory {

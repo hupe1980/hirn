@@ -301,6 +301,11 @@ pub struct CompactOptions {
 pub struct CompactResult {
     pub fragments_removed: u64,
     pub fragments_added: u64,
+    /// Rows physically pruned by the compaction pass.
+    ///
+    /// Lance's `CompactionMetrics` only reports fragment/file counts, not a
+    /// row-level delta, so `LancePhysicalStore` always reports `0` here.
+    /// Treat the fragment counts as the authoritative signal of work done.
     pub rows_removed: u64,
 }
 

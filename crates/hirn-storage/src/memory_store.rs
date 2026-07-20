@@ -429,7 +429,20 @@ impl PhysicalStore for MemoryStore {
         dataset: &str,
         opts: VectorSearchOptions,
     ) -> Result<Vec<RecordBatch>, HirnDbError> {
-        let batches = self.get_batches(dataset)?;
+        let mut batches = self.get_batches(dataset)?;
+        // Apply the predicate BEFORE scoring so that policy-injected
+        // `namespace IN (...)` filters (and any caller filter) actually scope
+        // the result. Previously `opts.filter` was ignored, silently returning
+        // cross-namespace rows and making every filtered-search and
+        // policy-enforcement test over this backend vacuous.
+        if let Some(filter) = opts.filter.as_deref() {
+            batches = scan::filter_batches(filter, &batches)?;
+        }
+        // Guard against an all-rows-deleted dataset leaving `Vec::new()` — the
+        // old `batches[0]` indexed out of bounds and panicked.
+        if batches.iter().all(|b| b.num_rows() == 0) {
+            return Ok(Vec::new());
+        }
         let schema = batches[0].schema();
 
         let col_idx = schema.index_of(&opts.column).map_err(|_| {
@@ -516,7 +529,14 @@ impl PhysicalStore for MemoryStore {
         dataset: &str,
         opts: FtsSearchOptions,
     ) -> Result<Vec<RecordBatch>, HirnDbError> {
-        let batches = self.get_batches(dataset)?;
+        let mut batches = self.get_batches(dataset)?;
+        // Scope by predicate before scoring and guard the empty dataset.
+        if let Some(filter) = opts.filter.as_deref() {
+            batches = scan::filter_batches(filter, &batches)?;
+        }
+        if batches.iter().all(|b| b.num_rows() == 0) {
+            return Ok(Vec::new());
+        }
         let schema = batches[0].schema();
 
         let col_indices: Vec<usize> = opts
@@ -538,18 +558,11 @@ impl PhysicalStore for MemoryStore {
                 for &col_idx in &col_indices {
                     let col = batch.column(col_idx);
                     if let Some(str_array) = col.as_any().downcast_ref::<StringArray>()
-                        && let Some(text) = str_array
-                            .value(row_idx)
-                            .to_lowercase()
-                            .as_str()
-                            .strip_prefix("")
+                        && !str_array.is_null(row_idx)
                     {
-                        let text_lower = text.to_lowercase();
+                        let text_lower = str_array.value(row_idx).to_lowercase();
                         // Simple TF-based scoring: count occurrences
-                        let count = text_lower.matches(&query_lower).count();
-                        if count > 0 {
-                            score += count as f32;
-                        }
+                        score += text_lower.matches(&query_lower).count() as f32;
                     }
                 }
                 if score > 0.0 {
@@ -653,7 +666,14 @@ impl PhysicalStore for MemoryStore {
         dataset: &str,
         opts: MultivectorSearchOptions,
     ) -> Result<Vec<RecordBatch>, HirnDbError> {
-        let batches = self.get_batches(dataset)?;
+        let mut batches = self.get_batches(dataset)?;
+        // Scope by predicate before scoring and guard the empty dataset.
+        if let Some(filter) = opts.filter.as_deref() {
+            batches = scan::filter_batches(filter, &batches)?;
+        }
+        if batches.iter().all(|b| b.num_rows() == 0) {
+            return Ok(Vec::new());
+        }
         let schema = batches[0].schema();
 
         let col_idx = schema.index_of(&opts.column).map_err(|_| {

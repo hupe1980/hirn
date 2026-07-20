@@ -14,6 +14,15 @@ fn safe_text() -> impl Strategy<Value = String> {
         .prop_filter("non-empty", |s| !s.is_empty())
 }
 
+/// Text that DELIBERATELY includes characters requiring escaping (quotes,
+/// backslashes) so the serializer's escaping is exercised by the round-trip.
+fn escapable_text() -> impl Strategy<Value = String> {
+    prop::string::string_regex(r#"[a-zA-Z"\\ ]{1,20}"#)
+        .unwrap()
+        .prop_map(|s| s.trim().to_string())
+        .prop_filter("non-empty", |s| !s.is_empty())
+}
+
 /// Random layer(s) for RECALL.
 fn recall_layers() -> impl Strategy<Value = String> {
     prop::sample::subsequence(&["episodic", "semantic", "procedural"][..], 1..=3)
@@ -28,19 +37,79 @@ fn opt_limit() -> impl Strategy<Value = String> {
     })
 }
 
-/// Random optional NAMESPACE clause.
+/// Random optional NAMESPACE clause. Emits a quoted namespace containing
+/// escapable characters so the serializer's namespace escaping round-trips.
 fn opt_namespace() -> impl Strategy<Value = String> {
-    prop::option::of(prop::string::string_regex("[a-z]{3,8}").unwrap()).prop_map(|opt| match opt {
-        Some(ns) => format!(" NAMESPACE {ns}"),
+    prop::option::of(escapable_text()).prop_map(|opt| match opt {
+        Some(ns) => format!(" NAMESPACE \"{}\"", escape(&ns)),
         None => String::new(),
     })
 }
 
-/// Strategy for RECALL queries.
-fn recall_query() -> impl Strategy<Value = String> {
-    (recall_layers(), safe_text(), opt_namespace(), opt_limit()).prop_map(
-        |(layers, about, ns, limit)| format!("RECALL {layers} ABOUT \"{about}\"{ns}{limit}"),
+/// Escape a value the same way the serializer does (for building valid inputs).
+fn escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Random optional TOPIC clause with escapable content.
+fn opt_topic() -> impl Strategy<Value = String> {
+    prop::option::of(escapable_text()).prop_map(|opt| match opt {
+        Some(t) => format!(" TOPIC \"{}\"", escape(&t)),
+        None => String::new(),
+    })
+}
+
+/// Random optional DEPTH scheduling clause.
+fn opt_depth() -> impl Strategy<Value = String> {
+    prop::option::of(prop::sample::select(&["auto", "full", "summary"][..])).prop_map(|opt| {
+        match opt {
+            Some(d) => format!(" DEPTH {d}"),
+            None => String::new(),
+        }
+    })
+}
+
+/// Random optional trailing WITH clauses + BUDGET, exercising clause ordering.
+fn opt_with_and_budget() -> impl Strategy<Value = String> {
+    (
+        any::<bool>(),
+        prop::option::of(1..1000usize),
+        prop::option::of(prop::sample::select(&["ON", "OFF"][..])),
     )
+        .prop_map(|(conflicts, budget, prospective)| {
+            let mut s = String::new();
+            if let Some(p) = prospective {
+                s.push_str(&format!(" WITH PROSPECTIVE {p}"));
+            }
+            if conflicts {
+                s.push_str(" WITH CONFLICTS");
+            }
+            if let Some(b) = budget {
+                s.push_str(&format!(" BUDGET {b}"));
+            }
+            s
+        })
+}
+
+/// Strategy for RECALL queries covering the ordering- and escaping-sensitive
+/// clauses (about/topic/namespace with escapable text, depth, WITH clauses,
+/// budget, limit) — exactly the surface the previous generator avoided.
+fn recall_query() -> impl Strategy<Value = String> {
+    (
+        recall_layers(),
+        escapable_text(),
+        opt_depth(),
+        opt_topic(),
+        opt_with_and_budget(),
+        opt_namespace(),
+        opt_limit(),
+    )
+        .prop_map(|(layers, about, depth, topic, withs, ns, limit)| {
+            format!(
+                "RECALL {layers} ABOUT \"{}\"{depth}{topic}{withs}{ns}{limit}",
+                escape(&about)
+            )
+        })
 }
 
 /// Random THINK mode.
@@ -113,15 +182,22 @@ fn edge_relation() -> impl Strategy<Value = String> {
     .prop_map(String::from)
 }
 
-/// Strategy for TRAVERSE queries.
+/// Strategy for TRAVERSE queries, now including the NAMESPACE clause that the
+/// grammar gained (previously it could not round-trip a namespace).
 fn traverse_query() -> impl Strategy<Value = String> {
-    (1..10usize, prop::option::of(edge_relation())).prop_map(|(depth, via)| {
-        let via_clause = match via {
-            Some(rel) => format!(" VIA {rel}"),
-            None => String::new(),
-        };
-        format!("TRAVERSE FROM \"{FIXED_ULID}\"{via_clause} DEPTH {depth}")
-    })
+    (
+        1..10usize,
+        prop::option::of(edge_relation()),
+        opt_namespace(),
+        opt_limit(),
+    )
+        .prop_map(|(depth, via, ns, limit)| {
+            let via_clause = match via {
+                Some(rel) => format!(" VIA {rel}"),
+                None => String::new(),
+            };
+            format!("TRAVERSE FROM \"{FIXED_ULID}\"{via_clause} DEPTH {depth}{ns}{limit}")
+        })
 }
 
 /// Strategy for CONNECT queries.

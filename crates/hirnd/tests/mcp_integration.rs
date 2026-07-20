@@ -52,7 +52,18 @@ async fn start_mcp_client_parts() -> (
     let db = Arc::new(HirnDB::open_with_config(config, storage).await.unwrap());
 
     let (watch_tx, _) = broadcast::channel::<WatchEvent>(128);
-    let service = HirnMcpService::new(Arc::clone(&db), watch_tx.clone(), "default".to_string());
+    let rate_limiter = std::sync::Arc::new(hirnd::throttle::RateLimiter::from_config(
+        &hirnd::config::ThrottleConfig::default(),
+    ));
+    // Tests act as an unrestricted system credential in the default realm.
+    let identity = hirnd::auth::BearerIdentity {
+        realm: "default".to_string(),
+        agent_id: "system".to_string(),
+        namespaces: None,
+        operations: Vec::new(),
+    };
+    let service = HirnMcpService::new(Arc::clone(&db), watch_tx.clone(), rate_limiter, identity)
+        .expect("valid MCP identity");
 
     let (server_transport, client_transport) = tokio::io::duplex(65536);
 
@@ -1541,7 +1552,17 @@ async fn start_mcp_client_with_cedar()
 
     let db = Arc::new(db);
     let (watch_tx, _) = broadcast::channel::<WatchEvent>(128);
-    let service = HirnMcpService::new(db, watch_tx, "default".to_string());
+    let rate_limiter = std::sync::Arc::new(hirnd::throttle::RateLimiter::from_config(
+        &hirnd::config::ThrottleConfig::default(),
+    ));
+    let identity = hirnd::auth::BearerIdentity {
+        realm: "default".to_string(),
+        agent_id: "system".to_string(),
+        namespaces: None,
+        operations: Vec::new(),
+    };
+    let service =
+        HirnMcpService::new(db, watch_tx, rate_limiter, identity).expect("valid MCP identity");
 
     let (server_transport, client_transport) = tokio::io::duplex(65536);
 

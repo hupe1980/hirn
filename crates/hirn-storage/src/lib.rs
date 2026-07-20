@@ -41,15 +41,15 @@ pub use reranker::{
 };
 pub use resource_ops::{
     DerivedArtifactInput, HydratedResource, RESOURCE_HEAD_TRANSITION_KIND,
-    ResourceGovernanceUpdate, ResourceRetentionApplyResult, ResourceSupersession,
-    apply_resource_retention_policy, build_configured_blob_resource,
+    RESOURCE_PAYLOAD_PURGE_KIND, ResourceGovernanceUpdate, ResourceRetentionApplyResult,
+    ResourceSupersession, apply_resource_retention_policy, build_configured_blob_resource,
     configure_audio_resource_builder, derived_artifact_evidence_role,
     evidence_links_for_derived_artifacts, fetch_resource, get_resource, get_resource_head,
     list_derived_artifacts, list_resource_revisions, load_resource_blob,
     persist_default_derived_artifacts, persist_derived_artifact, persist_resource,
     persist_resource_with_quota_policy, purge_resource, reconcile_pending_resource_blob_staging,
-    reconcile_resource_head_mutations, redact_resource, supersede_resource,
-    supersede_resource_with_quota_policy, text_backed_resource_checksum,
+    reconcile_resource_head_mutations, reconcile_resource_payload_purges, redact_resource,
+    supersede_resource, supersede_resource_with_quota_policy, text_backed_resource_checksum,
 };
 pub use store::{DistanceMetric, NormalizeMethod, PhysicalStore, RecordBatchStream};
 pub use with_embeddings::{EmbeddingMapping, WithEmbeddings};

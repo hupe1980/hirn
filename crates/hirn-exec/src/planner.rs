@@ -203,7 +203,7 @@ impl ExtensionPlanner for HirnExtensionPlanner {
             HirnOp::GraphActivation {
                 seed_limit,
                 depth,
-                min_weight: _,
+                min_weight,
                 activation,
             } => {
                 let input = require_single_input(physical_inputs, "GraphActivation")?;
@@ -224,6 +224,8 @@ impl ExtensionPlanner for HirnExtensionPlanner {
                     .as_ref()
                     .map(|c| c.graph_activation_inhibition_mu)
                     .unwrap_or(0.5_f32);
+                // The logical node carries min_weight as f32 × 1000 for Hash/Eq.
+                let min_weight = min_weight.map(|weight| weight as f32 / 1000.0);
                 Arc::new(GraphActivationExec::new(
                     input,
                     *seed_limit,
@@ -231,6 +233,7 @@ impl ExtensionPlanner for HirnExtensionPlanner {
                     *depth,
                     epsilon,
                     inhibition_mu,
+                    min_weight,
                 )?)
             }
 

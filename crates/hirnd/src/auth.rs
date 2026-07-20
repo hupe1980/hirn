@@ -44,6 +44,9 @@ pub enum Operation {
     Admin,
 }
 
+/// Issuer claim embedded in every hirnd-minted JWT.
+pub const TOKEN_ISSUER: &str = "hirnd";
+
 /// JWT claims carried in a token-scoped session token.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenClaims {
@@ -57,6 +60,12 @@ pub struct TokenClaims {
     /// Allowed operations. Empty = all.
     #[serde(default)]
     pub operations: Vec<Operation>,
+    /// Issuer — always [`TOKEN_ISSUER`]; rejected otherwise.
+    pub iss: String,
+    /// Audience — the realm the token is scoped to. Bound to `realm` at
+    /// issuance and re-checked at validation so a token cannot be replayed
+    /// against a different audience.
+    pub aud: String,
     /// Issued-at (seconds since epoch).
     pub iat: u64,
     /// Expiry (seconds since epoch).
@@ -243,6 +252,8 @@ impl AuthState {
             agent_id: identity.agent_id.clone(),
             namespaces,
             operations,
+            iss: TOKEN_ISSUER.to_owned(),
+            aud: identity.realm.clone(),
             iat: now,
             exp: now + ttl,
         };
@@ -263,7 +274,12 @@ impl AuthState {
             .ok_or(TokenError::NotConfigured)?;
 
         let mut validation = Validation::default();
-        validation.set_required_spec_claims(&["exp", "iat"]);
+        validation.set_required_spec_claims(&["exp", "iat", "iss", "aud"]);
+        validation.set_issuer(&[TOKEN_ISSUER]);
+        // The audience is the token's own realm, which is only known after
+        // decoding — disable the library's audience-list check and compare
+        // aud against the realm claim below instead.
+        validation.validate_aud = false;
         // N-M01 fix: leeway covers only clock skew between client and server.
         // rotation_grace_secs is NOT applied as universal leeway because that
         // would silently accept tokens expired by up to rotation_grace_secs
@@ -283,8 +299,61 @@ impl AuthState {
             _ => TokenError::Invalid(e.to_string()),
         })?;
 
+        if data.claims.aud != data.claims.realm {
+            return Err(TokenError::Invalid(
+                "token audience does not match its realm".to_owned(),
+            ));
+        }
+
         Ok(data.claims)
     }
+
+    /// Resolve a bearer credential to an identity using the same acceptance
+    /// rules as the HTTP middleware: a JWT is tried first when token sessions
+    /// are configured, then the credential is treated as an API key.
+    pub fn resolve_bearer(&self, bearer: &str) -> Result<BearerIdentity, String> {
+        if self.tokens_enabled() {
+            match self.validate_token(bearer) {
+                Ok(claims) => {
+                    return Ok(BearerIdentity {
+                        realm: claims.realm,
+                        agent_id: claims.agent_id,
+                        namespaces: Some(claims.namespaces),
+                        operations: claims.operations,
+                    });
+                }
+                Err(TokenError::Expired) => return Err("token expired".to_owned()),
+                // Not a valid JWT — fall through to API key lookup.
+                Err(TokenError::Invalid(_) | TokenError::NotConfigured) => {}
+            }
+        }
+
+        self.validate(bearer)
+            .map(|ki| BearerIdentity {
+                realm: ki.realm.clone(),
+                agent_id: ki.agent_id.clone(),
+                namespaces: None,
+                operations: vec![],
+            })
+            .ok_or_else(|| "credential is not a valid API key or token".to_owned())
+    }
+}
+
+/// Identity resolved from a bearer credential (JWT or API key).
+///
+/// Unlike [`ResolvedIdentity`], namespace scoping keeps the distinction
+/// between "no restriction" (API key → `None`) and "token with an explicit —
+/// possibly empty — allowlist" (`Some(list)`), matching how the HTTP layer
+/// only enforces namespace scope for token-authenticated requests.
+#[derive(Debug, Clone)]
+pub struct BearerIdentity {
+    pub realm: String,
+    pub agent_id: String,
+    /// `None` = unrestricted (API key); `Some(list)` = token allowlist where
+    /// an empty list means private + shared namespaces only.
+    pub namespaces: Option<Vec<String>>,
+    /// Operation restrictions (empty = all operations).
+    pub operations: Vec<Operation>,
 }
 
 #[derive(Debug)]
@@ -474,6 +543,105 @@ mod tests {
 
     async fn ok() -> &'static str {
         "ok"
+    }
+
+    fn token_config() -> TokenConfig {
+        TokenConfig {
+            secret: zeroize::Zeroizing::new("0123456789abcdef0123456789abcdef".to_owned()),
+            ttl_secs: 3600,
+            rotation_grace_secs: 0,
+            clock_skew_leeway_secs: 30,
+        }
+    }
+
+    fn auth_state_with_tokens() -> AuthState {
+        AuthState::new(None, Some(&token_config()))
+    }
+
+    fn identity() -> KeyIdentity {
+        KeyIdentity {
+            realm: "default".to_owned(),
+            agent_id: "agent-a".to_owned(),
+        }
+    }
+
+    #[test]
+    fn issued_tokens_carry_issuer_and_realm_audience() {
+        let state = auth_state_with_tokens();
+        let token = state
+            .issue_token(&identity(), vec![], vec![Operation::Read], None)
+            .unwrap();
+
+        let claims = state.validate_token(&token).unwrap();
+        assert_eq!(claims.iss, TOKEN_ISSUER);
+        assert_eq!(claims.aud, "default");
+        assert_eq!(claims.aud, claims.realm);
+        assert_eq!(claims.operations, vec![Operation::Read]);
+    }
+
+    fn encode_raw_claims(claims: &serde_json::Value) -> String {
+        encode(
+            &Header::default(),
+            claims,
+            &EncodingKey::from_secret(token_config().secret.as_bytes()),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn tokens_without_issuer_or_audience_are_rejected() {
+        let state = auth_state_with_tokens();
+        let now = jsonwebtoken::get_current_timestamp();
+        // Legacy claim shape: correctly signed, but missing iss/aud.
+        let token = encode_raw_claims(&serde_json::json!({
+            "realm": "default",
+            "agent_id": "agent-a",
+            "iat": now,
+            "exp": now + 3600,
+        }));
+
+        assert!(matches!(
+            state.validate_token(&token),
+            Err(TokenError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn tokens_with_wrong_issuer_are_rejected() {
+        let state = auth_state_with_tokens();
+        let now = jsonwebtoken::get_current_timestamp();
+        let token = encode_raw_claims(&serde_json::json!({
+            "realm": "default",
+            "agent_id": "agent-a",
+            "iss": "someone-else",
+            "aud": "default",
+            "iat": now,
+            "exp": now + 3600,
+        }));
+
+        assert!(matches!(
+            state.validate_token(&token),
+            Err(TokenError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn tokens_with_mismatched_audience_are_rejected() {
+        let state = auth_state_with_tokens();
+        let now = jsonwebtoken::get_current_timestamp();
+        let token = encode_raw_claims(&serde_json::json!({
+            "realm": "default",
+            "agent_id": "agent-a",
+            "iss": TOKEN_ISSUER,
+            "aud": "other-realm",
+            "iat": now,
+            "exp": now + 3600,
+        }));
+
+        assert!(matches!(
+            state.validate_token(&token),
+            Err(TokenError::Invalid(_))
+        ));
     }
 
     #[tokio::test]

@@ -13,7 +13,7 @@ use std::{collections::BTreeSet, time::Duration};
 use super::error::{LlmError, parse_retry_after};
 
 /// Default request timeout for HTTP calls.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+const REQUEST_TIMEOUT: Duration = Duration::from_mins(5);
 /// Default connection timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -195,6 +195,16 @@ struct StreamEvent {
     message: Option<StreamMessage>,
     #[serde(default)]
     usage: Option<StreamUsage>,
+    #[serde(default)]
+    error: Option<StreamErrorBody>,
+}
+
+#[derive(Default, serde::Deserialize)]
+struct StreamErrorBody {
+    #[serde(rename = "type", default)]
+    kind: String,
+    #[serde(default)]
+    message: String,
 }
 
 #[derive(Default, serde::Deserialize)]
@@ -230,6 +240,8 @@ struct StreamUsage {
 #[derive(Default)]
 struct AnthropicStreamParser {
     buffer: String,
+    /// Undecoded UTF-8 tail carried across network chunk boundaries.
+    byte_buffer: Vec<u8>,
     open_text_blocks: BTreeSet<u32>,
     closed_text_blocks: BTreeSet<u32>,
     usage: TokenUsage,
@@ -237,6 +249,48 @@ struct AnthropicStreamParser {
 }
 
 impl AnthropicStreamParser {
+    /// Feed raw network bytes, decoding only complete UTF-8 sequences.
+    ///
+    /// Network chunks can split a multi-byte code point; decoding each chunk
+    /// independently (e.g. via `from_utf8_lossy`) would turn both halves into
+    /// U+FFFD. Instead the longest valid prefix is decoded and any incomplete
+    /// trailing sequence stays buffered until the next chunk completes it.
+    /// Bytes that are genuinely invalid UTF-8 are replaced with U+FFFD.
+    fn push_bytes(&mut self, bytes: &[u8]) -> Vec<HirnResult<LlmChunk>> {
+        self.byte_buffer.extend_from_slice(bytes);
+
+        let mut text = String::new();
+        let mut rest: &[u8] = &self.byte_buffer;
+        loop {
+            match std::str::from_utf8(rest) {
+                Ok(valid) => {
+                    text.push_str(valid);
+                    rest = &[];
+                    break;
+                }
+                Err(error) => {
+                    let (valid, after) = rest.split_at(error.valid_up_to());
+                    text.push_str(std::str::from_utf8(valid).expect("prefix validated above"));
+                    match error.error_len() {
+                        // Invalid sequence: substitute and skip past it.
+                        Some(invalid_len) => {
+                            text.push('\u{FFFD}');
+                            rest = &after[invalid_len..];
+                        }
+                        // Incomplete trailing sequence: keep it buffered.
+                        None => break,
+                    }
+                }
+            }
+        }
+
+        let undecoded = rest.len();
+        let decoded = self.byte_buffer.len() - undecoded;
+        self.byte_buffer.drain(..decoded);
+
+        self.push_text(&text)
+    }
+
     fn push_text(&mut self, text: &str) -> Vec<HirnResult<LlmChunk>> {
         self.buffer.push_str(text);
         self.buffer = self.buffer.replace("\r\n", "\n");
@@ -266,6 +320,23 @@ impl AnthropicStreamParser {
         }
 
         match serde_json::from_str::<StreamEvent>(&data) {
+            // Mid-stream failures (e.g. overloaded_error) arrive as `error`
+            // events on an otherwise-200 stream; surface them to the consumer
+            // instead of silently dropping the frame.
+            Ok(event) if event.r#type == "error" => {
+                let detail = event.error.unwrap_or_default();
+                let body = if detail.kind.is_empty() && detail.message.is_empty() {
+                    data
+                } else {
+                    format!("{}: {}", detail.kind, detail.message)
+                };
+                Some(Err(LlmError::ProviderError {
+                    provider: "anthropic".into(),
+                    status: 0,
+                    body,
+                }
+                .into()))
+            }
             Ok(event) => self.handle_event(event).map(Ok),
             Err(error) => {
                 tracing::warn!(raw = data, error = %error, "SSE JSON parse failure, skipping event");
@@ -311,9 +382,7 @@ impl AnthropicStreamParser {
                         return None;
                     }
 
-                    if !self.open_text_blocks.contains(&index) {
-                        self.open_text_blocks.insert(index);
-                    }
+                    self.open_text_blocks.insert(index);
                 }
 
                 self.chunk(delta.text.unwrap_or_default(), false)
@@ -384,14 +453,19 @@ impl LlmProvider for AnthropicProvider {
         let url = format!("{}/v1/messages", self.base_url);
         let model_to_use = options.model_override.as_deref().unwrap_or(&self.model);
 
-        if let Some(max) = super::error::max_tokens_for_model(model_to_use) {
-            if options.max_tokens > max {
-                return Err(LlmError::TokenLimitExceeded {
-                    requested: options.max_tokens,
-                    max,
-                }
-                .into());
-            }
+        // Advisory only: the table below inevitably lags model releases, so a
+        // hard pre-flight reject turns table rot into spurious failures for
+        // valid requests. The provider API remains the authority.
+        if let Some(max) = super::error::max_tokens_for_model(model_to_use)
+            && options.max_tokens > max
+        {
+            tracing::warn!(
+                model = model_to_use,
+                requested = options.max_tokens,
+                known_max = max,
+                "requested max_tokens exceeds the last known limit for this model; \
+                 sending anyway — the provider will reject it if truly unsupported"
+            );
         }
 
         let body = self.build_body(messages, options, false);
@@ -428,8 +502,7 @@ impl LlmProvider for AnthropicProvider {
             .content
             .into_iter()
             .filter_map(|b| b.text)
-            .collect::<Vec<_>>()
-            .join("");
+            .collect::<String>();
 
         if content.is_empty() {
             return Err(LlmError::local(&self.model, "Anthropic returned empty response").into());
@@ -486,7 +559,7 @@ impl LlmProvider for AnthropicProvider {
                     raw: format!("stream read error: {error}"),
                 }
                 .into())],
-                Ok(bytes) => parser.push_text(&String::from_utf8_lossy(&bytes)),
+                Ok(bytes) => parser.push_bytes(&bytes),
             })
             .flat_map(futures::stream::iter);
 
@@ -809,6 +882,48 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(usage_chunks[1].completion_tokens, 11);
 
         handle.await.unwrap();
+    }
+
+    #[test]
+    fn multibyte_utf8_split_across_chunks_decodes_intact() {
+        let frame = "event: content_block_delta\n\
+            data: {\"type\":\"content_block_delta\",\"index\":0,\
+            \"delta\":{\"type\":\"text_delta\",\"text\":\"Grüße 🦀\"}}\n\n";
+
+        // Feeding one byte at a time exercises every possible chunk boundary,
+        // including splits inside the two-byte 'ü' and the four-byte crab.
+        let mut parser = AnthropicStreamParser::default();
+        let mut items = Vec::new();
+        for byte in frame.as_bytes() {
+            items.extend(parser.push_bytes(&[*byte]));
+        }
+
+        let text: String = items
+            .into_iter()
+            .map(|item| item.expect("chunks should parse").delta)
+            .collect();
+        assert_eq!(text, "Grüße 🦀");
+    }
+
+    #[test]
+    fn error_event_yields_stream_error() {
+        let mut parser = AnthropicStreamParser::default();
+        let frame = "event: error\n\
+            data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\
+            \"message\":\"Overloaded\"}}\n\n";
+
+        let items = parser.push_bytes(frame.as_bytes());
+        assert_eq!(items.len(), 1);
+        let err = items
+            .into_iter()
+            .next()
+            .unwrap()
+            .expect_err("error event should surface as a stream error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("overloaded_error") && msg.contains("Overloaded"),
+            "error should carry the provider detail: {msg}"
+        );
     }
 
     #[tokio::test]

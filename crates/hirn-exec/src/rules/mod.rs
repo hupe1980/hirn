@@ -26,16 +26,16 @@ use datafusion_physical_optimizer::PhysicalOptimizerRule;
 ///
 /// Rule ordering:
 /// 1. `PolicyPushdownRule` — inject namespace filters (must run first)
-/// 2. `NamespacePartitionPruneRule` — simplify IN to = for single namespace
-/// 3. `ActivationFusionRule` — fuse adjacent graph activation operators
-/// 4. `TemporalIndexRule` — rewrite temporal predicates for index usage
-/// 5. `DepthSchedulingRule` — prune operators based on query complexity (runs last)
+/// 2. `ActivationFusionRule` — fuse adjacent same-mode graph activation operators
+///
+/// `NamespacePartitionPruneRule`, `TemporalIndexRule`, and
+/// `DepthSchedulingRule` are intentionally not registered: they currently
+/// perform no transformation on production plans, so running them would only
+/// add a full plan traversal per query. Register them here once they apply a
+/// correct rewrite.
 pub fn all_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
     vec![
         Arc::new(PolicyPushdownRule::new()),
-        Arc::new(NamespacePartitionPruneRule::new()),
         Arc::new(ActivationFusionRule::new()),
-        Arc::new(TemporalIndexRule::new()),
-        Arc::new(DepthSchedulingRule::new()),
     ]
 }

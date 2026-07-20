@@ -213,9 +213,11 @@ pub async fn check_integrity(storage: &dyn PhysicalStore) -> Result<IntegrityRep
     }
 
     // 3. Graph node consistency — check persistent graph nodes reference real records.
+    //    The dataset is `graph_nodes` (no leading underscore); the previous literal
+    //    never matched, so this check silently reported the graph as always clean.
     let graph_batches = storage
         .scan(
-            "_graph_nodes",
+            hirn_storage::datasets::graph::DATASET_NODES_NAME,
             ScanOptions {
                 columns: Some(vec!["id".into()]),
                 filter: None,

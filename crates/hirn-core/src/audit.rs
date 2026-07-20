@@ -119,6 +119,27 @@ pub enum AuditAction {
         revised_confidence: f32,
         reason: String,
     },
+    /// A dataset was restored to an earlier version from a named snapshot.
+    DatasetRollback {
+        dataset: String,
+        tag: String,
+        from_version: u64,
+        to_version: u64,
+    },
+    /// Full database export through the admin surface.
+    Export {
+        record_count: u64,
+        namespaces: Vec<String>,
+    },
+    /// Full database import through the admin surface. The per-namespace and
+    /// per-author counts make injected records attributable to the batch.
+    Import {
+        record_count: u64,
+        /// Records imported per namespace, `(namespace, count)`.
+        namespace_counts: Vec<(String, u64)>,
+        /// Records imported per claimed `provenance.created_by`, `(agent, count)`.
+        created_by_counts: Vec<(String, u64)>,
+    },
 }
 
 /// A single entry in the audit log.
@@ -126,22 +147,42 @@ pub enum AuditAction {
 pub struct AuditEntry {
     /// Unique entry identifier.
     pub id: MemoryId,
+    /// Gap-free position of this entry in the audit trail. Assigned by the
+    /// engine at append time; combined with the hash chain it makes deletion
+    /// and truncation of entries detectable.
+    #[serde(default)]
+    pub seq: u64,
     /// When the action occurred.
     pub timestamp: Timestamp,
     /// The agent that performed the action (if applicable).
     pub actor: Option<AgentId>,
     /// The action that was performed.
     pub action: AuditAction,
+    /// Keyed-hash tag over this entry's contents (hex-encoded). `None` when
+    /// the store has no HMAC secret configured (unsigned mode).
+    #[serde(default)]
+    pub hmac: Option<String>,
+    /// The `hmac` of the immediately preceding entry, folded into this
+    /// entry's own tag so the trail forms a tamper-evident hash chain.
+    /// `None` for the first entry or in unsigned mode.
+    #[serde(default)]
+    pub prev_hmac: Option<String>,
 }
 
 impl AuditEntry {
     /// Create a new audit entry.
+    ///
+    /// `seq`, `hmac`, and `prev_hmac` start empty; the engine's append path
+    /// assigns them when the entry is written to the audit trail.
     pub fn new(actor: Option<AgentId>, action: AuditAction) -> Self {
         Self {
             id: MemoryId::new(),
+            seq: 0,
             timestamp: Timestamp::now(),
             actor,
             action,
+            hmac: None,
+            prev_hmac: None,
         }
     }
 }
@@ -338,6 +379,33 @@ mod tests {
             logical_memory_ids: vec![LogicalMemoryId::new()],
             applied_memory_ids: vec![mid()],
             rationale: "approved offline reconcile".into(),
+        });
+    }
+
+    #[test]
+    fn dataset_rollback() {
+        assert_round_trip(AuditAction::DatasetRollback {
+            dataset: "episodic".into(),
+            tag: "pre-migration".into(),
+            from_version: 42,
+            to_version: 17,
+        });
+    }
+
+    #[test]
+    fn export() {
+        assert_round_trip(AuditAction::Export {
+            record_count: 1234,
+            namespaces: vec!["shared".into(), "team_backend".into()],
+        });
+    }
+
+    #[test]
+    fn import() {
+        assert_round_trip(AuditAction::Import {
+            record_count: 99,
+            namespace_counts: vec![("shared".into(), 60), ("team_backend".into(), 39)],
+            created_by_counts: vec![("agent_a".into(), 80), ("agent_b".into(), 19)],
         });
     }
 

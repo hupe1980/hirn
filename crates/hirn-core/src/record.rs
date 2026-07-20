@@ -49,6 +49,21 @@ impl MemoryRecord {
         }
     }
 
+    /// Get the primary human-readable text of this record.
+    ///
+    /// Returns the layer's main text field: episodic/working `content`, or the
+    /// semantic/procedural `description`. Convenient for displaying recall
+    /// results without matching on the variant.
+    #[must_use]
+    pub fn content(&self) -> &str {
+        match self {
+            Self::Working(w) => &w.content,
+            Self::Episodic(e) => &e.content,
+            Self::Semantic(s) => &s.description,
+            Self::Procedural(p) => &p.description,
+        }
+    }
+
     /// Get the effective namespace used for access control and visibility.
     /// Working memory derives a private namespace from the owning agent.
     #[must_use]
@@ -61,16 +76,53 @@ impl MemoryRecord {
         }
     }
 
-    /// Strip raw text content from this record (for privacy / Cedar policy enforcement).
+    /// Strip raw text and payload-bearing content from this record, for privacy
+    /// and Cedar `recall_raw_text` enforcement.
+    ///
+    /// This must clear **every** field that can carry user-authored text or raw
+    /// bytes — not just the primary `content`/`description`. In particular it
+    /// clears multi-modal payloads (raw image/audio/document bytes and their
+    /// transcripts), extracted entities, and free-form metadata, which earlier
+    /// versions leaked. Structural identity fields (ids, timestamps, revision
+    /// chain, namespace, importance/confidence scores) are preserved so a
+    /// redacted record is still routable and rankable.
+    ///
+    /// Invariant: after this call the record must contain no user payload bytes.
+    /// The `redacted_record_carries_no_payload` test enforces it per layer.
     pub fn strip_raw_text(&mut self) {
         match self {
-            Self::Working(w) => w.content = String::new(),
+            Self::Working(w) => {
+                w.content = String::new();
+                w.multi_content = None;
+                w.revision_reason = None;
+                w.thread_id = None;
+            }
             Self::Episodic(e) => {
                 e.content = String::new();
                 e.summary = String::new();
+                e.entities.clear();
+                e.metadata.clear();
+                e.multi_content = None;
+                e.revision_reason = None;
+                // `episode_id` is a free-form segment label and can echo content.
+                e.episode_id = None;
             }
-            Self::Semantic(s) => s.description = String::new(),
-            Self::Procedural(p) => p.description = String::new(),
+            Self::Semantic(s) => {
+                // `concept` is a short derived label used as the record's key and
+                // is preserved; the free-form body and any contradiction context
+                // are cleared.
+                s.description = String::new();
+                s.revision_reason = None;
+            }
+            Self::Procedural(p) => {
+                p.description = String::new();
+                // `steps` carry tool parameters (potentially secrets/PII) and
+                // `preconditions` are free text — both must go.
+                p.steps.clear();
+                p.preconditions.clear();
+                p.metadata.clear();
+                p.revision_reason = None;
+            }
         }
     }
 }
@@ -129,6 +181,114 @@ mod tests {
             .unwrap();
         let record = MemoryRecord::Semantic(entry);
         assert_eq!(record.layer(), Layer::Semantic);
+    }
+
+    #[test]
+    fn redacted_episodic_record_carries_no_payload() {
+        use crate::content::MemoryContent;
+        let mut entry = EpisodicRecord::builder()
+            .content("secret raw content")
+            .summary("secret summary")
+            .agent_id(agent())
+            .entity("alice", "actor")
+            .metadata_entry("pii", "ssn-123-45-6789")
+            .build()
+            .unwrap();
+        entry.multi_content = Some(MemoryContent::Text("raw multimodal payload".into()));
+        entry.revision_reason = Some("superseded because the address changed".into());
+        entry.episode_id = Some("trip to the secret facility".into());
+        let mut record = MemoryRecord::Episodic(entry);
+        record.strip_raw_text();
+        let MemoryRecord::Episodic(e) = &record else {
+            unreachable!()
+        };
+        assert!(e.content.is_empty());
+        assert!(e.summary.is_empty());
+        assert!(e.entities.is_empty(), "entities must be stripped");
+        assert!(e.metadata.is_empty(), "metadata must be stripped");
+        assert!(e.multi_content.is_none(), "multi_content must be stripped");
+        assert!(
+            e.revision_reason.is_none(),
+            "revision_reason is free text and must be stripped"
+        );
+        assert!(
+            e.episode_id.is_none(),
+            "episode_id is a free-form label and must be stripped"
+        );
+    }
+
+    #[test]
+    fn redacted_working_record_carries_no_payload() {
+        use crate::content::MemoryContent;
+        let mut entry = WorkingMemoryEntry::builder()
+            .content("secret working thought")
+            .agent_id(agent())
+            .build()
+            .unwrap();
+        entry.multi_content = Some(MemoryContent::Text("raw payload".into()));
+        entry.revision_reason = Some("changed my mind about the plan".into());
+        entry.thread_id = Some("conversation-with-secrets".into());
+        let mut record = MemoryRecord::Working(entry);
+        record.strip_raw_text();
+        let MemoryRecord::Working(w) = &record else {
+            unreachable!()
+        };
+        assert!(w.content.is_empty());
+        assert!(w.multi_content.is_none(), "multi_content must be stripped");
+        assert!(
+            w.revision_reason.is_none(),
+            "revision_reason is free text and must be stripped"
+        );
+        assert!(
+            w.thread_id.is_none(),
+            "thread_id is a free-form label and must be stripped"
+        );
+    }
+
+    #[test]
+    fn redacted_semantic_record_clears_revision_reason() {
+        let mut rec = SemanticRecord::builder()
+            .concept("keep_this_concept")
+            .description("secret description")
+            .agent_id(agent())
+            .build()
+            .unwrap();
+        rec.revision_reason = Some("contradicted by a newer observation".into());
+        let mut record = MemoryRecord::Semantic(rec);
+        record.strip_raw_text();
+        let MemoryRecord::Semantic(s) = &record else {
+            unreachable!()
+        };
+        assert!(s.description.is_empty());
+        assert_eq!(s.concept, "keep_this_concept", "concept key is preserved");
+        assert!(
+            s.revision_reason.is_none(),
+            "revision_reason is free text and must be stripped"
+        );
+    }
+
+    #[test]
+    fn redacted_procedural_record_carries_no_steps() {
+        let mut rec = ProceduralRecord::builder()
+            .name("deploy")
+            .description("run the deploy")
+            .preconditions(vec!["has creds".to_string()])
+            .agent_id(agent())
+            .build()
+            .unwrap();
+        rec.metadata.insert(
+            "token".into(),
+            crate::metadata::MetadataValue::String("secret".into()),
+        );
+        let mut record = MemoryRecord::Procedural(rec);
+        record.strip_raw_text();
+        let MemoryRecord::Procedural(p) = &record else {
+            unreachable!()
+        };
+        assert!(p.description.is_empty());
+        assert!(p.steps.is_empty());
+        assert!(p.preconditions.is_empty());
+        assert!(p.metadata.is_empty());
     }
 
     #[test]

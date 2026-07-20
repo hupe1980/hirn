@@ -7,10 +7,8 @@
 //!
 //! - **LoCoMo** (Maharana et al., 2024): Long-conversation memory benchmark with
 //!   5 question categories (single-hop, multi-hop, temporal, world-knowledge, adversarial).
-//!   Reported by: SYNAPSE, TraceMem, FadeMem, Hippocampus.
 //!
 //! - **DMR** (Dialog Memory Retrieval): Multi-turn dialog fact retrieval.
-//!   Reported by: Zep (94.8%), MemGPT (93.4%).
 //!
 //! # Usage
 //!

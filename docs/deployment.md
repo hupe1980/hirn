@@ -1,8 +1,79 @@
+---
+title: Deployment
+parent: Deployment & Operations
+nav_order: 1
+description: >-
+  Deploy hirn embedded, as a standalone hirnd daemon, or as a multi-node Raft cluster — with the CLI flags, ports, and TLS/auth model for each.
+---
+
 # Deployment Modes
+{: .no_toc }
 
 > **⚠️ Experimental:** This project is under active development. APIs, on-disk formats, and behaviour may change without notice. Not recommended for production use.
 
 hirn supports multiple deployment modes, from embedded library to distributed cluster. Choose the mode that fits your architecture.
+
+## Table of contents
+{: .no_toc .text-delta }
+
+1. TOC
+{:toc}
+
+---
+
+## Choosing a Deployment Mode
+
+hirn is built as a single cognitive engine (`hirn-engine`) that can be consumed
+in three fundamentally different operational shapes. The engine, the storage
+format, and the cognition pipeline are identical in all of them — what changes
+is *who owns the process* and *how clients reach it*.
+
+- **Embedded** — the engine runs inside your own process as a Rust library (with
+  Python and Node.js bindings). There is no network, no daemon, and no separate
+  lifecycle to manage. This is the SQLite-style model: lowest latency, simplest
+  operations, single-writer.
+- **Standalone daemon (`hirnd`)** — the engine runs behind a server process that
+  exposes gRPC, HTTP/REST, and MCP. Many clients, languages, and LLM tool callers
+  share one memory store over the network, with TLS, authentication, and Cedar
+  policy enforcement on every request.
+- **Distributed cluster** — several `hirnd` nodes coordinate metadata through
+  Raft (or DynamoDB in serverless mode) over shared object storage, giving
+  horizontal scale across realms and automatic failover.
+
+Start embedded. Move to a daemon when more than one process needs the same
+memory, or when an LLM needs an MCP tool endpoint. Move to a cluster only when a
+single node can no longer meet availability or throughput requirements — the
+coordination machinery is real operational surface area you do not want until you
+need it.
+
+```mermaid
+flowchart TD
+    subgraph Embedded["Embedded — in-process"]
+        A[Your app process]:::s --> B[hirn-engine]:::s
+        B --> C[(Local Lance datasets)]:::s
+    end
+
+    subgraph Daemon["Standalone daemon — hirnd"]
+        D[HTTP / gRPC / MCP clients]:::s --> E[hirnd]:::s
+        E --> F[hirn-engine]:::s
+        F --> G[(Local Lance datasets)]:::s
+    end
+
+    subgraph Cluster["Distributed cluster"]
+        H[Clients]:::s --> I[hirnd leader]:::s
+        H --> J[hirnd follower]:::s
+        I <-->|Raft metadata| J
+        I --> K[(Shared S3 / GCS / Azure)]:::s
+        J --> K
+    end
+
+    classDef s fill:#1a1b26,stroke:#7c9cff,color:#e6e8f0;
+```
+
+{: .tip }
+> There is no lock-in between modes. All modes read and write the same Lance
+> on-disk format, so you can prototype embedded and later point a `hirnd` daemon
+> at the same brain directory.
 
 ---
 
@@ -65,36 +136,86 @@ console.log(ctx.context);
 
 `hirnd` now fails closed by default: configure `[auth]` credentials for normal startup, or pass the explicit `--insecure-dev-mode` switch for local unauthenticated development.
 
+The `hirnd` CLI accepts only these flags (see `hirnd --help`): `--config <file>`
+(TOML), `--data <dir>`, `--bind <addr>`, and `--insecure-dev-mode`. TLS,
+ports, and auth are configured in the TOML file, not via flags.
+
 ```bash
-# Basic start
-hirnd --db-path ./brain --grpc-port 50051 --http-port 8080
+# Basic start — bind address sets the base port; HTTP = base, gRPC = base+1, MCP (SSE) = base+2
+hirnd --config hirnd.toml --data ./brain --bind 127.0.0.1:3000
 
-# Local insecure development only
-hirnd --insecure-dev-mode --db-path ./brain --grpc-port 50051 --http-port 8080
-
-# With TLS
-hirnd --db-path ./brain \
-  --tls-cert server.pem \
-  --tls-key server-key.pem \
-  --grpc-port 50051
+# Local insecure development only (no auth, loopback bind)
+hirnd --insecure-dev-mode --data ./brain --bind 127.0.0.1:3000
 ```
+
+TLS is enabled by adding a `[tls]` section to `hirnd.toml` (`cert_path`,
+`key_path`, optional `client_ca_path` for mTLS) — see the Security section below.
+
+> **mTLS identity mapping requires a client CA.** If you configure
+> `[auth.client_certs]` (mapping certificate CNs to identities), you MUST also
+> set `tls.client_ca_path`. Startup fails otherwise. Without mandatory,
+> server-verified mTLS the `x-client-cert-cn` identity would come from a
+> client-supplied header that any caller can forge — so the daemon refuses that
+> configuration rather than trust an unauthenticated CN.
 
 ### Interfaces
 
-| Interface | Port | Protocol | Use Case |
+The `--bind` address is the base port; the other interfaces are derived from it.
+
+| Interface | Default port | Protocol | Use Case |
 |-----------|------|----------|----------|
-| gRPC | 50051 | HTTP/2 + Protobuf | High-throughput programmatic access |
-| HTTP | 8080 | REST + JSON | Web clients, curl, simple integrations |
-| MCP | (via gRPC) | Model Context Protocol | LLM tool calling (Claude, GPT, etc.) |
+| HTTP | `3000` (base) | REST + JSON | Web clients, curl, simple integrations |
+| gRPC | `3001` (base+1) | HTTP/2 + Protobuf | High-throughput programmatic access |
+| MCP (SSE) | `3002` (base+2) | Model Context Protocol over SSE | LLM tool calling (Claude, GPT, etc.) |
 
-### gRPC Client Example (Rust)
+Binding all three interfaces to a single base port keeps firewall rules and
+service discovery simple: expose `--bind` and the daemon derives the rest. The
+HTTP loopback default (`127.0.0.1:3000`) is deliberately conservative — nothing
+is reachable off-host until you bind a routable address and configure `[tls]`.
 
-```rust
-use hirn::client::HirnClient;
+### Request Lifecycle
 
-let client = HirnClient::connect("http://localhost:50051").await?;
-client.remember("agent-1", "The sky is blue").await?;
+Every daemon request runs through the same ordered pipeline: transport, then
+authentication (bearer token or verified mTLS identity), then Cedar policy
+evaluation, then route-class throttling keyed by the authenticated actor, and
+only then the engine and storage. Authorization happens before any storage
+access, so a denied request never touches Lance.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant T as TLS / transport
+    participant A as Auth (token / mTLS CN)
+    participant P as Cedar policy
+    participant R as Route-class throttle
+    participant E as hirn-engine
+    participant S as Lance storage
+    C->>T: HTTP / gRPC / MCP request
+    T->>A: verified connection
+    A->>P: authenticated actor (realm + agent_id)
+    P->>R: allow decision
+    R->>E: within budget
+    E->>S: read / write
+    S-->>C: response (+ retryable flag on error)
+    Note over A,P: deny → 403 before any storage access
+    Note over R: over budget → 429 retryable
 ```
+
+See [Security](security.md) for the full authentication and policy model.
+
+### HTTP Client Example
+
+```bash
+# Obtain a token (when [auth] is configured), then call the REST API
+curl -sX POST http://127.0.0.1:3000/v1/remember \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"agent_id":"agent-1","content":"The sky is blue"}'
+```
+
+> There is no `hirn::client::HirnClient` type. Rust programs embed the engine
+> directly (`Hirn::open`) or call the daemon's HTTP/gRPC endpoints with a
+> standard client.
 
 ### MCP Integration
 
@@ -105,13 +226,23 @@ hirnd exposes hirn as an MCP tool server. Configure your LLM client to connect:
   "mcpServers": {
     "hirn": {
       "command": "hirnd",
-      "args": ["--db-path", "./brain"]
+      "args": ["--data", "./brain", "--bind", "127.0.0.1:3000"]
     }
   }
 }
 ```
 
 Available MCP tools: `remember`, `recall`, `think`, `forget`, `connect`, `inspect`, `trace`, `consolidate`.
+
+{: .important }
+> **MCP authentication.** The MCP listener authenticates **once at startup**:
+> outside `insecure_dev_mode` you must set `mcp.auth_token` in the config to an
+> API key or JWT accepted by your `[auth]`/`[token]` settings. Every MCP tool
+> call then runs as that validated identity — realm, agent, operation scope,
+> and namespace scope come from the credential, never from tool parameters —
+> and is rate-limited with the same route classes as the HTTP API. HirnQL run
+> through `hirn_execute` is verb-classified, so a read-scoped credential cannot
+> execute write or admin statements.
 
 **Characteristics:**
 - Multi-client access over network
@@ -257,6 +388,23 @@ Each realm is assigned to a preferred node for write operations. Writes to non-o
 - **Reads:** Served by any node (Lance MVCC on shared storage)
 - **Writes:** Forwarded to the realm's owner node via HTTP proxy
 - **Failover:** If the owner is down, any node can serve reads from shared storage
+
+```mermaid
+flowchart LR
+    W[Write for realm A]:::s --> N2[hirnd node 2<br/>non-owner]:::s
+    N2 -->|forward via HTTP proxy| N1[hirnd node 1<br/>owner of realm A]:::s
+    N1 --> ST[(Shared object store)]:::s
+    RD[Read for realm A]:::s --> N3[hirnd node 3<br/>any node]:::s
+    N3 -->|Lance MVCC| ST
+    classDef s fill:#1a1b26,stroke:#7c9cff,color:#e6e8f0;
+```
+
+{: .warning }
+> Every node in a cluster must share the same `raft.transport_secret`, and
+> production `transport_profile` values (`prod-tls` / `prod-mtls`) require
+> `https://` cluster URLs. `hirnd` fails startup if `[raft]` is configured without
+> the secret unless `insecure_dev_mode = true`. Keep Raft traffic on a private
+> network — the `/raft/*` endpoints are control-plane transport, not public API.
 
 ### Consolidation Leases
 

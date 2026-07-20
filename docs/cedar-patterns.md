@@ -1,8 +1,37 @@
+---
+title: Cedar Patterns
+parent: Security
+nav_order: 2
+description: >-
+  A copy-ready Cedar pattern library for hirn — least-privilege writers,
+  read-only auditors, tenant isolation, guarded recall_raw_text, and a ship checklist.
+---
+
 # Cedar Policy Patterns
+{: .no_toc }
 
 > **⚠️ Experimental:** This project is under active development. APIs, on-disk formats, and behaviour may change without notice. Not recommended for production use.
 
+## Table of contents
+{: .no_toc .text-delta }
+
+1. TOC
+{:toc}
+
 This is the operator-facing pattern library for hirn's major Cedar action types. Use it alongside the broader [docs/cedar-guide.md](cedar-guide.md).
+
+Each pattern applies the **principle of least privilege**: grant the narrowest
+action set that lets an agent do its job, then add explicit `forbid` clauses for
+the powers it must never hold. Because Cedar evaluates `forbid` over `permit`, the
+paired permit/forbid shape below is deliberate — the `forbid` is the enforceable
+guarantee, and the `permit` is merely the enabling grant.
+
+{: .warning }
+> A `permit` without a matching `forbid` is only as narrow as the actions you
+> happened to list. The high-blast-radius actions — `purge`, `admin`,
+> `consolidate`, `execute`, and `recall_raw_text` — should be denied explicitly
+> to everyone except their intended principal set, so a future broad `permit`
+> cannot silently re-grant them.
 
 ## Writer With No Destructive Powers
 

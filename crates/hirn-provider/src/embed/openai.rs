@@ -12,7 +12,7 @@ use std::time::Duration;
 use super::error::EmbedError;
 
 /// Default request timeout for HTTP calls.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const REQUEST_TIMEOUT: Duration = Duration::from_mins(1);
 /// Default connection timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -74,12 +74,27 @@ impl OpenAIEmbedder {
         self.max_tokens = max;
         self
     }
+
+    /// The `dimensions` request parameter, when the model supports it.
+    ///
+    /// `text-embedding-3-*` models accept a reduced (Matryoshka) output width
+    /// via `dimensions`; without it the API returns the native width, which
+    /// fails response validation whenever this embedder was constructed with a
+    /// reduced dimension. Older models such as `text-embedding-ada-002` reject
+    /// the parameter, so it is omitted for them.
+    fn request_dimensions(&self) -> Option<usize> {
+        self.model
+            .starts_with("text-embedding-3-")
+            .then_some(self.dimensions)
+    }
 }
 
 #[derive(serde::Serialize)]
 struct EmbedRequest<'a> {
     model: &'a str,
     input: &'a [&'a str],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dimensions: Option<usize>,
 }
 
 #[derive(serde::Deserialize)]
@@ -101,6 +116,7 @@ impl Embedder for OpenAIEmbedder {
         let body = EmbedRequest {
             model: &self.model,
             input: texts,
+            dimensions: self.request_dimensions(),
         };
 
         let resp = self
@@ -235,6 +251,35 @@ mod tests {
     }
 
     #[test]
+    fn embedding_3_request_includes_dimensions() {
+        let e = OpenAIEmbedder::new("sk-test", "text-embedding-3-small", 256)
+            .expect("openai client should initialize");
+        let body = serde_json::to_value(EmbedRequest {
+            model: &e.model,
+            input: &["hello"],
+            dimensions: e.request_dimensions(),
+        })
+        .unwrap();
+        assert_eq!(body["dimensions"], 256);
+    }
+
+    #[test]
+    fn ada_002_request_omits_dimensions() {
+        let e = OpenAIEmbedder::new("sk-test", "text-embedding-ada-002", 1536)
+            .expect("openai client should initialize");
+        let body = serde_json::to_value(EmbedRequest {
+            model: &e.model,
+            input: &["hello"],
+            dimensions: e.request_dimensions(),
+        })
+        .unwrap();
+        assert!(
+            body.get("dimensions").is_none(),
+            "ada-002 rejects the dimensions parameter"
+        );
+    }
+
+    #[test]
     fn remote_plaintext_base_url_is_rejected() {
         let result = OpenAIEmbedder::new("sk-test", "text-embedding-3-small", 1536)
             .expect("openai client should initialize")
@@ -301,7 +346,7 @@ mod tests {
     async fn mock_embed_single_text() {
         let response = serde_json::json!({
             "data": [
-                { "embedding": [1.0, 2.0, 3.0] }
+                { "index": 0, "embedding": [1.0, 2.0, 3.0] }
             ]
         });
 
@@ -434,7 +479,7 @@ mod tests {
     #[tokio::test]
     async fn mock_truncated_embedding_returns_dimension_mismatch() {
         let response = serde_json::json!({
-            "data": [{ "embedding": [0.1, 0.2] }]
+            "data": [{ "index": 0, "embedding": [0.1, 0.2] }]
         });
 
         let (url, handle) = mock_server(&response.to_string()).await;

@@ -59,10 +59,7 @@ fn invalid_base_url(provider: &'static str, value: &str, reason: impl Into<Strin
 }
 
 fn is_loopback_http_endpoint(url: &reqwest::Url) -> bool {
-    matches!(
-        url.host_str(),
-        Some("localhost") | Some("127.0.0.1") | Some("::1")
-    )
+    matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "::1"))
 }
 
 #[cfg(test)]

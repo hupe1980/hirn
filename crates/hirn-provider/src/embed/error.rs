@@ -148,7 +148,10 @@ impl From<EmbedError> for hirn_core::HirnError {
             // Non-transient provider errors (4xx client errors) must NOT be retried.
             // map them to InvalidInput so HirnError::is_retryable() returns false (N-L02).
             _ if !err.is_transient() => Self::InvalidInput(err.to_string()),
-            _ => Self::ProviderError(err.to_string()),
+            _ => Self::ProviderError {
+                message: err.to_string(),
+                retryable: true,
+            },
         }
     }
 }

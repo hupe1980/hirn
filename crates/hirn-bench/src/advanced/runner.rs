@@ -322,8 +322,8 @@ fn run_dream_hypothesis(run_id: &str, offline_wait_ms: u64) -> Result<AdvancedRe
         let entry = pending
             .first()
             .ok_or_else(|| "dream benchmark expected one pending hypothesis".to_string())?;
-        let hypothesis: SemanticRecord =
-            bincode::deserialize(&entry.record).map_err(|error| error.to_string())?;
+        let hypothesis: SemanticRecord = hirn_core::persist::from_versioned_bytes(&entry.record)
+            .map_err(|error| error.to_string())?;
 
         let source_hits = source_ids
             .iter()
@@ -430,7 +430,8 @@ fn run_reconcile_accuracy(run_id: &str, offline_wait_ms: u64) -> Result<Advanced
             .first()
             .ok_or_else(|| "reconcile benchmark expected one pending proposal".to_string())?;
         let proposal_record: SemanticRecord =
-            bincode::deserialize(&entry.record).map_err(|error| error.to_string())?;
+            hirn_core::persist::from_versioned_bytes(&entry.record)
+                .map_err(|error| error.to_string())?;
         let proposal = ReconcileProposal::from_json(&proposal_record.description)
             .map_err(|error| error.to_string())?;
 
@@ -515,8 +516,8 @@ fn run_planning_usefulness(run_id: &str, offline_wait_ms: u64) -> Result<Advance
         let entry = pending
             .first()
             .ok_or_else(|| "planning benchmark expected one pending agenda".to_string())?;
-        let agenda_record: SemanticRecord =
-            bincode::deserialize(&entry.record).map_err(|error| error.to_string())?;
+        let agenda_record: SemanticRecord = hirn_core::persist::from_versioned_bytes(&entry.record)
+            .map_err(|error| error.to_string())?;
         let agenda = PlanningAgenda::from_json(&agenda_record.description)
             .map_err(|error| error.to_string())?;
 

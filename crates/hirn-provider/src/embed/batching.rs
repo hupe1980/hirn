@@ -3,7 +3,7 @@
 use std::num::NonZeroUsize;
 
 use async_trait::async_trait;
-use hirn_core::embed::{Embedder, Embedding};
+use hirn_core::embed::{Embedder, Embedding, MultivectorEmbedding};
 use hirn_core::{HirnError, HirnResult, PartialEmbeddingBatch};
 use tracing::warn;
 
@@ -176,8 +176,23 @@ impl<E: Embedder> Embedder for BatchingEmbedder<E> {
         self.inner.model_id()
     }
 
+    fn embedding_space_id(&self) -> String {
+        self.inner.embedding_space_id()
+    }
+
     fn max_input_tokens(&self) -> usize {
         self.inner.max_input_tokens()
+    }
+
+    // Multivector requests are passed through unchunked: the partial-failure
+    // bookkeeping above is single-vector only, and multivec batches are small
+    // in practice. Forwarding keeps the inner embedder's capability visible.
+    async fn embed_multivec(&self, texts: &[&str]) -> HirnResult<Vec<MultivectorEmbedding>> {
+        self.inner.embed_multivec(texts).await
+    }
+
+    fn supports_multivec(&self) -> bool {
+        self.inner.supports_multivec()
     }
 }
 
@@ -243,7 +258,7 @@ mod tests {
         async fn embed(&self, texts: &[&str]) -> HirnResult<Vec<Embedding>> {
             let call = self.calls.fetch_add(1, Ordering::Relaxed);
             if call == 1 {
-                return Err(HirnError::ProviderError("second chunk failed".into()));
+                return Err(HirnError::provider("second chunk failed"));
             }
             self.inner.embed(texts).await
         }
@@ -303,6 +318,14 @@ mod tests {
 
         let err = batched.embed(&["a", "b"]).await.unwrap_err();
         assert!(err.to_string().contains("expected 2 embeddings"));
+    }
+
+    #[tokio::test]
+    async fn multivec_forwards_to_inner() {
+        let batched = BatchingEmbedder::new(PseudoEmbedder::new(16), nz(2));
+        assert!(batched.supports_multivec());
+        let result = batched.embed_multivec(&["a", "b", "c"]).await.unwrap();
+        assert_eq!(result.len(), 3);
     }
 
     #[tokio::test]

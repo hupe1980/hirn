@@ -45,6 +45,11 @@ struct BreakerState {
     consecutive_failures: u32,
     consecutive_successes: u32,
     last_failure_time: Option<Instant>,
+    /// Probes admitted in half-open that have not yet recorded an outcome.
+    /// Caps concurrent half-open traffic at `success_threshold` so the
+    /// instant the recovery timeout elapses, a burst of in-flight callers
+    /// cannot all hammer a still-recovering provider at once.
+    in_flight_probes: u32,
 }
 
 /// A thread-safe circuit breaker.
@@ -71,6 +76,7 @@ impl CircuitBreaker {
                 consecutive_failures: 0,
                 consecutive_successes: 0,
                 last_failure_time: None,
+                in_flight_probes: 0,
             }),
         }
     }
@@ -112,6 +118,7 @@ impl CircuitBreaker {
                 guard.consecutive_failures = 0;
             }
             CircuitState::HalfOpen => {
+                guard.in_flight_probes = guard.in_flight_probes.saturating_sub(1);
                 guard.consecutive_successes += 1;
                 if guard.consecutive_successes >= self.config.success_threshold {
                     guard.state = CircuitState::Closed;
@@ -140,6 +147,7 @@ impl CircuitBreaker {
                 // Any failure in half-open goes straight back to open.
                 guard.state = CircuitState::Open;
                 guard.consecutive_successes = 0;
+                guard.in_flight_probes = 0;
             }
             CircuitState::Open => {
                 // Already open — just update timestamp.
@@ -150,13 +158,24 @@ impl CircuitBreaker {
     /// Check if a call is allowed. Returns `true` if the call should proceed,
     /// `false` if the breaker is open and the call should be rejected.
     ///
-    /// When transitioning from Open → Half-Open, this returns `true` once
-    /// to allow a probe request.
+    /// In half-open, at most `success_threshold` probes may be in flight at
+    /// once; additional callers are rejected until a probe records its
+    /// outcome. Every allowed half-open call MUST be followed by
+    /// `record_success` or `record_failure`, or its probe slot stays
+    /// occupied.
     pub fn allow_call(&self) -> bool {
         let mut guard = self.inner.lock();
         Self::maybe_transition_to_half_open(&self.config, &mut guard);
         match guard.state {
-            CircuitState::Closed | CircuitState::HalfOpen => true,
+            CircuitState::Closed => true,
+            CircuitState::HalfOpen => {
+                if guard.in_flight_probes < self.config.success_threshold {
+                    guard.in_flight_probes += 1;
+                    true
+                } else {
+                    false
+                }
+            }
             CircuitState::Open => false,
         }
     }
@@ -168,6 +187,7 @@ impl CircuitBreaker {
         {
             state.state = CircuitState::HalfOpen;
             state.consecutive_successes = 0;
+            state.in_flight_probes = 0;
         }
     }
 }
@@ -183,6 +203,26 @@ mod tests {
             recovery_timeout: Duration::from_millis(100),
             success_threshold: 2,
         }
+    }
+
+    #[test]
+    fn half_open_caps_concurrent_probes() {
+        let cb = CircuitBreaker::new("test", test_config());
+        for _ in 0..5 {
+            cb.record_failure();
+        }
+        assert_eq!(cb.state(), CircuitState::Open);
+        thread::sleep(Duration::from_millis(120));
+
+        // success_threshold = 2 → exactly two probes admitted, the burst
+        // beyond that is rejected until a probe resolves.
+        assert!(cb.allow_call());
+        assert!(cb.allow_call());
+        assert!(!cb.allow_call(), "third concurrent probe must be rejected");
+
+        // A resolved probe frees its slot.
+        cb.record_success();
+        assert!(cb.allow_call());
     }
 
     #[test]

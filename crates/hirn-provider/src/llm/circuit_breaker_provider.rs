@@ -1,9 +1,14 @@
 //! Circuit-breaker wrapper for LLM providers.
 
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+
 use async_trait::async_trait;
+use futures::Stream;
 use hirn_core::HirnResult;
 use hirn_core::circuit_breaker::CircuitBreaker;
-use hirn_core::embed::{ChatMessage, LlmOptions, LlmProvider, LlmResponse, LlmStream};
+use hirn_core::embed::{ChatMessage, LlmChunk, LlmOptions, LlmProvider, LlmResponse, LlmStream};
 
 use super::error::LlmError;
 
@@ -15,17 +20,54 @@ use super::error::LlmError;
 #[derive(Debug)]
 pub struct CircuitBreakerLlmProvider<P> {
     inner: P,
-    breaker: CircuitBreaker,
+    // Shared so the returned stream wrapper can record its outcome after the
+    // provider call itself has returned.
+    breaker: Arc<CircuitBreaker>,
+}
+
+/// Stream adapter that reports the streaming outcome to the breaker: the
+/// first `Err` item records a failure; dropping the stream without having
+/// seen an error records a success (clean end-of-stream or consumer done).
+struct BreakerObservedStream {
+    inner: LlmStream,
+    breaker: Arc<CircuitBreaker>,
+    errored: bool,
+}
+
+impl Stream for BreakerObservedStream {
+    type Item = HirnResult<LlmChunk>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let item = std::task::ready!(self.inner.as_mut().poll_next(cx));
+        if let Some(Err(_)) = &item
+            && !self.errored
+        {
+            self.errored = true;
+            self.breaker.record_failure();
+        }
+        Poll::Ready(item)
+    }
+}
+
+impl Drop for BreakerObservedStream {
+    fn drop(&mut self) {
+        if !self.errored {
+            self.breaker.record_success();
+        }
+    }
 }
 
 impl<P: LlmProvider> CircuitBreakerLlmProvider<P> {
     /// Wrap `inner` with the given circuit breaker.
-    pub const fn new(inner: P, breaker: CircuitBreaker) -> Self {
-        Self { inner, breaker }
+    pub fn new(inner: P, breaker: CircuitBreaker) -> Self {
+        Self {
+            inner,
+            breaker: Arc::new(breaker),
+        }
     }
 
     /// Returns a reference to the underlying circuit breaker.
-    pub const fn circuit_breaker(&self) -> &CircuitBreaker {
+    pub fn circuit_breaker(&self) -> &CircuitBreaker {
         &self.breaker
     }
 
@@ -81,12 +123,23 @@ impl<P: LlmProvider> LlmProvider for CircuitBreakerLlmProvider<P> {
         options: &LlmOptions,
     ) -> HirnResult<LlmStream> {
         self.check_breaker()?;
-        let result = self.inner.generate_stream(messages, options).await;
-        match &result {
-            Ok(_) => self.breaker.record_success(),
-            Err(_) => self.breaker.record_failure(),
+        match self.inner.generate_stream(messages, options).await {
+            Ok(stream) => {
+                // Record the outcome at stream COMPLETION, not at the HTTP
+                // handshake: a connection that establishes and then fails
+                // mid-body (or emits a provider error event) is a failure —
+                // otherwise the breaker never opens on streaming outages.
+                Ok(Box::pin(BreakerObservedStream {
+                    inner: stream,
+                    breaker: Arc::clone(&self.breaker),
+                    errored: false,
+                }))
+            }
+            Err(error) => {
+                self.breaker.record_failure();
+                Err(error)
+            }
         }
-        result
     }
 
     fn model_id(&self) -> &str {

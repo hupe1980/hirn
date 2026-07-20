@@ -327,7 +327,7 @@ impl MultiModalEmbedder {
             .enumerate()
             .map(|(idx, embedding)| {
                 embedding.ok_or_else(|| {
-                    HirnError::ProviderError(format!(
+                    HirnError::provider_permanent(format!(
                         "multimodal embedding missing result for content index {idx}"
                     ))
                 })
@@ -467,7 +467,7 @@ async fn embed_one(embedder: &dyn Embedder, text: &str) -> HirnResult<Embedding>
     let results = embedder.embed(&[text]).await?;
     let count = results.len();
     if count != 1 {
-        return Err(HirnError::ProviderError(format!(
+        return Err(HirnError::provider_permanent(format!(
             "embedder `{}` returned {count} embeddings for one input",
             embedder.model_id()
         )));
@@ -483,7 +483,7 @@ fn assign_batch_embeddings(
     model_id: &str,
 ) -> HirnResult<()> {
     if embeddings.len() != batch.len() {
-        return Err(HirnError::ProviderError(format!(
+        return Err(HirnError::provider_permanent(format!(
             "embedder `{model_id}` returned {} embeddings for {} inputs",
             embeddings.len(),
             batch.len()
@@ -508,6 +508,10 @@ impl Embedder for MultiModalEmbedder {
 
     fn model_id(&self) -> &str {
         self.text_embedder.model_id()
+    }
+
+    fn embedding_space_id(&self) -> String {
+        self.text_embedder.embedding_space_id()
     }
 
     fn max_input_tokens(&self) -> usize {

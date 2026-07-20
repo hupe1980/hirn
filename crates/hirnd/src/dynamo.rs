@@ -222,37 +222,59 @@ pub mod store {
         }
 
         /// Acquire a compaction lease for a realm using conditional writes.
-        /// Returns `Ok(true)` if acquired, `Ok(false)` if already held.
+        ///
+        /// Returns `Ok(Some(fence))` when acquired, `Ok(None)` when the lease
+        /// is held by another live holder. The fence is a server-side
+        /// monotonically increasing counter (`ADD fence :one`): every
+        /// acquisition — including re-acquisition after an expiry decided by a
+        /// *different* node's clock — observes a strictly greater value.
+        /// Holders must attach the fence to downstream storage mutations so a
+        /// stalled ex-holder (GC/VM pause) resuming with a stale fence can be
+        /// rejected; expiry alone cannot provide that guarantee because
+        /// `expires_at < :now` is evaluated against the acquirer's clock.
         pub async fn acquire_lease(
             &self,
             realm: &str,
             holder: &str,
             duration_secs: u64,
-        ) -> Result<bool, String> {
+        ) -> Result<Option<u64>, String> {
             let now = now_epoch_secs();
             let expires = now + duration_secs;
 
             let result = self
                 .client
-                .put_item()
+                .update_item()
                 .table_name(&self.locks_table)
-                .item("pk", AttributeValue::S(format!("lease#{realm}")))
-                .item("holder", AttributeValue::S(holder.to_string()))
-                .item("acquired_at", AttributeValue::N(now.to_string()))
-                .item("expires_at", AttributeValue::N(expires.to_string()))
-                .item("ttl", AttributeValue::N((expires + 60).to_string()))
+                .key("pk", AttributeValue::S(format!("lease#{realm}")))
+                .update_expression(
+                    "SET holder = :holder, acquired_at = :now, expires_at = :expires, \
+                     #ttl = :ttl ADD fence :one",
+                )
                 .condition_expression(
                     "attribute_not_exists(pk) OR expires_at < :now OR holder = :holder",
                 )
+                .expression_attribute_names("#ttl", "ttl")
                 .expression_attribute_values(":now", AttributeValue::N(now.to_string()))
+                .expression_attribute_values(":expires", AttributeValue::N(expires.to_string()))
+                .expression_attribute_values(":ttl", AttributeValue::N((expires + 60).to_string()))
                 .expression_attribute_values(":holder", AttributeValue::S(holder.to_string()))
+                .expression_attribute_values(":one", AttributeValue::N("1".to_string()))
+                .return_values(aws_sdk_dynamodb::types::ReturnValue::AllNew)
                 .send()
                 .await;
 
             match result {
-                Ok(_) => {
-                    info!(realm, holder, expires, "DynamoDB lease acquired");
-                    Ok(true)
+                Ok(output) => {
+                    let fence = output
+                        .attributes()
+                        .and_then(|attrs| attrs.get("fence"))
+                        .and_then(|v| v.as_n().ok())
+                        .and_then(|n| n.parse::<u64>().ok())
+                        .ok_or_else(|| {
+                            "DynamoDB lease acquired but fence attribute missing".to_string()
+                        })?;
+                    info!(realm, holder, expires, fence, "DynamoDB lease acquired");
+                    Ok(Some(fence))
                 }
                 Err(sdk_err) => {
                     if sdk_err
@@ -260,7 +282,7 @@ pub mod store {
                         .is_some_and(|e| e.is_conditional_check_failed_exception())
                     {
                         debug!(realm, holder, "DynamoDB lease conflict");
-                        Ok(false)
+                        Ok(None)
                     } else {
                         Err(format!("DynamoDB lease acquire error: {sdk_err}"))
                     }
@@ -356,7 +378,7 @@ pub mod store {
         /// Get all registered nodes (paginated — handles >1MB of results).
         pub async fn list_nodes(&self) -> Result<HashMap<String, String>, String> {
             let mut nodes = HashMap::new();
-            let mut exclusive_start_key = None;
+            let mut exclusive_start_key: Option<HashMap<String, AttributeValue>> = None;
 
             loop {
                 let mut query = self

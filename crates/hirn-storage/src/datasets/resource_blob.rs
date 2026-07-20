@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{BinaryArray, RecordBatch, StringArray, UInt32Array};
+use arrow_array::{LargeBinaryArray, RecordBatch, StringArray, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
 use hirn_core::resource::ResourceId;
@@ -21,11 +21,15 @@ pub struct ResourceBlobRow {
 }
 
 /// Build the canonical Arrow schema for the resource blob dataset.
+///
+/// `data` uses `LargeBinary` (i64 offsets): with i32-offset `Binary` a single
+/// batch of payloads is capped at 2 GiB total, which large media blobs can
+/// exceed.
 pub fn schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("resource_id", DataType::Utf8, false),
         Field::new("blob_index", DataType::UInt32, false),
-        Field::new("data", DataType::Binary, false),
+        Field::new("data", DataType::LargeBinary, false),
     ]))
 }
 
@@ -49,7 +53,7 @@ pub fn to_batch(rows: &[ResourceBlobRow]) -> Result<RecordBatch, HirnDbError> {
         vec![
             Arc::new(StringArray::from(id_refs)),
             Arc::new(UInt32Array::from(blob_indices)),
-            Arc::new(BinaryArray::from(data_refs)),
+            Arc::new(LargeBinaryArray::from(data_refs)),
         ],
     )
     .map_err(|e| HirnDbError::InvalidArgument(e.to_string()))
@@ -68,7 +72,7 @@ pub fn from_batch(batch: &RecordBatch) -> Result<Vec<ResourceBlobRow>, HirnDbErr
         .ok_or_else(|| HirnDbError::InvalidArgument("missing blob_index column".into()))?;
     let data_col = batch
         .column_by_name("data")
-        .and_then(|col| col.as_any().downcast_ref::<BinaryArray>())
+        .and_then(|col| col.as_any().downcast_ref::<LargeBinaryArray>())
         .ok_or_else(|| HirnDbError::InvalidArgument("missing data column".into()))?;
 
     let mut decoded = Vec::with_capacity(rows);
@@ -98,5 +102,23 @@ mod tests {
         let batch = to_batch(std::slice::from_ref(&row)).unwrap();
         let decoded = from_batch(&batch).unwrap();
         assert_eq!(decoded, vec![row]);
+    }
+
+    #[test]
+    fn data_column_uses_large_binary() {
+        let schema = schema();
+        let field = schema.field_with_name("data").unwrap();
+        assert_eq!(field.data_type(), &DataType::LargeBinary);
+
+        let row = ResourceBlobRow {
+            resource_id: ResourceId::new(),
+            blob_index: 0,
+            data: vec![9; 16],
+        };
+        let batch = to_batch(std::slice::from_ref(&row)).unwrap();
+        assert_eq!(
+            batch.schema().field_with_name("data").unwrap().data_type(),
+            &DataType::LargeBinary
+        );
     }
 }

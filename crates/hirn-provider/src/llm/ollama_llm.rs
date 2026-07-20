@@ -8,7 +8,7 @@ use std::time::Duration;
 use super::error::LlmError;
 
 /// Default request timeout for HTTP calls.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+const REQUEST_TIMEOUT: Duration = Duration::from_mins(5);
 /// Default connection timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -254,8 +254,7 @@ mod tests {
         let err = OllamaLlmProvider::new("llama3.1")
             .expect("ollama client should initialize")
             .with_host("http://192.168.1.100:11434")
-            .err()
-            .expect("remote plaintext host must be rejected");
+            .expect_err("remote plaintext host must be rejected");
         assert!(
             err.to_string()
                 .contains("privacy-bearing provider traffic requires HTTPS")

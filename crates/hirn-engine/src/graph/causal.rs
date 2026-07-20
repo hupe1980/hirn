@@ -90,7 +90,18 @@ pub struct CausalChainResult {
     pub chains: Vec<CausalChain>,
     /// Whether any cycles were detected (and broken).
     pub cycles_detected: bool,
+    /// Whether enumeration stopped at [`MAX_CAUSAL_CHAINS`]. The number of
+    /// distinct paths in a DAG is exponential in depth; without a cap a
+    /// single deep, high-fan-out query could allocate unbounded memory.
+    pub truncated: bool,
 }
+
+/// Hard ceiling on the number of chains a single enumeration may emit.
+///
+/// Bounds total work as well: each loop iteration either records a chain
+/// (bounded by this cap) or extends a path prefix of one of those chains, so
+/// the explored state is at most `MAX_CAUSAL_CHAINS × max_depth × fan-out`.
+pub const MAX_CAUSAL_CHAINS: usize = 4096;
 
 // ── Causal Relevance Scoring ────────────────────────────────────────────
 
@@ -189,6 +200,7 @@ async fn extract_causal_chains(
         return Ok(CausalChainResult {
             chains: vec![],
             cycles_detected: false,
+            truncated: false,
         });
     }
 
@@ -197,18 +209,21 @@ async fn extract_causal_chains(
             return Ok(CausalChainResult {
                 chains: vec![],
                 cycles_detected: false,
+                truncated: false,
             });
         };
         if !allowed.contains(&namespace) {
             return Ok(CausalChainResult {
                 chains: vec![],
                 cycles_detected: false,
+                truncated: false,
             });
         }
     }
 
     let mut chains = Vec::new();
     let mut cycles_detected = false;
+    let mut truncated = false;
 
     let mut stack: Vec<(MemoryId, Vec<CausalLink>, HashSet<MemoryId>)> = Vec::new();
     let mut initial_visited = HashSet::new();
@@ -216,6 +231,10 @@ async fn extract_causal_chains(
     stack.push((start, Vec::new(), initial_visited));
 
     while let Some((current, path, visited)) = stack.pop() {
+        if chains.len() >= MAX_CAUSAL_CHAINS {
+            truncated = true;
+            break;
+        }
         if path.len() >= max_depth {
             if !path.is_empty() {
                 chains.push(CausalChain { links: path });
@@ -297,6 +316,7 @@ async fn extract_causal_chains(
     Ok(CausalChainResult {
         chains,
         cycles_detected,
+        truncated,
     })
 }
 
@@ -847,6 +867,7 @@ mod tests {
         let result = CausalChainResult {
             chains: vec![],
             cycles_detected: false,
+            truncated: false,
         };
         assert!((causal_relevance(&result)).abs() < f32::EPSILON);
     }
@@ -857,6 +878,7 @@ mod tests {
         let result = CausalChainResult {
             chains: vec![CausalChain { links: vec![link] }],
             cycles_detected: false,
+            truncated: false,
         };
         let score = causal_relevance(&result);
         // 0.9 * 0.8 * ln(2) ≈ 0.72 * 0.693 ≈ 0.499
@@ -873,6 +895,7 @@ mod tests {
         let result = CausalChainResult {
             chains: vec![CausalChain { links: vec![link] }],
             cycles_detected: false,
+            truncated: false,
         };
         let score = causal_relevance(&result);
         assert!((score - 0.6).abs() < 0.01, "score={score}");
@@ -890,6 +913,7 @@ mod tests {
                 },
             ],
             cycles_detected: false,
+            truncated: false,
         };
         let score = causal_relevance(&result);
         // max(0.2, 0.95*0.95*ln(2)) = max(0.2, 0.625) = 0.625
@@ -905,6 +929,7 @@ mod tests {
                 links: vec![l1, l2],
             }],
             cycles_detected: false,
+            truncated: false,
         };
         let score = causal_relevance(&result);
         // avg(0.693, 0.173) ≈ 0.433

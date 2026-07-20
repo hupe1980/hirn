@@ -712,7 +712,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         watch_tx.clone(),
         Arc::clone(&shared_rate_limiter),
     );
-    let grpc_interceptor = hirnd::grpc::grpc_auth_interceptor(auth_state);
+    let grpc_interceptor = hirnd::grpc::grpc_auth_interceptor(Arc::clone(&auth_state));
+
+    // One shutdown broadcast for every listener: SIGTERM/ctrl-c flips the
+    // watch channel, and the TLS accept loop, tonic, axum, and MCP all drain
+    // on it. Previously only the non-TLS axum branch observed the signal, so
+    // production (TLS) deployments were killed without connection draining.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = shutdown_tx.send(());
+    });
 
     let grpc_timeout = Duration::from_secs(config.grpc.timeout_secs);
     let grpc_server = if let Some(ref tls_config) = config.tls {
@@ -728,7 +738,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 grpc_service,
                 grpc_interceptor,
             ))
-            .serve(grpc_addr)
+            .serve_with_shutdown(grpc_addr, wait_for_shutdown(shutdown_rx.clone()))
     } else {
         tonic::transport::Server::builder()
             .timeout(grpc_timeout)
@@ -736,7 +746,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 grpc_service,
                 grpc_interceptor,
             ))
-            .serve(grpc_addr)
+            .serve_with_shutdown(grpc_addr, wait_for_shutdown(shutdown_rx.clone()))
     };
 
     info!(bind = %grpc_addr, "gRPC server listening");
@@ -761,16 +771,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .get("default")
             .await
             .map_err(|e| format!("default realm must be open for MCP server: {e}"))?;
+        // Resolve the configured MCP credential through the same machinery as
+        // the HTTP API. The SSE transport cannot carry per-request headers to
+        // tool handlers, so every tool call runs as this validated identity —
+        // never as a caller-asserted one. Config validation already requires
+        // `mcp.auth_token` outside insecure_dev_mode.
+        let mcp_identity = match config.mcp.auth_token.as_ref() {
+            Some(token) => auth_state
+                .resolve_bearer(token.as_str())
+                .map_err(|e| format!("mcp.auth_token does not resolve to an identity: {e}"))?,
+            None => {
+                // insecure_dev_mode only (config validation enforces this):
+                // fall back to the system agent in the default realm.
+                hirnd::auth::BearerIdentity {
+                    realm: "default".to_string(),
+                    agent_id: "system".to_string(),
+                    namespaces: None,
+                    operations: Vec::new(),
+                }
+            }
+        };
         let mcp_watch_tx = watch_tx.clone();
+        let mcp_rate_limiter = Arc::clone(&shared_rate_limiter);
         let mcp_server = SseServer::serve(mcp_addr).await?;
-        let ct = mcp_server.with_service(move || {
-            HirnMcpService::new(
-                Arc::clone(&mcp_db),
-                mcp_watch_tx.clone(),
-                "default".to_string(),
-            )
-        });
-        // F-12 FIX: Warn about plaintext SSE transport and missing auth.
+        let service_template = HirnMcpService::new(
+            Arc::clone(&mcp_db),
+            mcp_watch_tx,
+            mcp_rate_limiter,
+            mcp_identity,
+        )?;
+        let ct = mcp_server.with_service(move || service_template.clone());
+        // Warn about plaintext SSE transport.
         tracing::warn!(
             bind = %mcp_addr,
             "MCP SSE transport is plaintext (no TLS); place behind a TLS-terminating \
@@ -779,8 +810,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !mcp_ip.is_loopback() {
             tracing::warn!(
                 bind = %mcp_addr,
-                "MCP SSE server is exposed on a non-loopback interface without built-in auth; \
-                 use a reverse proxy with authentication in production"
+                "MCP SSE server is exposed on a non-loopback interface; its tools run as the \
+                 single identity resolved from mcp.auth_token"
             );
         }
         info!(bind = %mcp_addr, "MCP SSE server listening");
@@ -792,12 +823,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── HTTP server with optional TLS ──
     let http_tls = tls_acceptor.clone();
+    let http_shutdown_rx = shutdown_rx.clone();
     let http_future = async move {
         if let Some(acceptor) = http_tls {
-            hirnd::http::serve_http_tls(http_listener, http_router, acceptor).await
+            hirnd::http::serve_http_tls(http_listener, http_router, acceptor, http_shutdown_rx)
+                .await
         } else {
             axum::serve(http_listener, http_router)
-                .with_graceful_shutdown(shutdown_signal())
+                .with_graceful_shutdown(wait_for_shutdown(http_shutdown_rx))
                 .await
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
         }
@@ -903,6 +936,13 @@ fn init_otel_tracer() -> Result<
     opentelemetry::global::set_tracer_provider(provider);
 
     Ok(tracing_opentelemetry::layer().with_tracer(tracer))
+}
+
+/// Resolve when the shutdown watch channel fires (or its sender is dropped).
+/// Named so both if/else branches of a server construction share one future
+/// type when passed to `serve_with_shutdown`.
+async fn wait_for_shutdown(mut rx: tokio::sync::watch::Receiver<()>) {
+    let _ = rx.changed().await;
 }
 
 async fn shutdown_signal() {

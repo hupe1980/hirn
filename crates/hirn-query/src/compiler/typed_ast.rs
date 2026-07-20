@@ -1127,14 +1127,25 @@ mod tests {
     }
 
     #[test]
-    fn analyze_traverse_rejects_namespace_clause() {
+    fn analyze_traverse_supports_namespace_clause() {
         let id = MemoryId::new();
         let without_namespace = parse(&format!(r#"TRAVERSE FROM "{id}" DEPTH 2"#)).unwrap();
-        assert!(parse(&format!(r#"TRAVERSE FROM "{id}" DEPTH 2 NAMESPACE custom"#)).is_err());
-
         match analyze(&without_namespace, &ctx()).unwrap() {
             TypedStatement::Traverse(traverse) => {
                 assert_eq!(traverse.requested_namespace, None);
+            }
+            _ => panic!("expected Traverse"),
+        }
+
+        // TRAVERSE now accepts a NAMESPACE clause and resolves it (it round-trips
+        // through Display, unlike the previous grammar which had no slot).
+        let with_namespace = parse(&format!(
+            r#"TRAVERSE FROM "{id}" DEPTH 2 NAMESPACE "custom""#
+        ))
+        .unwrap();
+        match analyze(&with_namespace, &ctx()).unwrap() {
+            TypedStatement::Traverse(traverse) => {
+                assert!(traverse.requested_namespace.is_some());
             }
             _ => panic!("expected Traverse"),
         }

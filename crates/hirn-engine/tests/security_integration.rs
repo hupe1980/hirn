@@ -654,6 +654,64 @@ permit(
         );
     }
 
+    // ── Test 4b: Audit trail hash chain ─────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn audit_trail_chain_verifies_with_configured_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = HirnConfig::builder()
+            .db_path(dir.path().join("audit_chain"))
+            .embedding_dimensions(DIM as u32)
+            .event_hmac_secret("a-32-byte-secret-key-for-testing")
+            .build()
+            .unwrap();
+        let storage: Arc<dyn PhysicalStore> =
+            Arc::new(hirn_storage::memory_store::MemoryStore::new());
+        let db = HirnDB::open_with_config(config, storage).await.unwrap();
+
+        // Agent registration writes signed entries into the `_audit` trail.
+        let agent = AgentId::new("audited_agent").unwrap();
+        db.register_agent(&agent, "Audited").await.unwrap();
+
+        let audit = db.admin().audit_log(None, None).await.unwrap();
+        assert!(!audit.is_empty(), "registration should be audited");
+        assert!(
+            audit.iter().all(|entry| entry.hmac.is_some()),
+            "every audit entry must be signed when a secret is configured"
+        );
+
+        match db.admin().verify_audit_chain().await.unwrap() {
+            hirn_engine::AuditChainVerification::Verified { entries } => {
+                assert_eq!(entries, audit.len());
+            }
+            other => panic!("expected a verified chain, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn audit_trail_unsigned_without_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = HirnConfig::builder()
+            .db_path(dir.path().join("audit_unsigned"))
+            .embedding_dimensions(DIM as u32)
+            .build()
+            .unwrap();
+        let storage: Arc<dyn PhysicalStore> =
+            Arc::new(hirn_storage::memory_store::MemoryStore::new());
+        let db = HirnDB::open_with_config(config, storage).await.unwrap();
+
+        let agent = AgentId::new("plain_agent").unwrap();
+        db.register_agent(&agent, "Plain").await.unwrap();
+
+        let audit = db.admin().audit_log(None, None).await.unwrap();
+        assert!(!audit.is_empty());
+        assert!(audit.iter().all(|entry| entry.hmac.is_none()));
+        assert_eq!(
+            db.admin().verify_audit_chain().await.unwrap(),
+            hirn_engine::AuditChainVerification::Unsigned
+        );
+    }
+
     // ── Test 5: ABAC — reputation change affects authorization ──────────
 
     #[tokio::test(flavor = "multi_thread")]

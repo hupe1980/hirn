@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::io::Cursor;
 
-use arrow_array::{Array, BinaryArray};
+use arrow_array::{Array, LargeBinaryArray};
 use image::ImageFormat;
 
 use hirn_core::metadata::Metadata;
@@ -22,12 +22,21 @@ use crate::mutation_envelope_ops::{
 use crate::store::{PhysicalStore, ScanOptions};
 
 pub const RESOURCE_HEAD_TRANSITION_KIND: &str = "resource_head_transition";
+pub const RESOURCE_PAYLOAD_PURGE_KIND: &str = "resource_payload_purge";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct ResourceHeadTransitionEnvelope {
     current_id: ResourceId,
     successor_id: ResourceId,
     successor_created_at_ms: i64,
+}
+
+/// Durable intent to physically delete every payload blob and derived artifact
+/// in a lineage once its governance placeholder head has committed.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ResourcePayloadPurgeEnvelope {
+    logical_resource_id: LogicalResourceId,
+    governed_head_id: ResourceId,
 }
 
 /// Patch-style update describing a superseding resource revision.
@@ -272,6 +281,8 @@ async fn supersede_resource_inner(
     Ok(successor)
 }
 
+/// Reconcile pending resource mutation envelopes left by a crash: interrupted
+/// head transitions and interrupted payload purges.
 pub async fn reconcile_resource_head_mutations(
     store: &dyn PhysicalStore,
 ) -> Result<usize, HirnDbError> {
@@ -288,6 +299,10 @@ pub async fn reconcile_resource_head_mutations(
             }
         }
     }
+
+    // Payload purges share this startup entry point: an interrupted redact or
+    // purge must finish deleting payload bytes before the store reports clean.
+    reconciled += reconcile_resource_payload_purges(store).await?;
 
     Ok(reconciled)
 }
@@ -1096,7 +1111,7 @@ async fn load_resource_blob_unchecked(
         .column_by_name("data")
         .ok_or_else(|| HirnDbError::InvalidArgument("missing data column".into()))?
         .as_any()
-        .downcast_ref::<BinaryArray>()
+        .downcast_ref::<LargeBinaryArray>()
         .ok_or_else(|| {
             HirnDbError::InvalidArgument("resource blob data column wrong type".into())
         })?;
@@ -1370,19 +1385,176 @@ async fn govern_resource(
     successor.size_bytes = 0;
     successor.location = ResourceLocation::Inline;
 
-    append_resource_revision(store, &successor, None).await?;
+    // Record the payload-deletion intent durably BEFORE any side effect, so a
+    // crash or a failed delete can never leave payload bytes behind without a
+    // pending envelope that startup reconciliation will retry.
+    let envelope = build_resource_payload_purge_envelope(&current, &successor)?;
+    crate::mutation_envelope_ops::append_mutation_envelope(store, &envelope).await?;
+
+    if let Err(error) = append_resource_revision(store, &successor, None).await {
+        // The governance head never committed; the lineage stays active and
+        // its payload must not be deleted on a later reconciliation pass.
+        let _ = update_mutation_envelope_state(
+            store,
+            &envelope.id,
+            MutationEnvelopeState::Failed,
+            Some(error.to_string()),
+        )
+        .await;
+        return Err(error);
+    }
 
     let mut updated_current = current.clone();
     updated_current.superseded_by = Some(successor.id);
     updated_current.updated_at = now;
     if let Err(error) = upsert_resource_revision(store, &updated_current).await {
         rollback_resource_revision(store, &successor).await;
+        let _ = update_mutation_envelope_state(
+            store,
+            &envelope.id,
+            MutationEnvelopeState::Failed,
+            Some(error.to_string()),
+        )
+        .await;
         return Err(error);
     }
 
-    let _ = delete_lineage_payloads_and_artifacts(store, current.logical_resource_id).await;
+    if let Err(error) =
+        delete_lineage_payloads_and_artifacts(store, current.logical_resource_id).await
+    {
+        // Keep the envelope pending so startup reconciliation re-attempts the
+        // deletion; the caller must not observe a successful purge while
+        // payload bytes may still exist.
+        let _ = update_mutation_envelope_state(
+            store,
+            &envelope.id,
+            MutationEnvelopeState::Pending,
+            Some(error.to_string()),
+        )
+        .await;
+        return Err(error);
+    }
+
+    update_mutation_envelope_state(store, &envelope.id, MutationEnvelopeState::Applied, None)
+        .await?;
 
     Ok(successor)
+}
+
+fn build_resource_payload_purge_envelope(
+    current: &ResourceObject,
+    successor: &ResourceObject,
+) -> Result<MutationEnvelopeRecord, HirnDbError> {
+    let payload = ResourcePayloadPurgeEnvelope {
+        logical_resource_id: current.logical_resource_id,
+        governed_head_id: successor.id,
+    };
+    let payload = serde_json::to_vec(&payload).map_err(|error| {
+        HirnDbError::InvalidArgument(format!("resource purge envelope serialize: {error}"))
+    })?;
+
+    Ok(MutationEnvelopeRecord::pending(
+        format!("resource-purge:{}", successor.id),
+        RESOURCE_PAYLOAD_PURGE_KIND,
+        payload,
+    ))
+}
+
+/// Re-attempt payload deletions whose `resource_payload_purge` envelope is
+/// still pending (crash mid-purge, or a physical delete that failed).
+///
+/// Deletion only proceeds when the lineage's effective head actually hides the
+/// payload — an envelope whose governance transition never committed is marked
+/// failed instead of deleting live payload bytes.
+pub async fn reconcile_resource_payload_purges(
+    store: &dyn PhysicalStore,
+) -> Result<usize, HirnDbError> {
+    let envelopes =
+        list_pending_mutation_envelopes(store, Some(RESOURCE_PAYLOAD_PURGE_KIND)).await?;
+    let mut reconciled = 0usize;
+
+    for envelope in envelopes {
+        match reconcile_single_resource_payload_purge(store, &envelope).await {
+            Ok(true) => reconciled += 1,
+            Ok(false) => {}
+            Err(error) => {
+                // The deletion is still failing — keep the envelope pending so
+                // the next startup retries it, and record the latest error.
+                let _ = update_mutation_envelope_state(
+                    store,
+                    &envelope.id,
+                    MutationEnvelopeState::Pending,
+                    Some(error.to_string()),
+                )
+                .await;
+            }
+        }
+    }
+
+    Ok(reconciled)
+}
+
+async fn reconcile_single_resource_payload_purge(
+    store: &dyn PhysicalStore,
+    envelope: &MutationEnvelopeRecord,
+) -> Result<bool, HirnDbError> {
+    let payload: ResourcePayloadPurgeEnvelope = match serde_json::from_slice(&envelope.payload) {
+        Ok(payload) => payload,
+        Err(error) => {
+            update_mutation_envelope_state(
+                store,
+                &envelope.id,
+                MutationEnvelopeState::Failed,
+                Some(format!("resource purge envelope deserialize: {error}")),
+            )
+            .await?;
+            return Ok(false);
+        }
+    };
+
+    match effective_head_for_logical_id(store, payload.logical_resource_id).await? {
+        Some(head) if head.governance_state.hides_payload() => {
+            delete_lineage_payloads_and_artifacts(store, payload.logical_resource_id).await?;
+            update_mutation_envelope_state(
+                store,
+                &envelope.id,
+                MutationEnvelopeState::Applied,
+                None,
+            )
+            .await?;
+            Ok(true)
+        }
+        Some(_) => {
+            // The governance placeholder never became the effective head, so
+            // the payload is still live and must not be deleted.
+            update_mutation_envelope_state(
+                store,
+                &envelope.id,
+                MutationEnvelopeState::Failed,
+                Some(format!(
+                    "resource purge recovery: lineage {} head is not governed (expected {})",
+                    payload.logical_resource_id, payload.governed_head_id
+                )),
+            )
+            .await?;
+            Ok(true)
+        }
+        None => {
+            // No revisions remain, so there are no resource ids left to key a
+            // payload delete on — nothing this repair can still do.
+            update_mutation_envelope_state(
+                store,
+                &envelope.id,
+                MutationEnvelopeState::Failed,
+                Some(format!(
+                    "resource purge recovery: lineage {} has no remaining revisions",
+                    payload.logical_resource_id
+                )),
+            )
+            .await?;
+            Ok(false)
+        }
+    }
 }
 
 async fn list_active_resource_heads(
@@ -1720,6 +1892,20 @@ mod tests {
         inner: MemoryStore,
         fail_blob_append: bool,
         fail_resource_merge_insert: bool,
+        /// Runtime-switchable so a test can fail the physical purge first and
+        /// then let reconciliation succeed on the same store.
+        fail_blob_delete: std::sync::atomic::AtomicBool,
+    }
+
+    impl FaultInjectingStore {
+        fn healthy() -> Self {
+            Self {
+                inner: MemoryStore::new(),
+                fail_blob_append: false,
+                fail_resource_merge_insert: false,
+                fail_blob_delete: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
     }
 
     #[async_trait]
@@ -1761,6 +1947,15 @@ mod tests {
         }
 
         async fn delete(&self, dataset: &str, predicate: &str) -> Result<u64, HirnDbError> {
+            if dataset == blob_ds::DATASET_NAME
+                && self
+                    .fail_blob_delete
+                    .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Err(HirnDbError::Unsupported(
+                    "simulated blob delete failure".to_string(),
+                ));
+            }
             self.inner.delete(dataset, predicate).await
         }
 
@@ -1949,9 +2144,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn persist_resource_rolls_back_when_blob_append_fails() {
         let store = FaultInjectingStore {
-            inner: MemoryStore::new(),
             fail_blob_append: true,
-            fail_resource_merge_insert: false,
+            ..FaultInjectingStore::healthy()
         };
         let blob = vec![4_u8; 128];
         let resource = ResourceObject::builder()
@@ -1998,9 +2192,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn persist_resource_rolls_back_when_visibility_finalize_fails() {
         let store = FaultInjectingStore {
-            inner: MemoryStore::new(),
-            fail_blob_append: false,
             fail_resource_merge_insert: true,
+            ..FaultInjectingStore::healthy()
         };
         let blob = vec![6_u8; 128];
         let resource = ResourceObject::builder()
@@ -2623,6 +2816,129 @@ mod tests {
         assert_eq!(revisions.len(), 2);
         assert_eq!(revisions[0].id, resource.id);
         assert_eq!(revisions[1].id, purged.id);
+
+        // A successful purge leaves no payload rows behind and completes its
+        // deletion envelope.
+        let remaining_blobs = store
+            .scan(blob_ds::DATASET_NAME, ScanOptions::default())
+            .await
+            .unwrap()
+            .iter()
+            .map(|batch| batch.num_rows())
+            .sum::<usize>();
+        assert_eq!(remaining_blobs, 0);
+
+        let envelope = get_mutation_envelope(&store, &format!("resource-purge:{}", purged.id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(envelope.state, MutationEnvelopeState::Applied);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn purge_resource_propagates_delete_failure_and_reconciles_on_restart() {
+        let store = FaultInjectingStore {
+            fail_blob_delete: std::sync::atomic::AtomicBool::new(true),
+            ..FaultInjectingStore::healthy()
+        };
+        let blob = vec![8_u8; 96];
+        let resource = ResourceObject::builder()
+            .modality(ModalityProfile::Document)
+            .display_name("dossier.pdf")
+            .location(ResourceLocation::Blob { blob_index: 0 })
+            .build()
+            .unwrap();
+        let resource = persist_resource(&store, resource, Some(blob))
+            .await
+            .unwrap();
+
+        // The physical delete fails: purge must report the failure instead of
+        // claiming success while payload bytes remain.
+        let error = purge_resource(&store, resource.id, ResourceGovernanceUpdate::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, HirnDbError::Unsupported(_)));
+
+        let remaining_blobs = store
+            .scan(blob_ds::DATASET_NAME, ScanOptions::default())
+            .await
+            .unwrap()
+            .iter()
+            .map(|batch| batch.num_rows())
+            .sum::<usize>();
+        assert!(remaining_blobs > 0, "payload bytes should still exist");
+
+        // The deletion intent survived as a pending envelope.
+        let pending = crate::mutation_envelope_ops::list_pending_mutation_envelopes(
+            &store,
+            Some(RESOURCE_PAYLOAD_PURGE_KIND),
+        )
+        .await
+        .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].last_error.is_some());
+
+        // The store recovers (as after a restart) and reconciliation completes
+        // the interrupted purge.
+        store
+            .fail_blob_delete
+            .store(false, std::sync::atomic::Ordering::Release);
+        let reconciled = reconcile_resource_head_mutations(&store).await.unwrap();
+        assert_eq!(reconciled, 1);
+
+        let remaining_blobs = store
+            .scan(blob_ds::DATASET_NAME, ScanOptions::default())
+            .await
+            .unwrap()
+            .iter()
+            .map(|batch| batch.num_rows())
+            .sum::<usize>();
+        assert_eq!(remaining_blobs, 0);
+
+        let envelope = get_mutation_envelope(&store, &pending[0].id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(envelope.state, MutationEnvelopeState::Applied);
+
+        let head = get_resource_head(&store, resource.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(head.governance_state, ResourceGovernanceState::Purged);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn purge_reconciliation_keeps_envelope_pending_while_delete_still_fails() {
+        let store = FaultInjectingStore {
+            fail_blob_delete: std::sync::atomic::AtomicBool::new(true),
+            ..FaultInjectingStore::healthy()
+        };
+        let resource = ResourceObject::builder()
+            .modality(ModalityProfile::Image)
+            .location(ResourceLocation::Blob { blob_index: 0 })
+            .build()
+            .unwrap();
+        let resource = persist_resource(&store, resource, Some(vec![1_u8; 32]))
+            .await
+            .unwrap();
+
+        purge_resource(&store, resource.id, ResourceGovernanceUpdate::default())
+            .await
+            .unwrap_err();
+
+        // Reconciliation with the fault still active must not mark the
+        // envelope applied or failed — it stays pending for the next attempt.
+        let reconciled = reconcile_resource_payload_purges(&store).await.unwrap();
+        assert_eq!(reconciled, 0);
+
+        let pending = crate::mutation_envelope_ops::list_pending_mutation_envelopes(
+            &store,
+            Some(RESOURCE_PAYLOAD_PURGE_KIND),
+        )
+        .await
+        .unwrap();
+        assert_eq!(pending.len(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -143,7 +143,24 @@ where
 
     // ── MCP server (in-memory duplex) ──
     let (mcp_watch_tx, _) = tokio::sync::broadcast::channel::<WatchEvent>(128);
-    let mcp_service = HirnMcpService::new(Arc::clone(&db), mcp_watch_tx, "default".to_string());
+    let mcp_rate_limiter = std::sync::Arc::new(hirnd::throttle::RateLimiter::from_config(
+        &hirnd::config::ThrottleConfig::default(),
+    ));
+    // MCP tools run as one authenticated identity resolved at startup; tests
+    // act as an unrestricted system credential in the default realm.
+    let mcp_identity = hirnd::auth::BearerIdentity {
+        realm: "default".to_string(),
+        agent_id: "system".to_string(),
+        namespaces: None,
+        operations: Vec::new(),
+    };
+    let mcp_service = HirnMcpService::new(
+        Arc::clone(&db),
+        mcp_watch_tx,
+        mcp_rate_limiter,
+        mcp_identity,
+    )
+    .expect("valid MCP identity");
     let (server_transport, client_transport) = tokio::io::duplex(65536);
 
     let mcp_server_handle = tokio::spawn(async move {

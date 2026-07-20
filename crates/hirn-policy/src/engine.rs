@@ -523,9 +523,21 @@ impl PolicyEngine {
         }
         #[cfg(not(feature = "cedar"))]
         {
+            // The engine is marked enabled (a real enforcing engine built via
+            // `PolicyEngine::new`/`load_from_brain`) but was compiled without the
+            // `cedar` feature, so it physically cannot evaluate any policy. Fail
+            // CLOSED rather than silently permitting every request — a downstream
+            // binary that trims default features must not end up with
+            // `is_enabled() == true` while all authorization is granted.
+            // `open_mode()` sets `enabled = false` and is handled above, so the
+            // explicit permit-all posture is unaffected.
             let _ = &guard;
             let _ = request;
-            AuthzDecision::allow()
+            AuthzDecision::deny(
+                "policy engine built without the `cedar` feature cannot evaluate policies; \
+                 denying (fail-closed). Enable the `cedar` feature or use PolicyEngine::open_mode() \
+                 for an explicit unauthenticated posture.",
+            )
         }
     }
 
@@ -564,7 +576,7 @@ impl PolicyEngine {
         created_at: &str,
         teams: &[&str],
     ) -> Result<(), PolicyError> {
-        let key = format!("Hirn::Agent::\"{}\"", agent_id);
+        let key = Self::make_entity_key("Hirn::Agent", agent_id)?;
         let entity = EntityKind::Agent {
             reputation,
             created_at: created_at.to_string(),
@@ -582,7 +594,7 @@ impl PolicyEngine {
         description: &str,
         organization: Option<&str>,
     ) -> Result<(), PolicyError> {
-        let key = format!("Hirn::Team::\"{}\"", team_id);
+        let key = Self::make_entity_key("Hirn::Team", team_id)?;
         let entity = EntityKind::Team {
             description: description.to_string(),
             organization: organization.map(String::from),
@@ -598,7 +610,7 @@ impl PolicyEngine {
         org_id: &str,
         description: &str,
     ) -> Result<(), PolicyError> {
-        let key = format!("Hirn::Organization::\"{}\"", org_id);
+        let key = Self::make_entity_key("Hirn::Organization", org_id)?;
         let entity = EntityKind::Organization {
             description: description.to_string(),
         };
@@ -609,7 +621,7 @@ impl PolicyEngine {
 
     /// Register a realm entity.
     pub fn register_realm(&self, realm_id: &str, description: &str) -> Result<(), PolicyError> {
-        let key = format!("Hirn::Realm::\"{}\"", realm_id);
+        let key = Self::make_entity_key("Hirn::Realm", realm_id)?;
         let entity = EntityKind::Realm {
             description: description.to_string(),
         };
@@ -625,7 +637,7 @@ impl PolicyEngine {
         classification: &str,
         realm: &str,
     ) -> Result<(), PolicyError> {
-        let key = format!("Hirn::Namespace::\"{}\"", namespace_id);
+        let key = Self::make_entity_key("Hirn::Namespace", namespace_id)?;
         let entity = EntityKind::Namespace {
             classification: classification.to_string(),
             realm: realm.to_string(),
@@ -641,7 +653,7 @@ impl PolicyEngine {
         layer_id: &str,
         description: &str,
     ) -> Result<(), PolicyError> {
-        let key = format!("Hirn::MemoryLayer::\"{}\"", layer_id);
+        let key = Self::make_entity_key("Hirn::MemoryLayer", layer_id)?;
         let entity = EntityKind::MemoryLayer {
             description: description.to_string(),
         };
@@ -656,7 +668,7 @@ impl PolicyEngine {
         operation_id: &str,
         description: &str,
     ) -> Result<(), PolicyError> {
-        let key = format!("Hirn::Operation::\"{}\"", operation_id);
+        let key = Self::make_entity_key("Hirn::Operation", operation_id)?;
         let entity = EntityKind::Operation {
             description: description.to_string(),
         };
@@ -667,7 +679,7 @@ impl PolicyEngine {
 
     /// Register a tool entity for MCP tool-level access control.
     pub fn register_tool(&self, tool_id: &str, description: &str) -> Result<(), PolicyError> {
-        let key = format!("Hirn::Tool::\"{}\"", tool_id);
+        let key = Self::make_entity_key("Hirn::Tool", tool_id)?;
         let entity = EntityKind::Tool {
             description: description.to_string(),
         };
@@ -1011,6 +1023,19 @@ impl PolicyEngine {
         }
     }
 
+    /// Build a Cedar entity key `Type::"id"`, rejecting ids that would make the
+    /// key ambiguous or unparseable. Rejecting `"` and `::` here guarantees
+    /// `parse_entity_key` round-trips and `parse_type_name` never sees a
+    /// malformed type string that would panic its `.expect(...)`.
+    fn make_entity_key(type_name: &str, id: &str) -> Result<String, PolicyError> {
+        if id.is_empty() || id.contains('"') || id.contains("::") {
+            return Err(PolicyError::EntityInvalid(format!(
+                "invalid entity id {id:?}: must be non-empty and contain no '\"' or '::'"
+            )));
+        }
+        Ok(format!("{type_name}::\"{id}\""))
+    }
+
     /// Parse `Hirn::Agent::"agent-007"` → `("Hirn::Agent", "agent-007")`
     #[cfg(feature = "cedar")]
     fn parse_entity_key(key: &str) -> Result<(&str, &str), PolicyError> {
@@ -1056,6 +1081,35 @@ mod tests {
     fn valid_schema_parses() {
         let engine = PolicyEngine::new(DEFAULT_SCHEMA, &[("default.cedar", DEFAULT_OPEN_POLICY)]);
         assert!(engine.is_ok(), "default schema should parse: {engine:?}");
+    }
+
+    #[test]
+    fn register_agent_rejects_injection_ids() {
+        // Ids containing `"` or `::` used to build a malformed Cedar entity key
+        // that panicked `parse_type_name`. They must now be rejected.
+        let engine =
+            PolicyEngine::new(DEFAULT_SCHEMA, &[("default.cedar", DEFAULT_OPEN_POLICY)]).unwrap();
+        assert!(
+            engine
+                .register_agent("evil::\"admin", 100, "2025-01-01T00:00:00Z", &[])
+                .is_err()
+        );
+        assert!(
+            engine
+                .register_agent("has\"quote", 100, "2025-01-01T00:00:00Z", &[])
+                .is_err()
+        );
+        assert!(engine.register_realm("realm::x", "d").is_err());
+        assert!(
+            engine
+                .register_namespace("ns\"x", "public", "prod")
+                .is_err()
+        );
+        assert!(
+            engine
+                .register_agent("agent-007", 100, "2025-01-01T00:00:00Z", &[])
+                .is_ok()
+        );
     }
 
     #[test]

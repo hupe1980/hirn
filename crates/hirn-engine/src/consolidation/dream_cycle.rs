@@ -637,7 +637,7 @@ mod tests {
 
         assert_eq!(result.hypotheses_generated, 1);
         assert!(result.phase_results.len() >= 2); // DREAM + VALIDATE
-        assert!(result.hypotheses_promoted + result.hypotheses_discarded == 1);
+        assert_eq!(result.hypotheses_promoted + result.hypotheses_discarded, 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -853,7 +853,7 @@ mod tests {
             .expect("should have an inferred record");
 
         assert!(hypothesis.concept.starts_with("hypothesis:"));
-        assert!(*hypothesis.provenance.origin() == Origin::DreamReplay);
+        assert_eq!(*hypothesis.provenance.origin(), Origin::DreamReplay);
         // Source episodes should contain the two source memory IDs.
         assert_eq!(hypothesis.source_episodes.len(), 2);
     }

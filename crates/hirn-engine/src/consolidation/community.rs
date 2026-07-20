@@ -18,7 +18,7 @@ use hirn_core::error::HirnResult;
 use hirn_core::id::MemoryId;
 use hirn_core::metadata::Metadata;
 use hirn_core::semantic::SemanticRecord;
-use hirn_core::types::{AgentId, EdgeRelation, KnowledgeType, Layer, Origin};
+use hirn_core::types::{AgentId, EdgeRelation, KnowledgeType, Layer, Namespace, Origin};
 
 use crate::db::HirnDB;
 use crate::graph_store::GraphStore;
@@ -75,6 +75,26 @@ pub struct Community {
     pub parent: Option<usize>,
     /// Child community indices at the previous level.
     pub children: Vec<usize>,
+}
+
+/// Stable concept name for a community summary, derived from a hash of the
+/// sorted member-ID set.
+///
+/// Positional indices are re-assigned on every detection run, so keying
+/// summaries by index made index N refer to a different member set from one
+/// run to the next — existing summaries were never refreshed after a restart
+/// (the exists-check matched the wrong community) and incremental deletes
+/// targeted the wrong record. The member-set hash is invariant under
+/// reordering: same members → same name, changed members → new name.
+pub fn community_concept_name(community: &Community) -> String {
+    let mut ids = community.members.clone();
+    ids.sort();
+    let mut hasher = blake3::Hasher::new();
+    for id in &ids {
+        hasher.update(id.to_string().as_bytes());
+    }
+    let hex = hasher.finalize().to_hex();
+    format!("community-{}-{}", community.level, &hex[..16])
 }
 
 /// Result of running community detection.
@@ -655,6 +675,8 @@ pub struct CommunitySummaryResult {
     pub summaries_stored: usize,
     /// Number of provenance edges created.
     pub edges_created: usize,
+    /// Number of stale summaries purged (membership changed or dissolved).
+    pub summaries_removed: usize,
 }
 
 async fn community_edge_exists(
@@ -741,22 +763,90 @@ async fn repair_community_membership_edges(
     edges_created
 }
 
-/// Generate and store LLM summaries for each leaf community.
+/// Generate and store LLM summaries for each leaf community, scoped to a
+/// single namespace.
 ///
-/// For each community, fetches descriptions of member nodes (semantic or episodic),
-/// sends them to the LLM for summarization, then stores the result as a
-/// `SemanticRecord` with `KnowledgeType::Community`.
+/// Graph communities are detected on topology alone and may span namespaces,
+/// so each community's membership is first filtered to `namespace`: a summary
+/// must never blend records from different namespaces, and it is stored in
+/// the namespace its member records came from. For each scoped community,
+/// fetches descriptions of member nodes (semantic or episodic), sends them to
+/// the LLM for summarization, then stores the result as a `SemanticRecord`
+/// with `KnowledgeType::Community`.
 pub async fn generate_community_summaries(
     db: &HirnDB,
     llm: &Arc<dyn LlmProvider>,
     communities: &CommunityResult,
     max_members_per_prompt: usize,
     llm_timeout: std::time::Duration,
+    namespace: &Namespace,
+) -> HirnResult<CommunitySummaryResult> {
+    let mut result = generate_community_summaries_batch(
+        db,
+        llm,
+        communities,
+        max_members_per_prompt,
+        llm_timeout,
+        namespace,
+    )
+    .await?;
+    // This entry point receives the COMPLETE detection result, so any stored
+    // community summary in this namespace whose member-set name is no longer
+    // present is stale (its community dissolved or changed membership while
+    // the process was down — the in-memory prev-result cache does not survive
+    // restarts). Purge them so summaries always reflect current membership.
+    result.summaries_removed +=
+        purge_orphaned_community_summaries(db, communities, namespace).await?;
+    Ok(result)
+}
+
+/// Purge stored community summaries in `namespace` whose stable concept name
+/// does not correspond to any community in the current detection result.
+async fn purge_orphaned_community_summaries(
+    db: &HirnDB,
+    communities: &CommunityResult,
+    namespace: &Namespace,
+) -> HirnResult<usize> {
+    let expected: std::collections::HashSet<String> = communities
+        .levels
+        .first()
+        .map(|leaves| leaves.iter().map(community_concept_name).collect())
+        .unwrap_or_default();
+
+    let stored = db
+        .list_semantics(&crate::db::SemanticFilter {
+            knowledge_type: Some(KnowledgeType::Community),
+            min_confidence: None,
+            namespace: Some(namespace.clone()),
+            limit: None,
+        })
+        .await?;
+
+    let mut removed = 0;
+    for record in stored {
+        if record.concept.starts_with("community-") && !expected.contains(&record.concept) {
+            db.purge_semantic(record.id).await?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+/// Generate summaries for exactly the communities in `communities` (which may
+/// be a filtered subset on the incremental path — no orphan cleanup here).
+async fn generate_community_summaries_batch(
+    db: &HirnDB,
+    llm: &Arc<dyn LlmProvider>,
+    communities: &CommunityResult,
+    max_members_per_prompt: usize,
+    llm_timeout: std::time::Duration,
+    namespace: &Namespace,
 ) -> HirnResult<CommunitySummaryResult> {
     if communities.levels.is_empty() {
         return Ok(CommunitySummaryResult {
             summaries_stored: 0,
             edges_created: 0,
+            summaries_removed: 0,
         });
     }
 
@@ -766,23 +856,27 @@ pub async fn generate_community_summaries(
     let mut edges_created = 0;
 
     for community in leaf_communities {
-        if community.members.is_empty() {
+        let members = members_in_namespace(db, &community.members, namespace).await;
+        if members.is_empty() {
             continue;
         }
 
         // Gather descriptions for member nodes.
-        let descriptions =
-            collect_member_descriptions(db, &community.members, max_members_per_prompt).await;
+        let descriptions = collect_member_descriptions(db, &members, max_members_per_prompt).await;
         if descriptions.is_empty() {
             continue;
         }
 
-        let concept_name = format!("community-{}-{}", community.level, community.index);
+        let concept_name = community_concept_name(community);
 
         // Reruns should repair missing membership edges for existing summaries.
-        if let Ok(existing) = db.get_semantic_by_concept(&concept_name).await {
-            edges_created +=
-                repair_community_membership_edges(db, existing.id, &community.members).await;
+        // Lookup is namespace-scoped: the same community concept name may
+        // exist once per namespace.
+        if let Ok(existing) = db
+            .get_semantic_by_concept_ns(&concept_name, namespace)
+            .await
+        {
+            edges_created += repair_community_membership_edges(db, existing.id, &members).await;
             continue;
         }
 
@@ -827,22 +921,24 @@ pub async fn generate_community_summaries(
             super::generate_text_with_timeout(llm.as_ref(), &[system, user], &options, llm_timeout)
                 .await?;
 
-        // Store as SemanticRecord.
+        // Store as SemanticRecord in the members' namespace.
         let mut builder = SemanticRecord::builder()
             .concept(&concept_name)
             .knowledge_type(KnowledgeType::Community)
             .description(&summary)
             .confidence(0.7)
             .agent_id(agent.clone())
-            .origin(Origin::Consolidation);
+            .origin(Origin::Consolidation)
+            .namespace(namespace.clone());
 
         // Embed the summary text.
         if let Ok(emb) = db.embed_text(&summary).await {
             builder = builder.embedding(emb);
         }
 
-        // Link to source members.
-        for &member_id in &community.members {
+        // Link to source members (namespace-scoped, so provenance never
+        // crosses a namespace boundary).
+        for &member_id in &members {
             builder = builder.source_episode(member_id);
         }
 
@@ -850,13 +946,13 @@ pub async fn generate_community_summaries(
         let semantic_id = db.store_semantic(record).await?;
         summaries_stored += 1;
 
-        edges_created +=
-            repair_community_membership_edges(db, semantic_id, &community.members).await;
+        edges_created += repair_community_membership_edges(db, semantic_id, &members).await;
     }
 
     Ok(CommunitySummaryResult {
         summaries_stored,
         edges_created,
+        summaries_removed: 0,
     })
 }
 
@@ -873,22 +969,27 @@ pub async fn generate_community_summaries_incremental(
     new: &CommunityResult,
     max_members_per_prompt: usize,
     llm_timeout: std::time::Duration,
+    namespace: &Namespace,
 ) -> HirnResult<CommunitySummaryResult> {
     let delta = compute_community_delta(prev, new);
 
-    // Delete summaries for removed communities.
+    // Delete summaries whose member set no longer exists. `delta.removed`
+    // carries PREVIOUS-result indices, and the stable concept name is derived
+    // from the previous community's member set — so this also covers the old
+    // version of every "modified" community (its old member-key vanished).
+    let prev_leaves = prev.levels.first().map(|l| l.as_slice()).unwrap_or(&[]);
+    let mut summaries_removed = 0;
     for &removed_idx in &delta.removed {
-        let concept_name = format!("community-0-{removed_idx}");
-        if let Ok(record) = db.get_semantic_by_concept(&concept_name).await {
+        let Some(prev_community) = prev_leaves.iter().find(|c| c.index == removed_idx) else {
+            continue;
+        };
+        let concept_name = community_concept_name(prev_community);
+        if let Ok(record) = db
+            .get_semantic_by_concept_ns(&concept_name, namespace)
+            .await
+        {
             db.purge_semantic(record.id).await?;
-        }
-    }
-
-    // Delete stale summaries for modified communities so they are re-generated.
-    for &modified_idx in &delta.modified {
-        let concept_name = format!("community-0-{modified_idx}");
-        if let Ok(record) = db.get_semantic_by_concept(&concept_name).await {
-            db.purge_semantic(record.id).await?;
+            summaries_removed += 1;
         }
     }
 
@@ -926,6 +1027,7 @@ pub async fn generate_community_summaries_incremental(
         CommunitySummaryResult {
             summaries_stored: 0,
             edges_created: 0,
+            summaries_removed: 0,
         }
     } else {
         let filtered = CommunityResult {
@@ -934,19 +1036,83 @@ pub async fn generate_community_summaries_incremental(
             total_communities: needs_summary.len(),
         };
 
-        generate_community_summaries(db, llm, &filtered, max_members_per_prompt, llm_timeout)
-            .await?
+        generate_community_summaries_batch(
+            db,
+            llm,
+            &filtered,
+            max_members_per_prompt,
+            llm_timeout,
+            namespace,
+        )
+        .await?
     };
+    result.summaries_removed += summaries_removed;
 
     for community in unchanged_leaves {
-        let concept_name = format!("community-{}-{}", community.level, community.index);
-        if let Ok(existing) = db.get_semantic_by_concept(&concept_name).await {
+        let concept_name = community_concept_name(&community);
+        if let Ok(existing) = db
+            .get_semantic_by_concept_ns(&concept_name, namespace)
+            .await
+        {
+            let members = members_in_namespace(db, &community.members, namespace).await;
             result.edges_created +=
-                repair_community_membership_edges(db, existing.id, &community.members).await;
+                repair_community_membership_edges(db, existing.id, &members).await;
         }
     }
 
     Ok(result)
+}
+
+/// Resolve the namespace of a community member node (semantic or episodic).
+async fn member_namespace(db: &HirnDB, id: MemoryId) -> Option<Namespace> {
+    match db.graph_store().node_layer(id).await.ok().flatten() {
+        Some(Layer::Semantic) => db.get_semantic(id).await.ok().map(|r| r.namespace),
+        Some(Layer::Episodic) => db.get_episode(id).await.ok().map(|r| r.namespace),
+        _ => None,
+    }
+}
+
+/// Filter community members down to those stored in `namespace`.
+///
+/// Members whose namespace cannot be resolved are dropped rather than
+/// defaulted, so a summary can never absorb records of unknown provenance.
+async fn members_in_namespace(
+    db: &HirnDB,
+    members: &[MemoryId],
+    namespace: &Namespace,
+) -> Vec<MemoryId> {
+    let mut scoped = Vec::new();
+    for &id in members {
+        if member_namespace(db, id).await.as_ref() == Some(namespace) {
+            scoped.push(id);
+        }
+    }
+    scoped
+}
+
+/// Enumerate the distinct namespaces across all leaf-community members.
+///
+/// The consolidation pipeline generates community summaries once per returned
+/// namespace so that each summary only aggregates records from a single
+/// namespace. The result is sorted for deterministic pipeline ordering.
+pub(crate) async fn leaf_member_namespaces(
+    db: &HirnDB,
+    communities: &CommunityResult,
+) -> Vec<Namespace> {
+    let mut namespaces: Vec<Namespace> = Vec::new();
+    if let Some(leaves) = communities.levels.first() {
+        for community in leaves {
+            for &member in &community.members {
+                if let Some(ns) = member_namespace(db, member).await {
+                    if !namespaces.contains(&ns) {
+                        namespaces.push(ns);
+                    }
+                }
+            }
+        }
+    }
+    namespaces.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    namespaces
 }
 
 /// Collect human-readable descriptions for community member nodes.
@@ -1049,10 +1215,16 @@ mod tests {
             node_to_community: HashMap::new(),
             total_communities: 0,
         };
-        let result =
-            generate_community_summaries(&db, &llm, &empty, 50, std::time::Duration::from_secs(30))
-                .await
-                .unwrap();
+        let result = generate_community_summaries(
+            &db,
+            &llm,
+            &empty,
+            50,
+            std::time::Duration::from_secs(30),
+            &Namespace::default_ns(),
+        )
+        .await
+        .unwrap();
         assert_eq!(result.summaries_stored, 0);
         assert_eq!(result.edges_created, 0);
     }
@@ -1104,18 +1276,122 @@ mod tests {
             &communities,
             50,
             std::time::Duration::from_secs(30),
+            &Namespace::default_ns(),
         )
         .await
         .unwrap();
         assert_eq!(result.summaries_stored, 1);
 
         // Verify the stored record.
-        let stored = db.get_semantic_by_concept("community-0-0").await.unwrap();
+        let stored = db
+            .get_semantic_by_concept(&community_concept_name(&communities.levels[0][0]))
+            .await
+            .unwrap();
         assert_eq!(stored.knowledge_type, KnowledgeType::Community);
         assert!(stored.description.contains("THEME:"));
         assert!(stored.description.contains("KEY_ENTITIES:"));
         // source_episodes tracks the member_count
         assert_eq!(stored.source_episodes.len(), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn summary_scoped_to_member_namespace() {
+        let db = test_db().await;
+        let llm: Arc<dyn LlmProvider> = Arc::new(MockCommunityLlm::new("Summary."));
+        let ns_a = Namespace::new("tenant-a").unwrap();
+        let ns_b = Namespace::new("tenant-b").unwrap();
+
+        // One graph community whose members span two namespaces.
+        let agent = AgentId::new("test").unwrap();
+        let mut members_a: Vec<MemoryId> = Vec::new();
+        let mut members_b: Vec<MemoryId> = Vec::new();
+        for i in 0..2 {
+            let record = SemanticRecord::builder()
+                .concept(&format!("a-member-{i}"))
+                .description(&format!("tenant-a fact {i}"))
+                .agent_id(agent.clone())
+                .origin(Origin::Consolidation)
+                .namespace(ns_a.clone())
+                .build()
+                .unwrap();
+            members_a.push(db.store_semantic(record).await.unwrap());
+        }
+        for i in 0..2 {
+            let record = SemanticRecord::builder()
+                .concept(&format!("b-member-{i}"))
+                .description(&format!("tenant-b fact {i}"))
+                .agent_id(agent.clone())
+                .origin(Origin::Consolidation)
+                .namespace(ns_b.clone())
+                .build()
+                .unwrap();
+            members_b.push(db.store_semantic(record).await.unwrap());
+        }
+
+        let all_members: Vec<MemoryId> =
+            members_a.iter().chain(members_b.iter()).copied().collect();
+        let mut node_to_community = HashMap::new();
+        for &id in &all_members {
+            node_to_community.insert(id, 0);
+        }
+        let communities = CommunityResult {
+            levels: vec![vec![Community {
+                level: 0,
+                index: 0,
+                members: all_members,
+                parent: None,
+                children: vec![],
+            }]],
+            node_to_community,
+            total_communities: 1,
+        };
+
+        // Namespace enumeration sees both member namespaces.
+        let namespaces = leaf_member_namespaces(&db, &communities).await;
+        assert_eq!(namespaces, vec![ns_a.clone(), ns_b.clone()]);
+
+        for namespace in &namespaces {
+            let result = generate_community_summaries(
+                &db,
+                &llm,
+                &communities,
+                50,
+                std::time::Duration::from_secs(30),
+                namespace,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.summaries_stored, 1);
+        }
+
+        // Each namespace gets its own summary derived only from its own members.
+        let summary_a = db
+            .get_semantic_by_concept_ns(&community_concept_name(&communities.levels[0][0]), &ns_a)
+            .await
+            .unwrap();
+        assert_eq!(summary_a.namespace, ns_a);
+        let mut sources_a = summary_a.source_episodes.clone();
+        sources_a.sort();
+        members_a.sort();
+        assert_eq!(sources_a, members_a);
+
+        let summary_b = db
+            .get_semantic_by_concept_ns(&community_concept_name(&communities.levels[0][0]), &ns_b)
+            .await
+            .unwrap();
+        assert_eq!(summary_b.namespace, ns_b);
+        let mut sources_b = summary_b.source_episodes.clone();
+        sources_b.sort();
+        members_b.sort();
+        assert_eq!(sources_b, members_b);
+
+        // Nothing leaks into the default namespace.
+        assert!(
+            db.get_semantic_by_concept(&community_concept_name(&communities.levels[0][0]))
+                .await
+                .is_err(),
+            "community summary must not land in the default namespace"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1155,6 +1431,7 @@ mod tests {
             &communities,
             50,
             std::time::Duration::from_secs(30),
+            &Namespace::default_ns(),
         )
         .await
         .unwrap();
@@ -1166,6 +1443,7 @@ mod tests {
             &communities,
             50,
             std::time::Duration::from_secs(30),
+            &Namespace::default_ns(),
         )
         .await
         .unwrap();
@@ -1217,12 +1495,16 @@ mod tests {
             &communities,
             50,
             std::time::Duration::from_secs(30),
+            &Namespace::default_ns(),
         )
         .await
         .unwrap();
         assert_eq!(first.summaries_stored, 1);
 
-        let summary = db.get_semantic_by_concept("community-0-0").await.unwrap();
+        let summary = db
+            .get_semantic_by_concept(&community_concept_name(&communities.levels[0][0]))
+            .await
+            .unwrap();
         for &member_id in &member_ids {
             let edges = db
                 .cached_graph()
@@ -1248,6 +1530,7 @@ mod tests {
             &communities,
             50,
             std::time::Duration::from_secs(30),
+            &Namespace::default_ns(),
         )
         .await
         .unwrap();
@@ -1332,10 +1615,16 @@ mod tests {
         };
 
         // Generate initial summaries — should call LLM twice.
-        let r1 =
-            generate_community_summaries(&db, &llm, &prev, 50, std::time::Duration::from_secs(30))
-                .await
-                .unwrap();
+        let r1 = generate_community_summaries(
+            &db,
+            &llm,
+            &prev,
+            50,
+            std::time::Duration::from_secs(30),
+            &Namespace::default_ns(),
+        )
+        .await
+        .unwrap();
         assert_eq!(r1.summaries_stored, 2);
         assert_eq!(mock.calls.load(Ordering::Relaxed), 2);
 
@@ -1400,6 +1689,7 @@ mod tests {
             &new,
             50,
             std::time::Duration::from_secs(30),
+            &Namespace::default_ns(),
         )
         .await
         .unwrap();
@@ -1414,10 +1704,22 @@ mod tests {
         );
 
         // Verify the new community summary was stored.
-        assert!(db.get_semantic_by_concept("community-0-2").await.is_ok());
+        assert!(
+            db.get_semantic_by_concept(&community_concept_name(&new.levels[0][2]))
+                .await
+                .is_ok()
+        );
         // Verify unchanged community summaries still exist.
-        assert!(db.get_semantic_by_concept("community-0-0").await.is_ok());
-        assert!(db.get_semantic_by_concept("community-0-1").await.is_ok());
+        assert!(
+            db.get_semantic_by_concept(&community_concept_name(&new.levels[0][0]))
+                .await
+                .is_ok()
+        );
+        assert!(
+            db.get_semantic_by_concept(&community_concept_name(&new.levels[0][1]))
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1461,11 +1763,15 @@ mod tests {
             &communities,
             50,
             std::time::Duration::from_secs(30),
+            &Namespace::default_ns(),
         )
         .await
         .unwrap();
 
-        let summary = db.get_semantic_by_concept("community-0-0").await.unwrap();
+        let summary = db
+            .get_semantic_by_concept(&community_concept_name(&communities.levels[0][0]))
+            .await
+            .unwrap();
         for &member_id in &member_ids {
             let edges = db
                 .cached_graph()
@@ -1489,6 +1795,7 @@ mod tests {
             &communities,
             50,
             std::time::Duration::from_secs(30),
+            &Namespace::default_ns(),
         )
         .await
         .unwrap();

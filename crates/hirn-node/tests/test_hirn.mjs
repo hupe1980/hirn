@@ -30,7 +30,7 @@ function estimateTokens(text) {
 
 async function withDb(fn) {
   const dir = mkdtempSync(join(tmpdir(), 'hirn-test-'));
-  const db = HirnBridge.open(join(dir, 'test.hirn'), DIM);
+  const db = await HirnBridge.open(join(dir, 'test.hirn'), DIM);
   try {
     await fn(db);
   } finally {
@@ -40,7 +40,7 @@ async function withDb(fn) {
 }
 
 async function seedSemanticRevisionHistory(path, embeddings) {
-  const mem = Memory.open(path, { agentId: TEST_AGENT_ID, embeddings });
+  const mem = await Memory.open(path, { agentId: TEST_AGENT_ID, embeddings });
   try {
     await mem._ensureAgent(TEST_AGENT_ID);
     const originalEmbedding = await embeddings.embedQuery(ORIGINAL_ABOUT);
@@ -90,27 +90,27 @@ describe('HirnBridge open/close', () => {
     });
   });
 
-  it('should allow double close', () => {
+  it('should allow double close', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hirn-test-'));
-    const db = HirnBridge.open(join(dir, 'test.hirn'), DIM);
+    const db = await HirnBridge.open(join(dir, 'test.hirn'), DIM);
     db.close();
     db.close(); // should not throw
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it('should throw on operations after close', () => {
+  it('should throw on operations after close', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hirn-test-'));
-    const db = HirnBridge.open(join(dir, 'test.hirn'), DIM);
+    const db = await HirnBridge.open(join(dir, 'test.hirn'), DIM);
     db.close();
-    assert.throws(() => db.stats(), /closed/);
+    await assert.rejects(() => db.stats(), /closed/);
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it('should accept custom tokenBudget', () => {
+  it('should accept custom tokenBudget', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hirn-test-'));
-    const db = HirnBridge.open(join(dir, 'test.hirn'), DIM, 2048);
+    const db = await HirnBridge.open(join(dir, 'test.hirn'), DIM, 2048);
     try {
-      const s = db.stats();
+      const s = await db.stats();
       assert.equal(s.totalCount, 0);
     } finally {
       db.close();
@@ -251,7 +251,7 @@ describe('think', () => {
 
   it('should honor tokenizerName via the Rust registry', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hirn-test-'));
-    const db = HirnBridge.open(join(dir, 'test.hirn'), DIM, undefined, 'estimating');
+    const db = await HirnBridge.open(join(dir, 'test.hirn'), DIM, undefined, 'estimating');
     try {
       await db.registerAgent('agent-1', 'Test Agent');
       await db.remember(
@@ -361,8 +361,8 @@ describe('trace', () => {
 
 describe('stats', () => {
   it('should return stats for empty db', async () => {
-    await withDb((db) => {
-      const s = db.stats();
+    await withDb(async (db) => {
+      const s = await db.stats();
       assert.equal(s.totalCount, 0);
       assert.equal(s.episodicCount, 0);
       assert.equal(s.workingCount, 0);
@@ -375,7 +375,7 @@ describe('stats', () => {
     await withDb(async (db) => {
       await db.registerAgent('agent-1', 'Test Agent');
       await db.remember('agent-1', 'Stats test', makeEmbedding());
-      const s = db.stats();
+      const s = await db.stats();
       assert.equal(s.episodicCount, 1);
       assert.ok(s.totalCount >= 1);
     });
@@ -387,7 +387,7 @@ describe('stats', () => {
 describe('error handling', () => {
   it('should reject remember after close', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hirn-test-'));
-    const db = HirnBridge.open(join(dir, 'test.hirn'), DIM);
+    const db = await HirnBridge.open(join(dir, 'test.hirn'), DIM);
     db.close();
     await assert.rejects(() => db.remember('agent-1', 'test'), /closed/);
     rmSync(dir, { recursive: true, force: true });
@@ -395,17 +395,17 @@ describe('error handling', () => {
 
   it('should reject recall after close', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hirn-test-'));
-    const db = HirnBridge.open(join(dir, 'test.hirn'), DIM);
+    const db = await HirnBridge.open(join(dir, 'test.hirn'), DIM);
     db.close();
     await assert.rejects(() => db.recall('agent-1', makeEmbedding()), /closed/);
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it('should throw on stats after close', () => {
+  it('should throw on stats after close', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hirn-test-'));
-    const db = HirnBridge.open(join(dir, 'test.hirn'), DIM);
+    const db = await HirnBridge.open(join(dir, 'test.hirn'), DIM);
     db.close();
-    assert.throws(() => db.stats(), /closed/);
+    await assert.rejects(() => db.stats(), /closed/);
     rmSync(dir, { recursive: true, force: true });
   });
 });
@@ -415,7 +415,7 @@ describe('error handling', () => {
 describe('watch', () => {
   it('should receive created event on remember', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hirn-test-'));
-    const db = HirnBridge.open(join(dir, 'test.hirn'), DIM);
+    const db = await HirnBridge.open(join(dir, 'test.hirn'), DIM);
     try {
       await db.registerAgent('agent-1', 'Test Agent');
       const stream = await db.watch();
@@ -439,7 +439,7 @@ describe('watch', () => {
 
   it('should receive archived event on forget', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hirn-test-'));
-    const db = HirnBridge.open(join(dir, 'test.hirn'), DIM);
+    const db = await HirnBridge.open(join(dir, 'test.hirn'), DIM);
     try {
       await db.registerAgent('agent-1', 'Test Agent');
       const id = await db.remember('agent-1', 'To be forgotten', makeEmbedding());
@@ -465,7 +465,7 @@ describe('watch', () => {
 
   it('should return null after unsubscribe', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hirn-test-'));
-    const db = HirnBridge.open(join(dir, 'test.hirn'), DIM);
+    const db = await HirnBridge.open(join(dir, 'test.hirn'), DIM);
     try {
       const stream = await db.watch();
       stream.unsubscribe();
@@ -479,7 +479,7 @@ describe('watch', () => {
 
   it('should filter by layer', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hirn-test-'));
-    const db = HirnBridge.open(join(dir, 'test.hirn'), DIM);
+    const db = await HirnBridge.open(join(dir, 'test.hirn'), DIM);
     try {
       await db.registerAgent('agent-1', 'Test Agent');
 
@@ -503,7 +503,7 @@ describe('watch', () => {
 
   it('should receive multiple events', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hirn-test-'));
-    const db = HirnBridge.open(join(dir, 'test.hirn'), DIM);
+    const db = await HirnBridge.open(join(dir, 'test.hirn'), DIM);
     try {
       await db.registerAgent('agent-1', 'Test Agent');
       const stream = await db.watch();
@@ -531,7 +531,7 @@ describe('watch', () => {
 describe('Memory open/close', () => {
   it('should open and close', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hirn-mem-'));
-    const mem = Memory.open(join(dir, 'brain.hirn'));
+    const mem = await Memory.open(join(dir, 'brain.hirn'));
     try {
       assert.ok(mem);
     } finally {
@@ -540,25 +540,25 @@ describe('Memory open/close', () => {
     }
   });
 
-  it('should allow double close', () => {
+  it('should allow double close', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hirn-mem-'));
-    const mem = Memory.open(join(dir, 'brain.hirn'));
+    const mem = await Memory.open(join(dir, 'brain.hirn'));
     mem.close();
     mem.close(); // should not throw
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it('should throw on operations after close', () => {
+  it('should throw on operations after close', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hirn-mem-'));
-    const mem = Memory.open(join(dir, 'brain.hirn'));
+    const mem = await Memory.open(join(dir, 'brain.hirn'));
     mem.close();
-    assert.throws(() => mem.stats(), /closed/);
+    await assert.rejects(() => mem.stats(), /closed/);
     rmSync(dir, { recursive: true, force: true });
   });
 
   it('should reject remember after close', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hirn-mem-'));
-    const mem = Memory.open(join(dir, 'brain.hirn'));
+    const mem = await Memory.open(join(dir, 'brain.hirn'));
     mem.close();
     await assert.rejects(() => mem.remember('test content'), /closed/);
     rmSync(dir, { recursive: true, force: true });
@@ -566,7 +566,7 @@ describe('Memory open/close', () => {
 
   it('should reject think after close', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hirn-mem-'));
-    const mem = Memory.open(join(dir, 'brain.hirn'));
+    const mem = await Memory.open(join(dir, 'brain.hirn'));
     mem.close();
     await assert.rejects(() => mem.think('query'), /closed/);
     rmSync(dir, { recursive: true, force: true });
@@ -574,7 +574,7 @@ describe('Memory open/close', () => {
 
   it('should reject recall after close', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hirn-mem-'));
-    const mem = Memory.open(join(dir, 'brain.hirn'));
+    const mem = await Memory.open(join(dir, 'brain.hirn'));
     mem.close();
     await assert.rejects(() => mem.recall('query'), /closed/);
     rmSync(dir, { recursive: true, force: true });
@@ -582,7 +582,7 @@ describe('Memory open/close', () => {
 
   it('should reject query after close', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hirn-mem-'));
-    const mem = Memory.open(join(dir, 'brain.hirn'));
+    const mem = await Memory.open(join(dir, 'brain.hirn'));
     mem.close();
     await assert.rejects(() => mem.query('CONSOLIDATE'), /closed/);
     rmSync(dir, { recursive: true, force: true });
@@ -592,7 +592,7 @@ describe('Memory open/close', () => {
 describe('Memory remember', () => {
   it('should return a ULID string', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hirn-mem-'));
-    const mem = Memory.open(join(dir, 'brain.hirn'));
+    const mem = await Memory.open(join(dir, 'brain.hirn'));
     try {
       const id = await mem.remember('The capital of France is Paris and it is known for the Eiffel Tower');
       assert.equal(typeof id, 'string');
@@ -605,11 +605,11 @@ describe('Memory remember', () => {
 
   it('should increment episodic count', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hirn-mem-'));
-    const mem = Memory.open(join(dir, 'brain.hirn'));
+    const mem = await Memory.open(join(dir, 'brain.hirn'));
     try {
       await mem.remember('Machine learning is a subset of artificial intelligence that enables systems to learn from data');
       await mem.remember('The Great Wall of China is one of the most famous landmarks in the world spanning thousands of miles');
-      const stats = mem.stats();
+      const stats = await mem.stats();
       assert.ok(stats.episodicCount >= 2);
     } finally {
       mem.close();
@@ -621,7 +621,7 @@ describe('Memory remember', () => {
 describe('Memory think', () => {
   it('should return context', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hirn-mem-'));
-    const mem = Memory.open(join(dir, 'brain.hirn'));
+    const mem = await Memory.open(join(dir, 'brain.hirn'));
     try {
       await mem.remember('Photosynthesis is the process by which green plants convert sunlight into chemical energy using chlorophyll');
       const ctx = await mem.think('How do plants make food from sunlight?');
@@ -636,7 +636,7 @@ describe('Memory think', () => {
 
   it('should respect budget parameter', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hirn-mem-'));
-    const mem = Memory.open(join(dir, 'brain.hirn'));
+    const mem = await Memory.open(join(dir, 'brain.hirn'));
     try {
       await mem.remember('The periodic table organizes chemical elements by their atomic number and chemical properties');
       const ctx = await mem.think('chemistry elements', { budget: 2048 });
@@ -651,7 +651,7 @@ describe('Memory think', () => {
 describe('Memory recall', () => {
   it('should return recall results', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hirn-mem-'));
-    const mem = Memory.open(join(dir, 'brain.hirn'));
+    const mem = await Memory.open(join(dir, 'brain.hirn'));
     try {
       await mem.remember('Quantum computing uses quantum-mechanical phenomena such as superposition and entanglement to process data');
       const results = await mem.recall('quantum computers');
@@ -669,7 +669,7 @@ describe('Memory recall', () => {
 
   it('should respect limit parameter', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hirn-mem-'));
-    const mem = Memory.open(join(dir, 'brain.hirn'));
+    const mem = await Memory.open(join(dir, 'brain.hirn'));
     try {
       await mem.remember('The solar system has eight planets orbiting around the Sun in elliptical paths');
       await mem.remember('Jupiter is the largest planet in our solar system with a mass more than twice all other planets combined');
@@ -731,7 +731,7 @@ describe('Memory recall', () => {
 describe('Memory query (HirnQL)', () => {
   it('should execute a RECALL query', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hirn-mem-'));
-    const mem = Memory.open(join(dir, 'brain.hirn'));
+    const mem = await Memory.open(join(dir, 'brain.hirn'));
     try {
       await mem.remember('TypeScript is a strongly typed programming language that builds on JavaScript adding static type checking');
       const result = await mem.query('RECALL episodic ABOUT "programming languages" LIMIT 5');
@@ -745,7 +745,7 @@ describe('Memory query (HirnQL)', () => {
 
   it('should execute a CONSOLIDATE query', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hirn-mem-'));
-    const mem = Memory.open(join(dir, 'brain.hirn'));
+    const mem = await Memory.open(join(dir, 'brain.hirn'));
     try {
       const recordsProcessed = await mem._hirn.consolidate();
       assert.equal(typeof recordsProcessed, 'number');
@@ -758,7 +758,7 @@ describe('Memory query (HirnQL)', () => {
 
   it('should reject invalid HirnQL', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hirn-mem-'));
-    const mem = Memory.open(join(dir, 'brain.hirn'));
+    const mem = await Memory.open(join(dir, 'brain.hirn'));
     try {
       await assert.rejects(() => mem.query('NOT VALID QUERY'), /parse error/);
     } finally {
@@ -880,7 +880,7 @@ describe('Memory semantic edit helpers', () => {
 
   it('should reject invalid helper arguments before executing HirnQL', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hirn-mem-'));
-    const mem = Memory.open(join(dir, 'brain.hirn'), { agentId: TEST_AGENT_ID });
+    const mem = await Memory.open(join(dir, 'brain.hirn'), { agentId: TEST_AGENT_ID });
     try {
       await assert.rejects(
         () => mem.correct('01HXYZ'),
@@ -900,9 +900,9 @@ describe('Memory semantic edit helpers', () => {
 describe('Memory stats', () => {
   it('should return statistics', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hirn-mem-'));
-    const mem = Memory.open(join(dir, 'brain.hirn'));
+    const mem = await Memory.open(join(dir, 'brain.hirn'));
     try {
-      const stats = mem.stats();
+      const stats = await mem.stats();
       assert.equal(typeof stats.workingCount, 'number');
       assert.equal(typeof stats.episodicCount, 'number');
       assert.equal(typeof stats.semanticCount, 'number');
@@ -918,9 +918,9 @@ describe('Memory stats', () => {
 // ─── Memory agentId ──────────────────────────────────────────
 
 describe('Memory agentId', () => {
-  it('should open with agentId', () => {
+  it('should open with agentId', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hirn-mem-'));
-    const mem = Memory.open(join(dir, 'brain.hirn'), { agentId: 'agent-alpha' });
+    const mem = await Memory.open(join(dir, 'brain.hirn'), { agentId: 'agent-alpha' });
     try {
       assert.ok(mem);
     } finally {
@@ -931,7 +931,7 @@ describe('Memory agentId', () => {
 
   it('should remember with constructor agentId (Cedar path)', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hirn-mem-'));
-    const mem = Memory.open(join(dir, 'brain.hirn'), { agentId: 'agent-alpha' });
+    const mem = await Memory.open(join(dir, 'brain.hirn'), { agentId: 'agent-alpha' });
     try {
       const id = await mem.remember('Memory with agent context for authorization testing purposes');
       assert.equal(typeof id, 'string');
@@ -944,7 +944,7 @@ describe('Memory agentId', () => {
 
   it('should remember with per-call agentId override', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hirn-mem-'));
-    const mem = Memory.open(join(dir, 'brain.hirn'));
+    const mem = await Memory.open(join(dir, 'brain.hirn'));
     try {
       const id = await mem.remember('Memory with per-call agent override for authorization', { agentId: 'agent-beta' });
       assert.equal(typeof id, 'string');
@@ -957,7 +957,7 @@ describe('Memory agentId', () => {
 
   it('should think with agentId', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hirn-mem-'));
-    const mem = Memory.open(join(dir, 'brain.hirn'), { agentId: 'agent-alpha' });
+    const mem = await Memory.open(join(dir, 'brain.hirn'), { agentId: 'agent-alpha' });
     try {
       await mem.remember('Photosynthesis converts sunlight into chemical energy in plants using chlorophyll');
       const ctx = await mem.think('How do plants make energy from sunlight?', { agentId: 'agent-alpha' });
@@ -970,7 +970,7 @@ describe('Memory agentId', () => {
 
   it('should recall with agentId', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hirn-mem-'));
-    const mem = Memory.open(join(dir, 'brain.hirn'), { agentId: 'agent-alpha' });
+    const mem = await Memory.open(join(dir, 'brain.hirn'), { agentId: 'agent-alpha' });
     try {
       await mem.remember('The solar system has eight planets orbiting around the Sun in elliptical paths');
       const results = await mem.recall('planets', { agentId: 'agent-alpha' });
@@ -983,7 +983,7 @@ describe('Memory agentId', () => {
 
   it('should query with agentId', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hirn-mem-'));
-    const mem = Memory.open(join(dir, 'brain.hirn'), { agentId: 'agent-alpha' });
+    const mem = await Memory.open(join(dir, 'brain.hirn'), { agentId: 'agent-alpha' });
     try {
       await mem.remember('TypeScript is a strongly typed programming language that builds on JavaScript');
       const result = await mem.query('RECALL episodic ABOUT "programming" LIMIT 5', { agentId: 'agent-alpha' });
@@ -996,7 +996,7 @@ describe('Memory agentId', () => {
 
   it('should default to anonymous when no agentId', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hirn-mem-'));
-    const mem = Memory.open(join(dir, 'brain.hirn'));
+    const mem = await Memory.open(join(dir, 'brain.hirn'));
     try {
       // No agentId → uses default "anonymous" → delegates to HirnMemory.remember
       const id = await mem.remember('Memory without any agent context uses default anonymous path');
@@ -1013,7 +1013,7 @@ describe('Memory agentId', () => {
 describe('Memory batchRemember', () => {
   it('should store multiple memories in one call', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hirn-mem-'));
-    const mem = Memory.open(join(dir, 'brain.hirn'));
+    const mem = await Memory.open(join(dir, 'brain.hirn'));
     try {
       const ids = await mem.batchRemember([
         'Alpha particles consist of two protons and two neutrons bound together',
@@ -1035,7 +1035,7 @@ describe('Memory batchRemember', () => {
 
   it('should return empty array for empty input', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hirn-mem-'));
-    const mem = Memory.open(join(dir, 'brain.hirn'));
+    const mem = await Memory.open(join(dir, 'brain.hirn'));
     try {
       const ids = await mem.batchRemember([]);
       assert.deepEqual(ids, []);
@@ -1047,7 +1047,7 @@ describe('Memory batchRemember', () => {
 
   it('should reject non-string elements', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hirn-mem-'));
-    const mem = Memory.open(join(dir, 'brain.hirn'));
+    const mem = await Memory.open(join(dir, 'brain.hirn'));
     try {
       await assert.rejects(
         () => mem.batchRemember([42]),
@@ -1061,7 +1061,7 @@ describe('Memory batchRemember', () => {
 
   it('should reject empty strings', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hirn-mem-'));
-    const mem = Memory.open(join(dir, 'brain.hirn'));
+    const mem = await Memory.open(join(dir, 'brain.hirn'));
     try {
       await assert.rejects(
         () => mem.batchRemember(['valid', '   ']),
@@ -1079,7 +1079,7 @@ describe('Memory batchRemember', () => {
 describe('Memory forget', () => {
   it('should forget a remembered memory', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hirn-mem-'));
-    const mem = Memory.open(join(dir, 'brain.hirn'));
+    const mem = await Memory.open(join(dir, 'brain.hirn'));
     try {
       const id = await mem.remember('Temporary fact to be forgotten soon after creation');
       await mem.forget(id); // should not throw
@@ -1091,7 +1091,7 @@ describe('Memory forget', () => {
 
   it('should forward agentId option', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hirn-mem-'));
-    const mem = Memory.open(join(dir, 'brain.hirn'), { agentId: 'agent-f' });
+    const mem = await Memory.open(join(dir, 'brain.hirn'), { agentId: 'agent-f' });
     try {
       const id = await mem.remember('Fact to forget with explicit agent identifier');
       await mem.forget(id, { agentId: 'agent-f' }); // should not throw
@@ -1107,7 +1107,7 @@ describe('Memory forget', () => {
 describe('Memory watch', () => {
   it('should receive events for remembered memories', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hirn-mem-'));
-    const mem = Memory.open(join(dir, 'brain.hirn'));
+    const mem = await Memory.open(join(dir, 'brain.hirn'));
     try {
       const stream = await mem.watch();
       assert.ok(stream);
@@ -1127,7 +1127,7 @@ describe('Memory watch', () => {
 
   it('should support layer filter', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hirn-mem-'));
-    const mem = Memory.open(join(dir, 'brain.hirn'));
+    const mem = await Memory.open(join(dir, 'brain.hirn'));
     try {
       const stream = await mem.watch({ filterLayer: 'Episodic' });
       assert.ok(stream);
@@ -1160,6 +1160,30 @@ describe('error types', () => {
     assert.ok(qe instanceof HirnError);
     assert.equal(qe.name, 'QueryError');
   });
+
+  it('should mark not-found lookups with a stable NOT_FOUND prefix', async () => {
+    await withDb(async (db) => {
+      await db.registerAgent('agent-1', 'Test Agent');
+      // Valid ULID format, but no such record exists.
+      const missingId = '01ARZ3NDEKTSV4RRFFQ69G5FAV';
+      await assert.rejects(
+        () => db.inspect('agent-1', missingId),
+        (err) => {
+          assert.match(err.message, /^NOT_FOUND:/);
+          return true;
+        },
+      );
+    });
+  });
+
+  it('should wrap NOT_FOUND-prefixed native errors as NotFoundError', async () => {
+    const { wrapNativeError, NotFoundError } = require('../errors.js');
+    const wrapped = wrapNativeError(
+      new Error('NOT_FOUND: not found: memory 01ARZ3NDEKTSV4RRFFQ69G5FAV'),
+    );
+    assert.ok(wrapped instanceof NotFoundError);
+    assert.equal(wrapped.code, 'NOT_FOUND');
+  });
 });
 
 // ─── Concurrent operations ───────────────────────────────────
@@ -1167,7 +1191,7 @@ describe('error types', () => {
 describe('concurrent operations', () => {
   it('should handle 50 concurrent Memory.remember operations', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hirn-mem-'));
-    const mem = Memory.open(join(dir, 'brain.hirn'));
+    const mem = await Memory.open(join(dir, 'brain.hirn'));
     try {
       // Seed a first entry to initialize tables
       await mem.remember('Initialization seed entry for the concurrent operations test database');
@@ -1293,7 +1317,7 @@ async function main() {
   const snapshotKind: RecallSnapshotKind = 'revision';
 
   // Memory (L1) API with options
-  const mem: Memory = Memory.open('/tmp/brain.hirn', { agentId: 'agent-1', embeddings: fake });
+  const mem: Memory = await Memory.open('/tmp/brain.hirn', { agentId: 'agent-1', embeddings: fake });
   const memId: string = await mem.remember('content', { agentId: 'agent-override' });
   const memCtx: Context = await mem.think('query', { budget: 2048, agentId: 'agent-1' });
   const memResults: RecallResult[] = await mem.recall('query', { limit: 10, threshold: 0.25, agentId: 'agent-1', asOf: '2026-01-01T00:00:00Z', snapshotKind });
@@ -1307,11 +1331,11 @@ async function main() {
   const superseded: QueryResult = await mem.supersede('01HXYZ', { description: 'updated v2' });
   const merged: QueryResult = await mem.merge(['01HAAA', '01HBBB'], '01HXYZ', { reason: 'dedupe' });
   const retracted: QueryResult = await mem.retract('01HXYZ', { reason: 'obsolete' });
-  const memStats: Stats = mem.stats();
+  const memStats: Stats = await mem.stats();
   mem.close();
 
   // Memory without options (backward compat)
-  const mem2: Memory = Memory.open('/tmp/brain2.hirn');
+  const mem2: Memory = await Memory.open('/tmp/brain2.hirn');
   await mem2.remember('no agent');
   await mem2.think('query');
   await mem2.recall('query');

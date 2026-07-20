@@ -156,32 +156,25 @@ pub fn bind(
     prepared: &PreparedStatement,
     values: &HashMap<String, String>,
 ) -> Result<CompiledQuery, CompileError> {
-    // Validate all parameters are provided.
-    for param in &prepared.params {
-        if !values.contains_key(param) {
-            return Err(CompileError::Analysis(vec![AnalysisError {
-                message: format!("missing value for parameter {param}"),
-                kind: AnalysisErrorKind::UnknownField,
-            }]));
-        }
+    // Parse the prepared source back to an AST (parameters remain as `$name`
+    // placeholders), then substitute values **into the AST**, not into the
+    // query text. Placing values into typed AST nodes means a value can never
+    // break out of a string literal to inject trailing clauses, and there is no
+    // `$t`/`$t2` prefix-collision hazard that naive `String::replace` had.
+    let mut ast = parser::parse(&prepared.source).map_err(CompileError::Parse)?;
+
+    let missing = hirn_query::ast::bind_parameters(&mut ast, values);
+    if !missing.is_empty() {
+        return Err(CompileError::Analysis(vec![AnalysisError {
+            message: format!("missing value for parameter(s): {}", missing.join(", ")),
+            kind: AnalysisErrorKind::UnknownField,
+        }]));
     }
 
-    // Substitute parameters in the source query.
-    let mut bound_query = prepared.source.clone();
-    for (name, value) in values {
-        // Determine if this parameter appears in a numeric context.
-        // If the value is purely numeric, don't quote it.
-        let replacement = if value.parse::<f64>().is_ok() || value.parse::<i64>().is_ok() {
-            value.clone()
-        } else {
-            // Escape double quotes in the value for safe embedding.
-            format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
-        };
-        bound_query = bound_query.replace(name.as_str(), &replacement);
-    }
-
-    // Re-parse with concrete values.
-    let ast = parser::parse(&bound_query).map_err(CompileError::Parse)?;
+    // Re-serialize the bound AST. This is now safe: the serializer emits every
+    // clause in grammar order and escapes every string, so the bound text
+    // re-parses to an equal AST.
+    let bound_query = ast.to_string();
 
     // Full semantic analysis now that all values are concrete.
     let errors = analyzer::analyze(&ast);
@@ -572,19 +565,36 @@ mod tests {
 
     #[test]
     fn bind_substitutes_numeric_param() {
-        let stmt = prepare(r#"RECALL episodic ABOUT $query LIMIT $limit"#, None).unwrap();
+        // Numeric parameters are supported in WHERE conditions (typed values),
+        // where the name survives in the AST. Integer clauses like LIMIT take
+        // literals only.
+        let stmt = prepare(
+            r#"RECALL episodic ABOUT $query WHERE importance > $threshold"#,
+            None,
+        )
+        .unwrap();
         let mut values = HashMap::new();
         values.insert("$query".to_string(), "test".to_string());
-        values.insert("$limit".to_string(), "20".to_string());
+        values.insert("$threshold".to_string(), "0.5".to_string());
 
         let compiled = bind(&stmt, &values).unwrap();
         match &compiled.ast {
             Statement::Recall(r) => {
                 assert_eq!(r.about, "test");
-                assert_eq!(r.limit, Some(20));
+                assert_eq!(
+                    r.where_clauses[0].value,
+                    hirn_query::ast::ConditionValue::Float(0.5)
+                );
             }
             _ => panic!("expected Recall"),
         }
+    }
+
+    #[test]
+    fn integer_clause_param_is_rejected_at_parse() {
+        // `LIMIT $n` used to silently coerce to 0 (returning nothing); it now
+        // errors clearly at parse time.
+        assert!(prepare(r#"RECALL episodic ABOUT "x" LIMIT $n"#, None).is_err());
     }
 
     #[test]

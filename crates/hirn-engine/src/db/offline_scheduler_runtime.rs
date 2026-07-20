@@ -39,7 +39,6 @@ use parking_lot::Mutex;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
-use crate::StoreError;
 use crate::consolidation::{DreamCycleConfig, generate_text_with_timeout};
 use crate::provider_registry::ProviderRegistry;
 use crate::ql::context::{
@@ -1057,9 +1056,7 @@ impl DefaultOfflineJobExecutor {
                 used_fallback,
                 self.dream_quality_threshold,
             );
-            let record_bytes = bincode::serialize(&hypothesis).map_err(|error| {
-                HirnError::storage(StoreError::Serialization(error.to_string()))
-            })?;
+            let record_bytes = hirn_core::persist::to_versioned_bytes(&hypothesis)?;
             rows.push(quarantine::QuarantineRow {
                 memory_id: hypothesis_id,
                 record_kind: QuarantinedRecordKind::Semantic,
@@ -1191,9 +1188,7 @@ impl DefaultOfflineJobExecutor {
             let proposal_id = proposal.id;
             let generated_review =
                 build_reconcile_generated_review(group, action, self.reconcile_quality_threshold);
-            let record_bytes = bincode::serialize(&proposal).map_err(|error| {
-                HirnError::storage(StoreError::Serialization(error.to_string()))
-            })?;
+            let record_bytes = hirn_core::persist::to_versioned_bytes(&proposal)?;
             rows.push(quarantine::QuarantineRow {
                 memory_id: proposal_id,
                 record_kind: QuarantinedRecordKind::Semantic,
@@ -1354,8 +1349,7 @@ impl DefaultOfflineJobExecutor {
         let plan_record = build_quarantined_planning_agenda(&record, &agenda)?;
         let plan_id = plan_record.id;
         let generated_review = build_plan_generated_review(&agenda, self.plan_quality_threshold);
-        let record_bytes = bincode::serialize(&plan_record)
-            .map_err(|error| HirnError::storage(StoreError::Serialization(error.to_string())))?;
+        let record_bytes = hirn_core::persist::to_versioned_bytes(&plan_record)?;
         let batch = quarantine::to_batch(&[quarantine::QuarantineRow {
             memory_id: plan_id,
             record_kind: QuarantinedRecordKind::Semantic,
@@ -1543,16 +1537,17 @@ impl DefaultOfflineJobExecutor {
                 "backward evolution triggered by new episodic memory {new_id}"
             )),
             output_summary: Some(format!(
-                "evolved {records_evolved} semantic neighbor(s) with new contextual evidence"
+                "corroborated {records_evolved} semantic neighbor(s): evidence count and confidence updated"
             )),
             generated_review: None,
             change_summary: Some(format!(
-                "enriched {records_evolved} existing semantic memory description(s) with corroboration from {new_id}"
+                "corroborated {records_evolved} existing semantic memory record(s) from {new_id}"
             )),
         }))
     }
 
-    /// Append a corroboration note to a semantic record's description and bump its evidence count.
+    /// Record a corroboration on a semantic neighbor: bump its evidence count
+    /// and raise (never lower) its confidence.
     async fn evolve_semantic_record(
         &self,
         id: MemoryId,
@@ -1564,49 +1559,46 @@ impl DefaultOfflineJobExecutor {
         let id_str = id.to_string();
         let filter = format!("id = '{}'", id_str.replace('\'', "''"));
 
-        // Fetch current description + evidence_count.
+        // Fetch current evidence_count + confidence.
         let batches = self
             .storage
             .scan(
                 SEM_DS,
                 ScanOptions {
                     filter: Some(filter.clone()),
-                    columns: Some(vec![
-                        "description".to_string(),
-                        "evidence_count".to_string(),
-                    ]),
+                    columns: Some(vec!["evidence_count".to_string(), "confidence".to_string()]),
                     ..ScanOptions::default()
                 },
             )
             .await
             .map_err(HirnError::storage)?;
 
-        let (description, evidence_count) = extract_evolve_fields(&batches);
-
-        let new_note = format!(
-            "{}. [Corroborated at {:.2} similarity by episode '{}' on {}]",
-            description.trim(),
-            sim,
-            triggering.content.chars().take(80).collect::<String>(),
-            triggering.timestamp.as_datetime().format("%Y-%m-%d"),
+        let (evidence_count, existing_confidence) = extract_evolve_fields(&batches);
+        tracing::debug!(
+            semantic_id = %id,
+            episode_id = %triggering.id,
+            similarity = sim,
+            "corroborating semantic neighbor"
         );
 
+        // Corroboration bumps the evidence count and can only raise
+        // confidence — the description is not touched (appending a note per
+        // similar episode grew it without bound and carried no information
+        // beyond what `evidence_count` already tracks).
         let new_evidence_count = evidence_count.saturating_add(1);
-        let new_confidence: f32 = match new_evidence_count {
+        let evidence_floor: f32 = match new_evidence_count {
             1 => 0.3,
             2..=3 => 0.5,
             4..=7 => 0.7,
             _ => 0.85,
         };
+        let new_confidence = existing_confidence.max(evidence_floor);
         let now_ms = hirn_core::timestamp::Timestamp::now()
             .timestamp_ms()
             .to_string();
         let new_evidence_str = new_evidence_count.to_string();
         let new_confidence_str = new_confidence.to_string();
-        // SQL-quote the description: wrap in single quotes and escape interior quotes.
-        let new_note_sql = format!("'{}'", new_note.replace('\'', "''"));
         let updates: &[(&str, &str)] = &[
-            ("description", &new_note_sql),
             ("evidence_count", &new_evidence_str),
             ("confidence", &new_confidence_str),
             ("updated_at_ms", &now_ms),
@@ -2914,24 +2906,24 @@ fn tokenize_focus_text(value: &str) -> HashSet<String> {
 /// Extract `(description, evidence_count)` from a set of Arrow batches returned
 /// from a semantic dataset scan.  Falls back to sensible defaults when columns
 /// are absent.
-fn extract_evolve_fields(batches: &[arrow_array::RecordBatch]) -> (String, u32) {
+fn extract_evolve_fields(batches: &[arrow_array::RecordBatch]) -> (u32, f32) {
     for batch in batches {
         if batch.num_rows() == 0 {
             continue;
         }
-        let description = batch
-            .column_by_name("description")
-            .and_then(|c| c.as_any().downcast_ref::<arrow_array::StringArray>())
-            .map(|arr| arr.value(0).to_string())
-            .unwrap_or_default();
         let evidence_count = batch
             .column_by_name("evidence_count")
             .and_then(|c| c.as_any().downcast_ref::<arrow_array::UInt32Array>())
             .map(|arr| arr.value(0))
             .unwrap_or(0);
-        return (description, evidence_count);
+        let confidence = batch
+            .column_by_name("confidence")
+            .and_then(|c| c.as_any().downcast_ref::<arrow_array::Float32Array>())
+            .map(|arr| arr.value(0))
+            .unwrap_or(0.0);
+        return (evidence_count, confidence);
     }
-    (String::new(), 0)
+    (0, 0.0)
 }
 
 fn estimate_messages_tokens(tokenizer: &EstimatingTokenizer, messages: &[ChatMessage]) -> u32 {
@@ -3971,7 +3963,8 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].record_kind, QuarantinedRecordKind::Semantic);
 
-        let hypothesis: SemanticRecord = bincode::deserialize(&rows[0].record_bytes).unwrap();
+        let hypothesis: SemanticRecord =
+            hirn_core::persist::from_versioned_bytes(&rows[0].record_bytes).unwrap();
         assert_eq!(hypothesis.namespace, Namespace::default_ns());
         assert_eq!(
             hypothesis.knowledge_type,
@@ -4031,7 +4024,8 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].record_kind, QuarantinedRecordKind::Semantic);
 
-        let proposal: SemanticRecord = bincode::deserialize(&rows[0].record_bytes).unwrap();
+        let proposal: SemanticRecord =
+            hirn_core::persist::from_versioned_bytes(&rows[0].record_bytes).unwrap();
         assert_eq!(proposal.namespace, Namespace::default_ns());
         assert_eq!(
             proposal.knowledge_type,

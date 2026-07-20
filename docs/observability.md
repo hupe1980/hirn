@@ -1,6 +1,23 @@
+---
+title: Observability
+parent: Deployment & Operations
+nav_order: 3
+description: >-
+  Metrics, durable events, and query diagnostics for hirn — the surfaces that tell you whether the fleet is healthy, what changed, and why a request behaved so.
+---
+
 # Observability Guide
+{: .no_toc }
 
 > **⚠️ Experimental:** This project is under active development. APIs, on-disk formats, and behaviour may change without notice. Not recommended for production use.
+
+## Table of contents
+{: .no_toc .text-delta }
+
+1. TOC
+{:toc}
+
+---
 
 hirn exposes three observability surfaces that work together:
 
@@ -31,6 +48,37 @@ State-of-the-art memory systems need all three. Metrics tell you that recall qua
 │ EventLog append    │        │                    │        │                     │
 └────────────────────┘        └────────────────────┘        └─────────────────────┘
 ```
+
+The same picture as a signal-flow pipeline — three producers inside the engine,
+three exit surfaces on the daemon, and three destinations in your telemetry stack:
+
+```mermaid
+flowchart LR
+    subgraph Engine["hirn-engine"]
+        M[metrics::*]:::s
+        EB[EventBus + EventLog]:::s
+        QD[QueryDiagnostics]:::s
+    end
+    subgraph Daemon["hirnd"]
+        MET[/metrics endpoint/]:::s
+        WATCH[WATCH / streams]:::s
+        TR[tracing / logs]:::s
+    end
+    subgraph Sink["External systems"]
+        PROM[Prometheus / Grafana]:::s
+        DASH[operator dashboards]:::s
+        OTEL[OTEL / log pipeline]:::s
+    end
+    M --> MET --> PROM
+    EB --> WATCH --> DASH
+    QD --> TR --> OTEL
+    classDef s fill:#1a1b26,stroke:#7c9cff,color:#e6e8f0;
+```
+
+Read the pipeline top to bottom when triaging: **metrics** flag that something
+changed, **events** tell you what mutated in storage and cognition, and
+**diagnostics** explain why one specific request behaved the way it did. You
+almost always move left-to-right through those three surfaces during an incident.
 
 The observability implementation lives in `hirn-engine::observability` and is split into focused modules:
 
@@ -181,6 +229,12 @@ It is designed for forensic and replay use cases, not only live dashboards:
 - range, time-window, and criteria-based reads
 - snapshot support for faster recovery
 - retention and compaction policies for bounded history cost
+
+{: .note }
+> When `event_hmac_secret` is configured, event-log entries are HMAC-signed and
+> hash-chained, making the audit trail tamper-evident. Verify the integrity of the
+> chain with `EventLog::verify_chain`. See [Security](security.md) for the audit
+> and integrity model.
 
 For offline cognition, use the durable `offline_jobs` dataset together with the durable event log: `offline_jobs` explains one job lifecycle, while `events` gives you surrounding system context.
 

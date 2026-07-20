@@ -75,6 +75,24 @@ pub trait Embedder: Send + Sync {
     /// Stable model identifier stored alongside each memory for re-embedding detection.
     fn model_id(&self) -> &str;
 
+    /// Identifier for the **vector space** this embedder produces.
+    ///
+    /// Two embedders share cache-compatible, interchangeable output iff they
+    /// return the same `embedding_space_id`. It MUST therefore vary with
+    /// anything that changes the produced vectors for the same input text:
+    /// the model, the output dimension, and — for asymmetric models such as
+    /// Cohere/Voyage — the input type / task prompt.
+    ///
+    /// The persistent embedding cache keys on this value. A too-coarse
+    /// implementation (e.g. just `model_id()`) silently cross-poisons the cache
+    /// between, say, a document-encoding embedder and a query-encoding embedder
+    /// that share one store. The default combines model id and dimension, which
+    /// is correct for symmetric single-space models; asymmetric providers
+    /// override it.
+    fn embedding_space_id(&self) -> String {
+        format!("{}:{}", self.model_id(), self.dimensions())
+    }
+
     /// Maximum number of input tokens the model accepts per text.
     fn max_input_tokens(&self) -> usize;
 
@@ -107,6 +125,10 @@ impl<T: Embedder + ?Sized> Embedder for Arc<T> {
 
     fn model_id(&self) -> &str {
         self.as_ref().model_id()
+    }
+
+    fn embedding_space_id(&self) -> String {
+        self.as_ref().embedding_space_id()
     }
 
     fn max_input_tokens(&self) -> usize {

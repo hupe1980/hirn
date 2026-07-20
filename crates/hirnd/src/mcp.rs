@@ -1,3 +1,14 @@
+//! MCP (Model Context Protocol) surface.
+//!
+//! The rmcp SSE transport cannot deliver per-request HTTP headers to the tool
+//! handlers, so the MCP listener authenticates once at startup: `main`
+//! resolves `mcp.auth_token` through the same credential machinery as the
+//! HTTP API and hands the resulting [`BearerIdentity`] to this service. Every
+//! tool call then runs as that identity — realm, agent, operation scope, and
+//! namespace scope all come from the validated credential, never from
+//! caller-supplied parameters — and is throttled by the shared rate limiter
+//! with the same route classes as the HTTP layer.
+
 use std::sync::Arc;
 
 use hirn::prelude::*;
@@ -14,6 +25,8 @@ use rmcp::{Error as McpError, RoleServer, ServerHandler, tool};
 use serde::Deserialize;
 use tokio::sync::broadcast;
 
+use crate::auth::{BearerIdentity, Operation, token_allows_namespace, token_allows_operation};
+use crate::throttle::{RateLimitClass, RateLimiter};
 use crate::watch::{WatchEvent, WatchNamespaceScope};
 
 /// MCP server handler wrapping the hirn engine.
@@ -22,38 +35,89 @@ pub struct HirnMcpService {
     db: Arc<HirnDB>,
     toolkit: MemoryToolkit,
     watch_tx: broadcast::Sender<WatchEvent>,
-    realm: String,
+    rate_limiter: Arc<RateLimiter>,
+    identity: BearerIdentity,
+    agent_id: AgentId,
 }
 
 impl HirnMcpService {
-    /// Create a new MCP service backed by the given database and event channel.
-    pub fn new(db: Arc<HirnDB>, watch_tx: broadcast::Sender<WatchEvent>, realm: String) -> Self {
+    /// Create a new MCP service acting as the given authenticated identity.
+    ///
+    /// The identity must come from a validated credential (see the module
+    /// docs); tool parameters can never override it.
+    pub fn new(
+        db: Arc<HirnDB>,
+        watch_tx: broadcast::Sender<WatchEvent>,
+        rate_limiter: Arc<RateLimiter>,
+        identity: BearerIdentity,
+    ) -> Result<Self, String> {
+        let agent_id = AgentId::new(&identity.agent_id)
+            .map_err(|e| format!("MCP credential resolves to an invalid agent id: {e}"))?;
         let toolkit = MemoryToolkit::new(Arc::clone(&db));
-        Self {
+        Ok(Self {
             db,
             toolkit,
             watch_tx,
-            realm,
-        }
+            rate_limiter,
+            identity,
+            agent_id,
+        })
     }
 
-    /// Resolve the agent identity from an optional parameter.
-    /// Falls back to `"system"` when no agent_id is provided so read-only tools
-    /// do not require callers to supply an identity.
-    fn resolve_agent_id(&self, agent_id: Option<&str>) -> Result<String, McpError> {
-        match agent_id {
-            Some(id) if !id.is_empty() => Ok(id.to_owned()),
-            _ => Ok("system".to_owned()),
+    /// Authorize a tool call as the authenticated identity: credential
+    /// operation scope, shared rate limit, then the Cedar policy engine —
+    /// mirroring the HTTP layer's check order.
+    async fn authorize(&self, action: Action, operation: &Operation) -> Result<(), McpError> {
+        if !token_allows_operation(&self.identity.operations, operation) {
+            return Err(McpError::invalid_params(
+                format!("credential does not permit {operation:?} operations"),
+                None,
+            ));
         }
-    }
 
-    /// Authorize an MCP request via the Cedar policy engine.
-    async fn authorize(&self, agent_id: &str, action: Action) -> Result<(), McpError> {
+        let class = rate_limit_class(operation);
+        if !self
+            .rate_limiter
+            .check_agent(class, &self.identity.realm, &self.identity.agent_id)
+        {
+            return Err(McpError::internal_error(
+                format!("{} rate limit exceeded — try again later", class.as_str()),
+                None,
+            ));
+        }
+
         self.db
             .policy()
-            .enforce(agent_id, action, &self.realm, "")
+            .enforce(&self.identity.agent_id, action, &self.identity.realm, "")
             .await
             .map_err(|e| McpError::invalid_params(format!("access denied: {e}"), None))
+    }
+
+    /// Check the credential's namespace scope for an explicit namespace
+    /// parameter. API-key identities are unrestricted; token identities carry
+    /// an allowlist, exactly as on the HTTP layer.
+    fn check_namespace(&self, namespace: Option<&str>) -> Result<(), McpError> {
+        if let Some(allowed) = &self.identity.namespaces {
+            if !token_allows_namespace(&self.agent_id, allowed, namespace) {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "credential does not permit access to namespace '{}'",
+                        namespace.unwrap_or("default")
+                    ),
+                    None,
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Map an operation to the same rate-limit class the HTTP layer uses.
+fn rate_limit_class(operation: &Operation) -> RateLimitClass {
+    match operation {
+        Operation::Read => RateLimitClass::Read,
+        Operation::Write => RateLimitClass::Write,
+        Operation::Admin => RateLimitClass::Admin,
     }
 }
 
@@ -61,8 +125,6 @@ impl HirnMcpService {
 struct RememberParams {
     /// Text content of the memory to store
     content: String,
-    /// Agent ID performing the operation.
-    agent_id: Option<String>,
     /// Event type: conversation, tool_call, observation, experiment, error, decision
     event_type: Option<String>,
     /// Importance score from 0.0 to 1.0
@@ -85,8 +147,6 @@ struct RecallParams {
     limit: Option<u32>,
     /// Activation mode: none, static, spreading
     activation_mode: Option<String>,
-    /// Agent ID performing the operation.
-    agent_id: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -97,8 +157,6 @@ struct ThinkParams {
     budget: Option<u32>,
     /// Maximum number of records to consider
     limit: Option<u32>,
-    /// Agent ID performing the operation.
-    agent_id: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -107,32 +165,24 @@ struct ForgetParams {
     id: String,
     /// Forget mode: archive (default) or purge
     mode: Option<String>,
-    /// Agent ID performing the operation.
-    agent_id: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
 struct InspectParams {
     /// Memory ID to inspect
     id: String,
-    /// Agent ID performing the operation.
-    agent_id: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
 struct ConsolidateParams {
     /// Whether to archive processed episodes
     archive: Option<bool>,
-    /// Agent ID performing the operation.
-    agent_id: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
 struct ExecuteParams {
     /// HirnQL query string to execute
     query: String,
-    /// Agent ID performing the operation.
-    agent_id: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -147,8 +197,6 @@ struct WatchParams {
     min_importance: Option<f32>,
     /// Filter by namespace
     namespace: Option<String>,
-    /// Agent ID performing the operation.
-    agent_id: Option<String>,
 }
 
 // ── MemoryToolkit param structs ────────────────────────────────────────
@@ -157,8 +205,6 @@ struct WatchParams {
 struct MemoryStoreParams {
     /// Text content of the memory to store (required, non-empty)
     content: String,
-    /// Agent ID performing the operation
-    agent_id: Option<String>,
     /// Event type: conversation, tool_call, observation, experiment, error, decision
     event_type: Option<String>,
     /// Importance score from 0.0 to 1.0
@@ -175,8 +221,6 @@ struct MemoryRecallParams {
     limit: Option<usize>,
     /// Target namespace (defaults to "default")
     namespace: Option<String>,
-    /// Agent ID performing the operation
-    agent_id: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -187,16 +231,12 @@ struct MemoryUpdateParams {
     content: Option<String>,
     /// New importance score (0.0 to 1.0)
     importance: Option<f64>,
-    /// Agent ID performing the operation
-    agent_id: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
 struct MemoryDeleteParams {
     /// Memory ID to soft-delete (ULID string, required)
     id: String,
-    /// Agent ID performing the operation
-    agent_id: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -209,16 +249,12 @@ struct MemoryLinkParams {
     relation: String,
     /// Edge weight from 0.0 to 1.0 (default: 0.5)
     weight: Option<f64>,
-    /// Agent ID performing the operation
-    agent_id: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
 struct MemoryIntrospectParams {
     /// Optional memory ID to get graph neighborhood for (ULID string)
     id: Option<String>,
-    /// Agent ID performing the operation
-    agent_id: Option<String>,
 }
 
 #[tool(tool_box)]
@@ -232,11 +268,9 @@ impl HirnMcpService {
         &self,
         #[tool(aggr)] params: RememberParams,
     ) -> Result<CallToolResult, McpError> {
-        let agent_id_str = self.resolve_agent_id(params.agent_id.as_deref())?;
-        self.authorize(&agent_id_str, Action::Remember).await?;
-
-        let aid = AgentId::new(agent_id_str)
-            .map_err(|e| McpError::invalid_params(format!("invalid agent_id: {e}"), None))?;
+        self.authorize(Action::Remember, &Operation::Write).await?;
+        self.check_namespace(params.namespace.as_deref())?;
+        let aid = self.agent_id;
 
         let mut builder = EpisodicRecord::builder()
             .content(&params.content)
@@ -286,8 +320,7 @@ impl HirnMcpService {
         &self,
         #[tool(aggr)] params: RecallParams,
     ) -> Result<CallToolResult, McpError> {
-        let agent_id_str = self.resolve_agent_id(params.agent_id.as_deref())?;
-        self.authorize(&agent_id_str, Action::Recall).await?;
+        self.authorize(Action::Recall, &Operation::Read).await?;
 
         // If a HirnQL query is provided, execute it directly.
         if let Some(ref query) = params.query {
@@ -374,8 +407,7 @@ impl HirnMcpService {
         &self,
         #[tool(aggr)] params: ThinkParams,
     ) -> Result<CallToolResult, McpError> {
-        let agent_id_str = self.resolve_agent_id(params.agent_id.as_deref())?;
-        self.authorize(&agent_id_str, Action::Think).await?;
+        self.authorize(Action::Think, &Operation::Read).await?;
         let embedding: Vec<f32> = params
             .query_embedding
             .into_iter()
@@ -427,8 +459,7 @@ impl HirnMcpService {
         &self,
         #[tool(aggr)] params: ForgetParams,
     ) -> Result<CallToolResult, McpError> {
-        let agent_id_str = self.resolve_agent_id(params.agent_id.as_deref())?;
-        self.authorize(&agent_id_str, Action::Forget).await?;
+        self.authorize(Action::Forget, &Operation::Write).await?;
 
         let memory_id = parse_memory_id(&params.id)
             .map_err(|e| McpError::invalid_params(format!("invalid id: {e}"), None))?;
@@ -468,8 +499,7 @@ impl HirnMcpService {
         &self,
         #[tool(aggr)] params: InspectParams,
     ) -> Result<CallToolResult, McpError> {
-        let agent_id_str = self.resolve_agent_id(params.agent_id.as_deref())?;
-        self.authorize(&agent_id_str, Action::Recall).await?;
+        self.authorize(Action::Recall, &Operation::Read).await?;
 
         // Validate the ID as a ULID to prevent HirnQL injection.
         let memory_id = MemoryId::parse(&params.id)
@@ -502,8 +532,8 @@ impl HirnMcpService {
         &self,
         #[tool(aggr)] params: ConsolidateParams,
     ) -> Result<CallToolResult, McpError> {
-        let agent_id_str = self.resolve_agent_id(params.agent_id.as_deref())?;
-        self.authorize(&agent_id_str, Action::Consolidate).await?;
+        self.authorize(Action::Consolidate, &Operation::Admin)
+            .await?;
 
         let mut builder = self.db.admin().consolidate();
 
@@ -540,12 +570,17 @@ impl HirnMcpService {
         &self,
         #[tool(aggr)] params: ExecuteParams,
     ) -> Result<CallToolResult, McpError> {
-        let agent_id_str = self.resolve_agent_id(params.agent_id.as_deref())?;
-        self.authorize(&agent_id_str, Action::Execute).await?;
-
         if params.query.is_empty() {
             return Err(McpError::invalid_params("query is required", None));
         }
+
+        // Classify the statement's verb into the same Operation the HTTP
+        // layer uses, so a read-scoped credential cannot run write/admin
+        // HirnQL through this tool.
+        let stmt = hirn_engine::ql::parser::parse(&params.query)
+            .map_err(|e| McpError::invalid_params(format!("invalid HirnQL: {e}"), None))?;
+        let operation = crate::http::execute_statement_operation(&stmt);
+        self.authorize(Action::Execute, &operation).await?;
 
         let result = self
             .db
@@ -569,8 +604,8 @@ impl HirnMcpService {
         &self,
         #[tool(aggr)] params: WatchParams,
     ) -> Result<CallToolResult, McpError> {
-        let agent_id_str = self.resolve_agent_id(params.agent_id.as_deref())?;
-        self.authorize(&agent_id_str, Action::Watch).await?;
+        self.authorize(Action::Watch, &Operation::Read).await?;
+        self.check_namespace(params.namespace.as_deref())?;
 
         let duration_ms = params.duration_ms.unwrap_or(5000).min(30_000);
         let mut rx = self.watch_tx.subscribe();
@@ -591,7 +626,16 @@ impl HirnMcpService {
             .map(|e| e.split(',').map(|s| s.trim().to_string()).collect())
             .unwrap_or_default();
         let min_importance = params.min_importance;
-        let namespace_scope = WatchNamespaceScope::unrestricted(params.namespace.clone());
+        // Token-restricted identities only see events inside their allowlist;
+        // API-key identities are unrestricted, mirroring the HTTP watch route.
+        let namespace_scope = match &self.identity.namespaces {
+            Some(allowed) => WatchNamespaceScope::token_scoped(
+                &self.agent_id,
+                params.namespace.clone(),
+                allowed.clone(),
+            ),
+            None => WatchNamespaceScope::unrestricted(params.namespace.clone()),
+        };
 
         let mut events = Vec::new();
         let deadline =
@@ -651,9 +695,9 @@ impl HirnMcpService {
         &self,
         #[tool(aggr)] params: MemoryStoreParams,
     ) -> Result<CallToolResult, McpError> {
-        let agent_id_str = self.resolve_agent_id(params.agent_id.as_deref())?;
-        let aid = AgentId::new(agent_id_str)
-            .map_err(|e| McpError::invalid_params(format!("invalid agent_id: {e}"), None))?;
+        self.authorize(Action::Remember, &Operation::Write).await?;
+        self.check_namespace(params.namespace.as_deref())?;
+        let aid = self.agent_id;
 
         let ns = params
             .namespace
@@ -692,9 +736,9 @@ impl HirnMcpService {
         &self,
         #[tool(aggr)] params: MemoryRecallParams,
     ) -> Result<CallToolResult, McpError> {
-        let agent_id_str = self.resolve_agent_id(params.agent_id.as_deref())?;
-        let aid = AgentId::new(agent_id_str)
-            .map_err(|e| McpError::invalid_params(format!("invalid agent_id: {e}"), None))?;
+        self.authorize(Action::Recall, &Operation::Read).await?;
+        self.check_namespace(params.namespace.as_deref())?;
+        let aid = self.agent_id;
 
         let ns = params
             .namespace
@@ -740,9 +784,8 @@ impl HirnMcpService {
         &self,
         #[tool(aggr)] params: MemoryUpdateParams,
     ) -> Result<CallToolResult, McpError> {
-        let agent_id_str = self.resolve_agent_id(params.agent_id.as_deref())?;
-        let aid = AgentId::new(agent_id_str)
-            .map_err(|e| McpError::invalid_params(format!("invalid agent_id: {e}"), None))?;
+        self.authorize(Action::Correct, &Operation::Write).await?;
+        let aid = self.agent_id;
 
         let memory_id = parse_memory_id(&params.id)
             .map_err(|e| McpError::invalid_params(format!("invalid id: {e}"), None))?;
@@ -774,9 +817,8 @@ impl HirnMcpService {
         &self,
         #[tool(aggr)] params: MemoryDeleteParams,
     ) -> Result<CallToolResult, McpError> {
-        let agent_id_str = self.resolve_agent_id(params.agent_id.as_deref())?;
-        let aid = AgentId::new(agent_id_str)
-            .map_err(|e| McpError::invalid_params(format!("invalid agent_id: {e}"), None))?;
+        self.authorize(Action::Forget, &Operation::Write).await?;
+        let aid = self.agent_id;
 
         let memory_id = parse_memory_id(&params.id)
             .map_err(|e| McpError::invalid_params(format!("invalid id: {e}"), None))?;
@@ -800,9 +842,8 @@ impl HirnMcpService {
         &self,
         #[tool(aggr)] params: MemoryLinkParams,
     ) -> Result<CallToolResult, McpError> {
-        let agent_id_str = self.resolve_agent_id(params.agent_id.as_deref())?;
-        let aid = AgentId::new(agent_id_str)
-            .map_err(|e| McpError::invalid_params(format!("invalid agent_id: {e}"), None))?;
+        self.authorize(Action::Connect, &Operation::Write).await?;
+        let aid = self.agent_id;
 
         let source_id = parse_memory_id(&params.source_id)
             .map_err(|e| McpError::invalid_params(format!("invalid source_id: {e}"), None))?;
@@ -840,9 +881,8 @@ impl HirnMcpService {
         &self,
         #[tool(aggr)] params: MemoryIntrospectParams,
     ) -> Result<CallToolResult, McpError> {
-        let agent_id_str = self.resolve_agent_id(params.agent_id.as_deref())?;
-        let aid = AgentId::new(agent_id_str)
-            .map_err(|e| McpError::invalid_params(format!("invalid agent_id: {e}"), None))?;
+        self.authorize(Action::Recall, &Operation::Read).await?;
+        let aid = self.agent_id;
 
         let memory_id = params
             .id

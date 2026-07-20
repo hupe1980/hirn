@@ -231,6 +231,22 @@ pub(crate) struct RecallRow {
     pub(crate) invocation_count: Option<u64>,
 }
 
+impl RecallRow {
+    /// Semantic-layer confidence. The standardized `importance` slot carries
+    /// the layer-native salience column (`confidence` for semantic records),
+    /// so this is the per-record confidence value; NULL for other layers.
+    pub(crate) fn confidence(&self) -> Option<f32> {
+        (self.layer == "semantic").then_some(self.importance)
+    }
+
+    /// Procedural-layer success rate. The standardized `importance` slot
+    /// carries the layer-native salience column (`success_rate` for
+    /// procedural records); NULL for other layers.
+    pub(crate) fn success_rate(&self) -> Option<f32> {
+        (self.layer == "procedural").then_some(self.importance)
+    }
+}
+
 pub(crate) async fn fetch_recall_rows_by_ids(
     storage: &dyn PhysicalStore,
     ids: &[MemoryId],
@@ -694,6 +710,8 @@ pub(crate) fn build_output_batch(
         .iter()
         .map(|row| row.invocation_count)
         .collect::<Vec<_>>();
+    let confidences = rows.iter().map(RecallRow::confidence).collect::<Vec<_>>();
+    let success_rates = rows.iter().map(RecallRow::success_rate).collect::<Vec<_>>();
 
     RecordBatch::try_new(
         schema,
@@ -711,6 +729,8 @@ pub(crate) fn build_output_batch(
             Arc::new(Float32Array::from(surprises)),
             Arc::new(UInt32Array::from(evidence_counts)),
             Arc::new(UInt64Array::from(invocation_counts)),
+            Arc::new(Float32Array::from(confidences)),
+            Arc::new(Float32Array::from(success_rates)),
         ],
     )
     .map_err(hirn_storage::HirnDbError::ArrowError)
@@ -973,6 +993,8 @@ mod tests {
             Field::new("surprise", DataType::Float32, true),
             Field::new("evidence_count", DataType::UInt32, true),
             Field::new("invocation_count", DataType::UInt64, true),
+            Field::new("confidence", DataType::Float32, true),
+            Field::new("success_rate", DataType::Float32, true),
         ]))
     }
 

@@ -291,9 +291,16 @@ pub fn concat_batches(
 /// - `column != 'value'` / `column <> 'value'`
 /// - `column > value`, `column < value`, `column >= value`, `column <= value`
 /// - `column IN ('v1', 'v2', ...)`
+/// - `column IS NULL` / `column IS NOT NULL`
+/// - `NOT expr`
 /// - `expr AND expr`
 /// - `expr OR expr`
 /// - Parenthesized grouping: `(expr)`
+///
+/// Comparisons follow SQL three-valued logic: a comparison against a NULL cell
+/// evaluates to UNKNOWN, and only rows whose predicate evaluates to TRUE are
+/// kept — matching what Lance's SQL filter pushdown does. `IS [NOT] NULL` is
+/// the only way to match NULL cells.
 pub fn filter_batches(
     predicate: &str,
     batches: &[RecordBatch],
@@ -302,6 +309,9 @@ pub fn filter_batches(
 }
 
 /// Like [`filter_batches`] but keeps rows that **do not** match (inverted mask).
+///
+/// Follows SQL `DELETE ... WHERE` semantics: rows whose predicate evaluates to
+/// FALSE *or* UNKNOWN do not match, so both are kept by the inverted filter.
 pub fn filter_batches_inverted(
     predicate: &str,
     batches: &[RecordBatch],
@@ -317,16 +327,18 @@ fn filter_batches_impl(
     let expr = parse_filter_expr(predicate)?;
     let mut result = Vec::new();
     for batch in batches {
-        let mask = eval_expr(&expr, batch)?;
-        let final_mask = if invert {
-            BooleanArray::from(
-                mask.iter()
-                    .map(|v| Some(!v.unwrap_or(false)))
-                    .collect::<Vec<_>>(),
-            )
-        } else {
-            mask
-        };
+        // Three-valued predicate result per row: Some(true) / Some(false) /
+        // None (UNKNOWN). Only TRUE rows match; inversion keeps everything else.
+        let tri_mask = eval_expr(&expr, batch)?;
+        let final_mask = BooleanArray::from(
+            tri_mask
+                .iter()
+                .map(|v| {
+                    let matched = *v == Some(true);
+                    Some(if invert { !matched } else { matched })
+                })
+                .collect::<Vec<_>>(),
+        );
         let filtered = arrow_select::filter::filter_record_batch(batch, &final_mask)
             .map_err(HirnDbError::ArrowError)?;
         if filtered.num_rows() > 0 {
@@ -348,6 +360,11 @@ enum FilterExpr {
         column: String,
         values: Vec<String>,
     },
+    IsNull {
+        column: String,
+        negated: bool,
+    },
+    Not(Box<FilterExpr>),
     And(Box<FilterExpr>, Box<FilterExpr>),
     Or(Box<FilterExpr>, Box<FilterExpr>),
 }
@@ -362,101 +379,132 @@ enum CmpOp {
     Le,
 }
 
-/// Evaluate a filter expression against a RecordBatch, producing a boolean mask.
-fn eval_expr(expr: &FilterExpr, batch: &RecordBatch) -> Result<BooleanArray, HirnDbError> {
+fn column_for_expr<'a>(batch: &'a RecordBatch, column: &str) -> Result<&'a ArrayRef, HirnDbError> {
+    let index = batch
+        .schema()
+        .index_of(column)
+        .map_err(|_| HirnDbError::InvalidPredicate(format!("column `{column}` not in schema")))?;
+    Ok(batch.column(index))
+}
+
+/// Evaluate a filter expression against a RecordBatch, producing one
+/// three-valued result per row (`None` = SQL UNKNOWN).
+fn eval_expr(expr: &FilterExpr, batch: &RecordBatch) -> Result<Vec<Option<bool>>, HirnDbError> {
     match expr {
         FilterExpr::Comparison { column, op, value } => {
-            let schema = batch.schema();
-            let col_idx = schema.index_of(column).map_err(|_| {
-                HirnDbError::InvalidPredicate(format!("column `{column}` not in schema"))
-            })?;
-            let col = batch.column(col_idx);
+            let col = column_for_expr(batch, column)?;
             let mut bits = Vec::with_capacity(batch.num_rows());
             for row in 0..batch.num_rows() {
-                let cell = array_value_to_string(col, row);
-                let matched = match op {
-                    CmpOp::Eq => cell == *value,
-                    CmpOp::Ne => cell != *value,
-                    CmpOp::Gt => cmp_numeric(&cell, value, |a, b| a > b),
-                    CmpOp::Lt => cmp_numeric(&cell, value, |a, b| a < b),
-                    CmpOp::Ge => cmp_numeric(&cell, value, |a, b| a >= b),
-                    CmpOp::Le => cmp_numeric(&cell, value, |a, b| a <= b),
+                // NULL operand → UNKNOWN, never a match (SQL three-valued logic).
+                let Some(cell) = array_value_to_string(col, row) else {
+                    bits.push(None);
+                    continue;
                 };
-                bits.push(matched);
+                let ordering = cmp_values(&cell, value);
+                let matched = match op {
+                    CmpOp::Eq => ordering == std::cmp::Ordering::Equal,
+                    CmpOp::Ne => ordering != std::cmp::Ordering::Equal,
+                    CmpOp::Gt => ordering == std::cmp::Ordering::Greater,
+                    CmpOp::Lt => ordering == std::cmp::Ordering::Less,
+                    CmpOp::Ge => ordering != std::cmp::Ordering::Less,
+                    CmpOp::Le => ordering != std::cmp::Ordering::Greater,
+                };
+                bits.push(Some(matched));
             }
-            Ok(BooleanArray::from(bits))
+            Ok(bits)
         }
         FilterExpr::In { column, values } => {
-            let schema = batch.schema();
-            let col_idx = schema.index_of(column).map_err(|_| {
-                HirnDbError::InvalidPredicate(format!("column `{column}` not in schema"))
-            })?;
-            let col = batch.column(col_idx);
+            let col = column_for_expr(batch, column)?;
             let value_set: std::collections::HashSet<&str> =
                 values.iter().map(String::as_str).collect();
             let mut bits = Vec::with_capacity(batch.num_rows());
             for row in 0..batch.num_rows() {
-                let cell = array_value_to_string(col, row);
-                bits.push(value_set.contains(cell.as_str()));
+                bits.push(
+                    array_value_to_string(col, row).map(|cell| value_set.contains(cell.as_str())),
+                );
             }
-            Ok(BooleanArray::from(bits))
+            Ok(bits)
+        }
+        FilterExpr::IsNull { column, negated } => {
+            let col = column_for_expr(batch, column)?;
+            Ok((0..batch.num_rows())
+                .map(|row| Some(col.is_null(row) != *negated))
+                .collect())
+        }
+        FilterExpr::Not(inner) => {
+            // Kleene NOT: UNKNOWN stays UNKNOWN.
+            let inner = eval_expr(inner, batch)?;
+            Ok(inner.into_iter().map(|v| v.map(|b| !b)).collect())
         }
         FilterExpr::And(lhs, rhs) => {
             let l = eval_expr(lhs, batch)?;
             let r = eval_expr(rhs, batch)?;
-            let bits: Vec<bool> = (0..batch.num_rows())
-                .map(|i| l.value(i) && r.value(i))
-                .collect();
-            Ok(BooleanArray::from(bits))
+            Ok(l.into_iter()
+                .zip(r)
+                .map(|(a, b)| match (a, b) {
+                    // Kleene AND: FALSE dominates, then UNKNOWN.
+                    (Some(false), _) | (_, Some(false)) => Some(false),
+                    (Some(true), Some(true)) => Some(true),
+                    _ => None,
+                })
+                .collect())
         }
         FilterExpr::Or(lhs, rhs) => {
             let l = eval_expr(lhs, batch)?;
             let r = eval_expr(rhs, batch)?;
-            let bits: Vec<bool> = (0..batch.num_rows())
-                .map(|i| l.value(i) || r.value(i))
-                .collect();
-            Ok(BooleanArray::from(bits))
+            Ok(l.into_iter()
+                .zip(r)
+                .map(|(a, b)| match (a, b) {
+                    // Kleene OR: TRUE dominates, then UNKNOWN.
+                    (Some(true), _) | (_, Some(true)) => Some(true),
+                    (Some(false), Some(false)) => Some(false),
+                    _ => None,
+                })
+                .collect())
         }
     }
 }
 
-fn cmp_numeric(a: &str, b: &str, f: fn(f64, f64) -> bool) -> bool {
-    a.parse::<f64>()
-        .ok()
-        .zip(b.parse::<f64>().ok())
-        .map(|(x, y)| f(x, y))
-        .unwrap_or(false)
+/// Compare two scalar cell values: numerically when both parse as numbers
+/// (so `x = 1.0` matches an integer cell `1`, as SQL type coercion would),
+/// otherwise lexicographically as strings.
+fn cmp_values(a: &str, b: &str) -> std::cmp::Ordering {
+    match (a.parse::<f64>(), b.parse::<f64>()) {
+        (Ok(x), Ok(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
+        _ => a.cmp(b),
+    }
 }
 
-fn array_value_to_string(array: &ArrayRef, row: usize) -> String {
+/// Stringify the cell at `row`, or `None` when the cell is NULL.
+fn array_value_to_string(array: &ArrayRef, row: usize) -> Option<String> {
     if array.is_null(row) {
-        return String::new();
+        return None;
     }
     if let Some(a) = array.as_any().downcast_ref::<StringArray>() {
-        return a.value(row).to_string();
+        return Some(a.value(row).to_string());
     }
     if let Some(a) = array.as_any().downcast_ref::<BooleanArray>() {
-        return a.value(row).to_string();
+        return Some(a.value(row).to_string());
     }
     if let Some(a) = array.as_any().downcast_ref::<Int32Array>() {
-        return a.value(row).to_string();
+        return Some(a.value(row).to_string());
     }
     if let Some(a) = array.as_any().downcast_ref::<Int64Array>() {
-        return a.value(row).to_string();
+        return Some(a.value(row).to_string());
     }
     if let Some(a) = array.as_any().downcast_ref::<UInt32Array>() {
-        return a.value(row).to_string();
+        return Some(a.value(row).to_string());
     }
     if let Some(a) = array.as_any().downcast_ref::<UInt64Array>() {
-        return a.value(row).to_string();
+        return Some(a.value(row).to_string());
     }
     if let Some(a) = array.as_any().downcast_ref::<Float64Array>() {
-        return a.value(row).to_string();
+        return Some(a.value(row).to_string());
     }
     if let Some(a) = array.as_any().downcast_ref::<Float32Array>() {
-        return a.value(row).to_string();
+        return Some(a.value(row).to_string());
     }
-    format!("{:?}", array.slice(row, 1))
+    Some(format!("{:?}", array.slice(row, 1)))
 }
 
 // ── Recursive-descent filter parser ───────────────────────────────────
@@ -465,8 +513,10 @@ fn array_value_to_string(array: &ArrayRef, row: usize) -> String {
 //   expr     → or_expr
 //   or_expr  → and_expr ( "OR" and_expr )*
 //   and_expr → atom ( "AND" atom )*
-//   atom     → "(" expr ")" | comparison
+//   atom     → "(" expr ")" | "NOT" atom | comparison
 //   comparison → IDENT OP VALUE
+//              | IDENT "IN" "(" VALUE ("," VALUE)* ")"
+//              | IDENT "IS" ["NOT"] "NULL"
 //
 // Tokens are whitespace-separated, except operators which may abut values.
 
@@ -494,6 +544,9 @@ enum Token {
     And,
     Or,
     In,
+    Is,
+    Not,
+    Null,
 }
 
 fn tokenize(input: &str) -> Result<Vec<Token>, HirnDbError> {
@@ -597,6 +650,9 @@ fn tokenize(input: &str) -> Result<Vec<Token>, HirnDbError> {
                 "AND" => tokens.push(Token::And),
                 "OR" => tokens.push(Token::Or),
                 "IN" => tokens.push(Token::In),
+                "IS" => tokens.push(Token::Is),
+                "NOT" => tokens.push(Token::Not),
+                "NULL" => tokens.push(Token::Null),
                 _ => tokens.push(Token::Ident(word)),
             }
             continue;
@@ -648,7 +704,13 @@ fn parse_atom(tokens: &[Token], pos: &mut usize) -> Result<FilterExpr, HirnDbErr
         *pos += 1;
         return Ok(expr);
     }
-    // Comparison: IDENT OP VALUE, or IDENT IN (value, ...)
+    // Unary NOT (binds tighter than AND/OR, looser than comparisons)
+    if tokens[*pos] == Token::Not {
+        *pos += 1;
+        let inner = parse_atom(tokens, pos)?;
+        return Ok(FilterExpr::Not(Box::new(inner)));
+    }
+    // Comparison: IDENT OP VALUE, IDENT IN (value, ...), or IDENT IS [NOT] NULL
     let column = match &tokens[*pos] {
         Token::Ident(s) => s.clone(),
         other => {
@@ -662,6 +724,24 @@ fn parse_atom(tokens: &[Token], pos: &mut usize) -> Result<FilterExpr, HirnDbErr
         return Err(HirnDbError::InvalidPredicate(format!(
             "expected operator after `{column}`"
         )));
+    }
+
+    // Handle IS [NOT] NULL
+    if tokens[*pos] == Token::Is {
+        *pos += 1;
+        let negated = if *pos < tokens.len() && tokens[*pos] == Token::Not {
+            *pos += 1;
+            true
+        } else {
+            false
+        };
+        if *pos >= tokens.len() || tokens[*pos] != Token::Null {
+            return Err(HirnDbError::InvalidPredicate(format!(
+                "expected NULL after IS for `{column}`"
+            )));
+        }
+        *pos += 1;
+        return Ok(FilterExpr::IsNull { column, negated });
     }
 
     // Handle IN (value, value, ...)
@@ -952,6 +1032,125 @@ mod tests {
         let result = filter_batches("memory_id = 'm1' AND blob_index = 1", &[batch]).unwrap();
         let total: usize = result.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 1);
+    }
+
+    fn nullable_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("note", DataType::Utf8, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow_array::Int64Array::from(vec![1_i64, 2, 3, 4])),
+                Arc::new(StringArray::from(vec![
+                    Some("alpha"),
+                    None,
+                    Some(""),
+                    Some("beta"),
+                ])),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn collect_ids(batches: &[RecordBatch]) -> Vec<i64> {
+        batches
+            .iter()
+            .flat_map(|batch| {
+                let ids = batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .unwrap();
+                (0..batch.num_rows())
+                    .map(|row| ids.value(row))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_filter_eq_empty_string_does_not_match_null() {
+        let batch = nullable_batch();
+        let result = filter_batches("note = ''", &[batch]).unwrap();
+        assert_eq!(collect_ids(&result), vec![3]);
+    }
+
+    #[test]
+    fn test_filter_ne_excludes_null() {
+        let batch = nullable_batch();
+        let result = filter_batches("note != 'alpha'", &[batch]).unwrap();
+        // NULL comparison is UNKNOWN → excluded; only definite non-matches remain.
+        assert_eq!(collect_ids(&result), vec![3, 4]);
+    }
+
+    #[test]
+    fn test_filter_in_excludes_null() {
+        let batch = nullable_batch();
+        let result = filter_batches("note IN ('alpha', 'beta')", &[batch]).unwrap();
+        assert_eq!(collect_ids(&result), vec![1, 4]);
+    }
+
+    #[test]
+    fn test_filter_is_null() {
+        let batch = nullable_batch();
+        let result = filter_batches("note IS NULL", &[batch]).unwrap();
+        assert_eq!(collect_ids(&result), vec![2]);
+    }
+
+    #[test]
+    fn test_filter_is_not_null() {
+        let batch = nullable_batch();
+        let result = filter_batches("note IS NOT NULL", &[batch]).unwrap();
+        assert_eq!(collect_ids(&result), vec![1, 3, 4]);
+    }
+
+    #[test]
+    fn test_filter_not() {
+        let batch = nullable_batch();
+        // NOT over UNKNOWN stays UNKNOWN, so the NULL row remains excluded.
+        let result = filter_batches("NOT note = 'alpha'", &[batch]).unwrap();
+        assert_eq!(collect_ids(&result), vec![3, 4]);
+
+        let batch = nullable_batch();
+        let result = filter_batches("NOT (note IS NULL)", &[batch]).unwrap();
+        assert_eq!(collect_ids(&result), vec![1, 3, 4]);
+    }
+
+    #[test]
+    fn test_filter_inverted_keeps_null_rows() {
+        let batch = nullable_batch();
+        // DELETE-style inversion: rows where the predicate is FALSE or UNKNOWN
+        // are kept, so the NULL row survives.
+        let result = filter_batches_inverted("note = 'alpha'", &[batch]).unwrap();
+        assert_eq!(collect_ids(&result), vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn test_filter_numeric_eq_across_representations() {
+        let batch = nullable_batch();
+        // Float literal matches integer cell numerically.
+        let result = filter_batches("id = 1.0", &[batch]).unwrap();
+        assert_eq!(collect_ids(&result), vec![1]);
+
+        let batch = nullable_batch();
+        let result = filter_batches("id != 1.0", &[batch]).unwrap();
+        assert_eq!(collect_ids(&result), vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn test_filter_null_and_or_kleene() {
+        let batch = nullable_batch();
+        // UNKNOWN OR TRUE → TRUE: the NULL row matches through the id branch.
+        let result = filter_batches("note = 'alpha' OR id = 2", &[batch]).unwrap();
+        assert_eq!(collect_ids(&result), vec![1, 2]);
+
+        let batch = nullable_batch();
+        // UNKNOWN AND TRUE → UNKNOWN: the NULL row never matches.
+        let result = filter_batches("note != 'x' AND id >= 1", &[batch]).unwrap();
+        assert_eq!(collect_ids(&result), vec![1, 3, 4]);
     }
 
     #[test]

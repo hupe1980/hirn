@@ -214,7 +214,7 @@ async fn quarantine_reconcile_proposal(
             quarantine::to_batch(&[quarantine::QuarantineRow {
                 memory_id: entry_id,
                 record_kind: QuarantinedRecordKind::Semantic,
-                record_bytes: bincode::serialize(&record)?,
+                record_bytes: hirn_core::persist::to_versioned_bytes(&record)?,
                 anomaly_score: 0.0,
                 reason: format!(
                     "manual reconcile proposal {} awaiting approval",
@@ -417,7 +417,7 @@ async fn dream_jobs_remain_quarantined_until_explicit_approval() -> TestResult<(
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].record_kind, QuarantinedRecordKind::Semantic);
     let pending_hypothesis: hirn_core::semantic::SemanticRecord =
-        bincode::deserialize(&pending[0].record)?;
+        hirn_core::persist::from_versioned_bytes(&pending[0].record)?;
     assert_eq!(pending_hypothesis.source_episodes.len(), 2);
     for source in active_before.iter().map(|record| record.id) {
         assert!(pending_hypothesis.source_episodes.contains(&source));
@@ -528,7 +528,8 @@ async fn reconcile_jobs_quarantine_proposals_without_mutating_active_heads() -> 
     let pending = db.causal().review_quarantine().await?;
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].record_kind, QuarantinedRecordKind::Semantic);
-    let proposal: hirn_core::semantic::SemanticRecord = bincode::deserialize(&pending[0].record)?;
+    let proposal: hirn_core::semantic::SemanticRecord =
+        hirn_core::persist::from_versioned_bytes(&pending[0].record)?;
     assert_eq!(
         proposal.knowledge_type,
         hirn_core::types::KnowledgeType::Prescriptive
@@ -778,7 +779,7 @@ async fn plan_jobs_quarantine_goal_conditioned_agendas_with_supporting_evidence(
     let pending = db.causal().review_quarantine().await?;
     assert_eq!(pending.len(), 1);
     let agenda_record: hirn_core::semantic::SemanticRecord =
-        bincode::deserialize(&pending[0].record)?;
+        hirn_core::persist::from_versioned_bytes(&pending[0].record)?;
     assert_eq!(
         agenda_record.provenance.extraction_model.as_deref(),
         Some("offline-plan:deterministic-agenda")
@@ -894,7 +895,7 @@ async fn plan_jobs_surface_gaps_for_missing_prerequisites() -> TestResult<()> {
 
     let pending = db.causal().review_quarantine().await?;
     let agenda_record: hirn_core::semantic::SemanticRecord =
-        bincode::deserialize(&pending[0].record)?;
+        hirn_core::persist::from_versioned_bytes(&pending[0].record)?;
     let agenda = hirn_core::PlanningAgenda::from_json(&agenda_record.description)?;
     assert!(
         agenda
@@ -928,7 +929,7 @@ async fn plan_jobs_trim_subgoals_to_budget_without_corrupting_payload() -> TestR
 
     let pending = db.causal().review_quarantine().await?;
     let agenda_record: hirn_core::semantic::SemanticRecord =
-        bincode::deserialize(&pending[0].record)?;
+        hirn_core::persist::from_versioned_bytes(&pending[0].record)?;
     let agenda = hirn_core::PlanningAgenda::from_json(&agenda_record.description)?;
     assert_eq!(agenda.ordered_subgoals.len(), 2);
     assert!(agenda.quality_score > 0.0);

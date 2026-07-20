@@ -366,10 +366,17 @@ impl EpisodicRecordBuilder {
         provenance.evidence_links = self.evidence_links;
 
         // Compute expires_at: explicit > TTL-derived > None.
+        // A TTL that overflows chrono's range must saturate to the far future,
+        // NOT fall back to `Duration::zero()` — the latter makes
+        // `expires_at == timestamp`, marking the record immediately expired and
+        // eligible for `purge_expired()`, the opposite of a long TTL.
         let expires_at = self.expires_at.or_else(|| {
             self.ttl.map(|d| {
-                let dt = ts.as_datetime()
-                    + chrono::Duration::from_std(d).unwrap_or(chrono::Duration::zero());
+                let dt = match chrono::Duration::from_std(d) {
+                    Ok(dur) => ts.as_datetime().checked_add_signed(dur),
+                    Err(_) => None,
+                }
+                .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC);
                 Timestamp::from_datetime(dt)
             })
         });

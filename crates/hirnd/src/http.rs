@@ -109,6 +109,9 @@ enum IdempotencyCacheReservation {
     },
     Wait(Arc<Notify>),
     Conflict,
+    /// Every slot is occupied by an in-flight reservation, so nothing can be
+    /// evicted without breaking exactly-once semantics for a running request.
+    AtCapacity,
 }
 
 pub struct IdempotencyCache {
@@ -166,6 +169,17 @@ impl IdempotencyCache {
             },
             None => {
                 Self::evict_until_capacity(&mut entries, self.max_entries);
+
+                // `evict_until_capacity` only removes Ready entries; when the
+                // map is still full every slot is an InFlight reservation and
+                // inserting would grow the cache without bound. Hard-stop at
+                // the ceiling and let the caller signal a retryable overload.
+                if entries.len() >= self.max_entries {
+                    counter!("hirnd_idempotency_at_capacity_total").increment(1);
+                    drop(entries);
+                    Self::notify_waiters(expired_waiters);
+                    return IdempotencyCacheReservation::AtCapacity;
+                }
 
                 let notify = Arc::new(Notify::new());
                 entries.insert(
@@ -880,6 +894,15 @@ async fn acquire_idempotency_permit(
                     .invalidate_ready(idempotency_request);
             }
             IdempotencyCacheReservation::Wait(notify) => notify.notified().await,
+            IdempotencyCacheReservation::AtCapacity => {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ErrorResponse::with_retryable(
+                        "idempotency cache is at capacity — retry later",
+                        true,
+                    )),
+                ));
+            }
             IdempotencyCacheReservation::Conflict => {
                 return Err((
                     StatusCode::CONFLICT,
@@ -1053,8 +1076,9 @@ fn execute_statement_namespace(stmt: &Statement) -> Option<&str> {
     }
 }
 
-#[cfg(test)]
-fn execute_statement_operation(stmt: &Statement) -> Operation {
+/// Shared with the MCP surface so both interfaces gate HirnQL execution on
+/// the same verb → operation mapping.
+pub(crate) fn execute_statement_operation(stmt: &Statement) -> Operation {
     execute_statement_metadata(stmt).operation
 }
 
@@ -1351,9 +1375,43 @@ async fn issue_token(
         agent_id: agent_id.to_owned(),
     };
 
+    // Prevent privilege escalation via token minting. A caller authenticated by
+    // a *restricted* token carries its own scope in the `x-token-operations` /
+    // `x-token-namespaces` headers (injected by `auth_middleware`); it may only
+    // mint a token whose scope is a subset of its own. Unrestricted principals
+    // (API key / mTLS) have no such headers and may mint any scope for the realm.
+    let mut operations = body.operations;
+    let namespaces = body.namespaces;
+    if let Some(caller_ops) = parse_token_operations(&headers)? {
+        // Empty request means "all operations" — for a restricted caller that
+        // would be a widening, so inherit the caller's own scope instead.
+        if operations.is_empty() {
+            operations.clone_from(&caller_ops);
+        } else if let Some(op) = operations.iter().find(|op| !caller_ops.contains(op)) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(ErrorResponse::new(format!(
+                    "cannot issue a token with operation {op:?}: outside the caller's own scope"
+                ))),
+            ));
+        }
+    }
+    if let Some(caller_ns) = parse_token_namespaces(&headers)? {
+        // Empty namespaces is the narrow default (private + shared only), not a
+        // widening, so only non-empty explicit requests need the subset check.
+        if let Some(ns) = namespaces.iter().find(|ns| !caller_ns.contains(ns)) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(ErrorResponse::new(format!(
+                    "cannot issue a token for namespace {ns:?}: outside the caller's own scope"
+                ))),
+            ));
+        }
+    }
+
     let token = state
         .auth_state
-        .issue_token(&identity, body.namespaces, body.operations, body.ttl_secs)
+        .issue_token(&identity, namespaces, operations, body.ttl_secs)
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1487,7 +1545,16 @@ async fn brain_stats(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
     })
 }
 
-async fn cluster_status(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
+async fn cluster_status(
+    State(state): State<Arc<HttpState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(resp) = check_operation(&headers, &Operation::Admin) {
+        return resp.into_response();
+    }
+    if let Err(resp) = enforce_rate_limit(&state, &headers, RateLimitClass::Admin) {
+        return resp.into_response();
+    }
     if let Some(ref raft) = state.raft {
         let metrics = raft.metrics().borrow().clone();
         let nodes = if let Some(ref sm) = state.raft_state_machine {
@@ -1511,6 +1578,7 @@ async fn cluster_status(State(state): State<Arc<HttpState>>) -> impl IntoRespons
                 "members": members,
             })),
         )
+            .into_response()
     } else {
         (
             StatusCode::OK,
@@ -1520,6 +1588,7 @@ async fn cluster_status(State(state): State<Arc<HttpState>>) -> impl IntoRespons
                 "members": [],
             })),
         )
+            .into_response()
     }
 }
 
@@ -2647,8 +2716,18 @@ struct ClusterNodeEntry {
 /// Should only be called once on the leader node.
 async fn cluster_init(
     State(state): State<Arc<HttpState>>,
+    headers: HeaderMap,
     Json(req): Json<ClusterInitRequest>,
 ) -> impl IntoResponse {
+    // Cluster membership changes are Admin operations and must be scoped +
+    // throttled like every other mutating route — a Read-scoped token must not
+    // be able to reshape the Raft cluster.
+    if let Err(resp) = check_operation(&headers, &Operation::Admin) {
+        return resp.into_response();
+    }
+    if let Err(resp) = enforce_rate_limit(&state, &headers, RateLimitClass::Admin) {
+        return resp.into_response();
+    }
     let Some(ref raft) = state.raft else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2705,8 +2784,15 @@ struct ClusterJoinRequest {
 /// First adds as learner, then promotes to voter.
 async fn cluster_join(
     State(state): State<Arc<HttpState>>,
+    headers: HeaderMap,
     Json(req): Json<ClusterJoinRequest>,
 ) -> impl IntoResponse {
+    if let Err(resp) = check_operation(&headers, &Operation::Admin) {
+        return resp.into_response();
+    }
+    if let Err(resp) = enforce_rate_limit(&state, &headers, RateLimitClass::Admin) {
+        return resp.into_response();
+    }
     let Some(ref raft) = state.raft else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2763,7 +2849,17 @@ async fn cluster_join(
 }
 
 /// Get detailed Raft metrics for monitoring.
-async fn cluster_metrics(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
+async fn cluster_metrics(
+    State(state): State<Arc<HttpState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    // Cluster topology/metrics are Admin-visibility: gate behind the Admin op.
+    if let Err(resp) = check_operation(&headers, &Operation::Admin) {
+        return resp.into_response();
+    }
+    if let Err(resp) = enforce_rate_limit(&state, &headers, RateLimitClass::Admin) {
+        return resp.into_response();
+    }
     let Some(ref raft) = state.raft else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2789,20 +2885,35 @@ async fn cluster_metrics(State(state): State<Arc<HttpState>>) -> impl IntoRespon
 }
 
 /// Serve an axum `Router` over TLS using the given `TlsAcceptor`.
+///
+/// The accept loop runs until `shutdown` fires (or its sender is dropped),
+/// then stops accepting new connections and drains the in-flight ones before
+/// returning.
 pub async fn serve_http_tls(
     listener: tokio::net::TcpListener,
     app: Router,
     acceptor: tokio_rustls::TlsAcceptor,
+    mut shutdown: tokio::sync::watch::Receiver<()>,
 ) -> Result<(), std::io::Error> {
     use hyper_util::rt::TokioIo;
     use tower::ServiceExt;
 
+    let mut connections = tokio::task::JoinSet::new();
+
     loop {
-        let (stream, _addr) = listener.accept().await?;
+        // Reap connection tasks that already finished so the set does not
+        // accumulate one entry per connection for the process lifetime.
+        while connections.try_join_next().is_some() {}
+
+        let accepted = tokio::select! {
+            accepted = listener.accept() => accepted,
+            _ = shutdown.changed() => break,
+        };
+        let (stream, _addr) = accepted?;
         let acceptor = acceptor.clone();
         let app = app.clone();
 
-        tokio::spawn(async move {
+        connections.spawn(async move {
             match acceptor.accept(stream).await {
                 Ok(tls_stream) => {
                     // Extract client certificate CN for mTLS auth (if present)
@@ -2819,7 +2930,12 @@ pub async fn serve_http_tls(
                             let app = app.clone();
                             let cn = client_cn.clone();
                             async move {
-                                // Inject mTLS client CN as header for auth middleware
+                                // Always strip any client-supplied CN header first,
+                                // then inject the verified peer-certificate CN (if the
+                                // client actually presented one). This makes the header
+                                // the auth middleware sees unforgeable: absent when no
+                                // client cert was verified, present only with our value.
+                                req.headers_mut().remove("x-client-cert-cn");
                                 if let Some(ref cn) = cn {
                                     if let Ok(val) = hyper::header::HeaderValue::from_str(cn) {
                                         req.headers_mut().insert("x-client-cert-cn", val);
@@ -2844,18 +2960,115 @@ pub async fn serve_http_tls(
             }
         });
     }
+
+    // Stop accepting, then drain in-flight connections.
+    drop(listener);
+    tracing::info!("TLS HTTP server draining in-flight connections");
+    while connections.join_next().await.is_some() {}
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        cluster_endpoint_validation_profile, execute_statement_operation,
-        execute_statement_requires_owner_forwarding, validate_cluster_node_addr,
-        validate_raft_transport_token,
+        CachedJsonResponse, IdempotencyCache, IdempotencyCacheKey, IdempotencyCacheReservation,
+        IdempotencyReplayScope, IdempotencyRequest, cluster_endpoint_validation_profile,
+        execute_statement_operation, execute_statement_requires_owner_forwarding,
+        validate_cluster_node_addr, validate_raft_transport_token,
     };
     use crate::auth::Operation;
     use crate::config::ClusterTransportProfile;
     use axum::http::HeaderMap;
+    use axum::http::StatusCode as HttpStatusCode;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn idempotency_request(key: &str) -> IdempotencyRequest {
+        IdempotencyRequest {
+            cache_key: IdempotencyCacheKey {
+                path: "/v1/remember".to_owned(),
+                realm: "default".to_owned(),
+                agent_id: "agent-a".to_owned(),
+                namespace: None,
+                key: key.to_owned(),
+            },
+            request_hash: format!("hash-{key}"),
+        }
+    }
+
+    #[test]
+    fn idempotency_cache_rejects_new_keys_when_full_of_inflight_entries() {
+        let cache = Arc::new(IdempotencyCache::new(Duration::from_mins(1), 2));
+
+        let first = idempotency_request("a");
+        let second = idempotency_request("b");
+        let third = idempotency_request("c");
+
+        let _permit_a = match cache.reserve(&first) {
+            IdempotencyCacheReservation::Acquired(permit) => permit,
+            other => panic!("expected Acquired, got {}", reservation_name(&other)),
+        };
+        let _permit_b = match cache.reserve(&second) {
+            IdempotencyCacheReservation::Acquired(permit) => permit,
+            other => panic!("expected Acquired, got {}", reservation_name(&other)),
+        };
+
+        // Both slots are InFlight — a third distinct key must be refused
+        // instead of growing the cache past its ceiling.
+        assert!(matches!(
+            cache.reserve(&third),
+            IdempotencyCacheReservation::AtCapacity
+        ));
+
+        // Existing reservations are unaffected: same key + same payload waits.
+        assert!(matches!(
+            cache.reserve(&first),
+            IdempotencyCacheReservation::Wait(_)
+        ));
+    }
+
+    #[test]
+    fn idempotency_cache_accepts_new_keys_after_a_slot_becomes_evictable() {
+        let cache = Arc::new(IdempotencyCache::new(Duration::from_mins(1), 2));
+
+        let first = idempotency_request("a");
+        let second = idempotency_request("b");
+        let third = idempotency_request("c");
+
+        let permit_a = match cache.reserve(&first) {
+            IdempotencyCacheReservation::Acquired(permit) => permit,
+            other => panic!("expected Acquired, got {}", reservation_name(&other)),
+        };
+        let _permit_b = match cache.reserve(&second) {
+            IdempotencyCacheReservation::Acquired(permit) => permit,
+            other => panic!("expected Acquired, got {}", reservation_name(&other)),
+        };
+        assert!(matches!(
+            cache.reserve(&third),
+            IdempotencyCacheReservation::AtCapacity
+        ));
+
+        // Completing the first request turns its slot into a Ready entry,
+        // which is evictable — the new key can now reserve.
+        let _ = permit_a.finish(
+            CachedJsonResponse::from_parts(HttpStatusCode::CREATED, b"{}".to_vec()),
+            IdempotencyReplayScope::Local,
+        );
+        assert!(matches!(
+            cache.reserve(&third),
+            IdempotencyCacheReservation::Acquired(_)
+        ));
+    }
+
+    fn reservation_name(reservation: &IdempotencyCacheReservation) -> &'static str {
+        match reservation {
+            IdempotencyCacheReservation::Acquired(_) => "Acquired",
+            IdempotencyCacheReservation::Replay { .. } => "Replay",
+            IdempotencyCacheReservation::Wait(_) => "Wait",
+            IdempotencyCacheReservation::Conflict => "Conflict",
+            IdempotencyCacheReservation::AtCapacity => "AtCapacity",
+        }
+    }
 
     #[test]
     fn execute_statement_operation_treats_set_tier_policy_as_admin() {

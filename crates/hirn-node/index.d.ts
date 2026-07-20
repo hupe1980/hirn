@@ -15,11 +15,15 @@ export class HirnError extends Error {
 /** Thrown when a memory record is not found. */
 export class NotFoundError extends HirnError {
   readonly name: 'NotFoundError';
+  /** Stable machine-readable discriminator. */
+  readonly code: 'NOT_FOUND';
 }
 
 /** Thrown when a HirnQL query is invalid or fails. */
 export class QueryError extends HirnError {
   readonly name: 'QueryError';
+  /** Stable machine-readable discriminator. */
+  readonly code: 'QUERY';
 }
 
 export type RecallSnapshotKind = 'observed' | 'recorded' | 'revision';
@@ -133,7 +137,7 @@ export class WatchStream {
  * ```ts
  * import { Memory } from '@hupe1980/hirn';
  *
- * const mem = Memory.open('./brain.hirn');
+ * const mem = await Memory.open('./brain.hirn');
  * try {
  *   const id = await mem.remember('User prefers dark mode');
  *   const ctx = await mem.think('preferences?');
@@ -147,7 +151,7 @@ export class WatchStream {
  * ```ts
  * import { Memory, OpenAIEmbeddings } from '@hupe1980/hirn';
  *
- * const mem = Memory.open('./brain.hirn', {
+ * const mem = await Memory.open('./brain.hirn', {
  *   embeddings: new OpenAIEmbeddings(),
  * });
  * ```
@@ -170,7 +174,7 @@ export class Memory {
     tokenBudget?: number;
     /** Rust tokenizer registry name. JS token counting does not become authoritative. */
     tokenizerName?: string;
-  }): Memory;
+  }): Promise<Memory>;
 
   /** Close the memory database. Should be called when done. */
   close(): void;
@@ -292,7 +296,7 @@ export class Memory {
    *
    * @returns Stats with record counts and file size.
    */
-  stats(): Stats;
+  stats(): Promise<Stats>;
 
   /**
    * Subscribe to memory events (create, archive, consolidate).
@@ -308,7 +312,7 @@ export class Memory {
   }): Promise<WatchStream>;
 
   /**
-   * Support `using mem = Memory.open(...)` (TC39 Explicit Resource Management).
+   * Support `using mem = await Memory.open(...)` (TC39 Explicit Resource Management).
    */
   [Symbol.dispose](): void;
 }

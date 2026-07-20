@@ -275,6 +275,13 @@ pub struct EventEnvelope {
     /// `None` when no realm secret is configured.
     #[serde(default)]
     pub hmac: Option<String>,
+    /// HMAC tag of the immediately preceding event in the log, folded into this
+    /// event's own tag. This chains the events together (a Merkle-style hash
+    /// chain) so that deleting or truncating events — not just mutating one —
+    /// is detectable: a removed event breaks the `prev_hmac` linkage of its
+    /// successor. `None` for the first event or when signing is disabled.
+    #[serde(default)]
+    pub prev_hmac: Option<String>,
 }
 
 impl EventEnvelope {
@@ -295,6 +302,7 @@ impl EventEnvelope {
             agent_id: agent_id.into(),
             event,
             hmac: None,
+            prev_hmac: None,
         }
     }
 
@@ -308,6 +316,13 @@ impl EventEnvelope {
         let bytes = self.signable_bytes();
         let tag = Self::compute_hmac(secret, &bytes);
         self.hmac = Some(tag);
+    }
+
+    /// Sign this envelope as the successor of `prev_hmac`, folding the previous
+    /// event's tag into this one so the log forms a tamper-evident hash chain.
+    pub fn sign_chained(&mut self, secret: &[u8], prev_hmac: Option<String>) {
+        self.prev_hmac = prev_hmac;
+        self.sign(secret);
     }
 
     /// Verify the HMAC tag against the given secret.
@@ -333,6 +348,12 @@ impl EventEnvelope {
         buf.extend_from_slice(self.namespace.as_bytes());
         buf.push(0);
         buf.extend_from_slice(self.agent_id.as_bytes());
+        buf.push(0);
+        // Fold in the previous event's tag so the signature also authenticates
+        // this event's position in the chain.
+        if let Some(ref prev) = self.prev_hmac {
+            buf.extend_from_slice(prev.as_bytes());
+        }
         buf.push(0);
         if let Ok(payload) = bincode::serialize(&self.event) {
             buf.extend_from_slice(&payload);

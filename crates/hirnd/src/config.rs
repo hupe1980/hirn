@@ -290,6 +290,22 @@ pub struct McpConfig {
     /// Set to `0.0.0.0` to expose on all interfaces (use a reverse proxy with auth in production).
     #[serde(default = "default_mcp_bind")]
     pub bind: String,
+    /// Bearer credential (API key or JWT) that authenticates the MCP surface.
+    ///
+    /// The rmcp SSE transport cannot surface per-request HTTP headers to the
+    /// tool handlers, so the listener authenticates once at startup: this
+    /// credential is validated against the same `[auth]` / `[token]`
+    /// machinery as the HTTP API, and the identity it resolves to (realm,
+    /// agent, operation/namespace scopes) applies to every MCP call.
+    ///
+    /// Required whenever the daemon runs with auth enabled (i.e. unless
+    /// `insecure_dev_mode = true`). Supports `$ENV_VAR` and `file://` refs.
+    #[serde(
+        default,
+        deserialize_with = "resolve_optional_secret",
+        serialize_with = "serialize_optional_secret_redacted"
+    )]
+    pub auth_token: Option<zeroize::Zeroizing<String>>,
 }
 
 impl Default for McpConfig {
@@ -297,6 +313,7 @@ impl Default for McpConfig {
         Self {
             enabled: true,
             bind: default_mcp_bind(),
+            auth_token: None,
         }
     }
 }
@@ -364,6 +381,28 @@ impl ServerConfig {
             );
         }
 
+        // CN→identity mapping (auth.client_certs) is only safe under mandatory
+        // mTLS. Without a client CA the `x-client-cert-cn` identity comes from a
+        // client-supplied header that any caller can forge, granting the mapped
+        // identity with no credential. Require tls.client_ca_path so the CN can
+        // only ever be a certificate the server itself verified.
+        if self
+            .auth
+            .as_ref()
+            .is_some_and(|auth| !auth.client_certs.is_empty())
+            && self
+                .tls
+                .as_ref()
+                .and_then(|tls| tls.client_ca_path.as_ref())
+                .is_none()
+        {
+            return Err(
+                "auth.client_certs (CN→identity mapping) requires tls.client_ca_path so client \
+                 certificates are verified by mandatory mTLS; otherwise the CN header is forgeable"
+                    .to_string(),
+            );
+        }
+
         // JWT secret minimum length (OWASP recommendation: ≥ 32 bytes for HMAC-SHA256).
         if let Some(ref token) = self.token {
             if token.secret.len() < 32 {
@@ -375,6 +414,18 @@ impl ServerConfig {
         }
 
         self.throttle.validate()?;
+
+        // The MCP listener has no per-request auth (transport limitation), so
+        // outside explicit dev mode it must authenticate via a startup
+        // credential resolved against [auth]/[token].
+        if self.mcp.enabled && !self.insecure_dev_mode && self.mcp.auth_token.is_none() {
+            return Err(
+                "mcp.auth_token must be configured (an API key or JWT accepted by [auth]/[token]) \
+                 when the MCP server is enabled; set mcp.enabled = false to disable it, or \
+                 insecure_dev_mode = true for local development"
+                    .to_string(),
+            );
+        }
 
         // Raft configuration validation.
         if let Some(ref raft) = self.raft {

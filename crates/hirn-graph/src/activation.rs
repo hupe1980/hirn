@@ -2066,4 +2066,61 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn activation_does_not_follow_soft_expired_edges() {
+        let mut pg = PropertyGraph::new();
+        let seed = make_graph_node(&mut pg);
+        let retracted = make_graph_node(&mut pg);
+        let downstream = make_graph_node(&mut pg);
+        pg.add_edge(seed, retracted, EdgeRelation::Causes, 0.9, Metadata::new())
+            .unwrap();
+        pg.add_edge(
+            retracted,
+            downstream,
+            EdgeRelation::Causes,
+            0.9,
+            Metadata::new(),
+        )
+        .unwrap();
+
+        let cfg = ActivationConfig {
+            inhibition_strength: 0.0,
+            ..Default::default()
+        };
+
+        // Sanity: with live edges, activation reaches both hops.
+        let before = spread_activation(&pg, &[seed], &cfg, None, None);
+        assert!(before.activations.contains_key(&retracted));
+        assert!(before.activations.contains_key(&downstream));
+        let static_before = static_activation(&pg, &[seed], None);
+        assert!(static_before.contains_key(&retracted));
+        let ppr_before = personalized_pagerank(&pg, &[seed], &PprConfig::default(), None);
+        assert!(ppr_before.contains_key(&downstream));
+
+        // Retract the middle memory: its edges are soft-expired but kept for audit.
+        pg.expire_edges_for_node(retracted, Timestamp::from_millis(0));
+
+        let after = spread_activation(&pg, &[seed], &cfg, None, None);
+        assert!(
+            !after.activations.contains_key(&retracted),
+            "spreading activation must not follow soft-expired edges"
+        );
+        assert!(
+            !after.activations.contains_key(&downstream),
+            "nodes only reachable through a retracted memory must not activate"
+        );
+
+        let static_after = static_activation(&pg, &[seed], None);
+        assert!(
+            !static_after.contains_key(&retracted),
+            "static activation must not follow soft-expired edges"
+        );
+
+        let ppr_after = personalized_pagerank(&pg, &[seed], &PprConfig::default(), None);
+        assert!(
+            !ppr_after.contains_key(&retracted) && !ppr_after.contains_key(&downstream),
+            "PPR must not rank nodes only reachable through soft-expired edges"
+        );
+    }
 }

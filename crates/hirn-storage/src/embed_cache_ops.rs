@@ -18,13 +18,20 @@ pub async fn get_cached_embedding(
     // Escape single quotes to prevent filter injection.
     let escaped = content_hash.replace('\'', "''");
 
+    // Project exactly the columns `embed_cache::from_batch` decodes so a cache
+    // hit is served by this single scan (no full-row fallback re-scan).
     let batches = match store
         .scan(
             DATASET_NAME,
             ScanOptions {
                 filter: Some(format!("content_hash = '{escaped}'")),
                 exact_filter: None,
-                columns: Some(vec!["embedding".into()]),
+                columns: Some(vec![
+                    "content_hash".into(),
+                    "model".into(),
+                    "dimensions".into(),
+                    "embedding".into(),
+                ]),
                 order_by: None,
                 limit: Some(1),
                 offset: None,
@@ -38,55 +45,10 @@ pub async fn get_cached_embedding(
     };
 
     for batch in &batches {
-        if batch.num_rows() > 0 {
-            let entries = embed_cache::from_batch(batch).map_err(|_| {
-                // from_batch needs all columns, but we only projected "embedding".
-                // Fall back to full scan.
-                HirnDbError::InvalidArgument("embed cache projection decode failed".into())
-            });
-
-            // If projection-only decode fails, do a full read.
-            if entries.is_err() {
-                return get_cached_embedding_full(store, content_hash).await;
-            }
-
-            let entries = entries.unwrap();
-            if let Some(entry) = entries.first() {
-                return Ok(Some(entry.embedding.clone()));
-            }
-        }
-    }
-
-    Ok(None)
-}
-
-/// Full-column fallback for get_cached_embedding.
-async fn get_cached_embedding_full(
-    store: &dyn PhysicalStore,
-    content_hash: &str,
-) -> Result<Option<Vec<f32>>, HirnDbError> {
-    let escaped = content_hash.replace('\'', "''");
-
-    let batches = store
-        .scan(
-            DATASET_NAME,
-            ScanOptions {
-                filter: Some(format!("content_hash = '{escaped}'")),
-                exact_filter: None,
-                columns: None,
-                order_by: None,
-                limit: Some(1),
-                offset: None,
-            },
-        )
-        .await?;
-
-    for batch in &batches {
-        if batch.num_rows() > 0 {
-            let entries = embed_cache::from_batch(batch)?;
-            if let Some(entry) = entries.first() {
-                return Ok(Some(entry.embedding.clone()));
-            }
+        if batch.num_rows() > 0
+            && let Some(entry) = embed_cache::from_batch(batch)?.first()
+        {
+            return Ok(Some(entry.embedding.clone()));
         }
     }
 
@@ -174,6 +136,23 @@ mod tests {
         let result = get_cached_embedding(&store, &hash).await.unwrap();
         assert!(result.is_some());
         assert_eq!(result.unwrap(), embedding);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cache_hit_decodes_from_projected_scan() {
+        let store = MemoryStore::new();
+        let embedding = vec![0.5, 0.6, 0.7];
+
+        put_cached_embedding(&store, "proj-model", "projected", &embedding)
+            .await
+            .unwrap();
+
+        // The lookup projects content_hash/model/dimensions/embedding; a hit
+        // must decode from that single projected scan (the full-row fallback
+        // path no longer exists).
+        let hash = embed_cache::cache_key("proj-model", "projected");
+        let result = get_cached_embedding(&store, &hash).await.unwrap();
+        assert_eq!(result, Some(embedding));
     }
 
     #[tokio::test(flavor = "multi_thread")]

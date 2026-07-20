@@ -71,15 +71,16 @@ pub async fn evolve_on_new_memory(
             continue;
         }
 
-        // Evolve: bump evidence count and update description with new context.
-        let new_evidence = format!(
-            "{}. [Corroborated by episode at {}]",
-            record.description,
-            new_record.timestamp.as_datetime().format("%Y-%m-%d %H:%M")
-        );
-
-        // Boost confidence based on additional evidence.
+        // Evolve: bump the evidence count. The description is left untouched —
+        // corroboration is already tracked structurally in `evidence_count`
+        // and the provenance reason below; appending a timestamp tag on every
+        // similar episode grew the description linearly forever.
         let new_evidence_count = record.evidence_count + 1;
+
+        // Corroboration must be monotone: combine the evidence-derived floor
+        // with the record's existing confidence instead of replacing it, so a
+        // manually corrected high-confidence record is never knocked back
+        // down by the arrival of one more similar episode.
         let base_confidence: f32 = match new_evidence_count {
             1 => 0.3,
             2..=3 => 0.5,
@@ -91,12 +92,13 @@ pub async fn evolve_on_new_memory(
         } else {
             0.15_f32 * record.contradiction_ids.len() as f32
         };
-        let new_confidence = (base_confidence - contradiction_penalty).clamp(0.1, 1.0);
+        let evidence_floor = (base_confidence - contradiction_penalty).clamp(0.1, 1.0);
+        let new_confidence = record.confidence.max(evidence_floor);
 
         db.correct_semantic(
             candidate_id,
             crate::db::SemanticUpdate {
-                description: Some(new_evidence),
+                description: None,
                 confidence: Some(new_confidence),
                 evidence_count: Some(new_evidence_count),
                 reason: Some(format!(

@@ -29,7 +29,7 @@ LLMs are evolving from stateless chatbots into long-running autonomous agents. T
 - **Adaptive Bayesian segmentation** — EM-LLM-inspired episode boundaries using T = μ + γ·σ over a sliding window (Fountas et al., ICLR 2025)
 - **Temporal contiguity retrieval** — recall expands top-k hits with ±2 temporally adjacent episodes, mimicking the human contiguity effect
 - **Memory evolution** — A-MEM-inspired refinement: new episodes automatically update existing semantic records (evidence bumps, confidence recalculation)
-- **Spaced-repetition forgetting** — decay rate scaled by access history: I × exp(−λ·h / (1 + α·ln(1 + n))), rewarding repeated retrieval
+- **Spaced-repetition forgetting** — an Ebbinghaus retention curve `R = exp(−h / S)` where the per-record stability `S = stability · (1 + 0.5·ln(max(n, 1)))` grows with rehearsal count `n`, so repeatedly retrieved memories decay more slowly. Archival/purge thresholds act on `R`. (See [`retention_score`](crates/hirn-engine/src/consolidation/forgetting.rs).)
 - **Temporal fact versioning** — semantic records carry valid_from/valid_until/superseded_by for fact lifecycle tracking
 - **Working memory → episodic encoding** — high-relevance WM entries are encoded as episodic records on eviction
 - **Re-ranking pipeline** — pluggable `Reranker` trait with cross-encoder support and `NoopReranker` fallback
@@ -47,9 +47,9 @@ LLMs are evolving from stateless chatbots into long-running autonomous agents. T
 - **Domain-scoped API views** — typed views (`EpisodicView`, `SemanticView`, `ProceduralView`, `WorkingView`, `GraphView`, `RecallView`, `NamespaceView`) accessed via `db.episodic()`, `db.semantic()`, etc., providing focused, discoverable APIs per memory layer
 - **Unified GraphStore trait** — async `GraphStore` trait for pluggable graph backends; `PersistentGraph` implements it, accessed via `HirnDB::graph_store()`
 - **Cedar authorization** — fine-grained RBAC/ABAC via `cedar-policy` v4.9.1 with entity hierarchies (Agent ∈ Team ∈ Organization, Namespace ∈ Realm), 10 action types, schema validation, and automated policy reasoning
-- **Audit trail with HMAC** — every authorization decision logged with agent, action, resource, decision, and policy IDs; tamper-evident via HMAC signatures
-- **Encryption at rest** — AES-256-GCM field-level encryption for sensitive memory content with key rotation support
-- **Panic-free release paths** — all public API code paths use graceful error propagation instead of `unwrap()`/`expect()`; safety-critical invariants (e.g., SIMD dimension checks) use hard `assert!`
+- **Tamper-evident audit trail** — every authorization decision and mutation is logged with agent, action, resource, decision, and policy IDs. When `event_hmac_secret` is configured, each event on the production emit path is HMAC-SHA256 signed **and hash-chained** to its predecessor (`prev_hmac`), so not only mutation but also deletion or truncation of audit rows is detectable. Auditors verify the full chain (per-event tag + linkage + gap-free sequence) via `EventLog::verify_chain`.
+- **Encryption at rest** — ⚠️ **storage-delegated only.** hirn does **not** perform application-level AES-GCM encryption today; on-disk Arrow (content, embeddings, FTS, graph, audit) is protected only by whatever the underlying store/OS provides (OS full-disk encryption, or object-store SSE when configured *outside* hirn). Field-level AEAD is on the roadmap. See [docs/encryption-at-rest.md](docs/encryption-at-rest.md).
+- **Graceful error propagation on write paths** — public mutation APIs return `Result<T, HirnError>` rather than panicking; safety-critical invariants (e.g., SIMD dimension checks) use hard `assert!`. Note: this is a design goal enforced by review, not yet by a `clippy::unwrap_used` gate.
 
 ## Deployment Modes
 
@@ -76,7 +76,7 @@ When these documents disagree, [Write Guarantees](docs/write-guarantees.md) is n
 |------|---------|----------|
 | Workspace correctness | `cargo test --workspace` | Workspace test suite |
 | Formatting and lint | `cargo fmt --check --all` and `RUSTFLAGS="-Dwarnings" cargo clippy --workspace --all-targets` | Release-gate hygiene for code changes |
-| Docs consistency | `python3 scripts/check_markdown_links.py docs FINDINGS.md` | Link validation for public docs and the review ledger |
+| Docs consistency | `python3 scripts/check_markdown_links.py docs` | Link validation for public docs |
 | External benchmark evidence | Exact `locomo`, `dmr`, and `longmemeval` commands in [Benchmarks](docs/benchmarks.md) | Markdown benchmark artifacts plus cached embeddings under [embeddings](embeddings) |
 
 ## Cedar Authorization
@@ -111,9 +111,8 @@ See [docs/cedar-guide.md](docs/cedar-guide.md) for the full Cedar policy guide.
 
 ## Operator Docs
 
-The repository now ships a focused operator-docs surface for tuning, troubleshooting, policy, and benchmark interpretation:
+The repository now ships a focused operator-docs surface for tuning, troubleshooting, policy, and benchmark interpretation (browse it all on the [documentation site](https://hupe1980.github.io/hirn/)):
 
-- [Documentation Map](docs/documentation-map.md)
 - [Getting Started](docs/getting-started.md)
 - [Architecture](docs/architecture.md)
 - [Glossary](docs/glossary.md)
@@ -229,13 +228,8 @@ async fn main() -> HirnResult<()> {
         .embedding_dimensions(64)
         .build()?;
 
-    let db_config = HirnDbConfig::builder()
-        .db_path("./my_brain/lance")
-        .embedding_dimensions(64)
-        .build()?;
-    let storage: Arc<dyn PhysicalStore> = Arc::new(
-        HirnDb::open(db_config).await?
-    );
+    let db_config = HirnDbConfig::local("./my_brain/lance");
+    let storage: Arc<dyn PhysicalStore> = HirnDb::open(db_config).await?.store_arc();
 
     let brain = Hirn::open_with_config(config, storage).await?;
     brain.register_agent(&AgentId::new("agent-1")?, "My Agent").await?;
@@ -307,6 +301,8 @@ See [docs/architecture.md](docs/architecture.md) for the full architecture guide
 
 ## Documentation
 
+📖 **Full documentation site: [hupe1980.github.io/hirn](https://hupe1980.github.io/hirn/)** — searchable, with navigation, diagrams, and background.
+
 | Document | Description |
 |----------|-------------|
 | [Getting Started](docs/getting-started.md) | 5 minutes to working memory (Rust, Python, Node.js) |
@@ -317,7 +313,7 @@ See [docs/architecture.md](docs/architecture.md) for the full architecture guide
 | [HirnQL Reference](docs/hirnql-reference.md) | Complete HirnQL language reference |
 | [Cedar Policy Guide](docs/cedar-guide.md) | Authorization policies, schema, patterns |
 | [Benchmarks](docs/benchmarks.md) | H1–H6 scores, LoCoMo/DMR/LongMemEval results |
-| [Encryption at Rest](docs/encryption-at-rest.md) | AES-256-GCM field-level encryption |
+| [Encryption at Rest](docs/encryption-at-rest.md) | Storage/OS-delegated encryption (application-level AEAD is roadmap) |
 
 ## Benchmarks
 

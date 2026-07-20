@@ -93,8 +93,10 @@ pub struct ConsolidationConfig {
     pub edge_prune_threshold: f32,
     /// Spaced-repetition scaling factor α for forgetting.
     /// Higher α = more protection for frequently accessed memories.
-    /// Decay formula: I_new = I_current × exp(-λ × hours / (1 + α·ln(1 + access_count)))
-    /// Default: 0.5.
+    /// The spaced-repetition coefficient α in the retention formula
+    /// `R = exp(-t / S)` with `S = stability × (1 + α·ln(access_count.max(1)))`
+    /// — each retrieval stretches the effective stability by α per
+    /// log-rehearsal. Default: 0.5.
     pub spaced_repetition_alpha: f64,
     /// Minimum importance threshold for auto-encoding working memory
     /// entries into episodic memory on eviction/expiry. Default: 0.3.

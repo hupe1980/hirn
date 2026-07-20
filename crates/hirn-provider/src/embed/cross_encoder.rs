@@ -161,6 +161,23 @@ impl CrossEncoderReranker {
             EmbedError::local("cross-encoder", format!("Output extraction failed: {e}"))
         })?;
 
+        // Validate the logit count against the pair count. A 2-class
+        // classification head emits `[batch, 2]` — silently returning
+        // `2 × batch` scores would make `rerank` hand out result indices past
+        // `documents.len()` and the caller index out of bounds.
+        if logits.len() != documents.len() {
+            return Err(EmbedError::local(
+                "cross-encoder",
+                format!(
+                    "model returned {} logits for {} query/document pairs; \
+                     expected a single-logit relevance head ([batch, 1])",
+                    logits.len(),
+                    documents.len()
+                ),
+            )
+            .into());
+        }
+
         Ok(logits.iter().copied().collect())
     }
 }

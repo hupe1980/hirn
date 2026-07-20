@@ -1,40 +1,97 @@
-# HIRN — Architecture Guide
+---
+title: Architecture
+parent: Concepts
+nav_order: 2
+description: >-
+  hirn's crate layout, Lance-backed storage engine, DataFusion query pipeline,
+  property graph, consolidation, Cedar authorization, and language bindings.
+---
 
-> **⚠️ Experimental:** This project is under active development. APIs, on-disk formats, and behaviour may change without notice. Not recommended for production use.
+# Architecture
+{: .no_toc }
+
+This project is under active development. APIs, on-disk formats, and behaviour may change without notice. Not recommended for production use.
+{: .experimental }
 
 > A cognitive memory engine for AI agents — the brain an LLM never had.
 > Rust 2024 edition · 13 crates · ~117 000 lines · 2 700+ tests
 
-> **Storage:** All data is stored via **`hirn-storage`** — a purpose-built cognitive storage engine using **Lance 4.0** + `lance-namespace`, providing the `PhysicalStore` trait with `LancePhysicalStore` (production) and `MemoryStore` (testing) backends. DataFusion `SessionContext` is the single execution entry point. `DashMap` + epoch-based caching for lock-free Dataset access.
+**Storage:** All data is stored via **`hirn-storage`** — a purpose-built cognitive storage engine using **Lance 4.0** + `lance-namespace`, providing the `PhysicalStore` trait with `LancePhysicalStore` (production) and `MemoryStore` (testing) backends. DataFusion `SessionContext` is the single execution entry point. `DashMap` + epoch-based caching for lock-free Dataset access.
 
-If you want the shortest task-oriented route through the documentation before diving into internals, start with [documentation-map.md](documentation-map.md).
+If you want the shortest task-oriented route through the documentation before diving into internals, start with [Getting Started](getting-started.md).
+
+## Table of contents
+{: .no_toc .text-delta }
+
+1. TOC
+{:toc}
 
 ---
 
-## Table of Contents
+## Design philosophy
 
-1. [Crate Dependency Graph](#crate-dependency-graph)
-2. [Crate Overview](#crate-overview)
-3. [Data Model](#data-model)
-4. [Data Flow](#data-flow)
-5. [Persistence Layer](#persistence-layer)
-6. [Vector Index (HNSW)](#vector-index)
-7. [Property Graph & Spreading Activation](#property-graph--spreading-activation)
-8. [Consolidation Pipeline](#consolidation-pipeline)
-9. [Namespace & Multi-Agent Model](#namespace--multi-agent-model)
-10. [Cedar Authorization & Audit Trail](#cedar-authorization--audit-trail)
-11. [Lock Ordering & Concurrency](#lock-ordering--concurrency)
-12. [Memory Defense System](#memory-defense-system)
-13. [HirnQL Query Language](#hirnql-query-language)
-14. [Cognitive Operator Pipeline](#cognitive-operator-pipeline)
-15. [DataFusion Execution Model](#datafusion-execution-model)
-16. [hirnd Daemon Security Hardening](#hirnd-daemon-security-hardening)
-17. [Configuration Reference](#configuration-reference)
-18. [FFI & Language Bindings](#ffi--language-bindings)
+The single idea that shapes every layer below is: **cognition as database primitives, not
+application glue**. Spreading activation, temporal contiguity, Hebbian plasticity, consolidation,
+forgetting, and causal traversal are not helper functions that sit *above* a storage engine — in
+hirn they compile down into the query plan itself. HirnQL parses to a DataFusion `LogicalPlan`, the
+planner injects cognitive operators (`GraphActivationExec`, `CausalChainExec`, `HebbianBufferExec`,
+…), and the optimizer rewrites and fuses them before execution. Everything is a composable plan over
+Arrow `RecordBatch` streams rather than imperative async chains allocating intermediate `Vec`s.
+
+Three architectural commitments follow from that idea, and they recur throughout this guide:
+
+- **Columnar, versioned storage.** Every memory tier is a Lance 4.0 dataset with an Arrow-native
+  schema, MVCC versioning, and pushdown-friendly indices (IVF-HNSW, FTS/BM25, BTree, Bitmap). This
+  is what lets policy predicates, temporal filters, and namespace pruning execute at near-zero cost.
+- **A two-tier graph.** A hot in-memory `petgraph` serves sub-millisecond activation and shallow
+  traversal; a cold Lance-backed `PersistentGraph` serves deep, batched BFS. The engine delegates
+  between them by depth.
+- **Explicit, budgeted offline cognition.** Expensive synthesis (dream, reconcile, plan, RAPTOR
+  summarization) never hides inside the online write path — it runs as scheduled, budgeted jobs and
+  its outputs stay quarantined until reviewed.
+
+For the *why* behind the memory tiers and the neuroscience lineage, read the
+[Cognitive Model](cognitive-model.md) first; for causal traversal internals, see
+[Causal Reasoning](causal.md); for the write path in depth, see
+[Write-Path Intelligence](write-path.md).
+{: .note }
 
 ---
 
 ## Crate Dependency Graph
+
+The workspace is layered so that leaf crates carry only types and traits, and each successive layer
+composes the ones below it. Dependencies point downward — nothing below depends on anything above:
+
+```mermaid
+flowchart TB
+  core["hirn-core<br/>types · config · traits"]
+  prov["hirn-provider<br/>embedders · LLMs · rerankers"]
+  graph["hirn-graph<br/>property graph · activation"]
+  storage["hirn-storage<br/>Lance 4.0 · PhysicalStore"]
+  query["hirn-query<br/>HirnQL parser · plan compiler"]
+  exec["hirn-exec<br/>19 operators · 8 UDFs · 5 rules"]
+  engine["hirn-engine<br/>HirnDB orchestrator · 11 views"]
+  policy["hirn-policy<br/>Cedar 4.9"]
+  facade["hirn<br/>public façade · HirnMemory"]
+  daemon["hirnd<br/>HTTP/gRPC/MCP daemon"]
+  node["hirn-node<br/>napi-rs"]
+  py["hirn-python<br/>PyO3"]
+  bench["hirn-bench"]
+
+  core --> prov & graph & storage
+  core --> query
+  query --> exec
+  prov & graph & storage & exec --> engine
+  engine --> policy
+  engine --> facade
+  facade --> node & py & bench
+  facade --> daemon
+  classDef s fill:#1a1b26,stroke:#7c9cff,color:#e6e8f0;
+  class core,prov,graph,storage,query,exec,engine,policy,facade,daemon,node,py,bench s;
+```
+
+The ASCII rendering of the same dependency graph, with more detail on trait re-exports:
 
 ```
                     ┌──────────┐
@@ -127,7 +184,25 @@ If you want the shortest task-oriented route through the documentation before di
 
 ## Data Model
 
-HIRN implements a **four-layer memory architecture** inspired by human cognitive memory (CLS theory + CoALA):
+HIRN implements a **four-layer memory architecture** inspired by human cognitive memory (CLS theory + CoALA). Each layer is a separate Lance dataset with its own schema, index set, and lifecycle:
+
+```mermaid
+flowchart TB
+  wk["Working Memory<br/>token-bounded scratchpad · FIFO/TTL eviction<br/>WorkingMemoryEntry"]
+  ep["Episodic Memory<br/>timestamped events with embeddings<br/>EpisodicRecord: importance · surprise · entities · provenance"]
+  se["Semantic Memory<br/>consolidated facts & concepts<br/>SemanticRecord: knowledge_type · confidence · valid_from/until · superseded_by"]
+  pr["Procedural Memory<br/>learned skills & routines<br/>ProceduralRecord: steps · trigger · success_count · EMA"]
+  wk -->|eviction: high-relevance encoded| ep
+  ep -->|consolidation pipeline| se
+  classDef s fill:#1a1b26,stroke:#7c9cff,color:#e6e8f0;
+  class wk,ep,se,pr s;
+```
+
+See the [Cognitive Model](cognitive-model.md) for the neuroanatomical mapping (dlPFC, hippocampus,
+neocortex, basal ganglia) and the admission/eviction rules of each tier.
+{: .note }
+
+The ASCII rendering with full field lists:
 
 ```
 ┌─────────────────────────────────────────────────┐
@@ -579,6 +654,30 @@ Episodic Records
  │                  │  with DerivedFrom/PartOf edges
  └─────────────────┘
 ```
+
+The same pipeline as a flow, showing which research each stage draws on:
+
+```mermaid
+flowchart TB
+  ep[("Episodic records<br/>bounded batches")] --> seg["1. Segmentation<br/>Bayesian surprise T = μ + γ·σ<br/>(EM-LLM, ICLR 2025)"]
+  seg --> pat["2. Pattern detection<br/>entity · temporal · causal"]
+  pat --> nar["3. Narrative threading<br/>agglomerative clustering<br/>0.6·embedding + 0.4·entity Jaccard"]
+  nar --> con["4. Concept extraction<br/>SemanticRecords + DerivedFrom edges"]
+  con --> forg["5. Forgetting<br/>spaced-repetition decay · edge decay<br/>archive → purge"]
+  forg --> rec["6. Reconsolidation<br/>labile window after recall (300s)"]
+  rec --> evo["7. Memory evolution<br/>A-MEM (arXiv:2502.12110)"]
+  evo --> wm["8. WM → episodic encoding"]
+  wm --> rap["9. RAPTOR summaries<br/>(Sarthi et al., 2024, if enabled)"]
+  rap --> se[("Semantic dataset")]
+  classDef s fill:#1a1b26,stroke:#7c9cff,color:#e6e8f0;
+  class ep,seg,pat,nar,con,forg,rec,evo,wm,rap,se s;
+```
+
+Community detection inside stage 2/3 uses **weighted Louvain-style** modularity optimization with a
+connectivity post-pass (approximating Leiden fidelity) — it is **not** a full Leiden refinement.
+Causal discovery here is a **temporal co-occurrence heuristic**; a true Granger test, LLM
+validation, and Bayesian accumulation are roadmap. See [Causal Reasoning](causal.md#causal-discovery-during-consolidation).
+{: .important }
 
 ### Scheduling
 
