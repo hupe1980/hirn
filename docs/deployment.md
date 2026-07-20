@@ -234,6 +234,15 @@ hirnd exposes hirn as an MCP tool server. Configure your LLM client to connect:
 
 Available MCP tools: `remember`, `recall`, `think`, `forget`, `connect`, `inspect`, `trace`, `consolidate`.
 
+{: .warning }
+> **Browser-based DNS-rebinding exposure.** The current MCP transport does not
+> validate the `Host` header, so while the MCP listener is running, a malicious
+> website opened in a local browser can potentially reach it via DNS rebinding —
+> even on loopback. Keep MCP disabled unless you use it, and front it with a
+> reverse proxy that validates `Host`/`Origin` for anything beyond throwaway
+> local development. A transport upgrade that validates `Host` natively is
+> planned.
+
 {: .important }
 > **MCP authentication.** The MCP listener authenticates **once at startup**:
 > outside `insecure_dev_mode` you must set `mcp.auth_token` in the config to an

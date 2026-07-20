@@ -863,6 +863,9 @@ mod tests {
     fn production_raft_rejects_dev_local_profile() {
         let mut config = ServerConfig::default();
         config.auth = Some(auth_config());
+        // These fixtures exercise the raft transport validations; disable MCP
+        // so its own production requirement (mcp.auth_token) doesn't fire first.
+        config.mcp.enabled = false;
         let mut raft = base_raft_config();
         raft.transport_secret = Some(zeroize::Zeroizing::new(
             "0123456789abcdef0123456789abcdef".to_owned(),
@@ -880,6 +883,9 @@ mod tests {
     fn production_raft_tls_profile_requires_https() {
         let mut config = ServerConfig::default();
         config.auth = Some(auth_config());
+        // These fixtures exercise the raft transport validations; disable MCP
+        // so its own production requirement (mcp.auth_token) doesn't fire first.
+        config.mcp.enabled = false;
         let mut raft = base_raft_config();
         raft.transport_profile = ClusterTransportProfile::ProdTls;
         raft.transport_secret = Some(zeroize::Zeroizing::new(
@@ -895,6 +901,9 @@ mod tests {
     fn production_raft_mtls_requires_client_ca() {
         let mut config = ServerConfig::default();
         config.auth = Some(auth_config());
+        // These fixtures exercise the raft transport validations; disable MCP
+        // so its own production requirement (mcp.auth_token) doesn't fire first.
+        config.mcp.enabled = false;
         let mut raft = base_raft_config();
         raft.transport_profile = ClusterTransportProfile::ProdMtls;
         raft.advertise_addr = "https://node-1.example:3000".to_owned();
