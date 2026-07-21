@@ -4675,6 +4675,181 @@ impl HirnDB {
         Ok(())
     }
 
+    /// Reflect one evidence record against the nearest beliefs in its namespace.
+    ///
+    /// Loads the evidence (episodic or semantic), ranks the active
+    /// `KnowledgeType::Belief` heads in the SAME namespace by embedding
+    /// similarity, takes the configured top-K, classifies each pair
+    /// (LLM-backed when `llm` is provided, heuristic otherwise), and applies
+    /// the Hindsight-style confidence dynamics through `correct_semantic` so
+    /// every adjustment is a bi-temporally auditable revision. Contradicting
+    /// evidence additionally gets a `Contradicts` graph edge and is appended
+    /// to the belief's `contradiction_ids`.
+    ///
+    /// `actor_override` names the executing agent for Cedar enforcement and
+    /// revision authorship; without it the evidence author acts.
+    pub(crate) async fn reflect_semantic(
+        &self,
+        evidence_id: MemoryId,
+        actor_override: Option<AgentId>,
+        llm: Option<&dyn hirn_core::embed::LlmProvider>,
+    ) -> HirnResult<Vec<crate::consolidation::ReflectionUpdate>> {
+        use crate::consolidation::{
+            ReflectionOutcome, ReflectionUpdate, apply_reflection_outcome, classify_reflection,
+            reflection_cosine_similarity,
+        };
+
+        let (namespace, evidence_text, evidence_embedding, evidence_author, evidence_logical_id) =
+            match self.get_memory(evidence_id).await? {
+                MemoryRecord::Episodic(record) => {
+                    let text = if record.content.is_empty() {
+                        record.summary.clone()
+                    } else {
+                        record.content.clone()
+                    };
+                    (
+                        record.namespace,
+                        text,
+                        record.embedding.clone(),
+                        record.provenance.created_by,
+                        None,
+                    )
+                }
+                MemoryRecord::Semantic(record) => (
+                    record.namespace,
+                    record.description.clone(),
+                    record.embedding.clone(),
+                    record.provenance.created_by,
+                    Some(record.logical_memory_id),
+                ),
+                MemoryRecord::Working(_) | MemoryRecord::Procedural(_) => {
+                    return Err(HirnError::InvalidInput(format!(
+                        "reflect requires episodic or semantic evidence; {evidence_id} is neither"
+                    )));
+                }
+            };
+
+        let actor = actor_override.unwrap_or(evidence_author);
+
+        // ── Cedar policy enforcement ──
+        // Reflection mutates beliefs via corrective revisions, so it requires
+        // the same right as `correct_semantic`. Checked up front so a denied
+        // agent fails before any classification work.
+        self.enforce(
+            actor.as_str(),
+            crate::policy::Action::Correct,
+            &self.config.default_realm,
+            namespace.as_str(),
+        )
+        .await?;
+
+        if evidence_text.trim().is_empty() {
+            return Err(HirnError::InvalidInput(format!(
+                "reflect evidence {evidence_id} has no text content"
+            )));
+        }
+
+        let evidence_embedding = match evidence_embedding {
+            Some(embedding) => embedding,
+            None => self.embed_text(&evidence_text).await?,
+        };
+
+        // Candidate beliefs: active heads of the same namespace only —
+        // evidence never crosses namespace boundaries.
+        let beliefs = self
+            .list_semantics(&SemanticFilter {
+                knowledge_type: Some(hirn_core::types::KnowledgeType::Belief),
+                namespace: Some(namespace),
+                ..Default::default()
+            })
+            .await?;
+
+        let mut ranked: Vec<(SemanticRecord, f32)> = beliefs
+            .into_iter()
+            .filter(|belief| Some(belief.logical_memory_id) != evidence_logical_id)
+            .map(|belief| {
+                let similarity = belief
+                    .embedding
+                    .as_deref()
+                    .map(|embedding| reflection_cosine_similarity(&evidence_embedding, embedding))
+                    .unwrap_or(0.0);
+                (belief, similarity)
+            })
+            .collect();
+        ranked.sort_by(|left, right| {
+            right
+                .1
+                .partial_cmp(&left.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        ranked.truncate(self.config.reflection_top_k.max(1));
+
+        let similarity_threshold = self.config.reflection_similarity_threshold;
+        // Matches ConsolidationConfig::default().llm_timeout.
+        let llm_timeout = std::time::Duration::from_secs(10);
+
+        let mut updates = Vec::with_capacity(ranked.len());
+        for (belief, similarity) in ranked {
+            let (outcome, rationale) = classify_reflection(
+                llm,
+                &belief,
+                &evidence_text,
+                similarity,
+                similarity_threshold,
+                llm_timeout,
+            )
+            .await;
+
+            let prior_confidence = belief.confidence;
+            if outcome == ReflectionOutcome::Unrelated {
+                updates.push(ReflectionUpdate {
+                    belief_id: belief.id,
+                    outcome,
+                    prior_confidence,
+                    new_confidence: prior_confidence,
+                    evidence_id,
+                    rationale,
+                });
+                continue;
+            }
+
+            let new_confidence = apply_reflection_outcome(prior_confidence, outcome);
+            let reason = format!(
+                "reflection: evidence {evidence_id} {} belief ({rationale})",
+                outcome.as_str()
+            );
+            let update = SemanticUpdate {
+                description: None,
+                confidence: Some(new_confidence),
+                evidence_count: (outcome == ReflectionOutcome::Reinforces)
+                    .then(|| belief.evidence_count.saturating_add(1)),
+                reason: Some(reason),
+                actor_id: actor,
+                observed_at: None,
+                causation_id: evidence_id,
+            };
+            let next = self.correct_semantic(belief.id, update).await?;
+
+            if outcome == ReflectionOutcome::Contradicts {
+                // Record the epistemic conflict explicitly: Contradicts graph
+                // edge plus a contradiction_ids entry on the belief chain.
+                self.connect_contradiction(next.id, evidence_id, 1.0, Metadata::default())
+                    .await?;
+            }
+
+            updates.push(ReflectionUpdate {
+                belief_id: belief.id,
+                outcome,
+                prior_confidence,
+                new_confidence,
+                evidence_id,
+                rationale,
+            });
+        }
+
+        Ok(updates)
+    }
+
     /// F-015: Flush buffered semantic access counts to storage.
     /// Called during consolidation and on close/drop.
     pub(crate) async fn flush_semantic_access(&self) -> HirnResult<()> {
@@ -6186,5 +6361,251 @@ mod tests {
         let head = db.semantic_edit_target(corrected.id).await.unwrap();
         assert_eq!(head.id, corrected.id);
         assert_eq!(head.revision_operation, RevisionOperation::Correct);
+    }
+
+    // ── Reflection (belief revision) ────────────────────────────────────
+
+    fn reflection_embedding(index: usize) -> Vec<f32> {
+        let mut embedding = vec![0.0f32; 768];
+        embedding[index] = 1.0;
+        embedding
+    }
+
+    async fn store_reflection_belief(
+        db: &HirnDB,
+        concept: &str,
+        description: &str,
+        confidence: f32,
+        embedding_index: usize,
+        namespace: hirn_core::types::Namespace,
+    ) -> MemoryId {
+        db.store_semantic(
+            SemanticRecord::builder()
+                .concept(concept)
+                .description(description)
+                .belief()
+                .confidence(confidence)
+                .embedding(reflection_embedding(embedding_index))
+                .namespace(namespace)
+                .agent_id(agent())
+                .build()
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn store_reflection_evidence(
+        db: &HirnDB,
+        content: &str,
+        embedding_index: usize,
+        namespace: hirn_core::types::Namespace,
+    ) -> MemoryId {
+        db.remember(
+            EpisodicRecord::builder()
+                .event_type(EventType::Observation)
+                .content(content)
+                .summary(content)
+                .embedding(reflection_embedding(embedding_index))
+                .namespace(namespace)
+                .agent_id(agent())
+                .build()
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reflection_reinforce_raises_confidence_monotonically_toward_cap() {
+        use crate::consolidation::{REFLECTION_CONFIDENCE_CEILING, ReflectionOutcome};
+
+        let db = temp_db().await;
+        let ns = hirn_core::types::Namespace::default_ns();
+        let belief_id =
+            store_reflection_belief(&db, "pipeline-stable", "the pipeline is stable", 0.5, 0, ns)
+                .await;
+
+        let mut previous = 0.5f32;
+        for round in 0..4 {
+            let evidence_id =
+                store_reflection_evidence(&db, &format!("the pipeline passed run {round}"), 0, ns)
+                    .await;
+            let updates = db.reflect_semantic(evidence_id, None, None).await.unwrap();
+            assert_eq!(updates.len(), 1);
+            assert_eq!(updates[0].outcome, ReflectionOutcome::Reinforces);
+            assert!(
+                updates[0].new_confidence > previous,
+                "confidence must rise monotonically"
+            );
+            assert!(updates[0].new_confidence <= REFLECTION_CONFIDENCE_CEILING);
+            // Expected dynamics: c' = c + 0.15 * (1 - c).
+            let expected = 0.15f32.mul_add(1.0 - previous, previous);
+            assert!((updates[0].new_confidence - expected).abs() < 1e-4);
+            previous = updates[0].new_confidence;
+        }
+
+        // Evidence counter tracks the reinforcements.
+        let history = db.semantic_history(belief_id).await.unwrap();
+        let head = history.last().unwrap();
+        assert_eq!(head.evidence_count, 4);
+        assert_eq!(head.revision_operation, RevisionOperation::Correct);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reflection_contradict_halves_confidence_and_records_conflict() {
+        use crate::consolidation::ReflectionOutcome;
+
+        let db = temp_db().await;
+        let ns = hirn_core::types::Namespace::default_ns();
+        let belief_id =
+            store_reflection_belief(&db, "deploys-safe", "deploys are safe", 0.8, 0, ns).await;
+        let evidence_id =
+            store_reflection_evidence(&db, "the deploy is not safe anymore", 0, ns).await;
+
+        let updates = db.reflect_semantic(evidence_id, None, None).await.unwrap();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].outcome, ReflectionOutcome::Contradicts);
+        assert!((updates[0].new_confidence - 0.4).abs() < 1e-6);
+
+        let history = db.semantic_history(belief_id).await.unwrap();
+        let head = history.last().unwrap();
+        assert!((head.confidence - 0.4).abs() < 1e-6);
+        assert!(head.contradiction_ids.contains(&evidence_id));
+
+        // The Contradicts edge is drawn between the belief head and the evidence.
+        let edges = db
+            .cached_graph()
+            .get_edges_between(head.id, evidence_id)
+            .await
+            .unwrap();
+        assert!(
+            edges
+                .iter()
+                .any(|edge| edge.relation == EdgeRelation::Contradicts)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reflection_weaken_lowers_confidence_toward_floor_with_llm() {
+        use crate::consolidation::{REFLECTION_CONFIDENCE_FLOOR, ReflectionOutcome};
+        use hirn_core::embed::{ChatMessage, LlmOptions, LlmProvider};
+
+        struct WeakenLlm;
+
+        #[async_trait::async_trait]
+        impl LlmProvider for WeakenLlm {
+            async fn generate_text(
+                &self,
+                _messages: &[ChatMessage],
+                _options: &LlmOptions,
+            ) -> hirn_core::HirnResult<String> {
+                Ok("WEAKENS: the metric dropped but the claim may still hold".to_string())
+            }
+
+            fn model_id(&self) -> &str {
+                "weaken-mock"
+            }
+        }
+
+        let db = temp_db().await;
+        let ns = hirn_core::types::Namespace::default_ns();
+        let belief_id =
+            store_reflection_belief(&db, "cache-helps", "caching helps latency", 0.4, 0, ns).await;
+
+        let mut previous = 0.4f32;
+        for round in 0..4 {
+            let evidence_id =
+                store_reflection_evidence(&db, &format!("latency metric sample {round}"), 0, ns)
+                    .await;
+            let updates = db
+                .reflect_semantic(evidence_id, None, Some(&WeakenLlm))
+                .await
+                .unwrap();
+            assert_eq!(updates.len(), 1);
+            assert_eq!(updates[0].outcome, ReflectionOutcome::Weakens);
+            assert!(updates[0].new_confidence < previous);
+            assert!(updates[0].new_confidence >= REFLECTION_CONFIDENCE_FLOOR);
+            // Expected dynamics: c' = c - 0.15 * c.
+            let expected = previous - 0.15 * previous;
+            assert!((updates[0].new_confidence - expected).abs() < 1e-4);
+            previous = updates[0].new_confidence;
+        }
+
+        let history = db.semantic_history(belief_id).await.unwrap();
+        assert_eq!(history.len(), 5); // create + 4 weaken revisions
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reflection_unrelated_evidence_is_a_noop() {
+        use crate::consolidation::ReflectionOutcome;
+
+        let db = temp_db().await;
+        let ns = hirn_core::types::Namespace::default_ns();
+        let belief_id =
+            store_reflection_belief(&db, "gc-tuning", "gc tuning reduces pauses", 0.7, 0, ns).await;
+        // Orthogonal embedding: fails the similarity gate.
+        let evidence_id = store_reflection_evidence(&db, "the coffee machine broke", 5, ns).await;
+
+        let updates = db.reflect_semantic(evidence_id, None, None).await.unwrap();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].outcome, ReflectionOutcome::Unrelated);
+        assert!((updates[0].prior_confidence - updates[0].new_confidence).abs() < f32::EPSILON);
+
+        // No revision was appended.
+        let history = db.semantic_history(belief_id).await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert!((history[0].confidence - 0.7).abs() < 1e-6);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reflection_updates_flow_through_auditable_revisions() {
+        let db = temp_db().await;
+        let ns = hirn_core::types::Namespace::default_ns();
+        let belief_id =
+            store_reflection_belief(&db, "retries-help", "retries improve success", 0.5, 0, ns)
+                .await;
+        let evidence_id =
+            store_reflection_evidence(&db, "retries improved the success rate again", 0, ns).await;
+
+        db.reflect_semantic(evidence_id, None, None).await.unwrap();
+
+        let history = db.semantic_history(belief_id).await.unwrap();
+        assert_eq!(history.len(), 2);
+        let head = history.last().unwrap();
+        assert_eq!(head.revision_operation, RevisionOperation::Correct);
+        assert_eq!(head.revision_causation_id, Some(evidence_id));
+        let reason = head.revision_reason.as_deref().unwrap();
+        assert!(reason.contains("reflection"), "reason: {reason}");
+        assert!(
+            reason.contains(&evidence_id.to_string()),
+            "reason: {reason}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reflection_respects_namespace_isolation() {
+        let db = temp_db().await;
+        let ns_a = hirn_core::types::Namespace::new("reflect_ns_a").unwrap();
+        let ns_b = hirn_core::types::Namespace::new("reflect_ns_b").unwrap();
+        let belief_id = store_reflection_belief(
+            &db,
+            "shared-belief",
+            "the service is reliable",
+            0.6,
+            0,
+            ns_b,
+        )
+        .await;
+        // Same embedding, different namespace: must never touch the belief.
+        let evidence_id =
+            store_reflection_evidence(&db, "the service is not reliable", 0, ns_a).await;
+
+        let updates = db.reflect_semantic(evidence_id, None, None).await.unwrap();
+        assert!(updates.is_empty());
+
+        let history = db.semantic_history(belief_id).await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert!((history[0].confidence - 0.6).abs() < 1e-6);
     }
 }

@@ -374,6 +374,27 @@ impl<'a> AgentContext<'a> {
             .await
     }
 
+    // ── Reflect ─────────────────────────────────────────────────────────
+
+    /// Reflect an evidence record against the nearest beliefs in its
+    /// namespace, verifying namespace access for the executing agent.
+    ///
+    /// As with [`Self::connect_with`], the namespace scope check runs first
+    /// and the Cedar action policy is evaluated against this context's agent
+    /// id — the executing identity authors every resulting belief revision.
+    pub async fn reflect(
+        &self,
+        evidence_id: MemoryId,
+    ) -> HirnResult<Vec<crate::consolidation::ReflectionUpdate>> {
+        let record = self.db.get_memory(evidence_id).await?;
+        let ns = record_namespace(&record);
+        self.check_access(&ns)?;
+        self.enforce(crate::policy::Action::Correct, &ns).await?;
+        self.db
+            .reflect_semantic(evidence_id, Some(self.agent_id), None)
+            .await
+    }
+
     // ── Execute (HirnQL) ────────────────────────────────────────────────
 
     /// Execute a HirnQL query scoped to the agent's accessible namespaces.

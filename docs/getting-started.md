@@ -322,6 +322,51 @@ Offline outputs are deliberately provisional:
 
 See [offline-intelligence.md](offline-intelligence.md) for the runtime model and operator workflow.
 
+### Beliefs & Reflection
+
+Beliefs are semantic records whose `confidence` is a subjective credence
+rather than an extraction score. The `Reflect` operation classifies a new
+evidence record against the nearest beliefs in the same namespace and adjusts
+their credence traceably: reinforcing evidence nudges confidence toward 0.99,
+weakening evidence toward 0.05, and contradicting evidence halves it while
+recording a `Contradicts` relationship. Every adjustment is an appended
+revision carrying the rationale and the evidence id, so
+`db.semantic().history(...)` shows the full epistemic trajectory. With an
+`LlmProvider` the judgment is LLM-based (strictly parsed); without one, a
+negation-marker heuristic covers the reinforce/contradict cases.
+
+```rust
+// Hold a belief with an initial credence.
+let belief = SemanticRecord::builder()
+    .concept("deploys-safe")
+    .description("our deploy pipeline is safe to run on Fridays")
+    .belief()
+    .confidence(0.8)
+    .agent_id(agent_id)
+    .build()?;
+memory.db().semantic().store(belief).await?;
+
+// New experience arrives as episodic evidence...
+let evidence_id = memory.db().episodic().remember(incident_episode).await?;
+
+// ...and reflection revises the belief (here: contradicts → 0.8 → 0.4).
+for update in memory.db().semantic().reflect(evidence_id).await? {
+    println!(
+        "{}: {} {:.2} -> {:.2} ({})",
+        update.belief_id,
+        update.outcome,
+        update.prior_confidence,
+        update.new_confidence,
+        update.rationale
+    );
+}
+```
+
+The same sweep runs offline as `CognitiveJobKind::Reflect`, scoped to a
+namespace and bounded by the job's `temporal_window` and budget. See
+[cognitive-model.md](cognitive-model.md#beliefs--reflection) for the
+confidence dynamics table and audit-trail details.
+
 ## 7. Inspect Explanations
 
 hirn exposes structured explanation surfaces for both retrieval and the write path.

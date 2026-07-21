@@ -37,6 +37,7 @@ mod pattern;
 mod pipeline;
 mod raptor;
 mod reconsolidation;
+mod reflection;
 mod scheduler;
 mod segmentation;
 
@@ -52,6 +53,7 @@ pub use pattern::*;
 pub use pipeline::*;
 pub use raptor::*;
 pub use reconsolidation::*;
+pub use reflection::*;
 pub use scheduler::*;
 pub use segmentation::*;
 

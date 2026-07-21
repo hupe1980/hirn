@@ -419,7 +419,7 @@ fn run_activation(
                 hirn_graph::static_activation(graph, seeds, allowed_namespaces)
                     .into_iter()
                     .collect();
-            entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            hirn_graph::sort_by_score_then_id(&mut entries);
 
             for (node_id, score) in entries {
                 ids.push(node_id.to_string());
@@ -432,7 +432,7 @@ fn run_activation(
                 hirn_graph::spread_activation(graph, seeds, &config, None, allowed_namespaces)
                     .expect("test activation config should be valid");
             let mut entries: Vec<_> = result.activations.into_iter().collect();
-            entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            hirn_graph::sort_by_score_then_id(&mut entries);
 
             for (node_id, score) in entries {
                 let depth = result
@@ -451,7 +451,7 @@ fn run_activation(
                 hirn_graph::personalized_pagerank(graph, seeds, &ppr_config, allowed_namespaces)
                     .expect("default PPR config should be valid");
             let mut entries: Vec<_> = activations.into_iter().collect();
-            entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            hirn_graph::sort_by_score_then_id(&mut entries);
 
             for (node_id, score) in entries {
                 ids.push(node_id.to_string());

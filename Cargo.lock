@@ -4501,7 +4501,6 @@ version = "0.2.0"
 dependencies = [
  "chrono",
  "criterion",
- "dashmap",
  "datafusion",
  "datafusion-common",
  "datafusion-expr",

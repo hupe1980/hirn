@@ -13,7 +13,9 @@ use crate::security::{CorruptionDefense, CorruptionDefenseConfig};
 
 pub(crate) struct AdmissionRuntime {
     corruption_defense: Mutex<CorruptionDefense>,
-    admission_pipeline: Option<AdmissionPipeline>,
+    // Arc so the write path can hold a reservation guard (commit/release)
+    // that outlives the borrow of the runtime.
+    admission_pipeline: Option<Arc<AdmissionPipeline>>,
 }
 
 impl AdmissionRuntime {
@@ -33,7 +35,7 @@ impl AdmissionRuntime {
     }
 
     pub(crate) fn set_pipeline(&mut self, pipeline: AdmissionPipeline) {
-        self.admission_pipeline = Some(pipeline);
+        self.admission_pipeline = Some(Arc::new(pipeline));
     }
 
     pub(crate) fn setup_default_pipeline(
@@ -77,11 +79,16 @@ impl AdmissionRuntime {
             ))
             .with(RateLimiter::new(config.admission_rate_limit as u64, 60));
 
-        self.admission_pipeline = Some(pipeline);
+        self.admission_pipeline = Some(Arc::new(pipeline));
     }
 
     pub(crate) fn admission_pipeline(&self) -> Option<&AdmissionPipeline> {
-        self.admission_pipeline.as_ref()
+        self.admission_pipeline.as_deref()
+    }
+
+    /// Owned handle for reservation guards on the write path.
+    pub(crate) fn admission_pipeline_arc(&self) -> Option<Arc<AdmissionPipeline>> {
+        self.admission_pipeline.clone()
     }
 
     pub(crate) async fn evaluate_record(

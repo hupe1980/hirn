@@ -1,14 +1,16 @@
-//! HirnQL v2 compiler — transforms query text into cached, optimized execution plans.
+//! HirnQL v2 compiler front-end — parse, validate, and prepare statements.
 //!
-//! Pipeline: HirnQL text → Parser → Untyped AST → Semantic analysis → Planner → Physical plan → Execute
+//! Pipeline: HirnQL text → Parser → Untyped AST → Semantic analysis → Plan metadata
 //!
-//! Each stage is independently testable. Plans are cached by query text hash.
+//! Execution artifacts (typed AST + DataFusion logical plan) are produced and
+//! cached by `hirn_query::QueryPipeline`; that cache is the single plan cache
+//! in the system. This module owns the prepared-statement front-end: a
+//! statement is parsed once at `prepare()` time and parameter values are bound
+//! directly into the stored AST, which is then executed as-is.
 
 use std::collections::HashMap;
-use std::hash::{DefaultHasher, Hash, Hasher};
 
 use hirn_core::HirnError;
-use parking_lot::RwLock;
 
 use super::analyzer::{self, AnalysisError, AnalysisErrorKind};
 use super::planner::{self, QueryPlan};
@@ -100,7 +102,7 @@ pub fn compile(query: &str, stats: Option<&DbStats>) -> Result<CompiledQuery, Co
 /// A prepared statement with parameter slots and compatibility plan metadata.
 ///
 /// Created via `prepare()`. Prefer `QueryView::execute_prepared()` for
-/// execution, or use `bind()` when a concrete `CompiledQuery` is needed for
+/// execution, or use `bind()` when a bound `Statement` is needed for
 /// inspection or tests.
 #[derive(Debug, Clone)]
 pub struct PreparedStatement {
@@ -108,8 +110,11 @@ pub struct PreparedStatement {
     pub source: String,
     /// Parameter names found in the query (sorted, with `$` prefix).
     pub params: Vec<String>,
-    /// The pre-compiled plan (reused across bindings).
+    /// Plan metadata computed at prepare time (parameter-independent).
     pub plan: QueryPlan,
+    /// The AST template parsed once at prepare time; `bind()` clones it and
+    /// substitutes parameter values, so binding never re-parses the source.
+    template: Statement,
 }
 
 /// Prepare a parameterized query.
@@ -126,9 +131,11 @@ pub fn prepare(query: &str, stats: Option<&DbStats>) -> Result<PreparedStatement
     // Collect parameter references.
     let params = hirn_query::ast::collect_parameters(&ast);
 
-    // Skip semantic analysis for parameterized queries — params may cause
-    // false positives (e.g. importance > $threshold). Full analysis happens
-    // after bind().
+    // Analysis split: for parameter-free templates the full analyzer runs
+    // here, at prepare time. For parameterized templates it is deferred to
+    // bind() — value checks (numeric ranges, temporal formats) need concrete
+    // values and would false-positive on `$name` placeholders (e.g.
+    // importance > $threshold, AFTER $date).
     if params.is_empty() {
         let errors = analyzer::analyze(&ast);
         if !errors.is_empty() {
@@ -143,25 +150,32 @@ pub fn prepare(query: &str, stats: Option<&DbStats>) -> Result<PreparedStatement
         source: query.to_string(),
         params,
         plan,
+        template: ast,
     })
 }
 
-/// Bind parameter values to a prepared statement, producing an executable `CompiledQuery`.
+/// Bind parameter values to a prepared statement, producing a bound
+/// `Statement` ready for direct execution.
 ///
 /// `values` maps parameter names (with `$` prefix) to string representations.
 /// Positional parameters use `$1`, `$2`, etc.
+///
+/// The returned AST is executed as-is through the same compiled pipeline as
+/// any other statement (`HirnDB::execute_statement`); it is never serialized
+/// back to HirnQL text and re-parsed. Statement `Display` output exists for
+/// logging and EXPLAIN only and is not load-bearing for execution.
 ///
 /// Returns an error if any declared parameter is missing from `values`.
 pub fn bind(
     prepared: &PreparedStatement,
     values: &HashMap<String, String>,
-) -> Result<CompiledQuery, CompileError> {
-    // Parse the prepared source back to an AST (parameters remain as `$name`
+) -> Result<Statement, CompileError> {
+    // Clone the template parsed at prepare time (parameters remain as `$name`
     // placeholders), then substitute values **into the AST**, not into the
     // query text. Placing values into typed AST nodes means a value can never
     // break out of a string literal to inject trailing clauses, and there is no
     // `$t`/`$t2` prefix-collision hazard that naive `String::replace` had.
-    let mut ast = parser::parse(&prepared.source).map_err(CompileError::Parse)?;
+    let mut ast = prepared.template.clone();
 
     let missing = hirn_query::ast::bind_parameters(&mut ast, values);
     if !missing.is_empty() {
@@ -171,145 +185,16 @@ pub fn bind(
         }]));
     }
 
-    // Re-serialize the bound AST. This is now safe: the serializer emits every
-    // clause in grammar order and escapes every string, so the bound text
-    // re-parses to an equal AST.
-    let bound_query = ast.to_string();
-
-    // Full semantic analysis now that all values are concrete.
+    // Value-dependent semantic checks run now that all values are concrete.
+    // (For parameter-free templates this repeats the cheap prepare-time pass;
+    // the analyzer is a single non-allocating walk, so a split into
+    // value-dependent/independent halves is not worth the duplication.)
     let errors = analyzer::analyze(&ast);
     if !errors.is_empty() {
         return Err(CompileError::Analysis(errors));
     }
 
-    Ok(CompiledQuery {
-        source: bound_query,
-        ast,
-        plan: prepared.plan.clone(),
-    })
-}
-
-/// A plan cache that stores compiled query plans keyed by query text hash.
-///
-/// Plans are invalidated when the underlying data statistics change
-/// significantly (detected by comparing DbStats).
-#[derive(Debug)]
-pub struct PlanCache {
-    cache: RwLock<PlanCacheInner>,
-    capacity: usize,
-}
-
-#[derive(Debug)]
-struct PlanCacheInner {
-    entries: HashMap<u64, CacheEntry>,
-    /// Stats fingerprint at the time entries were cached.
-    stats_fingerprint: u64,
-}
-
-#[derive(Debug, Clone)]
-struct CacheEntry {
-    compiled: CompiledQuery,
-    hits: u64,
-}
-
-impl PlanCache {
-    /// Create a new plan cache with the given capacity.
-    pub fn new(capacity: usize) -> Self {
-        Self {
-            cache: RwLock::new(PlanCacheInner {
-                entries: HashMap::with_capacity(capacity),
-                stats_fingerprint: 0,
-            }),
-            capacity,
-        }
-    }
-
-    /// Compile a query, using the cache if possible.
-    ///
-    /// If the query was previously compiled with the same stats, the cached
-    /// plan is returned. Otherwise, a fresh compilation is performed.
-    pub fn compile(
-        &self,
-        query: &str,
-        stats: Option<&DbStats>,
-    ) -> Result<CompiledQuery, CompileError> {
-        let key = hash_query(query);
-        let fingerprint = stats_fingerprint(stats);
-
-        // Try cache read.
-        {
-            let cache = self.cache.read();
-            if cache.stats_fingerprint == fingerprint {
-                if let Some(entry) = cache.entries.get(&key) {
-                    return Ok(entry.compiled.clone());
-                }
-            }
-        }
-
-        // Cache miss — compile fresh.
-        let compiled = compile(query, stats)?;
-
-        // Store in cache.
-        {
-            let mut cache = self.cache.write();
-
-            // If stats changed, invalidate the entire cache.
-            if cache.stats_fingerprint != fingerprint {
-                cache.entries.clear();
-                cache.stats_fingerprint = fingerprint;
-            }
-
-            // Evict if at capacity (simple: remove oldest entry by lowest hit count).
-            if cache.entries.len() >= self.capacity {
-                if let Some((&evict_key, _)) = cache.entries.iter().min_by_key(|(_, e)| e.hits) {
-                    cache.entries.remove(&evict_key);
-                }
-            }
-
-            cache.entries.insert(
-                key,
-                CacheEntry {
-                    compiled: compiled.clone(),
-                    hits: 1,
-                },
-            );
-        }
-
-        Ok(compiled)
-    }
-
-    /// Number of cached entries.
-    pub fn len(&self) -> usize {
-        self.cache.read().entries.len()
-    }
-
-    /// Whether the cache is empty.
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Clear the plan cache.
-    pub fn clear(&self) {
-        let mut cache = self.cache.write();
-        cache.entries.clear();
-    }
-}
-
-fn hash_query(query: &str) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    // Normalize whitespace for cache key.
-    let normalized: String = query.split_whitespace().collect::<Vec<_>>().join(" ");
-    normalized.hash(&mut hasher);
-    hasher.finish()
-}
-
-fn stats_fingerprint(stats: Option<&DbStats>) -> u64 {
-    let Some(s) = stats else { return 0 };
-    let mut hasher = DefaultHasher::new();
-    s.total_count.hash(&mut hasher);
-    s.episodic_count.hash(&mut hasher);
-    s.semantic_count.hash(&mut hasher);
-    hasher.finish()
+    Ok(ast)
 }
 
 #[cfg(test)]
@@ -404,95 +289,6 @@ mod tests {
         assert!(matches!(hirn_err, HirnError::InvalidInput(_)));
     }
 
-    // ── Plan cache tests ───────────────────────────────────────────────
-
-    #[test]
-    fn cache_hit_returns_same_plan() {
-        let cache = PlanCache::new(100);
-        let q = r#"RECALL episodic ABOUT "test""#;
-        let c1 = cache.compile(q, None).unwrap();
-        let c2 = cache.compile(q, None).unwrap();
-        assert_eq!(c1.plan, c2.plan);
-        assert_eq!(cache.len(), 1);
-    }
-
-    #[test]
-    fn cache_different_queries_stored_separately() {
-        let cache = PlanCache::new(100);
-        cache.compile(r#"RECALL episodic ABOUT "a""#, None).unwrap();
-        cache.compile(r#"RECALL episodic ABOUT "b""#, None).unwrap();
-        assert_eq!(cache.len(), 2);
-    }
-
-    #[test]
-    fn cache_invalidated_on_stats_change() {
-        let cache = PlanCache::new(100);
-        let stats1 = DbStats {
-            working_count: 0,
-            episodic_count: 100,
-            semantic_count: 50,
-            edge_count: 0,
-            procedural_count: 0,
-            total_count: 150,
-            file_size_bytes: 0,
-        };
-        let stats2 = DbStats {
-            working_count: 0,
-            episodic_count: 5000,
-            semantic_count: 2000,
-            edge_count: 0,
-            procedural_count: 0,
-            total_count: 7000,
-            file_size_bytes: 0,
-        };
-
-        cache
-            .compile(r#"RECALL episodic ABOUT "test""#, Some(&stats1))
-            .unwrap();
-        assert_eq!(cache.len(), 1);
-
-        // Different stats → cache invalidated, fresh compilation.
-        cache
-            .compile(r#"RECALL episodic ABOUT "test""#, Some(&stats2))
-            .unwrap();
-        assert_eq!(cache.len(), 1); // Old entry cleared, new one stored.
-    }
-
-    #[test]
-    fn cache_eviction_at_capacity() {
-        let cache = PlanCache::new(2);
-        cache.compile(r#"RECALL episodic ABOUT "a""#, None).unwrap();
-        cache.compile(r#"RECALL episodic ABOUT "b""#, None).unwrap();
-        assert_eq!(cache.len(), 2);
-
-        // Third entry should evict one.
-        cache.compile(r#"RECALL episodic ABOUT "c""#, None).unwrap();
-        assert_eq!(cache.len(), 2);
-    }
-
-    #[test]
-    fn cache_clear_empties_all() {
-        let cache = PlanCache::new(100);
-        cache.compile(r#"RECALL episodic ABOUT "a""#, None).unwrap();
-        cache.compile(r#"RECALL episodic ABOUT "b""#, None).unwrap();
-        assert_eq!(cache.len(), 2);
-        cache.clear();
-        assert!(cache.is_empty());
-    }
-
-    #[test]
-    fn cache_whitespace_normalized() {
-        let cache = PlanCache::new(100);
-        cache
-            .compile(r#"RECALL episodic ABOUT "test""#, None)
-            .unwrap();
-        cache
-            .compile(r#"RECALL  episodic   ABOUT  "test""#, None)
-            .unwrap();
-        // Same query after normalization → still 1 entry.
-        assert_eq!(cache.len(), 1);
-    }
-
     // ── Parse performance ──────────────────────────────────────────────
 
     #[test]
@@ -556,9 +352,29 @@ mod tests {
         let mut values = HashMap::new();
         values.insert("$1".to_string(), "authentication".to_string());
 
-        let compiled = bind(&stmt, &values).unwrap();
-        match &compiled.ast {
+        let bound = bind(&stmt, &values).unwrap();
+        match &bound {
             Statement::Recall(r) => assert_eq!(r.about, "authentication"),
+            _ => panic!("expected Recall"),
+        }
+    }
+
+    #[test]
+    fn bind_does_not_reparse_template() {
+        // A bound value that would change meaning if the statement were
+        // serialized to text and re-parsed must survive as literal data.
+        let stmt = prepare(r#"RECALL episodic ABOUT $1 LIMIT 10"#, None).unwrap();
+        let payload = r#"x" LIMIT 1 NAMESPACE hijacked --"#;
+        let mut values = HashMap::new();
+        values.insert("$1".to_string(), payload.to_string());
+
+        let bound = bind(&stmt, &values).unwrap();
+        match &bound {
+            Statement::Recall(r) => {
+                assert_eq!(r.about, payload, "payload must stay data, not syntax");
+                assert_eq!(r.limit, Some(10), "LIMIT clause must be unchanged");
+                assert!(r.namespace.is_none(), "no namespace may be injected");
+            }
             _ => panic!("expected Recall"),
         }
     }
@@ -577,8 +393,8 @@ mod tests {
         values.insert("$query".to_string(), "test".to_string());
         values.insert("$threshold".to_string(), "0.5".to_string());
 
-        let compiled = bind(&stmt, &values).unwrap();
-        match &compiled.ast {
+        let bound = bind(&stmt, &values).unwrap();
+        match &bound {
             Statement::Recall(r) => {
                 assert_eq!(r.about, "test");
                 assert_eq!(
@@ -606,18 +422,22 @@ mod tests {
     }
 
     #[test]
-    fn bind_reuses_plan() {
+    fn bind_leaves_template_reusable() {
         let stmt = prepare(r#"RECALL episodic ABOUT $1 LIMIT 10"#, None).unwrap();
         let plan_before = stmt.plan.clone();
 
         let mut values = HashMap::new();
         values.insert("$1".to_string(), "auth".to_string());
-        let compiled = bind(&stmt, &values).unwrap();
+        let _ = bind(&stmt, &values).unwrap();
 
-        assert_eq!(
-            compiled.plan, plan_before,
-            "plan should be reused from prepare"
-        );
+        // Binding clones the template: the prepared statement (and its plan
+        // metadata) stays untouched and can be bound again.
+        assert_eq!(stmt.plan, plan_before);
+        let again = bind(&stmt, &values).unwrap();
+        match &again {
+            Statement::Recall(r) => assert_eq!(r.about, "auth"),
+            _ => panic!("expected Recall"),
+        }
     }
 
     #[test]
@@ -626,13 +446,13 @@ mod tests {
 
         let mut v1 = HashMap::new();
         v1.insert("$1".to_string(), "auth".to_string());
-        let c1 = bind(&stmt, &v1).unwrap();
+        let b1 = bind(&stmt, &v1).unwrap();
 
         let mut v2 = HashMap::new();
         v2.insert("$1".to_string(), "deployment".to_string());
-        let c2 = bind(&stmt, &v2).unwrap();
+        let b2 = bind(&stmt, &v2).unwrap();
 
-        match (&c1.ast, &c2.ast) {
+        match (&b1, &b2) {
             (Statement::Recall(r1), Statement::Recall(r2)) => {
                 assert_eq!(r1.about, "auth");
                 assert_eq!(r2.about, "deployment");
@@ -674,15 +494,16 @@ mod tests {
         }
         let compile_elapsed = start.elapsed();
 
-        // bind should be at most slightly slower than compile (both re-parse),
-        // but the plan is reused so no planner overhead.
-        // We just verify bind completes in reasonable time.
+        // bind clones the pre-parsed template and substitutes values — no
+        // parsing, no planning — so it must not be slower than a cold
+        // compile (which parses, analyzes, and plans). Allow slack for noisy
+        // CI schedulers rather than asserting a strict ratio.
         assert!(
             bind_elapsed.as_secs_f64() < 2.0,
             "1K binds took {:.2}s",
             bind_elapsed.as_secs_f64()
         );
-        let _ = compile_elapsed; // avoid unused warning
+        let _ = compile_elapsed;
     }
 
     // ── EXPLAIN ──

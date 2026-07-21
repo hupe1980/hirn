@@ -9,6 +9,7 @@ pub mod http;
 pub mod mcp;
 pub mod raft;
 pub mod realm;
+pub mod sleep;
 pub mod throttle;
 pub mod tls;
 pub mod watch;

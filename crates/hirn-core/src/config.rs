@@ -564,6 +564,18 @@ hirn_config_fields! {
     /// Minimum quality score required before planning agendas can be promoted.
     pub offline_plan_quality_threshold: f32,
 
+    // ── Reflection (Belief Revision) ─────────────────────────────────────
+
+    /// Minimum cosine similarity between an evidence record and a belief
+    /// before the Reflect operation classifies the pair at all. Pairs below
+    /// this gate are reported as `Unrelated` and left untouched.
+    /// Default: 0.75.
+    pub reflection_similarity_threshold: f32,
+
+    /// Number of nearest beliefs (same namespace) each evidence record is
+    /// reflected against. Default: 5.
+    pub reflection_top_k: usize,
+
     // ── Backward Memory Evolution (A-MEM) ────────────────────────────────
 
     /// Controls A-MEM–style backward evolution of historical memories.
@@ -778,6 +790,8 @@ impl Default for HirnConfig {
             offline_dream_quality_threshold: 0.55,
             offline_reconcile_quality_threshold: 0.6,
             offline_plan_quality_threshold: 0.45,
+            reflection_similarity_threshold: 0.75,
+            reflection_top_k: 5,
             evolution_mode: EvolutionMode::None,
             decay_interval_secs: 0,
             decay_sweep_window_secs: 86_400,
@@ -1026,6 +1040,16 @@ impl HirnConfig {
         if !(0.0..=1.0).contains(&self.offline_plan_quality_threshold) {
             return Err(HirnError::InvalidInput(
                 "offline_plan_quality_threshold must be in [0.0, 1.0]".into(),
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.reflection_similarity_threshold) {
+            return Err(HirnError::InvalidInput(
+                "reflection_similarity_threshold must be in [0.0, 1.0]".into(),
+            ));
+        }
+        if self.reflection_top_k == 0 {
+            return Err(HirnError::InvalidInput(
+                "reflection_top_k must be greater than zero".into(),
             ));
         }
         validate_conflict_resolution_policy(
@@ -1630,6 +1654,20 @@ impl HirnConfigBuilder {
     #[must_use]
     pub const fn offline_plan_quality_threshold(mut self, threshold: f32) -> Self {
         self.0.offline_plan_quality_threshold = threshold;
+        self
+    }
+
+    /// Set the similarity gate for reflection classification.
+    #[must_use]
+    pub const fn reflection_similarity_threshold(mut self, threshold: f32) -> Self {
+        self.0.reflection_similarity_threshold = threshold;
+        self
+    }
+
+    /// Set the number of nearest beliefs each evidence record is reflected against.
+    #[must_use]
+    pub const fn reflection_top_k(mut self, top_k: usize) -> Self {
+        self.0.reflection_top_k = top_k;
         self
     }
 

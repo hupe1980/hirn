@@ -3985,4 +3985,113 @@ mod tests {
         .unwrap_err();
         assert!(connect_err.message.contains("CONNECT is not supported"));
     }
+
+    // ── Prepared statements: bound AST executes directly ──────────────
+    //
+    // These are regression tests for the prepared-statement path. Binding
+    // substitutes parameter values into the template AST and the bound AST
+    // is executed as-is through the compiled pipeline; it is never
+    // serialized back to HirnQL text and re-parsed, so serializer output is
+    // not load-bearing for any of these statements.
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prepared_recall_events_with_importance_filter_executes() {
+        let (db, _dir) = temp_db().await;
+
+        // This statement previously failed when the prepared path round-
+        // tripped the bound AST through text.
+        let prepared = db
+            .ql()
+            .prepare(r#"RECALL EVENTS WHERE importance > 1.0 LIMIT 5"#)
+            .unwrap();
+        assert!(prepared.params.is_empty());
+
+        let params = std::collections::HashMap::new();
+        let result = db.ql().execute_prepared(&prepared, &params).await.unwrap();
+        match result {
+            QueryResult::SvoEvents(events) => {
+                assert_eq!(events.events_returned, events.events.len());
+            }
+            other => panic!("expected SvoEvents, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prepared_expand_graph_whole_number_min_weight_executes() {
+        let (db, _dir) = temp_db().await;
+        let dims = db.embedding_dims();
+        let content = "Prepared expand-graph regression fixture";
+
+        let rec = EpisodicRecord::builder()
+            .content(content)
+            .agent_id(agent())
+            .event_type(EventType::Observation)
+            .embedding(pseudo_embedding(content, dims))
+            .build()
+            .unwrap();
+        db.episodic().remember(rec).await.unwrap();
+
+        // MIN_WEIGHT 1.0 is a whole-number float; the old text round-trip
+        // could degrade it to an integer literal the grammar rejects.
+        let prepared = db
+            .ql()
+            .prepare(r#"RECALL episodic ABOUT $1 EXPAND GRAPH DEPTH 2 MIN_WEIGHT 1.0 LIMIT 5"#)
+            .unwrap();
+        let mut params = std::collections::HashMap::new();
+        params.insert("$1".to_string(), content.to_string());
+
+        let result = db.ql().execute_prepared(&prepared, &params).await.unwrap();
+        match result {
+            QueryResult::Records(rr) => {
+                assert!(!rr.records.is_empty(), "prepared recall should hit fixture");
+            }
+            other => panic!("expected Records, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prepared_about_param_with_injection_payload_stays_data() {
+        let (db, _dir) = temp_db().await;
+        let dims = db.embedding_dims();
+
+        let benign = EpisodicRecord::builder()
+            .content("benign fixture record")
+            .agent_id(agent())
+            .event_type(EventType::Observation)
+            .embedding(pseudo_embedding("benign fixture record", dims))
+            .build()
+            .unwrap();
+        db.episodic().remember(benign).await.unwrap();
+
+        let prepared = db
+            .ql()
+            .prepare(r#"RECALL episodic ABOUT $1 LIMIT 10"#)
+            .unwrap();
+
+        // A payload full of HirnQL syntax must be treated as an opaque search
+        // string. If it were spliced into query text, this would either fail
+        // to parse or hijack the statement with extra clauses.
+        let payload = r#"x" LIMIT 1 NAMESPACE hijacked WHERE importance > 0.0 --"#;
+        let mut params = std::collections::HashMap::new();
+        params.insert("$1".to_string(), payload.to_string());
+
+        let bound = hirn_engine::ql::bind(&prepared, &params).unwrap();
+        match &bound {
+            hirn_engine::ql::Statement::Recall(r) => {
+                assert_eq!(r.about, payload, "payload must remain literal data");
+                assert_eq!(r.limit, Some(10), "LIMIT must not be overridden");
+                assert!(r.namespace.is_none(), "no namespace may be injected");
+                assert!(r.where_clauses.is_empty(), "no WHERE may be injected");
+            }
+            other => panic!("expected Recall, got {other:?}"),
+        }
+
+        // End-to-end: the same binding executes successfully as a search for
+        // the literal payload (matching nothing is fine — it must not error).
+        let result = db.ql().execute_prepared(&prepared, &params).await.unwrap();
+        assert!(
+            matches!(result, QueryResult::Records(_)),
+            "expected Records, got {result:?}"
+        );
+    }
 }

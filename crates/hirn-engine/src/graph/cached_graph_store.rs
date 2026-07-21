@@ -14,7 +14,6 @@
 //!
 //! **Never** acquire `ns_index` before `graph`.
 
-use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -693,8 +692,7 @@ impl CachedGraphStore {
                     hirn_graph::static_activation(&graph, seeds, allowed_namespaces)
                         .into_iter()
                         .collect();
-                entries
-                    .sort_by(|left, right| right.1.partial_cmp(&left.1).unwrap_or(Ordering::Equal));
+                hirn_graph::sort_by_score_then_id(&mut entries);
 
                 Ok(GraphActivationOutput {
                     ids: entries
@@ -717,8 +715,7 @@ impl CachedGraphStore {
                     allowed_namespaces,
                 )?;
                 let mut entries: Vec<_> = result.activations.into_iter().collect();
-                entries
-                    .sort_by(|left, right| right.1.partial_cmp(&left.1).unwrap_or(Ordering::Equal));
+                hirn_graph::sort_by_score_then_id(&mut entries);
 
                 Ok(GraphActivationOutput {
                     ids: entries
@@ -749,8 +746,7 @@ impl CachedGraphStore {
                 )?
                 .into_iter()
                 .collect();
-                entries
-                    .sort_by(|left, right| right.1.partial_cmp(&left.1).unwrap_or(Ordering::Equal));
+                hirn_graph::sort_by_score_then_id(&mut entries);
 
                 Ok(GraphActivationOutput {
                     ids: entries
@@ -792,8 +788,7 @@ impl CachedGraphStore {
                 .await?
                 .into_iter()
                 .collect();
-                entries
-                    .sort_by(|left, right| right.1.partial_cmp(&left.1).unwrap_or(Ordering::Equal));
+                hirn_graph::sort_by_score_then_id(&mut entries);
 
                 Ok(GraphActivationOutput {
                     ids: entries
@@ -817,8 +812,7 @@ impl CachedGraphStore {
                 )
                 .await?;
                 let mut entries: Vec<_> = result.activations.into_iter().collect();
-                entries
-                    .sort_by(|left, right| right.1.partial_cmp(&left.1).unwrap_or(Ordering::Equal));
+                hirn_graph::sort_by_score_then_id(&mut entries);
 
                 Ok(GraphActivationOutput {
                     ids: entries
@@ -850,8 +844,7 @@ impl CachedGraphStore {
                 .await?
                 .into_iter()
                 .collect();
-                entries
-                    .sort_by(|left, right| right.1.partial_cmp(&left.1).unwrap_or(Ordering::Equal));
+                hirn_graph::sort_by_score_then_id(&mut entries);
 
                 Ok(GraphActivationOutput {
                     ids: entries
@@ -2322,5 +2315,144 @@ mod tests {
             rows.iter().any(|row| row.node_id == b.to_string()),
             "cold-tier traversal should include the persisted neighbor even when the hot graph is empty"
         );
+    }
+
+    /// Build the same small graph in both tiers (write-through) and return
+    /// the store plus the node ids in creation order.
+    ///
+    /// Topology: diamond with a tail and an upstream cause —
+    /// up → a, a → b, a → c, b → d, c → d, d → e.
+    async fn equivalence_fixture() -> (CachedGraphStore, Vec<MemoryId>) {
+        let cold = test_cold().await;
+        let cached = CachedGraphStore::new(cold);
+        let ns = Namespace::default();
+
+        let nodes: Vec<MemoryId> = (0..6).map(|_| MemoryId::new()).collect();
+        for &id in &nodes {
+            cached
+                .add_node(id, Layer::Episodic, 0.5, Timestamp::now(), ns)
+                .await
+                .unwrap();
+        }
+        let (up, a, b, c, d, e) = (nodes[0], nodes[1], nodes[2], nodes[3], nodes[4], nodes[5]);
+        for (src, tgt, w) in [
+            (up, a, 0.9_f32),
+            (a, b, 0.9),
+            (a, c, 0.6),
+            (b, d, 0.8),
+            (c, d, 0.8), // convergent path with equal weight → ordering ties
+            (d, e, 0.5),
+        ] {
+            cached
+                .add_edge(src, tgt, EdgeRelation::Causes, w, Metadata::new())
+                .await
+                .unwrap();
+        }
+        (cached, nodes)
+    }
+
+    /// The hot path and the delegated cold path must produce identical
+    /// id-sets, orderings, and depths, with scores equal within 1e-5 —
+    /// both run the shared `activation_core`.
+    #[tokio::test]
+    async fn hot_and_cold_activation_paths_agree() {
+        let (cached, nodes) = equivalence_fixture().await;
+        let seeds = [nodes[1]]; // `a`: has upstream cause `up` and downstream diamond
+
+        for mode in [
+            ExecActivationMode::Static,
+            ExecActivationMode::Spreading,
+            ExecActivationMode::Ppr,
+        ] {
+            // delegation_threshold = usize::MAX → hot tier; 0 → cold tier.
+            let hot = cached
+                .activate_graph(&seeds, mode, None, 3, 0.001, 0.0, usize::MAX, None)
+                .await
+                .unwrap();
+            let cold = cached
+                .activate_graph(&seeds, mode, None, 3, 0.001, 0.0, 0, None)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                hot.ids, cold.ids,
+                "hot and cold tiers must return identical id orderings for {mode:?}"
+            );
+            assert_eq!(
+                hot.depths, cold.depths,
+                "hot and cold tiers must return identical depths for {mode:?}"
+            );
+            assert_eq!(hot.scores.len(), cold.scores.len());
+            for (i, (h, c)) in hot.scores.iter().zip(cold.scores.iter()).enumerate() {
+                assert!(
+                    (h - c).abs() < 1e-5,
+                    "score mismatch for {mode:?} at rank {i}: hot={h}, cold={c}"
+                );
+            }
+        }
+    }
+
+    /// Namespace-scoped runs must also agree: the hot tier filters via node
+    /// data, the cold tier pushes `namespace IN (...)` into the batch scans.
+    #[tokio::test]
+    async fn hot_and_cold_activation_paths_agree_with_namespace_filter() {
+        let (cached, nodes) = equivalence_fixture().await;
+        let allowed = Namespace::default();
+
+        // A node in a foreign namespace hanging off the diamond must be
+        // excluded identically by both tiers.
+        let hidden = MemoryId::new();
+        cached
+            .add_node(
+                hidden,
+                Layer::Episodic,
+                0.5,
+                Timestamp::now(),
+                Namespace::new("private:other").unwrap(),
+            )
+            .await
+            .unwrap();
+        cached
+            .add_edge(nodes[1], hidden, EdgeRelation::Causes, 0.9, Metadata::new())
+            .await
+            .unwrap();
+
+        let seeds = [nodes[1]];
+        let allowed_slice = [allowed];
+        for mode in [
+            ExecActivationMode::Static,
+            ExecActivationMode::Spreading,
+            ExecActivationMode::Ppr,
+        ] {
+            let hot = cached
+                .activate_graph(
+                    &seeds,
+                    mode,
+                    None,
+                    3,
+                    0.001,
+                    0.0,
+                    usize::MAX,
+                    Some(&allowed_slice),
+                )
+                .await
+                .unwrap();
+            let cold = cached
+                .activate_graph(&seeds, mode, None, 3, 0.001, 0.0, 0, Some(&allowed_slice))
+                .await
+                .unwrap();
+
+            assert!(
+                !hot.ids.contains(&hidden.to_string()),
+                "hot tier must not leak foreign-namespace nodes for {mode:?}"
+            );
+            assert_eq!(
+                hot.ids, cold.ids,
+                "namespace-scoped hot and cold orderings must match for {mode:?}"
+            );
+            for (h, c) in hot.scores.iter().zip(cold.scores.iter()) {
+                assert!((h - c).abs() < 1e-5);
+            }
+        }
     }
 }

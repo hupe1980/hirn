@@ -8,9 +8,11 @@
 //! rejected explicitly instead of silently crossing into the old imperative
 //! dispatcher, while daemon-owned statements stay unsupported.
 //!
-//! The `CompiledPlan` is cached in `PlanCache` (DashMap + LRU eviction).
+//! The `CompiledPlan` is cached in `hirn_query::PlanCache` (a bounded LRU
+//! keyed by normalized query text — the single plan cache in the system).
 //! `PlanCache::clear()` is called on schema changes (dataset creation,
-//! index changes) to prevent stale plans.
+//! index changes) to prevent stale plans. Prepared statements execute their
+//! bound AST directly via `execute_statement`, skipping parse and cache.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -1179,6 +1181,24 @@ impl HirnDB {
             think_context_override,
         )
         .await
+    }
+
+    /// Execute an already-parsed HirnQL statement through the same compiled
+    /// pipeline as `execute_ql`, skipping only the parse stage.
+    ///
+    /// This is the prepared-statement execution entry: `bind()` substitutes
+    /// parameter values into the prepared template AST and the bound AST is
+    /// compiled (analyze → rewrite → plan) and executed directly. It is never
+    /// serialized back to HirnQL text and re-parsed, so statement `Display`
+    /// output is not load-bearing for execution.
+    ///
+    /// Bound statements bypass the text-keyed plan cache because parameter
+    /// values are embedded in the logical plan; parsing is still skipped, and
+    /// prepare-time template analysis is not repeated.
+    pub(crate) async fn execute_statement(&self, stmt: Statement) -> HirnResult<QueryResult> {
+        let compiled = self.query_pipeline().compile_statement(stmt)?;
+        self.execute_authoritative_statement(compiled.as_ref(), QueryExecutionScope::system(), None)
+            .await
     }
 
     /// Parse and execute a HirnQL query, enforcing namespace access control.

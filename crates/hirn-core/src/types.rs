@@ -53,6 +53,11 @@ pub enum KnowledgeType {
     /// RAPTOR hierarchical summary (Sarthi et al., 2024).
     /// Multi-level tree of clustered summaries for top-down retrieval.
     RaptorSummary,
+    /// Subjective belief/opinion with a credence, as opposed to an objective
+    /// world fact. `SemanticRecord::confidence` holds the credence and is
+    /// adjusted by the Reflect operation when new evidence reinforces,
+    /// weakens, or contradicts the belief (Hindsight, arXiv:2512.12818).
+    Belief,
 }
 
 /// Origin of a memory record for provenance tracking.
@@ -483,6 +488,7 @@ mod tests {
             KnowledgeType::Inferred,
             KnowledgeType::Community,
             KnowledgeType::RaptorSummary,
+            KnowledgeType::Belief,
         ] {
             let bytes = bincode::serialize(&kt).unwrap();
             let back: KnowledgeType = bincode::deserialize(&bytes).unwrap();

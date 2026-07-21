@@ -419,6 +419,9 @@ pub fn router(state: Arc<HttpState>, auth_state: Arc<AuthState>) -> Router {
         .route("/v1/watch", get(watch_sse))
         .route("/v1/auth/token", post(issue_token))
         .route("/debug/brain-stats", get(brain_stats))
+        // Inner to auth: only authenticated API traffic resets the sleep
+        // scheduler's idle clock (health probes must not keep hirnd awake).
+        .layer(middleware::from_fn(crate::sleep::track_http_activity))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&auth_state),
             auth_middleware,
@@ -1135,6 +1138,8 @@ struct BrainStatsResponse {
     event_seq: u64,
     policy_count: u64,
     cluster_size: u64,
+    /// Unix-ms timestamp of the last completed sleep-time consolidation pass.
+    sleep_last_pass_ms: Option<u64>,
 }
 
 // ── Remember types ──
@@ -1542,6 +1547,7 @@ async fn brain_stats(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
         event_seq,
         policy_count,
         cluster_size,
+        sleep_last_pass_ms: crate::sleep::last_pass_unix_ms(),
     })
 }
 

@@ -1,7 +1,12 @@
-//! Spreading activation engine with lateral inhibition.
+//! Spreading activation engine with lateral inhibition (hot tier).
 //!
 //! Implements the activation propagation algorithm from CONCEPT.md §6.3:
 //! `A(j) += A(i) × w(i,j) × d^l` where `d` is depth decay.
+//!
+//! The actual math lives in [`crate::activation_core`], which is shared with
+//! the cold-tier `PersistentGraph` caller in `hirn-engine`. This module only
+//! builds per-level adjacency from the in-memory petgraph (already filtered
+//! to currently-active edges and allowed namespaces) and feeds it to the core.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -9,6 +14,7 @@ use hirn_core::id::MemoryId;
 use hirn_core::types::Namespace;
 use hirn_core::{HirnError, HirnResult};
 
+use crate::activation_core::{self, AdjacencyMap, SpreadState};
 use crate::graph::PropertyGraph;
 
 /// Activation configuration.
@@ -248,133 +254,22 @@ fn spread_activation_unchecked(
     embeddings: Option<&HashMap<MemoryId, Vec<f32>>>,
     allowed_namespaces: Option<&[Namespace]>,
 ) -> ActivationResult {
-    let mut activations: HashMap<MemoryId, f64> = HashMap::new();
-    let mut traces: HashMap<MemoryId, ActivationTrace> = HashMap::new();
-
-    // Initialize seeds with A₀ = 1.0.
-    for &seed in seeds {
-        if graph.has_node(seed) {
-            activations.insert(seed, 1.0);
-            traces.insert(
-                seed,
-                ActivationTrace {
-                    path: vec![seed],
-                    seed,
-                },
-            );
-        }
-    }
-
-    // BFS wavefront propagation: process each depth level exactly once.
-    // This ensures additive accumulation from convergent paths at the same
-    // depth without re-propagating from already-settled nodes.
-    let mut frontier: Vec<(MemoryId, f64)> = seeds
+    // Initialize seeds with A₀ = 1.0 and run the shared BFS wavefront core:
+    // each depth level is processed exactly once, adjacency is materialized
+    // per level from the petgraph, and the math lives in `activation_core`.
+    let present_seeds: Vec<MemoryId> = seeds
         .iter()
-        .filter(|s| graph.has_node(**s))
-        .map(|&s| (s, 1.0))
+        .copied()
+        .filter(|s| graph.has_node(*s))
         .collect();
-    let mut propagated: HashSet<MemoryId> = seeds.iter().copied().collect();
+    let (mut state, mut frontier) = SpreadState::init(seeds, &present_seeds);
 
     for depth in 0..config.propagation_steps() {
         if frontier.is_empty() {
             break;
         }
-
-        let depth_decay = config
-            .decay_factor
-            .powi(i32::try_from(depth).unwrap_or(i32::MAX) + 1);
-        let mut next_frontier: HashMap<MemoryId, f64> = HashMap::new();
-
-        for (node_id, activation) in &frontier {
-            if *activation < config.epsilon {
-                continue;
-            }
-
-            let Some(node_idx) = graph.node_index(*node_id) else {
-                continue;
-            };
-
-            for (neighbor_idx, weight, _relation) in graph.outgoing_weighted_iter(node_idx) {
-                let Some(neighbor) = graph.node_id(neighbor_idx) else {
-                    continue;
-                };
-
-                // Namespace boundary enforcement.
-                if let Some(allowed) = allowed_namespaces
-                    && let Some(ns) = graph.node_namespace(neighbor)
-                    && !allowed.contains(ns)
-                {
-                    continue;
-                }
-
-                let contribution = activation * f64::from(weight) * depth_decay;
-                if contribution < config.epsilon {
-                    continue;
-                }
-
-                // Additive accumulation: convergent paths sum their contributions.
-                *next_frontier.entry(neighbor).or_insert(0.0) += contribution;
-
-                // Track provenance (best path).
-                if !traces.contains_key(&neighbor)
-                    && let Some(parent_trace) = traces.get(node_id)
-                {
-                    let mut path = parent_trace.path.clone();
-                    path.push(neighbor);
-                    traces.insert(
-                        neighbor,
-                        ActivationTrace {
-                            path,
-                            seed: parent_trace.seed,
-                        },
-                    );
-                }
-            }
-        }
-
-        if next_frontier.is_empty() {
-            break;
-        }
-
-        // Update activations and build the next frontier (only newly reached nodes propagate).
-        let mut new_frontier: Vec<(MemoryId, f64)> = Vec::new();
-        for (node, new_val) in next_frontier {
-            let old = activations.get(&node).copied().unwrap_or(0.0);
-            let updated = (old + new_val).min(1.0);
-            activations.insert(node, updated);
-            if propagated.insert(node) {
-                // Node newly reached — it will propagate in the next depth level.
-                new_frontier.push((node, updated));
-            }
-        }
-
-        // Frontier truncation — hard safety cap against OOM/DoS (F-ENG-01).
-        if config.max_frontier_size > 0 && new_frontier.len() > config.max_frontier_size {
-            tracing::warn!(
-                depth = depth,
-                frontier_before = new_frontier.len(),
-                frontier_after = config.max_frontier_size,
-                "spreading activation frontier exceeded max_frontier_size, truncating"
-            );
-            // Keep only the strongest prefix in O(n), then sort just the
-            // retained frontier to preserve deterministic propagation order.
-            new_frontier.select_nth_unstable_by(config.max_frontier_size, |a, b| {
-                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-            });
-            new_frontier.truncate(config.max_frontier_size);
-            new_frontier.sort_unstable_by(|a, b| {
-                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-            });
-        }
-
-        // Emit structured tracing span for frontier monitoring.
-        tracing::info!(
-            depth = depth,
-            frontier_size = new_frontier.len(),
-            "activation_depth"
-        );
-
-        frontier = new_frontier;
+        let adjacency = frontier_adjacency(graph, &frontier, allowed_namespaces);
+        frontier = activation_core::spread_level(&mut state, &frontier, &adjacency, depth, config);
     }
 
     // Apply lateral inhibition.
@@ -383,7 +278,7 @@ fn spread_activation_unchecked(
     {
         apply_lateral_inhibition(
             graph,
-            &mut activations,
+            &mut state.activations,
             config.inhibition_strength,
             config.inhibition_threshold,
             embs,
@@ -391,12 +286,43 @@ fn spread_activation_unchecked(
     }
 
     // Filter out nodes below threshold.
-    activations.retain(|_, v| *v >= config.epsilon);
+    activation_core::finalize_spread(state, config)
+}
 
-    ActivationResult {
-        activations,
-        traces,
+/// Materialize outgoing adjacency for one frontier level from the hot graph.
+///
+/// Only currently-active edges are yielded (the petgraph accessors filter on
+/// `is_currently_active()`), and targets outside `allowed_namespaces` are
+/// dropped here — the hot tier filters namespaces via its node data.
+fn frontier_adjacency(
+    graph: &PropertyGraph,
+    frontier: &[(MemoryId, f64)],
+    allowed_namespaces: Option<&[Namespace]>,
+) -> AdjacencyMap {
+    let mut adjacency: AdjacencyMap = HashMap::with_capacity(frontier.len());
+    for (node_id, _) in frontier {
+        let Some(node_idx) = graph.node_index(*node_id) else {
+            continue;
+        };
+        let neighbors: Vec<(MemoryId, f32)> = graph
+            .outgoing_weighted_iter(node_idx)
+            .filter_map(|(neighbor_idx, weight, _relation)| {
+                let neighbor = graph.node_id(neighbor_idx)?;
+                // Namespace boundary enforcement.
+                if let Some(allowed) = allowed_namespaces
+                    && let Some(ns) = graph.node_namespace(neighbor)
+                    && !allowed.contains(ns)
+                {
+                    return None;
+                }
+                Some((neighbor, weight))
+            })
+            .collect();
+        if !neighbors.is_empty() {
+            adjacency.insert(*node_id, neighbors);
+        }
     }
+    adjacency
 }
 
 /// Static activation: simple one-hop graph expansion from seeds.
@@ -407,22 +333,9 @@ pub fn static_activation(
     seeds: &[MemoryId],
     allowed_namespaces: Option<&[Namespace]>,
 ) -> HashMap<MemoryId, f64> {
-    let mut activations: HashMap<MemoryId, f64> = HashMap::new();
-    for &seed in seeds {
-        activations.insert(seed, 1.0);
-        for (neighbor, weight, _) in graph.outgoing_weighted(seed) {
-            // Namespace boundary enforcement.
-            if let Some(allowed) = allowed_namespaces
-                && let Some(ns) = graph.node_namespace(neighbor)
-                && !allowed.contains(ns)
-            {
-                continue;
-            }
-            let entry = activations.entry(neighbor).or_insert(0.0);
-            *entry = entry.max(f64::from(weight));
-        }
-    }
-    activations
+    let seed_frontier: Vec<(MemoryId, f64)> = seeds.iter().map(|&s| (s, 1.0)).collect();
+    let adjacency = frontier_adjacency(graph, &seed_frontier, allowed_namespaces);
+    activation_core::static_activation_from_adjacency(seeds, &adjacency)
 }
 
 /// Personalized `PageRank` (F-057).
@@ -468,95 +381,26 @@ fn personalized_pagerank_unchecked(
     // Restrict PPR to the seed-reachable induced subgraph. Full-graph ranking
     // biases toward hubs and turns each query into a global walk.
     let all_nodes = collect_reachable_nodes(graph, seeds, allowed_namespaces);
-
     if all_nodes.is_empty() {
         return HashMap::new();
     }
 
-    let n = all_nodes.len();
-    let node_to_idx: HashMap<MemoryId, usize> = all_nodes
-        .iter()
-        .enumerate()
-        .map(|(i, &id)| (id, i))
-        .collect();
-
-    // Personalization vector: uniform over seeds that exist in the graph.
-    let mut personalization = vec![0.0_f64; n];
-    let seed_count = seeds.iter().filter(|s| node_to_idx.contains_key(s)).count();
-    if seed_count == 0 {
-        return HashMap::new();
-    }
-    let seed_weight = 1.0 / seed_count as f64;
-    for &seed in seeds {
-        if let Some(&idx) = node_to_idx.get(&seed) {
-            personalization[idx] = seed_weight;
+    // Raw outgoing adjacency for the induced subgraph. Targets outside the
+    // reachable (namespace-filtered) node set are dropped by the core, which
+    // keeps the transition matrix out-edge-only over the subgraph.
+    let mut out_adjacency: AdjacencyMap = HashMap::with_capacity(all_nodes.len());
+    for &node in &all_nodes {
+        let neighbors: Vec<(MemoryId, f32)> = graph
+            .outgoing_weighted(node)
+            .into_iter()
+            .map(|(nb, w, _)| (nb, w))
+            .collect();
+        if !neighbors.is_empty() {
+            out_adjacency.insert(node, neighbors);
         }
     }
 
-    // Build sparse out-degree structure for efficient iteration.
-    // For each node, store (neighbor_idx, normalized_weight).
-    let mut out_edges: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
-    for (i, &node) in all_nodes.iter().enumerate() {
-        let neighbors = graph.outgoing_weighted(node);
-        let total_weight: f64 = neighbors
-            .iter()
-            .filter_map(|(nb, w, _)| node_to_idx.get(nb).map(|_| f64::from(*w)))
-            .sum();
-        if total_weight > 0.0 {
-            for (nb, w, _) in &neighbors {
-                if let Some(&j) = node_to_idx.get(nb) {
-                    out_edges[i].push((j, f64::from(*w) / total_weight));
-                }
-            }
-        }
-    }
-
-    // Power iteration: r(t+1) = α·p + (1-α)·M^T·r(t)
-    // where M is the column-stochastic transition matrix and p is personalization.
-    let alpha = config.alpha;
-    let mut scores = personalization.clone();
-
-    for _ in 0..config.max_iterations {
-        let mut new_scores = vec![0.0_f64; n];
-
-        // Accumulate contributions from incoming edges.
-        // M^T·r: for each node i with outgoing edges to j, node j receives
-        // r[i] * edge_weight_normalized.
-        let mut dangling_mass = 0.0_f64;
-        for i in 0..n {
-            if out_edges[i].is_empty() {
-                // Dangling node: redistribute its score to personalization nodes.
-                dangling_mass += scores[i];
-            } else {
-                for &(j, w) in &out_edges[i] {
-                    new_scores[j] += scores[i] * w;
-                }
-            }
-        }
-
-        // Apply teleportation and dangling node redistribution.
-        let mut max_delta = 0.0_f64;
-        for i in 0..n {
-            let val = alpha.mul_add(personalization[i], (1.0 - alpha) * new_scores[i])
-                + (1.0 - alpha) * dangling_mass * personalization[i];
-            let delta = (val - scores[i]).abs();
-            if delta > max_delta {
-                max_delta = delta;
-            }
-            scores[i] = val;
-        }
-
-        if max_delta < config.epsilon {
-            break;
-        }
-    }
-
-    // Convert to HashMap, exclude near-zero scores.
-    all_nodes
-        .into_iter()
-        .zip(scores)
-        .filter(|(_, s)| *s > 1e-10)
-        .collect()
+    activation_core::ppr_power_iteration(&all_nodes, &out_adjacency, seeds, config)
 }
 
 fn collect_reachable_nodes(
@@ -635,13 +479,9 @@ fn precompute_one_hop_neighbors(
         .collect()
 }
 
-/// Lateral inhibition: suppress nodes that are semantically similar to seeds
-/// but not graph-connected.
-///
-/// Inhibition strength is modulated by topical dissimilarity (Jaccard coefficient
-/// of 1-hop graph neighborhoods). Nodes in the same semantic cluster (high Jaccard)
-/// receive weak inhibition; nodes in different clusters (low Jaccard) receive strong
-/// inhibition. This implements the SYNAPSE refinement.
+/// Lateral inhibition on the hot graph: builds the seed-connectivity context
+/// (2-hop connected set + 1-hop out-neighbor sets) from the petgraph, then
+/// applies the shared Jaccard-modulated formula from `activation_core`.
 ///
 /// Competitors: high embedding similarity BUT low graph connectivity.
 fn apply_lateral_inhibition(
@@ -651,13 +491,7 @@ fn apply_lateral_inhibition(
     threshold: f64,
     embeddings: &HashMap<MemoryId, Vec<f32>>,
 ) {
-    // Identify seed nodes (activation == 1.0).
-    let seeds: Vec<MemoryId> = activations
-        .iter()
-        .filter(|(_, v)| (*v - 1.0).abs() < f64::EPSILON)
-        .map(|(&k, _)| k)
-        .collect();
-    let seed_set: HashSet<MemoryId> = seeds.iter().copied().collect();
+    let seeds = activation_core::identify_seeds(activations);
 
     // Collect connected nodes for each seed (within 2 hops).
     let mut connected_to_seeds: HashSet<MemoryId> = HashSet::new();
@@ -668,88 +502,20 @@ fn apply_lateral_inhibition(
         }
     }
 
-    // For each activated non-seed node, check if it's a competitor:
-    // - similar to seeds (high cosine similarity)
-    // - but NOT connected to seeds
-    let activated_nodes: Vec<MemoryId> = activations.keys().copied().collect();
     let neighbor_sets = precompute_one_hop_neighbors(
         graph,
-        activated_nodes.iter().copied().chain(seeds.iter().copied()),
+        activations.keys().copied().chain(seeds.iter().copied()),
     );
-    let empty_neighbors = HashSet::new();
 
-    for node in activated_nodes {
-        if seed_set.contains(&node) || connected_to_seeds.contains(&node) {
-            continue; // Connected nodes are NOT suppressed.
-        }
-
-        let Some(node_embedding) = embeddings.get(&node) else {
-            continue;
-        };
-
-        // Compute similarity to seeds and find the most-similar seed.
-        let mut max_sim = 0.0_f64;
-        let mut most_similar_seed = None;
-        for &seed in &seeds {
-            if let Some(seed_embedding) = embeddings.get(&seed) {
-                let sim = cosine_sim(seed_embedding, node_embedding);
-                if sim > max_sim {
-                    max_sim = sim;
-                    most_similar_seed = Some(seed);
-                }
-            }
-        }
-
-        // If similar but not connected → suppress.
-        // Inhibition modulated by topical dissimilarity (Jaccard):
-        //   inhibition = µ × (1 - jaccard(node, seed)) × cosine_sim
-        // Cap inhibition at 80% of activation to preserve a minimum floor.
-        if max_sim > threshold {
-            let jaccard = most_similar_seed
-                .map(|seed| {
-                    let node_neighbors = neighbor_sets.get(&node).unwrap_or(&empty_neighbors);
-                    let seed_neighbors = neighbor_sets.get(&seed).unwrap_or(&empty_neighbors);
-                    jaccard_similarity(node_neighbors, seed_neighbors)
-                })
-                .unwrap_or(0.0);
-            let inhibition = mu * (1.0 - jaccard) * max_sim;
-            if let Some(a) = activations.get_mut(&node) {
-                let floor = *a * 0.2; // preserve at least 20%
-                *a = (*a - inhibition).max(floor);
-            }
-        }
-    }
-}
-
-/// Jaccard similarity coefficient: |A ∩ B| / |A ∪ B|.
-///
-/// Returns 0.0 if both sets are empty.
-fn jaccard_similarity(a: &HashSet<MemoryId>, b: &HashSet<MemoryId>) -> f64 {
-    if a.is_empty() && b.is_empty() {
-        return 0.0;
-    }
-    let intersection = a.intersection(b).count();
-    let union = a.union(b).count();
-    intersection as f64 / union as f64
-}
-
-/// Simple cosine similarity for inhibition check (no SIMD needed — small scale).
-fn cosine_sim(a: &[f32], b: &[f32]) -> f64 {
-    if a.len() != b.len() || a.is_empty() {
-        return 0.0;
-    }
-    let mut dot = 0.0_f64;
-    let mut na = 0.0_f64;
-    let mut nb = 0.0_f64;
-    for (x, y) in a.iter().zip(b.iter()) {
-        let x = f64::from(*x);
-        let y = f64::from(*y);
-        dot += x * y;
-        na += x * x;
-        nb += y * y;
-    }
-    let denom = na.sqrt() * nb.sqrt();
-    if denom < 1e-10 { 0.0 } else { dot / denom }
+    activation_core::apply_lateral_inhibition(
+        activations,
+        &seeds,
+        mu,
+        threshold,
+        embeddings,
+        &connected_to_seeds,
+        &neighbor_sets,
+    );
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
@@ -757,6 +523,7 @@ fn cosine_sim(a: &[f32], b: &[f32]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::activation_core::{cosine_sim, jaccard_similarity};
     use hirn_core::HirnError;
     use hirn_core::id::MemoryId;
     use hirn_core::metadata::Metadata;
@@ -1863,7 +1630,7 @@ mod tests {
         let mut b: HashSet<MemoryId> = shared.into_iter().collect();
         b.insert(MemoryId::new());
         // intersection = 2, union = 4 → Jaccard = 0.5
-        let j = super::jaccard_similarity(&a, &b);
+        let j = jaccard_similarity(&a, &b);
         assert!((j - 0.5).abs() < f64::EPSILON, "expected 0.5, got {j}");
     }
 
@@ -1871,13 +1638,13 @@ mod tests {
     fn jaccard_empty_sets_returns_zero() {
         let a: HashSet<MemoryId> = HashSet::new();
         let b: HashSet<MemoryId> = HashSet::new();
-        assert_eq!(super::jaccard_similarity(&a, &b), 0.0);
+        assert_eq!(jaccard_similarity(&a, &b), 0.0);
     }
 
     #[test]
     fn jaccard_identical_sets_returns_one() {
         let ids: HashSet<MemoryId> = (0..5).map(|_| MemoryId::new()).collect();
-        let j = super::jaccard_similarity(&ids, &ids);
+        let j = jaccard_similarity(&ids, &ids);
         assert!((j - 1.0).abs() < f64::EPSILON, "expected 1.0, got {j}");
     }
 

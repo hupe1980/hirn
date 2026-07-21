@@ -14,11 +14,9 @@
 //! Stages 1–4 live here (pure transformations). Stages 5–7 require a
 //! DataFusion `SessionContext` and live in `hirn-engine`.
 
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-use dashmap::DashMap;
 use datafusion_expr::LogicalPlan;
 use datafusion_expr::logical_plan::Extension;
 use parking_lot::Mutex;
@@ -43,147 +41,174 @@ pub struct CompiledPlan {
     pub plan: LogicalPlan,
 }
 
-/// DashMap-backed plan cache with O(log N) LRU eviction via a min-heap.
+/// Bounded LRU cache for compiled plans.
 ///
-/// Cache key is a hash of normalized query text. Cache entries store the
-/// normalized source string so that 64-bit hash collisions are detected
-/// and rejected rather than silently returning a wrong plan (N-M19).
+/// A single mutex guards a `HashMap` of entries plus a `VecDeque` of
+/// `(generation, key)` recency stamps. Every hit and insert assigns the entry
+/// a fresh generation and appends one stamp, so both operations are O(1);
+/// older stamps for the same entry become stale. Eviction pops stamps from
+/// the front of the queue (oldest first) and skips stale ones, which yields
+/// true least-recently-used order: the entry whose live stamp is oldest is
+/// removed first.
 ///
-/// # Eviction (N-H14)
+/// The stamp queue is compacted (stale stamps dropped) whenever it grows past
+/// twice the live-entry watermark, so its memory stays O(capacity) even under
+/// hit-heavy workloads.
 ///
-/// A `BinaryHeap<(Reverse<u64>, u64)>` tracks `(Reverse<access_count>, key)`
-/// pairs. Eviction pops from the min-heap using lazy deletion: entries whose
-/// `access_count` has increased since they were pushed to the heap are skipped
-/// and a fresh entry is pushed so the updated count is reflected.
+/// Cache keys are 64-bit hashes of normalized query text. Entries store the
+/// normalized source string so a hash collision is detected and treated as a
+/// miss instead of silently serving a wrong plan.
 pub struct PlanCache {
-    entries: DashMap<u64, CacheEntry>,
-    /// Min-heap for O(log N) eviction. Entries are `(Reverse<access_count>, key)`.
-    /// Stale heap entries (count changed) are skipped lazily during eviction.
-    eviction_heap: Mutex<BinaryHeap<(Reverse<u64>, u64)>>,
+    inner: Mutex<PlanCacheInner>,
     max_entries: usize,
 }
 
-#[derive(Clone)]
+struct PlanCacheInner {
+    entries: HashMap<u64, CacheEntry>,
+    /// Recency stamps `(generation, key)`, oldest at the front. An entry's
+    /// only live stamp is the one matching its current `generation`.
+    recency: VecDeque<(u64, u64)>,
+    /// Monotonic counter; bumped on every hit and insert.
+    generation: u64,
+}
+
 struct CacheEntry {
-    /// Normalized source query used to detect 64-bit hash collisions (N-M19).
+    /// Normalized source query used to detect 64-bit hash collisions.
     normalized_source: Arc<str>,
     plan: Arc<CompiledPlan>,
-    access_count: u64,
+    /// Generation of this entry's live recency stamp.
+    generation: u64,
+}
+
+impl PlanCacheInner {
+    /// Remove the least-recently-used live entry. Skips stale stamps.
+    fn evict_lru(&mut self) {
+        while let Some((generation, key)) = self.recency.pop_front() {
+            let live = self
+                .entries
+                .get(&key)
+                .is_some_and(|e| e.generation == generation);
+            if live {
+                self.entries.remove(&key);
+                return;
+            }
+        }
+    }
+
+    /// Drop stale stamps once the queue exceeds twice the live watermark.
+    /// Amortized O(1) per operation; bounds the queue at O(capacity).
+    fn compact_if_needed(&mut self, max_entries: usize) {
+        if self.recency.len() <= self.entries.len().max(max_entries) * 2 {
+            return;
+        }
+        let entries = &self.entries;
+        self.recency.retain(|(generation, key)| {
+            entries
+                .get(key)
+                .is_some_and(|e| e.generation == *generation)
+        });
+    }
 }
 
 impl PlanCache {
     /// Create a plan cache with the given maximum number of entries.
     pub fn new(max_entries: usize) -> Self {
         Self {
-            entries: DashMap::with_capacity(max_entries.min(256)),
-            eviction_heap: Mutex::new(BinaryHeap::with_capacity(max_entries.min(256))),
+            inner: Mutex::new(PlanCacheInner {
+                entries: HashMap::with_capacity(max_entries.min(256)),
+                recency: VecDeque::with_capacity(max_entries.min(256)),
+                generation: 0,
+            }),
             max_entries,
         }
     }
 
-    /// Look up a cached plan by query hash.
+    /// Look up a cached plan by query hash, marking it most-recently-used.
     ///
-    /// Returns `None` on a miss **or** on a hash collision (N-M19): the caller
-    /// must pass the same normalized source string that was used to compute
-    /// `key` so that the stored string is compared for equality before serving
-    /// the cached plan.
+    /// Returns `None` on a miss **or** on a hash collision: the caller must
+    /// pass the same normalized source string that was used to compute `key`
+    /// so the stored string is compared for equality before serving the
+    /// cached plan.
     pub fn get(&self, key: u64, normalized_source: &str) -> Option<Arc<CompiledPlan>> {
-        self.entries.get_mut(&key).and_then(|mut entry| {
-            // Reject hash collisions: key matches but source differs.
-            if entry.normalized_source.as_ref() != normalized_source {
-                tracing::warn!(
-                    key,
-                    cached_source = %entry.normalized_source,
-                    incoming_source = %normalized_source,
-                    "plan cache: 64-bit hash collision — skipping cached plan"
-                );
-                return None;
-            }
-            entry.access_count += 1;
-            // Push the updated count into the heap so the lazy-deletion
-            // eviction always reflects the most recent access frequency.
-            self.eviction_heap
-                .lock()
-                .push((Reverse(entry.access_count), key));
-            Some(Arc::clone(&entry.plan))
-        })
+        let mut guard = self.inner.lock();
+        let inner = &mut *guard;
+        let entry = inner.entries.get_mut(&key)?;
+        // Reject hash collisions: key matches but source differs.
+        if entry.normalized_source.as_ref() != normalized_source {
+            tracing::warn!(
+                key,
+                cached_source = %entry.normalized_source,
+                incoming_source = %normalized_source,
+                "plan cache: 64-bit hash collision — skipping cached plan"
+            );
+            return None;
+        }
+        inner.generation += 1;
+        entry.generation = inner.generation;
+        let plan = Arc::clone(&entry.plan);
+        inner.recency.push_back((inner.generation, key));
+        inner.compact_if_needed(self.max_entries);
+        Some(plan)
     }
 
-    /// Insert a compiled plan. Evicts the least-recently-used entry when at
-    /// capacity using O(log N) heap-pop with lazy deletion (N-H14).
+    /// Insert a compiled plan as the most-recently-used entry, evicting the
+    /// least-recently-used entry first when at capacity.
     ///
-    /// Concurrent `put` calls may temporarily exceed `max_entries` by the number
-    /// of concurrent writers; the cap is enforced on a best-effort basis without
-    /// a global write lock (N-M03).
+    /// The capacity bound is strict: eviction and insert happen under the
+    /// same lock, so the cache never holds more than `max_entries` entries.
     pub fn put(&self, key: u64, normalized_source: Arc<str>, plan: Arc<CompiledPlan>) {
-        if self.entries.len() >= self.max_entries {
-            let evicted = self.try_evict_one();
-            // If the heap was exhausted (all entries freshly accessed), force-remove
-            // an arbitrary entry so the cache stays bounded (N-M03).
-            if !evicted && self.entries.len() >= self.max_entries {
-                // Eagerly extract the key before the if-let so the DashMap iterator
-                // guard is dropped before the subsequent remove (N-M03 / significant-drop).
-                let arbitrary_key = self.entries.iter().next().map(|e| *e.key());
-                if let Some(entry) = arbitrary_key {
-                    self.entries.remove(&entry);
-                }
-            }
+        if self.max_entries == 0 {
+            return;
         }
-        self.eviction_heap.lock().push((Reverse(1), key));
-        self.entries.insert(
+        let mut guard = self.inner.lock();
+        let inner = &mut *guard;
+        if !inner.entries.contains_key(&key) && inner.entries.len() >= self.max_entries {
+            inner.evict_lru();
+        }
+        inner.generation += 1;
+        let generation = inner.generation;
+        inner.entries.insert(
             key,
             CacheEntry {
                 normalized_source,
                 plan,
-                access_count: 1,
+                generation,
             },
         );
-    }
-
-    /// Pop the min-heap until one live (non-stale) entry is evicted.
-    /// Returns `true` if an entry was removed from `self.entries`.
-    fn try_evict_one(&self) -> bool {
-        let mut heap = self.eviction_heap.lock();
-        loop {
-            match heap.pop() {
-                None => return false,
-                Some((Reverse(snapshot_count), evict_key)) => {
-                    // `remove_if` is atomic: evict only if count matches snapshot.
-                    if self
-                        .entries
-                        .remove_if(&evict_key, |_, v| v.access_count == snapshot_count)
-                        .is_some()
-                    {
-                        return true;
-                    }
-                    // Count changed — this heap entry is stale; try next.
-                }
-            }
-        }
+        inner.recency.push_back((generation, key));
+        inner.compact_if_needed(self.max_entries);
     }
 
     /// Number of cached entries.
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.inner.lock().entries.len()
     }
 
     /// Whether the cache is empty.
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.inner.lock().entries.is_empty()
     }
 
     /// Remove all cached entries.
     pub fn clear(&self) {
-        self.entries.clear();
+        let mut inner = self.inner.lock();
+        inner.entries.clear();
+        inner.recency.clear();
+    }
+
+    /// Current length of the recency stamp queue (test instrumentation for
+    /// the boundedness guarantee).
+    #[cfg(test)]
+    fn recency_len(&self) -> usize {
+        self.inner.lock().recency.len()
     }
 }
 
 impl std::fmt::Debug for PlanCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PlanCache")
-            .field("len", &self.entries.len())
+            .field("len", &self.len())
             .field("max_entries", &self.max_entries)
-            // eviction_heap omitted — locking during Debug is undesirable.
             .finish_non_exhaustive()
     }
 }
@@ -254,6 +279,54 @@ impl QueryPipeline {
         let ast = parser::parse(query)
             .map_err(|e| HirnError::InvalidInput(format!("parse error: {e}")))?;
 
+        let compiled = Arc::new(self.compile_parsed(ast, query.to_string(), ctx)?);
+
+        // Store in cache with normalized source for future collision checks (N-M19).
+        if let Some(ref cache) = self.cache {
+            cache.put(key, normalized.into(), Arc::clone(&compiled));
+        }
+
+        Ok(compiled)
+    }
+
+    /// Compile an already-parsed statement through stages 2–4, using the
+    /// pipeline's default [`AnalyzeContext`].
+    ///
+    /// This is the prepared-statement execution entry: after `bind()` has
+    /// substituted parameter values into the template AST, the bound AST is
+    /// compiled and executed directly. It is never serialized back to HirnQL
+    /// text and re-parsed, so statement `Display` output is not load-bearing
+    /// for execution (it remains in use for logging and EXPLAIN only).
+    ///
+    /// Bypasses the plan cache: the cache is keyed by query text, and bound
+    /// statements embed per-execution parameter values.
+    pub fn compile_statement(&self, ast: Statement) -> HirnResult<Arc<CompiledPlan>> {
+        self.compile_statement_with_ctx(ast, &self.ctx)
+    }
+
+    /// Compile an already-parsed statement through stages 2–4 with an
+    /// explicit [`AnalyzeContext`]. See [`Self::compile_statement`].
+    pub fn compile_statement_with_ctx(
+        &self,
+        ast: Statement,
+        ctx: &AnalyzeContext,
+    ) -> HirnResult<Arc<CompiledPlan>> {
+        // `source` is derived via Display for diagnostics/logging only;
+        // execution consumes `typed`/`plan` and never re-parses it.
+        let source = ast.to_string();
+        Ok(Arc::new(self.compile_parsed(ast, source, ctx)?))
+    }
+
+    /// Stages 2–4 (analyze → rewrite → plan), shared by the text entry
+    /// ([`Self::compile_with_ctx`]) and the AST entry
+    /// ([`Self::compile_statement_with_ctx`]) so both paths run the exact
+    /// same pipeline.
+    fn compile_parsed(
+        &self,
+        ast: Statement,
+        source: String,
+        ctx: &AnalyzeContext,
+    ) -> HirnResult<CompiledPlan> {
         // Stage 2: Analyze.
         let typed = typed_ast::analyze(&ast, ctx)?;
 
@@ -266,19 +339,12 @@ impl QueryPipeline {
         // Stage 4: Plan.
         let plan = plan_compiler::compile(&typed)?;
 
-        let compiled = Arc::new(CompiledPlan {
-            source: query.to_string(),
+        Ok(CompiledPlan {
+            source,
             ast,
             typed,
             plan,
-        });
-
-        // Store in cache with normalized source for future collision checks (N-M19).
-        if let Some(ref cache) = self.cache {
-            cache.put(key, normalized.into(), Arc::clone(&compiled));
-        }
-
-        Ok(compiled)
+        })
     }
 
     /// Stage 3: Rewrite — logical rewrite pass.
@@ -551,6 +617,146 @@ mod tests {
         if lines.len() > 1 {
             assert!(lines[1].starts_with("  "), "child: {}", lines[1]);
         }
+    }
+
+    // ── Direct-AST compilation (prepared-statement path) ───────────────
+
+    #[test]
+    fn compile_statement_matches_text_compile() {
+        let p = pipeline();
+        let query = r#"RECALL episodic ABOUT "test" EXPAND GRAPH DEPTH 2 MIN_WEIGHT 1.0 LIMIT 5"#;
+        let from_text = p.compile(query).unwrap();
+        let ast = parser::parse(query).unwrap();
+        let from_ast = p.compile_statement(ast).unwrap();
+        assert_eq!(
+            super::format_plan_tree(&from_text.plan),
+            super::format_plan_tree(&from_ast.plan),
+            "text and AST entries must produce identical plans"
+        );
+    }
+
+    #[test]
+    fn compile_statement_does_not_reparse() {
+        // Inject a payload into the AST that would change meaning if the
+        // statement were serialized back to text and re-parsed. The direct
+        // AST entry must keep it as opaque data.
+        let p = pipeline();
+        let mut ast = parser::parse(r#"RECALL episodic ABOUT "placeholder" LIMIT 5"#).unwrap();
+        let payload = r#"x" LIMIT 1 NAMESPACE hijacked --"#;
+        match &mut ast {
+            Statement::Recall(r) => r.about = payload.to_string(),
+            _ => unreachable!(),
+        }
+        let compiled = p.compile_statement(ast).unwrap();
+        match &compiled.typed {
+            TypedStatement::Recall(r) => {
+                assert_eq!(r.query, payload, "payload must survive as literal data");
+            }
+            other => panic!("expected TypedStatement::Recall, got {other:?}"),
+        }
+    }
+
+    // ── LRU cache behavior ─────────────────────────────────────────────
+
+    fn dummy_plan() -> Arc<CompiledPlan> {
+        pipeline()
+            .compile(r#"RECALL episodic ABOUT "lru-fixture""#)
+            .unwrap()
+    }
+
+    #[test]
+    fn cache_lru_recently_used_survives_eviction() {
+        let cache = PlanCache::new(2);
+        let plan = dummy_plan();
+        cache.put(1, "a".into(), Arc::clone(&plan));
+        cache.put(2, "b".into(), Arc::clone(&plan));
+        // Touch entry 1 so entry 2 becomes least-recently-used.
+        assert!(cache.get(1, "a").is_some());
+        cache.put(3, "c".into(), Arc::clone(&plan));
+        assert_eq!(cache.len(), 2);
+        assert!(cache.get(1, "a").is_some(), "recently used must survive");
+        assert!(cache.get(2, "b").is_none(), "stale entry must be evicted");
+        assert!(cache.get(3, "c").is_some());
+    }
+
+    #[test]
+    fn cache_reinsert_refreshes_recency() {
+        let cache = PlanCache::new(2);
+        let plan = dummy_plan();
+        cache.put(1, "a".into(), Arc::clone(&plan));
+        cache.put(2, "b".into(), Arc::clone(&plan));
+        // Re-inserting key 1 makes it most-recently-used.
+        cache.put(1, "a".into(), Arc::clone(&plan));
+        cache.put(3, "c".into(), Arc::clone(&plan));
+        assert!(cache.get(1, "a").is_some());
+        assert!(cache.get(2, "b").is_none());
+    }
+
+    #[test]
+    fn cache_bounded_under_hit_heavy_workload() {
+        let cache = PlanCache::new(4);
+        let plan = dummy_plan();
+        let sources = ["a", "b", "c", "d"];
+        for (i, src) in sources.iter().enumerate() {
+            cache.put(i as u64, (*src).into(), Arc::clone(&plan));
+        }
+        for round in 0..10_000u64 {
+            let i = (round % 4) as usize;
+            assert!(cache.get(i as u64, sources[i]).is_some());
+        }
+        assert_eq!(cache.len(), 4, "no growth after warmup");
+        // The recency queue must stay O(capacity), not O(hits).
+        assert!(
+            cache.recency_len() <= 8,
+            "recency queue grew unbounded: {}",
+            cache.recency_len()
+        );
+    }
+
+    #[test]
+    fn cache_hash_collision_rejected() {
+        let cache = PlanCache::new(4);
+        let plan = dummy_plan();
+        cache.put(1, "a".into(), Arc::clone(&plan));
+        assert!(
+            cache.get(1, "different source").is_none(),
+            "same key with different source must be treated as a miss"
+        );
+    }
+
+    #[test]
+    fn cache_zero_capacity_stores_nothing() {
+        let cache = PlanCache::new(0);
+        let plan = dummy_plan();
+        cache.put(1, "a".into(), plan);
+        assert!(cache.is_empty());
+        assert!(cache.get(1, "a").is_none());
+    }
+
+    #[test]
+    fn cache_concurrent_gets_and_puts_stay_bounded() {
+        let cache = Arc::new(PlanCache::new(8));
+        let plan = dummy_plan();
+        std::thread::scope(|scope| {
+            for t in 0..8u64 {
+                let cache = Arc::clone(&cache);
+                let plan = Arc::clone(&plan);
+                scope.spawn(move || {
+                    for i in 0..500u64 {
+                        let key = (t * 500 + i) % 32;
+                        let source = format!("q{key}");
+                        if cache.get(key, &source).is_none() {
+                            cache.put(key, source.into(), Arc::clone(&plan));
+                        }
+                    }
+                });
+            }
+        });
+        assert!(
+            cache.len() <= 8,
+            "capacity bound violated: {} entries",
+            cache.len()
+        );
     }
 
     #[test]

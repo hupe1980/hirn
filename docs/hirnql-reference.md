@@ -957,6 +957,14 @@ value is placed into the parsed statement's typed node, so a value can never
 break out of a string literal to inject trailing clauses — parameterized queries
 are injection-safe regardless of the value's contents.
 
+**The bound AST executes directly.** A prepared statement is parsed once at
+`prepare()` time; each `execute_prepared()` call clones that template, binds
+the values, and runs the bound AST through the same analyze → plan → execute
+pipeline as any other statement. The statement is never serialized back to
+query text and re-parsed, so execution cost per call is bind + analyze + plan
+(no parse), and serialized statement text is used only for logging and
+`EXPLAIN` display.
+
 Parameters are accepted in value positions: `ABOUT`, `TOPIC`, `WHERE`
 comparison values, `NAMESPACE`, mutation targets, and `REASON`/`OBSERVED AT`/
 `CAUSED BY`. **Integer clauses — `LIMIT`, `BUDGET`, and `DEPTH` — take integer

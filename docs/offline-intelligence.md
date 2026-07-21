@@ -283,6 +283,7 @@ research, adapted to a durable multi-dataset store:
 ## Operating Guidance
 
 - use offline operators in batch windows, not request handlers
+- in the standalone daemon, [sleep-time consolidation](deployment.md#sleep-time-consolidation) triggers this machinery automatically: when `hirnd` has been idle past `sleep.idle_after_secs` it runs the consolidation pipeline and — if the offline scheduler is enabled — enqueues one `dream` and one `reconcile` job per realm under the scheduler's default budget
 - treat the `offline_jobs` dataset as the forensic log for one job and the Prometheus metrics as fleet health
 - benchmark new operator settings with the advanced suite before enabling them in production
 - require review automation or a human approval path before promoting generated cognition in regulated domains

@@ -9,14 +9,17 @@
 //! HirnQL text → Parser → AST → Semantic analysis → Query planner → Physical plan → Execute
 //! ```
 //!
-//! Each stage is independently testable. Plans are cacheable via `PlanCache`.
+//! Each stage is independently testable. Compiled plans are cached by
+//! `hirn_query::PlanCache` (the single plan cache, attached to the engine's
+//! `QueryPipeline`).
 //!
 //! # Example
 //! ```ignore
 //! // Preferred public entrypoint:
 //! let result = db.ql().execute(r#"RECALL episodic ABOUT "test" LIMIT 5"#).await?;
 //!
-//! // Prepared statements stay on the same execution bridge:
+//! // Prepared statements bind values into the parsed AST and execute it
+//! // directly on the same bridge — no re-serialization or re-parse:
 //! let prepared = db.ql().prepare(r#"RECALL episodic ABOUT $1 LIMIT 5"#)?;
 //! let result = db.ql().execute_prepared(&prepared, &params).await?;
 //! ```
@@ -35,9 +38,7 @@ pub(crate) mod results;
 
 pub use analyzer::{AnalysisError, AnalysisErrorKind, analyze};
 pub use ast::Statement;
-pub use compiler::{
-    CompileError, CompiledQuery, PlanCache, PreparedStatement, bind, compile, prepare,
-};
+pub use compiler::{CompileError, CompiledQuery, PreparedStatement, bind, compile, prepare};
 pub use parser::{ParseError, parse};
 pub use planner::{QueryPlan, plan};
 pub use results::{

@@ -68,6 +68,7 @@ impl HirnMcpService {
     /// operation scope, shared rate limit, then the Cedar policy engine —
     /// mirroring the HTTP layer's check order.
     async fn authorize(&self, action: Action, operation: &Operation) -> Result<(), McpError> {
+        crate::sleep::ActivityTracker::global().touch();
         if !token_allows_operation(&self.identity.operations, operation) {
             return Err(McpError::invalid_params(
                 format!("credential does not permit {operation:?} operations"),

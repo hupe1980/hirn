@@ -1,21 +1,39 @@
-//! Async spreading activation on `PersistentGraph`.
+//! Async spreading activation on `PersistentGraph` (cold tier).
 //!
-//! Mirrors the sync `hirn_graph::activation` module but operates on the
-//! LanceDB-backed persistent graph via async IO.
+//! Runs the SAME algorithms as the hot tier: all math lives in
+//! `hirn_graph::activation_core` and is shared with
+//! `hirn_graph::activation`. This module only materializes per-level
+//! adjacency via batched Lance scans (`batch_adjacency_read_*_scoped`), which
+//! also push the `namespace IN (...)` filter into the scan instead of issuing
+//! one `node_namespace` lookup per edge.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 
 use hirn_core::HirnResult;
 use hirn_core::id::MemoryId;
 use hirn_core::types::Namespace;
-use hirn_graph::activation::{ActivationConfig, ActivationResult, ActivationTrace};
+use hirn_graph::activation::{ActivationConfig, ActivationResult};
+use hirn_graph::activation_core::{self, AdjacencyMap, SpreadState};
 
 use crate::persistent_graph::PersistentGraph;
 
+/// Group a batch of edges into the per-source adjacency shape the core expects.
+fn adjacency_from_edges(edges: Vec<hirn_graph::GraphEdge>) -> AdjacencyMap {
+    let mut adjacency: AdjacencyMap = HashMap::new();
+    for edge in edges {
+        adjacency
+            .entry(edge.source)
+            .or_default()
+            .push((edge.target, edge.weight));
+    }
+    adjacency
+}
+
 /// Run async spreading activation from seed nodes through the persistent graph.
 ///
-/// BFS wavefront executes as iterative LanceDB queries on the edges table.
-/// Lateral inhibition is applied per wavefront step when embeddings are provided.
+/// BFS wavefront: one batched Lance scan per depth level, then the shared
+/// `spread_level` core — identical decay, epsilon, frontier-cap, and
+/// deterministic-ordering semantics as the hot tier.
 pub async fn spread_activation(
     graph: &PersistentGraph,
     seeds: &[MemoryId],
@@ -25,161 +43,68 @@ pub async fn spread_activation(
 ) -> HirnResult<ActivationResult> {
     config.validate()?;
 
-    let mut activations: HashMap<MemoryId, f64> = HashMap::new();
-    let mut traces: HashMap<MemoryId, ActivationTrace> = HashMap::new();
-
     // Initialize seeds with A₀ = 1.0.
+    let mut present_seeds = Vec::with_capacity(seeds.len());
     for &seed in seeds {
         if graph.has_node(seed).await? {
-            activations.insert(seed, 1.0);
-            traces.insert(
-                seed,
-                ActivationTrace {
-                    path: vec![seed],
-                    seed,
-                },
-            );
+            present_seeds.push(seed);
         }
     }
-
-    // BFS wavefront propagation using batch adjacency reads.
-    // Each depth level = 1 scan instead of O(frontier) scans.
-    let mut frontier: Vec<(MemoryId, f64)> = Vec::new();
-    for &s in seeds {
-        if graph.has_node(s).await? {
-            frontier.push((s, 1.0));
-        }
-    }
-    let mut propagated: HashSet<MemoryId> = seeds.iter().copied().collect();
+    let (mut state, mut frontier) = SpreadState::init(seeds, &present_seeds);
 
     for depth in 0..config.propagation_steps() {
         if frontier.is_empty() {
             break;
         }
 
-        let depth_decay = config.decay_factor.powi(depth as i32 + 1);
-
-        // Build activation map for the current frontier.
-        let frontier_map: HashMap<MemoryId, f64> = frontier.iter().copied().collect();
-
-        // Batch read all outgoing edges for the entire frontier.
+        // Batch read all outgoing edges for the entire frontier: one scan per
+        // depth level, with the namespace filter pushed into the scan.
         let frontier_ids: Vec<MemoryId> = frontier.iter().map(|(id, _)| *id).collect();
-        let all_edges = graph.batch_adjacency_read(&frontier_ids).await?;
-
-        let mut next_frontier: HashMap<MemoryId, f64> = HashMap::new();
-
-        for edge in &all_edges {
-            let activation = match frontier_map.get(&edge.source) {
-                Some(&a) if a >= config.epsilon => a,
-                _ => continue,
-            };
-
-            let neighbor = edge.target;
-            let weight = edge.weight;
-
-            // Namespace boundary enforcement.
-            if let Some(allowed) = allowed_namespaces {
-                if let Some(ns) = graph.node_namespace(neighbor).await? {
-                    if !allowed.contains(&ns) {
-                        continue;
-                    }
-                }
-            }
-
-            let contribution = activation * weight as f64 * depth_decay;
-            if contribution < config.epsilon {
-                continue;
-            }
-
-            *next_frontier.entry(neighbor).or_insert(0.0) += contribution;
-
-            // Track provenance (best path).
-            if !traces.contains_key(&neighbor) {
-                if let Some(parent_trace) = traces.get(&edge.source) {
-                    let mut path = parent_trace.path.clone();
-                    path.push(neighbor);
-                    traces.insert(
-                        neighbor,
-                        ActivationTrace {
-                            path,
-                            seed: parent_trace.seed,
-                        },
-                    );
-                }
-            }
-        }
-
-        if next_frontier.is_empty() {
-            break;
-        }
-
-        frontier = Vec::new();
-        for (node, new_val) in next_frontier {
-            let old = activations.get(&node).copied().unwrap_or(0.0);
-            let updated = (old + new_val).min(1.0);
-            activations.insert(node, updated);
-            if propagated.insert(node) {
-                frontier.push((node, updated));
-            }
-        }
-    }
-
-    // Apply lateral inhibition.
-    if config.inhibition_strength > 0.0 {
-        if let Some(embs) = embeddings {
-            apply_lateral_inhibition(
-                graph,
-                &mut activations,
-                config.inhibition_strength,
-                config.inhibition_threshold,
-                embs,
-            )
+        let edges = graph
+            .batch_adjacency_read_scoped(&frontier_ids, allowed_namespaces)
             .await?;
-        }
+        let adjacency = adjacency_from_edges(edges);
+
+        frontier = activation_core::spread_level(&mut state, &frontier, &adjacency, depth, config);
     }
 
-    // Filter out nodes below threshold.
-    activations.retain(|_, v| *v >= config.epsilon);
+    // Apply lateral inhibition (same Jaccard-modulated formula as the hot tier).
+    if config.inhibition_strength > 0.0
+        && let Some(embs) = embeddings
+    {
+        apply_lateral_inhibition(
+            graph,
+            &mut state.activations,
+            config.inhibition_strength,
+            config.inhibition_threshold,
+            embs,
+        )
+        .await?;
+    }
 
-    Ok(ActivationResult {
-        activations,
-        traces,
-    })
+    Ok(activation_core::finalize_spread(state, config))
 }
 
 /// Async static activation: simple one-hop graph expansion from seeds.
 ///
-/// Uses a single batch adjacency read instead of per-seed scans.
+/// Uses a single scoped batch adjacency read instead of per-seed scans.
 pub async fn static_activation(
     graph: &PersistentGraph,
     seeds: &[MemoryId],
     allowed_namespaces: Option<&[Namespace]>,
 ) -> HirnResult<HashMap<MemoryId, f64>> {
-    let mut activations: HashMap<MemoryId, f64> = HashMap::new();
-    for &seed in seeds {
-        activations.insert(seed, 1.0);
-    }
-
-    // Single batch read for all seeds.
-    let all_edges = graph.batch_adjacency_read(seeds).await?;
-    for edge in &all_edges {
-        let neighbor = edge.target;
-        let weight = edge.weight;
-
-        if let Some(allowed) = allowed_namespaces {
-            if let Some(ns) = graph.node_namespace(neighbor).await? {
-                if !allowed.contains(&ns) {
-                    continue;
-                }
-            }
-        }
-        let entry = activations.entry(neighbor).or_insert(0.0);
-        *entry = entry.max(weight as f64);
-    }
-    Ok(activations)
+    let edges = graph
+        .batch_adjacency_read_scoped(seeds, allowed_namespaces)
+        .await?;
+    let adjacency = adjacency_from_edges(edges);
+    Ok(activation_core::static_activation_from_adjacency(
+        seeds, &adjacency,
+    ))
 }
 
-/// Lateral inhibition on persistent graph.
+/// Lateral inhibition on the persistent graph: builds the seed-connectivity
+/// context (2-hop connected set + 1-hop out-neighbor sets) via batched reads,
+/// then applies the shared Jaccard-modulated formula from `activation_core`.
 async fn apply_lateral_inhibition(
     graph: &PersistentGraph,
     activations: &mut HashMap<MemoryId, f64>,
@@ -187,12 +112,9 @@ async fn apply_lateral_inhibition(
     threshold: f64,
     embeddings: &HashMap<MemoryId, Vec<f32>>,
 ) -> HirnResult<()> {
-    let seeds: Vec<MemoryId> = activations
-        .iter()
-        .filter(|(_, v)| (*v - 1.0).abs() < f64::EPSILON)
-        .map(|(&k, _)| k)
-        .collect();
+    let seeds = activation_core::identify_seeds(activations);
 
+    // Collect connected nodes for each seed (within 2 hops).
     let mut connected_to_seeds: HashSet<MemoryId> = HashSet::new();
     for &seed in &seeds {
         connected_to_seeds.insert(seed);
@@ -202,55 +124,41 @@ async fn apply_lateral_inhibition(
         }
     }
 
-    let activated_nodes: Vec<(MemoryId, f64)> = activations.iter().map(|(&k, &v)| (k, v)).collect();
-
-    for (node, _) in &activated_nodes {
-        if seeds.contains(node) || connected_to_seeds.contains(node) {
-            continue;
-        }
-
-        let max_sim = seeds
-            .iter()
-            .filter_map(|seed| {
-                let e1 = embeddings.get(seed)?;
-                let e2 = embeddings.get(node)?;
-                Some(cosine_sim(e1, e2))
-            })
-            .fold(0.0_f64, f64::max);
-
-        if max_sim > threshold {
-            let inhibition = mu * max_sim;
-            if let Some(a) = activations.get_mut(node) {
-                let floor = *a * 0.2;
-                *a = (*a - inhibition).max(floor);
-            }
-        }
+    // One-hop out-neighbor sets for the Jaccard term, fetched in one scan.
+    let interesting: Vec<MemoryId> = activations
+        .keys()
+        .copied()
+        .chain(seeds.iter().copied())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let mut one_hop_neighbors: HashMap<MemoryId, HashSet<MemoryId>> = HashMap::new();
+    for edge in graph.batch_adjacency_read(&interesting).await? {
+        one_hop_neighbors
+            .entry(edge.source)
+            .or_default()
+            .insert(edge.target);
     }
+
+    activation_core::apply_lateral_inhibition(
+        activations,
+        &seeds,
+        mu,
+        threshold,
+        embeddings,
+        &connected_to_seeds,
+        &one_hop_neighbors,
+    );
     Ok(())
-}
-
-fn cosine_sim(a: &[f32], b: &[f32]) -> f64 {
-    if a.len() != b.len() || a.is_empty() {
-        return 0.0;
-    }
-    let mut dot = 0.0_f64;
-    let mut na = 0.0_f64;
-    let mut nb = 0.0_f64;
-    for (x, y) in a.iter().zip(b.iter()) {
-        let x = *x as f64;
-        let y = *y as f64;
-        dot += x * y;
-        na += x * x;
-        nb += y * y;
-    }
-    let denom = na.sqrt() * nb.sqrt();
-    if denom < 1e-10 { 0.0 } else { dot / denom }
 }
 
 /// Async Personalized PageRank on the persistent graph.
 ///
-/// Mirrors `hirn_graph::activation::personalized_pagerank` but operates on
-/// `PersistentGraph` via async IO.
+/// Same semantics as `hirn_graph::activation::personalized_pagerank`: the
+/// induced subgraph is the forward+backward reachable set from the seeds
+/// (so upstream causes are ranked, not only downstream effects), while the
+/// transition matrix stays out-edge-only. Power iteration runs in the shared
+/// core with deterministic node ordering.
 pub async fn personalized_pagerank(
     graph: &PersistentGraph,
     seeds: &[MemoryId],
@@ -264,107 +172,38 @@ pub async fn personalized_pagerank(
     }
 
     let all_nodes = collect_reachable_nodes(graph, seeds, allowed_namespaces).await?;
-
     if all_nodes.is_empty() {
         return Ok(HashMap::new());
     }
 
-    let n = all_nodes.len();
-    let node_to_idx: HashMap<MemoryId, usize> = all_nodes
-        .iter()
-        .enumerate()
-        .map(|(i, &id)| (id, i))
-        .collect();
+    // Out-edge adjacency for the induced subgraph in one scoped scan; targets
+    // outside the reachable node set are dropped by the core.
+    let edges = graph
+        .batch_adjacency_read_scoped(&all_nodes, allowed_namespaces)
+        .await?;
+    let out_adjacency = adjacency_from_edges(edges);
 
-    // Personalization vector: uniform over seeds that exist in the graph.
-    let mut personalization = vec![0.0_f64; n];
-    let seed_count = seeds.iter().filter(|s| node_to_idx.contains_key(s)).count();
-    if seed_count == 0 {
-        return Ok(HashMap::new());
-    }
-    let seed_weight = 1.0 / seed_count as f64;
-    for &seed in seeds {
-        if let Some(&idx) = node_to_idx.get(&seed) {
-            personalization[idx] = seed_weight;
-        }
-    }
-
-    // Build sparse out-degree structure using batch adjacency read.
-    let mut out_edges: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
-    let all_outgoing = graph.batch_adjacency_read(&all_nodes).await?;
-    // Group edges by source.
-    let mut edges_by_source: HashMap<MemoryId, Vec<(MemoryId, f32)>> = HashMap::new();
-    for edge in &all_outgoing {
-        edges_by_source
-            .entry(edge.source)
-            .or_default()
-            .push((edge.target, edge.weight));
-    }
-    for (i, &node) in all_nodes.iter().enumerate() {
-        if let Some(neighbors) = edges_by_source.get(&node) {
-            let total_weight: f64 = neighbors
-                .iter()
-                .filter_map(|(nb, w)| node_to_idx.get(nb).map(|_| f64::from(*w)))
-                .sum();
-            if total_weight > 0.0 {
-                for (nb, w) in neighbors {
-                    if let Some(&j) = node_to_idx.get(nb) {
-                        out_edges[i].push((j, f64::from(*w) / total_weight));
-                    }
-                }
-            }
-        }
-    }
-
-    // Power iteration: r(t+1) = α·p + (1-α)·M^T·r(t)
-    let alpha = config.alpha;
-    let mut scores = personalization.clone();
-
-    for _ in 0..config.max_iterations {
-        let mut new_scores = vec![0.0_f64; n];
-        let mut dangling_mass = 0.0_f64;
-        for i in 0..n {
-            if out_edges[i].is_empty() {
-                dangling_mass += scores[i];
-            } else {
-                for &(j, w) in &out_edges[i] {
-                    new_scores[j] += scores[i] * w;
-                }
-            }
-        }
-
-        let dangling_per_seed = dangling_mass * seed_weight;
-        let mut max_delta = 0.0_f64;
-        for i in 0..n {
-            let val = alpha.mul_add(personalization[i], (1.0 - alpha) * new_scores[i])
-                + (1.0 - alpha) * dangling_per_seed * personalization[i] / seed_weight.max(1e-15);
-            let delta = (val - scores[i]).abs();
-            if delta > max_delta {
-                max_delta = delta;
-            }
-            scores[i] = val;
-        }
-
-        if max_delta < config.epsilon {
-            break;
-        }
-    }
-
-    Ok(all_nodes
-        .into_iter()
-        .zip(scores)
-        .filter(|(_, s)| *s > 1e-10)
-        .collect())
+    Ok(activation_core::ppr_power_iteration(
+        &all_nodes,
+        &out_adjacency,
+        seeds,
+        config,
+    ))
 }
 
+/// BFS over the persistent graph collecting the seed-reachable node set for
+/// PPR, traversing outgoing edges (forward reachability: what does this node
+/// cause?) AND incoming edges (backward reachability: what caused this node?).
+/// Including both directions ensures upstream causes appear in the PPR
+/// subgraph — matching the hot tier's `collect_reachable_nodes`.
 async fn collect_reachable_nodes(
     graph: &PersistentGraph,
     seeds: &[MemoryId],
     allowed_namespaces: Option<&[Namespace]>,
 ) -> HirnResult<Vec<MemoryId>> {
     let mut visited = HashSet::new();
-    let mut queue = VecDeque::new();
     let mut reachable = Vec::new();
+    let mut frontier = Vec::new();
 
     for &seed in seeds {
         if !graph.has_node(seed).await? {
@@ -377,27 +216,32 @@ async fn collect_reachable_nodes(
             continue;
         }
         if visited.insert(seed) {
-            queue.push_back(seed);
+            frontier.push(seed);
             reachable.push(seed);
         }
     }
 
-    while !queue.is_empty() {
-        let frontier: Vec<MemoryId> = std::mem::take(&mut queue).into_iter().collect();
-        let edges = graph.batch_adjacency_read(&frontier).await?;
-        for edge in edges {
-            let neighbor = edge.target;
-            if let Some(allowed) = allowed_namespaces
-                && let Some(ns) = graph.node_namespace(neighbor).await?
-                && !allowed.contains(&ns)
-            {
-                continue;
-            }
+    while !frontier.is_empty() {
+        // Two batched scans per level: forward neighbors are edge targets,
+        // backward neighbors are edge sources. Both scans push the namespace
+        // filter into the scan predicate.
+        let outgoing = graph
+            .batch_adjacency_read_scoped(&frontier, allowed_namespaces)
+            .await?;
+        let incoming = graph
+            .batch_incoming_adjacency_read_scoped(&frontier, allowed_namespaces)
+            .await?;
+
+        let mut next_frontier = Vec::new();
+        let forward = outgoing.iter().map(|edge| edge.target);
+        let backward = incoming.iter().map(|edge| edge.source);
+        for neighbor in forward.chain(backward) {
             if visited.insert(neighbor) {
-                queue.push_back(neighbor);
+                next_frontier.push(neighbor);
                 reachable.push(neighbor);
             }
         }
+        frontier = next_frontier;
     }
 
     Ok(reachable)
@@ -538,6 +382,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn frontier_cap_limits_deep_expansion() {
+        let (pg, _dir) = temp_graph().await;
+        // Hub → 8 leaves → second-level nodes; frontier cap 3 limits
+        // propagation from depth 1 to depth 2 on the delegated path too.
+        let hub = MemoryId::new();
+        pg.add_node(hub, Layer::Episodic, 0.5, Timestamp::now(), ns())
+            .await
+            .unwrap();
+        let mut second_level = Vec::new();
+        for _ in 0..8 {
+            let leaf = MemoryId::new();
+            let end = MemoryId::new();
+            for id in [leaf, end] {
+                pg.add_node(id, Layer::Episodic, 0.5, Timestamp::now(), ns())
+                    .await
+                    .unwrap();
+            }
+            pg.add_edge(hub, leaf, EdgeRelation::Causes, 1.0, Metadata::new())
+                .await
+                .unwrap();
+            pg.add_edge(leaf, end, EdgeRelation::Causes, 1.0, Metadata::new())
+                .await
+                .unwrap();
+            second_level.push(end);
+        }
+
+        let cfg = ActivationConfig {
+            max_frontier_size: 3,
+            max_depth: 3,
+            ..Default::default()
+        };
+        let result = spread_activation(&pg, &[hub], &cfg, None, None)
+            .await
+            .unwrap();
+        let activated_second = second_level
+            .iter()
+            .filter(|n| result.activations.contains_key(n))
+            .count();
+        assert!(
+            activated_second <= 3,
+            "cold-tier frontier cap should limit second-level activation to ≤3, got {activated_second}"
+        );
+    }
+
+    #[tokio::test]
     async fn ppr_excludes_disconnected_components() {
         let (pg, _dir) = temp_graph().await;
         let a = MemoryId::new();
@@ -569,6 +458,42 @@ mod tests {
         assert!(result.contains_key(&b));
         assert!(!result.contains_key(&d));
         assert!(!result.contains_key(&e));
+    }
+
+    #[tokio::test]
+    async fn ppr_reaches_upstream_causes() {
+        let (pg, _dir) = temp_graph().await;
+        // upstream → seed → downstream: the reachable set must include the
+        // upstream cause even though the seed has no outgoing edge to it.
+        let upstream = MemoryId::new();
+        let seed = MemoryId::new();
+        let downstream = MemoryId::new();
+        for id in [upstream, seed, downstream] {
+            pg.add_node(id, Layer::Episodic, 0.5, Timestamp::now(), ns())
+                .await
+                .unwrap();
+        }
+        pg.add_edge(upstream, seed, EdgeRelation::Causes, 0.9, Metadata::new())
+            .await
+            .unwrap();
+        pg.add_edge(seed, downstream, EdgeRelation::Causes, 0.9, Metadata::new())
+            .await
+            .unwrap();
+
+        let result = personalized_pagerank(
+            &pg,
+            &[seed],
+            &hirn_graph::activation::PprConfig::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.contains_key(&downstream));
+        assert!(
+            result.contains_key(&upstream),
+            "backward reachability must pull upstream causes into the PPR subgraph"
+        );
     }
 
     #[tokio::test]

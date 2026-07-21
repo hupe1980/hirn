@@ -134,6 +134,12 @@ impl RealmManager {
         if let Some(max) = self.engine.max_episodic_entries {
             config = config.max_episodic_entries(max);
         }
+        if let Some(enabled) = self.engine.offline_scheduler_enabled {
+            config = config.offline_scheduler(hirn_core::OfflineSchedulerConfig {
+                enabled,
+                ..hirn_core::OfflineSchedulerConfig::default()
+            });
+        }
 
         let lance_path = realm_dir.join("lance_brain");
         let storage_cfg = if let Some(ref backend) = self.storage_backend {

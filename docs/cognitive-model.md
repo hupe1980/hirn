@@ -298,7 +298,12 @@ works: hearing "nurse" activates "hospital", "doctor", "medicine" without explic
 
 **Hirn implementation:**
 
-Spreading activation operates on the **hot-tier PropertyGraph** (in-memory petgraph, sub-ms).
+Spreading activation usually runs on the **hot-tier PropertyGraph** (in-memory petgraph, sub-ms);
+deep queries (`max_depth` above the delegation threshold) run on the **cold-tier PersistentGraph**
+via batched Lance scans. Both tiers execute the identical algorithm — the math lives once in
+`hirn_graph::activation_core` (spreading, static expansion, Jaccard-modulated inhibition, PPR with
+forward+backward reachability, frontier cap, deterministic score/`MemoryId` ordering), and each
+tier only supplies pre-fetched adjacency.
 
 ```
 1. Seed nodes: memory IDs returned by LanceHybridSearchExec
@@ -461,6 +466,80 @@ Bayesian evidence accumulation are roadmap. The `NliContradictionExec` operator 
 contradictions via DeBERTa-MNLI (5–15ms/pair) and `AbaReconsolidationExec` resolves them via formal
 argumentation (ABA) + AGM belief revision — both are **query operators** ("implemented preview"),
 not automatic consolidation stages.
+
+---
+
+## Beliefs & Reflection
+
+Semantic records distinguish two epistemic classes. Most knowledge types
+(`Propositional`, `Taxonomic`, …) model *objective world facts*. The `Belief`
+knowledge type models a *subjective opinion with a credence*: the record's
+`confidence` field is interpreted as how strongly the agent currently holds
+the belief, not as extraction quality. This separation follows Hindsight
+(arXiv:2512.12818), which treats belief revision as a first-class memory
+operation rather than a retrieval concern.
+
+```rust
+let belief = SemanticRecord::builder()
+    .concept("postgres-default")
+    .description("Postgres is the right default database for new services")
+    .belief()            // KnowledgeType::Belief
+    .confidence(0.6)     // credence, not extraction confidence
+    .agent_id(agent_id)
+    .build()?;
+```
+
+### The Reflect operation
+
+`Reflect` takes one evidence record (episodic or semantic) and classifies it
+against the top-K nearest beliefs **in the same namespace** (K =
+`reflection_top_k`, default 5). Classification is two-stage:
+
+1. **Similarity gate** (always) — evidence/belief pairs below
+   `reflection_similarity_threshold` (default 0.75 cosine) are `Unrelated`
+   and never touch the belief.
+2. **Judgment** — with an `LlmProvider`, a compact prompt asks for exactly
+   `REINFORCES` / `WEAKENS` / `CONTRADICTS` / `UNRELATED` plus a one-sentence
+   rationale; the response is parsed strictly and anything malformed defaults
+   to `Unrelated`, so a confused model can never mutate a belief. Without an
+   LLM, a heuristic fallback reuses the insert-time contradiction signal
+   (negation-marker mismatch on a same-topic pair → `Contradicts`, otherwise
+   `Reinforces`). The heuristic never emits `Weakens` and misses paraphrase
+   contradictions — it is an availability fallback, not a substitute for
+   semantic judgment.
+
+### Confidence dynamics
+
+| Outcome | Update | Effect |
+|---------|--------|--------|
+| `Reinforces` | `c' = c + 0.15·(1 − c)` | asymptotic approach to the 0.99 ceiling; `evidence_count` +1 |
+| `Weakens` | `c' = c − 0.15·c` | asymptotic approach to the 0.05 floor |
+| `Contradicts` | `c' = c / 2` | Hindsight-style halving, plus a `Contradicts` graph edge and a `contradiction_ids` entry |
+| `Unrelated` | `c' = c` | no revision written |
+
+All results are clamped to `[0.05, 0.99]`: a belief never becomes certain and
+never silently dies — it stays revisable.
+
+### Audit trail
+
+Every adjustment is applied through the semantic revision machinery
+(`correct_semantic`), so each change appends an immutable revision with:
+
+- `revision_operation: Correct` and `version + 1`
+- the classification rationale in `revision_reason`
+- the triggering evidence id in `revision_causation_id`
+- a provenance `Mutation` entry recording old → new confidence
+
+`db.semantic().history(belief_id)` therefore reconstructs the full epistemic
+trajectory of a belief bi-temporally: what the agent believed, when, and which
+evidence moved it.
+
+Reflection runs on demand (`db.semantic().reflect(evidence_id)`,
+`AgentContext::reflect`) or as a budgeted offline sweep
+(`CognitiveJobKind::Reflect`) that processes recent evidence — bounded by the
+job's `temporal_window` cursor — against nearby beliefs. The offline sweep is
+storage-direct and records contradictions in `contradiction_ids` without
+drawing the graph edge; the online entry point does both.
 
 ---
 

@@ -185,10 +185,11 @@ pub fn knowledge_type_to_proto(kt: &KnowledgeType) -> i32 {
         KnowledgeType::Propositional => proto::KnowledgeType::Propositional as i32,
         KnowledgeType::Prescriptive => proto::KnowledgeType::Prescriptive as i32,
         KnowledgeType::Taxonomic => proto::KnowledgeType::Taxonomic as i32,
-        // Inferred, Community, and RaptorSummary don't have proto equivalents yet; map to Propositional.
-        KnowledgeType::Inferred | KnowledgeType::Community | KnowledgeType::RaptorSummary => {
-            proto::KnowledgeType::Propositional as i32
-        }
+        // Inferred, Community, RaptorSummary, and Belief don't have proto equivalents yet; map to Propositional.
+        KnowledgeType::Inferred
+        | KnowledgeType::Community
+        | KnowledgeType::RaptorSummary
+        | KnowledgeType::Belief => proto::KnowledgeType::Propositional as i32,
     }
 }
 

@@ -448,6 +448,9 @@ impl HirnDB {
             config.offline_plan_quality_threshold,
             f64::from(config.memory_decay_factor),
             config.decay_sweep_window_secs,
+            config.reflection_similarity_threshold,
+            config.reflection_top_k,
+            config.embedding_dimensions.as_usize(),
         )
         .await?;
         let namespace_runtime = NamespaceRuntime::new();

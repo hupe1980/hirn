@@ -399,6 +399,7 @@ fn knowledge_type_str(kt: KnowledgeType) -> &'static str {
         KnowledgeType::Inferred => "hypothesis",
         KnowledgeType::Community => "community summary",
         KnowledgeType::RaptorSummary => "hierarchical summary",
+        KnowledgeType::Belief => "belief",
     }
 }
 

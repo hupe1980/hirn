@@ -1,8 +1,53 @@
 //! Admission pipeline: ordered chain of controllers with short-circuit.
 
+use std::sync::Arc;
+
 use hirn_core::HirnResult;
 
 use super::{AdmissionController, AdmissionDecision, ControllerVerdict, MemoryCandidate};
+
+/// RAII guard for an admitted candidate's controller reservations.
+///
+/// Created by the write path after a pipeline `Accept`. Exactly one of two
+/// things happens: [`commit`](Self::commit) on durable-write success, or —
+/// on any early-return failure path — the `Drop` impl releases the
+/// reservations (spawned, since `Drop` cannot await).
+pub struct AdmissionReservation {
+    pipeline: Arc<AdmissionPipeline>,
+    candidate: Option<MemoryCandidate>,
+}
+
+impl AdmissionReservation {
+    pub fn new(pipeline: Arc<AdmissionPipeline>, candidate: MemoryCandidate) -> Self {
+        Self {
+            pipeline,
+            candidate: Some(candidate),
+        }
+    }
+
+    /// The record was durably persisted — convert reservations to usage.
+    pub async fn commit(mut self) {
+        if let Some(candidate) = self.candidate.take() {
+            self.pipeline.commit(&candidate).await;
+        }
+    }
+}
+
+impl Drop for AdmissionReservation {
+    fn drop(&mut self) {
+        if let Some(candidate) = self.candidate.take() {
+            let pipeline = Arc::clone(&self.pipeline);
+            // Best-effort async release from a sync Drop. If no runtime is
+            // available (pure-sync teardown), the reservation stays until the
+            // agent's next invalidation — a bounded, self-healing leak.
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    pipeline.release(&candidate).await;
+                });
+            }
+        }
+    }
+}
 
 /// Result of running the full admission pipeline.
 #[derive(Debug, Clone)]
@@ -52,13 +97,28 @@ impl AdmissionPipeline {
 
     /// Evaluate a candidate through all controllers.
     ///
-    /// Short-circuits on the first non-Accept decision.
+    /// Short-circuits on the first non-Accept decision. Controllers that
+    /// already accepted (and may hold reservations, e.g. token budgets) get
+    /// [`AdmissionController::release`] when a later controller short-circuits
+    /// — otherwise a downstream reject would leave their reservations counted
+    /// against the agent forever.
     pub async fn evaluate(&self, candidate: &MemoryCandidate) -> HirnResult<PipelineResult> {
         let mut verdicts = Vec::with_capacity(self.controllers.len());
         let mut final_importance_override: Option<f32> = None;
+        let mut accepted: Vec<&Box<dyn AdmissionController>> = Vec::new();
 
         for controller in &self.controllers {
-            let decision = controller.evaluate(candidate).await?;
+            let decision = match controller.evaluate(candidate).await {
+                Ok(decision) => decision,
+                Err(error) => {
+                    // An erroring controller aborts the pipeline; earlier
+                    // acceptances must not leak their reservations.
+                    for prior in &accepted {
+                        prior.release(candidate).await;
+                    }
+                    return Err(error);
+                }
+            };
             let name = controller.name().to_string();
 
             match &decision {
@@ -73,10 +133,15 @@ impl AdmissionPipeline {
                         controller: name,
                         decision,
                     });
+                    accepted.push(controller);
                     // Continue to the next controller.
                 }
                 _ => {
-                    // Short-circuit: Reject, Defer, or Merge.
+                    // Short-circuit: Reject, Defer, or Merge — release every
+                    // earlier acceptance.
+                    for prior in &accepted {
+                        prior.release(candidate).await;
+                    }
                     let short_circuit = decision.clone();
                     verdicts.push(ControllerVerdict {
                         controller: name,
@@ -97,6 +162,22 @@ impl AdmissionPipeline {
             },
             verdicts,
         })
+    }
+
+    /// The admitted candidate was durably persisted — commit every
+    /// controller's reservation.
+    pub async fn commit(&self, candidate: &MemoryCandidate) {
+        for controller in &self.controllers {
+            controller.commit(candidate).await;
+        }
+    }
+
+    /// The admitted candidate was NOT persisted (write failure or a decision
+    /// applied elsewhere) — release every controller's reservation.
+    pub async fn release(&self, candidate: &MemoryCandidate) {
+        for controller in &self.controllers {
+            controller.release(candidate).await;
+        }
     }
 }
 

@@ -6,7 +6,8 @@ use hirn_core::id::MemoryId;
 use hirn_core::metadata::Metadata;
 use hirn_core::timestamp::Timestamp;
 use hirn_core::types::{EdgeRelation, Layer};
-use hirn_graph::PropertyGraph;
+use hirn_graph::activation::{ActivationConfig, PprConfig};
+use hirn_graph::{PropertyGraph, personalized_pagerank, spread_activation};
 
 /// Graph operation to apply.
 #[derive(Debug, Clone)]
@@ -155,5 +156,120 @@ proptest! {
         let b_edges = graph.get_edges(b);
         let b_causes_a = b_edges.iter().any(|e| e.source == b && e.target == a && e.relation == EdgeRelation::Causes);
         prop_assert!(!b_causes_a, "directed Causes should not be symmetric");
+    }
+}
+
+// ── Activation-core properties ──────────────────────────────────────────
+
+/// Build a random connected graph: a chain n0→n1→…→n(k−1) guarantees that
+/// every node is reachable from n0, plus random extra edges for structure.
+fn build_connected_graph(
+    node_count: usize,
+    extra_edges: &[(usize, usize, u8)],
+) -> (PropertyGraph, Vec<MemoryId>) {
+    let mut graph = PropertyGraph::new();
+    let ids: Vec<MemoryId> = (0..node_count).map(|_| MemoryId::new()).collect();
+    let now = Timestamp::now();
+    for &id in &ids {
+        graph.add_node(id, Layer::Episodic, 0.5, now);
+    }
+    for i in 0..node_count - 1 {
+        let _ = graph.add_edge(
+            ids[i],
+            ids[i + 1],
+            EdgeRelation::Causes,
+            0.8,
+            Metadata::new(),
+        );
+    }
+    for &(src, tgt, w) in extra_edges {
+        let src = src % node_count;
+        let tgt = tgt % node_count;
+        if src != tgt {
+            // Weight in [0.1, 1.0]; duplicate edges are rejected and ignored.
+            let weight = 0.1 + (f32::from(w) / 255.0) * 0.9;
+            let _ = graph.add_edge(
+                ids[src],
+                ids[tgt],
+                EdgeRelation::Causes,
+                weight,
+                Metadata::new(),
+            );
+        }
+    }
+    (graph, ids)
+}
+
+fn arb_extra_edges() -> impl Strategy<Value = Vec<(usize, usize, u8)>> {
+    prop::collection::vec((0..32usize, 0..32usize, any::<u8>()), 0..24)
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// PPR probability mass is conserved (≈ 1) on random connected graphs,
+    /// and repeated runs are bitwise identical (deterministic node ordering
+    /// and accumulation order in the shared activation core).
+    #[test]
+    fn ppr_mass_conserved_and_deterministic(
+        node_count in 3..16usize,
+        extra_edges in arb_extra_edges(),
+    ) {
+        let (graph, ids) = build_connected_graph(node_count, &extra_edges);
+        let seeds = [ids[0]];
+        let config = PprConfig::default();
+
+        let first = personalized_pagerank(&graph, &seeds, &config, None).unwrap();
+        let total: f64 = first.values().sum();
+        prop_assert!(
+            (total - 1.0).abs() < 0.01,
+            "PPR mass should be ≈ 1.0, got {total}"
+        );
+
+        for _ in 0..3 {
+            let again = personalized_pagerank(&graph, &seeds, &config, None).unwrap();
+            prop_assert_eq!(&first, &again, "PPR must be deterministic across runs");
+        }
+    }
+
+    /// Spreading activation is deterministic: identical activations, traces,
+    /// and (score, id)-sorted orderings on repeated runs.
+    #[test]
+    fn spreading_activation_deterministic(
+        node_count in 3..16usize,
+        extra_edges in arb_extra_edges(),
+    ) {
+        let (graph, ids) = build_connected_graph(node_count, &extra_edges);
+        let seeds = [ids[0]];
+        let config = ActivationConfig {
+            max_depth: 4,
+            ..Default::default()
+        };
+
+        let sorted_entries = |result: &hirn_graph::ActivationResult| {
+            let mut entries: Vec<(MemoryId, f64)> =
+                result.activations.iter().map(|(&k, &v)| (k, v)).collect();
+            hirn_graph::sort_by_score_then_id(&mut entries);
+            entries
+        };
+
+        let first = spread_activation(&graph, &seeds, &config, None, None).unwrap();
+        let first_entries = sorted_entries(&first);
+
+        for _ in 0..3 {
+            let again = spread_activation(&graph, &seeds, &config, None, None).unwrap();
+            prop_assert_eq!(
+                &first_entries,
+                &sorted_entries(&again),
+                "activation scores and orderings must be deterministic"
+            );
+            for (node, trace) in &again.traces {
+                prop_assert_eq!(
+                    &first.traces[node].path,
+                    &trace.path,
+                    "activation traces must be deterministic"
+                );
+            }
+        }
     }
 }

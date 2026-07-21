@@ -58,6 +58,20 @@ impl Benchmark {
         }
     }
 
+    /// True when this suite's query routing derives namespace or temporal
+    /// hints from ground-truth labels (see `QueryRoutingProfile::for_query`):
+    /// H2 applies temporal cutoffs keyed on the query category, H4 derives the
+    /// agent namespace from the relevance labels, and H6 routes PII/conflict
+    /// queries by their known category. Scores from these suites measure
+    /// retrieval *given* oracle routing hints and must be published with the
+    /// `oracle_assisted` flag set.
+    pub fn uses_oracle_routing(&self) -> bool {
+        matches!(
+            self,
+            Benchmark::H2Temporal | Benchmark::H4Agent | Benchmark::H6Safety
+        )
+    }
+
     /// Returns a human-readable description of this benchmark.
     pub fn description(&self) -> &str {
         match self {
@@ -184,6 +198,33 @@ pub struct QAQuery {
     pub negative: bool,
 }
 
+/// Counts of items dropped from a dataset by load limits or safety limits.
+///
+/// Published alongside benchmark results so that truncated runs are always
+/// machine-detectable and never mistaken for full-corpus numbers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TruncationSummary {
+    /// Sessions dropped during loading.
+    pub sessions: usize,
+    /// Queries dropped during loading.
+    pub queries: usize,
+    /// Records (turns) dropped during loading.
+    pub records: usize,
+}
+
+impl TruncationSummary {
+    pub fn is_empty(&self) -> bool {
+        self.sessions == 0 && self.queries == 0 && self.records == 0
+    }
+
+    /// Merge another summary into this one (element-wise sum).
+    pub fn merge(&mut self, other: &TruncationSummary) {
+        self.sessions += other.sessions;
+        self.queries += other.queries;
+        self.records += other.records;
+    }
+}
+
 /// Complete cognitive benchmark dataset.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CognitiveDataset {
@@ -191,6 +232,10 @@ pub struct CognitiveDataset {
     pub benchmark: Benchmark,
     pub sessions: Vec<Session>,
     pub queries: Vec<QAQuery>,
+    /// Set when load limits dropped sessions/records/queries from the source
+    /// dataset. `None` means the dataset was loaded in full.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<TruncationSummary>,
 }
 
 pub fn render_turn_content(session_id: &str, turn: &Turn) -> String {
@@ -677,6 +722,28 @@ pub struct CognitiveResult {
     pub end_to_end_latency: LatencyStats,
     #[serde(default)]
     pub token_cost: TokenCostEstimate,
+    /// Mean tokens returned to the (hypothetical) reader per executed query
+    /// (assembled THINK context plus RECALL result contents).
+    #[serde(default)]
+    pub tokens_per_query_mean: f64,
+    /// p50 of tokens returned per executed query.
+    #[serde(default)]
+    pub tokens_per_query_p50: usize,
+    /// p95 of tokens returned per executed query.
+    #[serde(default)]
+    pub tokens_per_query_p95: usize,
+    /// Which token estimator produced the tokens-per-query numbers
+    /// (e.g. `tiktoken-rs/cl100k_base`). Empty for legacy artifacts.
+    #[serde(default)]
+    pub token_estimator: String,
+    /// True when query routing derived namespace/temporal hints from
+    /// ground-truth labels (H2/H4/H6). Oracle-assisted scores measure
+    /// retrieval *given* routing hints, not end-to-end routing.
+    #[serde(default)]
+    pub oracle_assisted: bool,
+    /// Set when load or safety limits dropped data before this run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<TruncationSummary>,
     pub total_queries: usize,
     pub ingest_time_secs: f64,
     pub query_time_secs: f64,
@@ -787,6 +854,7 @@ mod tests {
         let dataset = CognitiveDataset {
             name: "test".to_string(),
             benchmark: Benchmark::H1Retrieval,
+            truncated: None,
             sessions: vec![Session {
                 id: "session-1".to_string(),
                 turns: vec![Turn {

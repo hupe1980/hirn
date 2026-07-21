@@ -5,6 +5,7 @@
 //! cognitive memory database.
 
 pub mod activation;
+pub mod activation_core;
 pub mod graph;
 pub mod hebbian;
 
@@ -12,6 +13,7 @@ pub use activation::{
     ActivationConfig, ActivationMode, ActivationResult, ActivationTrace, PprConfig,
     personalized_pagerank, spread_activation, static_activation,
 };
+pub use activation_core::{AdjacencyMap, sort_by_score_then_id};
 pub use graph::{
     CausalDirection, CausalEdgeData, ConnectBuilder, EdgeId, GraphEdge, GraphNodeData,
     GraphSnapshot, MAX_EDGE_METADATA_BYTES, MAX_EDGES_PER_NODE, PropertyGraph, edge_metadata_bytes,

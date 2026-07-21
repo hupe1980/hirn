@@ -253,6 +253,49 @@ Available MCP tools: `remember`, `recall`, `think`, `forget`, `connect`, `inspec
 > through `hirn_execute` is verb-classified, so a read-scoped credential cannot
 > execute write or admin statements.
 
+### Sleep-Time Consolidation
+
+While the daemon is idle, `hirnd` opportunistically runs cognitive maintenance
+so it never competes with live traffic — the same idea as "sleep-time compute"
+in agent-memory research: reorganize memory off the hot path instead of at
+query time.
+
+Every authenticated request (HTTP, gRPC, or MCP) resets an idle clock; health
+probes and unauthenticated traffic do not. Once the daemon has been quiet for
+`idle_after_secs`, a background scheduler runs one **sleep pass** per open
+realm:
+
+1. **Consolidation pipeline** — segmentation → pattern extraction → community
+   detection → RAPTOR summaries → forgetting, via the same engine pipeline as
+   `POST /v1/consolidate`.
+2. **Offline cognition jobs** — one `dream` and one `reconcile` job are
+   enqueued *only if* the engine's offline scheduler is enabled, using its
+   configured default budget (see [Offline Intelligence](offline-intelligence.md)).
+   The scheduler is off by default; turn it on per daemon via
+   `[engine] offline_scheduler_enabled = true`.
+
+The pass re-checks the idle clock between phases and aborts as soon as a
+foreground request arrives. Passes are spaced at least
+`min_pass_interval_secs` apart.
+
+```toml
+[sleep]
+enabled = true                 # set to false to disable sleep passes
+idle_after_secs = 300          # quiet time before the daemon counts as idle
+check_interval_secs = 60       # how often the scheduler evaluates idleness
+min_pass_interval_secs = 3600  # minimum spacing between two passes
+```
+
+Validation requires `idle_after_secs >= check_interval_secs` and all values
+greater than zero when enabled. To disable the feature entirely, set
+`sleep.enabled = false`.
+
+Observability: each pass logs a `sleep_pass` tracing span with per-phase
+durations, increments the `hirnd_sleep_passes_total` counter (label
+`result = completed|aborted`), sets the
+`hirnd_sleep_last_pass_timestamp_seconds` gauge, and exposes the last pass
+timestamp as `sleep_last_pass_ms` in `GET /debug/brain-stats`.
+
 **Characteristics:**
 - Multi-client access over network
 - gRPC for performance, HTTP for convenience, MCP for LLMs
@@ -260,6 +303,7 @@ Available MCP tools: `remember`, `recall`, `think`, `forget`, `connect`, `inspec
 - TLS + mTLS support
 - Route-class throttling keyed by authenticated actor (`realm + agent_id`)
 - Cedar policy enforcement per request
+- Idle-time sleep passes (consolidation + offline cognition) when traffic stops
 
 ---
 

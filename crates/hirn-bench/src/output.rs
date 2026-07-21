@@ -510,7 +510,7 @@ fn write_cognitive_csv(result: &CognitiveSuiteResult, w: &mut dyn Write) -> io::
         w,
         "benchmark,strategy,run_id,dataset_source,corpus_embedding_source,corpus_embedding_model,query_embedding_source,query_embedding_model,retrieval_profile,execution_surface,active_surfaces,disabled_surfaces,os,arch,logical_cpus,\
             containment,token_f1,recall_accuracy,mrr,ndcg,fpr,exec_p50_us,exec_p95_us,exec_p99_us,eval_p50_us,eval_p95_us,eval_p99_us,e2e_p50_us,e2e_p95_us,e2e_p99_us,\
-            context_tokens,prompt_tokens,total_tokens,total_queries,ingest_time_s,query_time_s,total_time_s,\
+            context_tokens,prompt_tokens,total_tokens,tokens_per_query_mean,tokens_per_query_p50,tokens_per_query_p95,token_estimator,oracle_assisted,truncated_sessions,truncated_records,truncated_queries,total_queries,ingest_time_s,query_time_s,total_time_s,\
             repro_runs,repro_threshold,repro_max_relative_delta,repro_materially_similar"
     )?;
     for r in &result.results {
@@ -523,7 +523,7 @@ fn write_cognitive_csv(result: &CognitiveSuiteResult, w: &mut dyn Write) -> io::
     writeln!(
         w,
         "TOTAL,{},{},{},{},{},{},{},{},{},{},{},{},{},{},\\
-         {:.4},{:.4},{:.4},0.0000,0.0000,0.0000,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0,0,0,{},0.000,0.000,{:.3},0,0.0000,0.0000,false",
+         {:.4},{:.4},{:.4},0.0000,0.0000,0.0000,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0,0,0,0.0,0,0,,false,0,0,0,{},0.000,0.000,{:.3},0,0.0000,0.0000,false",
         summary_strategy,
         result.run_id,
         result.metadata.dataset_source,
@@ -688,11 +688,11 @@ fn write_cognitive_markdown(result: &CognitiveSuiteResult, w: &mut dyn Write) ->
     writeln!(w)?;
     writeln!(
         w,
-        "| Benchmark | Containment | Recall Acc. | MRR | nDCG | FPR | Exec p50 | Exec p95 | Exec p99 | Total tokens | SOTA Target | Status |"
+        "| Benchmark | Containment | Recall Acc. | MRR | nDCG | FPR | Exec p50 | Exec p95 | Exec p99 | Tokens / query | Total tokens | SOTA Target | Status |"
     )?;
     writeln!(
         w,
-        "|-----------|------------:|------------:|----:|-----:|----:|----:|----:|----:|-------------:|:------------|:-------|"
+        "|-----------|------------:|------------:|----:|-----:|----:|----:|----:|----:|---------------:|-------------:|:------------|:-------|"
     )?;
     for r in &result.results {
         let bench: Result<Benchmark, _> = r
@@ -711,8 +711,8 @@ fn write_cognitive_markdown(result: &CognitiveSuiteResult, w: &mut dyn Write) ->
         };
         writeln!(
             w,
-            "| {} | {:.4} | {:.4} | {:.4} | {:.4} | {:.4} | {:.1} ms | {:.1} ms | {:.1} ms | {} | {} | {} |",
-            r.benchmark,
+            "| {} | {:.4} | {:.4} | {:.4} | {:.4} | {:.4} | {:.1} ms | {:.1} ms | {:.1} ms | {:.0} | {} | {} | {} |",
+            format_benchmark_label(r),
             r.overall_containment,
             r.overall_recall_accuracy,
             r.overall_mrr,
@@ -721,12 +721,14 @@ fn write_cognitive_markdown(result: &CognitiveSuiteResult, w: &mut dyn Write) ->
             r.execution_latency.p50.as_secs_f64() * 1_000.0,
             r.execution_latency.p95.as_secs_f64() * 1_000.0,
             r.execution_latency.p99.as_secs_f64() * 1_000.0,
+            r.tokens_per_query_mean,
             r.token_cost.total_tokens,
             target_desc,
             status,
         )?;
     }
     writeln!(w)?;
+    write_cognitive_honesty_footnotes(result, w)?;
 
     writeln!(w, "## Strategy Comparisons")?;
     writeln!(w)?;
@@ -735,15 +737,15 @@ fn write_cognitive_markdown(result: &CognitiveSuiteResult, w: &mut dyn Write) ->
         writeln!(w)?;
         writeln!(
             w,
-            "| Strategy | Containment | Token F1 | Recall Acc. | MRR | nDCG | FPR | Exec p50 | Exec p95 | Exec p99 | Total tokens | Delta containment | Delta Exec p95 | Delta tokens | Reproducibility |"
+            "| Strategy | Containment | Token F1 | Recall Acc. | MRR | nDCG | FPR | Exec p50 | Exec p95 | Exec p99 | Tokens / query | Total tokens | Delta containment | Delta Exec p95 | Delta tokens | Reproducibility |"
         )?;
         writeln!(
             w,
-            "|----------|------------:|---------:|------------:|----:|-----:|----:|----:|----:|----:|-------------:|------------------:|----------:|-------------:|:----------------|"
+            "|----------|------------:|---------:|------------:|----:|-----:|----:|----:|----:|----:|---------------:|-------------:|------------------:|----------:|-------------:|:----------------|"
         )?;
         writeln!(
             w,
-            "| {} | {:.4} | {:.4} | {:.4} | {:.4} | {:.4} | {:.4} | {:.1} ms | {:.1} ms | {:.1} ms | {} | - | - | - | {} |",
+            "| {} | {:.4} | {:.4} | {:.4} | {:.4} | {:.4} | {:.4} | {:.1} ms | {:.1} ms | {:.1} ms | {} | {} | - | - | - | {} |",
             r.strategy,
             r.overall_containment,
             r.overall_token_f1,
@@ -754,13 +756,14 @@ fn write_cognitive_markdown(result: &CognitiveSuiteResult, w: &mut dyn Write) ->
             r.execution_latency.p50.as_secs_f64() * 1_000.0,
             r.execution_latency.p95.as_secs_f64() * 1_000.0,
             r.execution_latency.p99.as_secs_f64() * 1_000.0,
+            format_tokens_per_query(r),
             r.token_cost.total_tokens,
             format_reproducibility(r.reproducibility.as_ref()),
         )?;
         for baseline in &r.baselines {
             writeln!(
                 w,
-                "| {} | {:.4} | {:.4} | {:.4} | {:.4} | {:.4} | {:.4} | {:.1} ms | {:.1} ms | {:.1} ms | {} | {:+.4} | {:+.1} ms | {:+} | {} |",
+                "| {} | {:.4} | {:.4} | {:.4} | {:.4} | {:.4} | {:.4} | {:.1} ms | {:.1} ms | {:.1} ms | {} | {} | {:+.4} | {:+.1} ms | {:+} | {} |",
                 baseline.strategy,
                 baseline.overall_containment,
                 baseline.overall_token_f1,
@@ -771,6 +774,7 @@ fn write_cognitive_markdown(result: &CognitiveSuiteResult, w: &mut dyn Write) ->
                 baseline.execution_latency.p50.as_secs_f64() * 1_000.0,
                 baseline.execution_latency.p95.as_secs_f64() * 1_000.0,
                 baseline.execution_latency.p99.as_secs_f64() * 1_000.0,
+                format_tokens_per_query(baseline),
                 baseline.token_cost.total_tokens,
                 r.overall_containment - baseline.overall_containment,
                 (r.execution_latency.p95.as_secs_f64()
@@ -948,9 +952,10 @@ fn write_cognitive_csv_row(
     w: &mut dyn Write,
 ) -> io::Result<()> {
     let repro = result.reproducibility.as_ref();
+    let truncated = result.truncated.unwrap_or_default();
     writeln!(
         w,
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{},{},{},{},{:.3},{:.3},{:.3},{},{:.4},{:.4},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{},{},{},{:.1},{},{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{},{:.4},{:.4},{}",
         result.benchmark,
         result.strategy,
         result.run_id,
@@ -990,6 +995,14 @@ fn write_cognitive_csv_row(
         result.token_cost.context_tokens,
         result.token_cost.prompt_tokens,
         result.token_cost.total_tokens,
+        result.tokens_per_query_mean,
+        result.tokens_per_query_p50,
+        result.tokens_per_query_p95,
+        result.token_estimator,
+        result.oracle_assisted,
+        truncated.sessions,
+        truncated.records,
+        truncated.queries,
         result.total_queries,
         result.ingest_time_secs,
         result.query_time_secs,
@@ -999,6 +1012,69 @@ fn write_cognitive_csv_row(
         repro.map_or(0.0, |summary| summary.max_relative_delta),
         repro.is_some_and(|summary| summary.materially_similar),
     )
+}
+
+/// Benchmark label for summary tables; oracle-assisted suites carry a `†`
+/// marker that is explained in the footnotes below the table.
+fn format_benchmark_label(result: &CognitiveResult) -> String {
+    if result.oracle_assisted {
+        format!("{} †", result.benchmark)
+    } else {
+        result.benchmark.clone()
+    }
+}
+
+/// Render mean (p50/p95) tokens returned to the reader per query.
+fn format_tokens_per_query(result: &CognitiveResult) -> String {
+    format!(
+        "{:.0} (p50 {} / p95 {})",
+        result.tokens_per_query_mean, result.tokens_per_query_p50, result.tokens_per_query_p95,
+    )
+}
+
+/// Machine-derived honesty footnotes: oracle-assisted routing, dataset
+/// truncation, and the token estimator behind the tokens-per-query column.
+fn write_cognitive_honesty_footnotes(
+    result: &CognitiveSuiteResult,
+    w: &mut dyn Write,
+) -> io::Result<()> {
+    if result.results.iter().any(|r| r.oracle_assisted) {
+        writeln!(
+            w,
+            "† `oracle_assisted`: query routing derived namespace/temporal hints from ground-truth \
+             labels (H2 temporal cutoffs, H4 agent namespaces, H6 category routing). These scores \
+             measure retrieval *given* oracle routing, not end-to-end routing."
+        )?;
+        writeln!(w)?;
+    }
+
+    for r in &result.results {
+        if let Some(truncated) = &r.truncated {
+            writeln!(
+                w,
+                "⚠ `{}` ran on a TRUNCATED dataset: load/safety limits dropped sessions={}, \
+                 records={}, queries={}. Do not publish as a full-corpus result.",
+                r.benchmark, truncated.sessions, truncated.records, truncated.queries,
+            )?;
+            writeln!(w)?;
+        }
+    }
+
+    if let Some(estimated) = result
+        .results
+        .iter()
+        .find(|r| !r.token_estimator.is_empty())
+    {
+        writeln!(
+            w,
+            "Tokens / query counts the tokens returned to the (hypothetical) reader per executed \
+             query — assembled THINK context plus RECALL result contents — using estimator `{}`.",
+            estimated.token_estimator,
+        )?;
+        writeln!(w)?;
+    }
+
+    Ok(())
 }
 
 fn format_active_retrieval_surfaces(surfaces: &ActiveRetrievalSurfaces) -> String {
@@ -1148,6 +1224,12 @@ mod tests {
                 0,
                 10,
             ),
+            tokens_per_query_mean: total_tokens as f64 / 10.0,
+            tokens_per_query_p50: total_tokens / 10,
+            tokens_per_query_p95: total_tokens / 8,
+            token_estimator: "tiktoken-rs/cl100k_base".to_string(),
+            oracle_assisted: false,
+            truncated: None,
             total_queries: 10,
             ingest_time_secs: 0.2,
             query_time_secs: 0.4,
@@ -1397,6 +1479,69 @@ mod tests {
         assert!(markdown.contains("execute-plan"));
         assert!(markdown.contains("assemble"));
         assert!(markdown.contains("total"));
+    }
+
+    #[test]
+    fn cognitive_markdown_includes_tokens_per_query_column_and_estimator_note() {
+        let result = sample_cognitive_suite();
+        let mut buf = Vec::new();
+        write_cognitive_result(&result, OutputFormat::Markdown, &mut buf).unwrap();
+        let markdown = String::from_utf8(buf).unwrap();
+        assert!(markdown.contains("Tokens / query"));
+        assert!(markdown.contains("(p50 64 / p95 80)"));
+        assert!(markdown.contains("estimator `tiktoken-rs/cl100k_base`"));
+        // No oracle-assisted or truncated results in the sample suite.
+        assert!(!markdown.contains("oracle_assisted"));
+        assert!(!markdown.contains("TRUNCATED"));
+    }
+
+    #[test]
+    fn cognitive_markdown_flags_oracle_assisted_and_truncated_runs() {
+        let mut result = sample_cognitive_suite();
+        result.results[0].oracle_assisted = true;
+        result.results[0].truncated = Some(crate::cognitive::TruncationSummary {
+            sessions: 3,
+            queries: 7,
+            records: 42,
+        });
+        let mut buf = Vec::new();
+        write_cognitive_result(&result, OutputFormat::Markdown, &mut buf).unwrap();
+        let markdown = String::from_utf8(buf).unwrap();
+        assert!(markdown.contains("h1-retrieval †"));
+        assert!(markdown.contains("`oracle_assisted`"));
+        assert!(markdown.contains("TRUNCATED"));
+        assert!(markdown.contains("sessions=3"));
+        assert!(markdown.contains("records=42"));
+        assert!(markdown.contains("queries=7"));
+    }
+
+    #[test]
+    fn cognitive_json_includes_honesty_fields() {
+        let mut result = sample_cognitive_suite();
+        result.results[0].oracle_assisted = true;
+        result.results[0].truncated = Some(crate::cognitive::TruncationSummary {
+            sessions: 1,
+            queries: 2,
+            records: 3,
+        });
+        let mut buf = Vec::new();
+        write_cognitive_result(&result, OutputFormat::Json, &mut buf).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        let primary = &json["results"][0];
+        assert_eq!(primary["oracle_assisted"], serde_json::json!(true));
+        assert_eq!(primary["truncated"]["sessions"], serde_json::json!(1));
+        assert_eq!(primary["tokens_per_query_mean"], serde_json::json!(64.0));
+        assert_eq!(primary["tokens_per_query_p50"], serde_json::json!(64));
+        assert_eq!(primary["tokens_per_query_p95"], serde_json::json!(80));
+        assert_eq!(
+            primary["token_estimator"],
+            serde_json::json!("tiktoken-rs/cl100k_base")
+        );
+        // Baselines never use oracle routing and stay unflagged.
+        assert_eq!(
+            primary["baselines"][0]["oracle_assisted"],
+            serde_json::json!(false)
+        );
     }
 
     #[test]

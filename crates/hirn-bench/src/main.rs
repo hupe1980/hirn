@@ -418,9 +418,9 @@ enum Command {
         environment_label: Option<String>,
     },
 
-    /// Run benchmarks against an external dataset (LoCoMo, DMR) (F-38).
+    /// Run benchmarks against an external dataset (LoCoMo, DMR, LongMemEval, BEAM) (F-38).
     External {
-        /// External format: locomo, dmr, longmemeval.
+        /// External format: locomo, dmr, longmemeval, beam.
         #[arg(long)]
         format_name: String,
 
@@ -573,12 +573,12 @@ enum Command {
         max_api_texts: usize,
     },
 
-    /// Precompute OpenAI embeddings for an external dataset (LoCoMo, DMR, LongMemEval).
+    /// Precompute OpenAI embeddings for an external dataset (LoCoMo, DMR, LongMemEval, BEAM).
     ///
     /// Reads OPENAI_API_KEY from environment or .env file.
     /// Incrementally caches: re-running only embeds new/missing texts.
     PrecomputeExternal {
-        /// External format: locomo, dmr, longmemeval.
+        /// External format: locomo, dmr, longmemeval, beam.
         #[arg(long)]
         format_name: String,
 
@@ -1553,6 +1553,12 @@ fn run_external(
                     eprintln!("Error downloading LongMemEval: {e}");
                     std::process::exit(1);
                 }),
+            "beam" => {
+                eprintln!(
+                    "Error: BEAM auto-download is not supported (the corpus is published as per-conversation directories). Clone github.com/mohammadtavakoli78/BEAM or download Mohammadta/BEAM from HuggingFace and pass --data-dir."
+                );
+                std::process::exit(1);
+            }
             _ => {
                 eprintln!(
                     "Error: --auto-download is only supported for 'locomo', 'dmr', and 'longmemeval' formats"
@@ -1581,8 +1587,9 @@ fn run_external(
         "longmemeval" | "lme" => {
             cognitive::external::load_longmemeval_with_limits(&data_path, limit_hint)
         }
+        "beam" => cognitive::external::load_beam_with_limits(&data_path, limit_hint),
         other => Err(format!(
-            "unsupported format: {other} (expected: locomo, dmr, longmemeval)"
+            "unsupported format: {other} (expected: locomo, dmr, longmemeval, beam)"
         )),
     }
     .unwrap_or_else(|e| {
@@ -1616,6 +1623,20 @@ fn run_external(
             max_records,
             max_queries,
         );
+
+        // Fold post-load safety-limit drops into the dataset truncation note
+        // so published artifacts flag partial runs regardless of which stage
+        // dropped the data.
+        let safety_dropped = cognitive::TruncationSummary {
+            sessions: original_size.sessions - limited_size.sessions,
+            records: original_size.records - limited_size.records,
+            queries: original_size.queries - limited_size.queries,
+        };
+        if !safety_dropped.is_empty() {
+            let mut merged = dataset.truncated.unwrap_or_default();
+            merged.merge(&safety_dropped);
+            dataset.truncated = Some(merged);
+        }
     }
 
     if dataset.sessions.is_empty() || dataset.queries.is_empty() {
@@ -1769,7 +1790,7 @@ fn run_external(
     }
 
     eprintln!(
-        "  containment={:.4} token_f1={:.4} recall={:.4} mrr={:.4} ndcg={:.4} fpr={:.4} p95={:.2}ms tokens={} ({:.2}s)",
+        "  containment={:.4} token_f1={:.4} recall={:.4} mrr={:.4} ndcg={:.4} fpr={:.4} p95={:.2}ms tokens={} tokens/query={:.0} (p50 {} / p95 {}, estimator {}) ({:.2}s)",
         result.overall_containment,
         result.overall_token_f1,
         result.overall_recall_accuracy,
@@ -1778,6 +1799,10 @@ fn run_external(
         result.false_positive_rate,
         result.execution_latency.p95.as_secs_f64() * 1_000.0,
         result.token_cost.total_tokens,
+        result.tokens_per_query_mean,
+        result.tokens_per_query_p50,
+        result.tokens_per_query_p95,
+        result.token_estimator,
         result.total_time_secs,
     );
     for baseline in &result.baselines {
@@ -1980,6 +2005,12 @@ fn run_precompute_external(
                     eprintln!("Error downloading LongMemEval: {e}");
                     std::process::exit(1);
                 }),
+            "beam" => {
+                eprintln!(
+                    "Error: BEAM auto-download is not supported (the corpus is published as per-conversation directories). Clone github.com/mohammadtavakoli78/BEAM or download Mohammadta/BEAM from HuggingFace and pass --data-dir."
+                );
+                std::process::exit(1);
+            }
             _ => {
                 eprintln!(
                     "Error: --auto-download is only supported for 'locomo', 'dmr', and 'longmemeval' formats"
@@ -1996,6 +2027,7 @@ fn run_precompute_external(
         "locomo" => cognitive::external::load_locomo(&data_path),
         "dmr" => cognitive::external::load_dmr(&data_path),
         "longmemeval" | "lme" => cognitive::external::load_longmemeval(&data_path),
+        "beam" => cognitive::external::load_beam(&data_path),
         other => Err(format!("unsupported format: {other}")),
     }
     .unwrap_or_else(|e| {
@@ -2188,6 +2220,16 @@ fn average_cognitive_results(runs: &[cognitive::CognitiveResult]) -> cognitive::
         evaluation_latency: average_latency_stats(runs.iter().map(|run| &run.evaluation_latency)),
         end_to_end_latency: average_latency_stats(runs.iter().map(|run| &run.end_to_end_latency)),
         token_cost: average_token_cost(runs),
+        tokens_per_query_mean: runs.iter().map(|r| r.tokens_per_query_mean).sum::<f64>() / n,
+        tokens_per_query_p50: (runs.iter().map(|r| r.tokens_per_query_p50).sum::<usize>() as f64
+            / n)
+            .round() as usize,
+        tokens_per_query_p95: (runs.iter().map(|r| r.tokens_per_query_p95).sum::<usize>() as f64
+            / n)
+            .round() as usize,
+        token_estimator: first.token_estimator.clone(),
+        oracle_assisted: first.oracle_assisted,
+        truncated: first.truncated,
         total_queries: first.total_queries,
         ingest_time_secs: runs.iter().map(|r| r.ingest_time_secs).sum::<f64>() / n,
         query_time_secs: runs.iter().map(|r| r.query_time_secs).sum::<f64>() / n,

@@ -59,6 +59,10 @@ pub struct ServerConfig {
     #[serde(default)]
     pub mcp: McpConfig,
 
+    /// Sleep-time consolidation (idle-time cognitive maintenance) settings
+    #[serde(default)]
+    pub sleep: SleepConfig,
+
     /// Remote storage backend configuration (S3, GCS, Azure).
     /// When set, realms use the remote object store instead of local filesystem.
     pub storage: Option<StorageBackendConfig>,
@@ -318,6 +322,81 @@ impl Default for McpConfig {
     }
 }
 
+/// Sleep-time consolidation configuration.
+///
+/// When the daemon has seen no authenticated request for `idle_after_secs`,
+/// a background scheduler runs one budgeted maintenance pass per open realm
+/// (consolidation pipeline + bounded offline cognition jobs), spaced at
+/// least `min_pass_interval_secs` apart. See `docs/deployment.md`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SleepConfig {
+    /// Enable idle-time sleep passes (default: true).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Seconds without any authenticated request before the daemon counts
+    /// as idle (default: 300).
+    #[serde(default = "default_sleep_idle_after")]
+    pub idle_after_secs: u64,
+    /// How often (seconds) the scheduler wakes to evaluate idleness
+    /// (default: 60).
+    #[serde(default = "default_sleep_check_interval")]
+    pub check_interval_secs: u64,
+    /// Minimum seconds between the end of one sleep pass and the start of
+    /// the next (default: 3600).
+    #[serde(default = "default_sleep_min_pass_interval")]
+    pub min_pass_interval_secs: u64,
+}
+
+impl Default for SleepConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            idle_after_secs: default_sleep_idle_after(),
+            check_interval_secs: default_sleep_check_interval(),
+            min_pass_interval_secs: default_sleep_min_pass_interval(),
+        }
+    }
+}
+
+impl SleepConfig {
+    /// Validate sleep scheduling parameters for logical consistency.
+    /// A disabled section is accepted as-is, since none of its values are used.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.check_interval_secs == 0 {
+            return Err("sleep.check_interval_secs must be > 0".to_string());
+        }
+        if self.idle_after_secs == 0 {
+            return Err("sleep.idle_after_secs must be > 0".to_string());
+        }
+        if self.min_pass_interval_secs == 0 {
+            return Err("sleep.min_pass_interval_secs must be > 0".to_string());
+        }
+        if self.idle_after_secs < self.check_interval_secs {
+            return Err(format!(
+                "sleep.idle_after_secs ({}) must be >= sleep.check_interval_secs ({}) — \
+                 otherwise the idle window is finer than the scheduler can observe",
+                self.idle_after_secs, self.check_interval_secs
+            ));
+        }
+        Ok(())
+    }
+}
+
+const fn default_sleep_idle_after() -> u64 {
+    300
+}
+
+const fn default_sleep_check_interval() -> u64 {
+    60
+}
+
+const fn default_sleep_min_pass_interval() -> u64 {
+    3600
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct EngineConfig {
     pub embedding_dimensions: Option<u32>,
@@ -326,6 +405,10 @@ pub struct EngineConfig {
     pub decay_lambda: Option<f64>,
     pub archive_threshold: Option<f32>,
     pub max_episodic_entries: Option<u32>,
+    /// Enable the engine's offline cognition scheduler (dream/reconcile/
+    /// planning jobs). Off by default in the engine; the daemon's sleep-time
+    /// pass can only enqueue offline jobs when this is set.
+    pub offline_scheduler_enabled: Option<bool>,
 }
 
 /// Remote storage backend configuration.
@@ -414,6 +497,7 @@ impl ServerConfig {
         }
 
         self.throttle.validate()?;
+        self.sleep.validate()?;
 
         // The MCP listener has no per-request auth (transport limitation), so
         // outside explicit dev mode it must authenticate via a startup
@@ -491,6 +575,7 @@ impl Default for ServerConfig {
             watch: WatchConfig::default(),
             engine: EngineConfig::default(),
             mcp: McpConfig::default(),
+            sleep: SleepConfig::default(),
             storage: None,
             raft: None,
         }
@@ -924,5 +1009,87 @@ mod tests {
             client_ca_path: Some(PathBuf::from("ca.crt")),
         });
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn sleep_defaults_are_valid() {
+        let sleep = SleepConfig::default();
+        assert!(sleep.enabled);
+        assert_eq!(sleep.idle_after_secs, 300);
+        assert_eq!(sleep.check_interval_secs, 60);
+        assert_eq!(sleep.min_pass_interval_secs, 3600);
+        sleep.validate().unwrap();
+    }
+
+    #[test]
+    fn sleep_rejects_zero_intervals() {
+        for field in ["idle_after", "check_interval", "min_pass_interval"] {
+            let mut sleep = SleepConfig::default();
+            match field {
+                "idle_after" => sleep.idle_after_secs = 0,
+                "check_interval" => sleep.check_interval_secs = 0,
+                _ => sleep.min_pass_interval_secs = 0,
+            }
+            let err = sleep.validate().unwrap_err();
+            assert!(err.contains("must be > 0"), "unexpected error: {err}");
+        }
+    }
+
+    #[test]
+    fn sleep_idle_window_must_cover_check_interval() {
+        let mut sleep = SleepConfig::default();
+        sleep.idle_after_secs = 30;
+        sleep.check_interval_secs = 60;
+
+        let err = sleep.validate().unwrap_err();
+        assert!(
+            err.contains("sleep.idle_after_secs"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn disabled_sleep_section_skips_interval_validation() {
+        let sleep = SleepConfig {
+            enabled: false,
+            idle_after_secs: 0,
+            check_interval_secs: 0,
+            min_pass_interval_secs: 0,
+        };
+        sleep.validate().unwrap();
+    }
+
+    #[test]
+    fn server_validation_covers_sleep_section() {
+        let mut config = ServerConfig::default();
+        config.auth = Some(auth_config());
+        // Mirror neighboring production fixtures: disable MCP so its own
+        // auth_token requirement doesn't fire before the sleep check.
+        config.mcp.enabled = false;
+        config.sleep.idle_after_secs = 0;
+
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.contains("sleep.idle_after_secs"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn sleep_section_deserializes_with_partial_toml() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+            insecure_dev_mode = true
+
+            [sleep]
+            idle_after_secs = 120
+            "#,
+        )
+        .unwrap();
+
+        assert!(config.sleep.enabled);
+        assert_eq!(config.sleep.idle_after_secs, 120);
+        assert_eq!(config.sleep.check_interval_secs, 60);
+        assert_eq!(config.sleep.min_pass_interval_secs, 3600);
     }
 }

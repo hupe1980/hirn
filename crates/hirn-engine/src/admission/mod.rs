@@ -30,7 +30,7 @@ pub use controllers::rate_limiter::RateLimiter;
 pub use controllers::surprise::SurpriseGate;
 pub use controllers::token_budget::TokenBudgetGate;
 pub use decision::{AdmissionDecision, ControllerVerdict};
-pub use pipeline::{AdmissionPipeline, PipelineResult};
+pub use pipeline::{AdmissionPipeline, AdmissionReservation, PipelineResult};
 
 use hirn_core::HirnResult;
 
@@ -44,5 +44,19 @@ pub trait AdmissionController: Send + Sync {
     fn name(&self) -> &str;
 
     /// Evaluate a candidate and return a decision.
+    ///
+    /// A controller that tracks resources (e.g. token budgets) should treat an
+    /// `Accept` as a *reservation*: the pipeline guarantees exactly one of
+    /// [`commit`](Self::commit) or [`release`](Self::release) follows for every
+    /// accepted candidate.
     async fn evaluate(&self, candidate: &MemoryCandidate) -> HirnResult<AdmissionDecision>;
+
+    /// The admitted candidate was durably persisted — convert any reservation
+    /// into confirmed usage. Default: no-op.
+    async fn commit(&self, _candidate: &MemoryCandidate) {}
+
+    /// The admitted candidate will NOT be persisted (a later controller
+    /// rejected it, or the write failed) — drop any reservation. Default:
+    /// no-op.
+    async fn release(&self, _candidate: &MemoryCandidate) {}
 }

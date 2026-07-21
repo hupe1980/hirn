@@ -35,6 +35,7 @@ pub fn load(benchmark: Benchmark, data_dir: &Path) -> Result<CognitiveDataset, S
         benchmark,
         sessions,
         queries,
+        truncated: None,
     })
 }
 

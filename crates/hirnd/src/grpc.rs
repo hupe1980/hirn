@@ -74,6 +74,7 @@ pub fn grpc_auth_interceptor(
                 );
                 return Err(Status::unauthenticated("authentication required"));
             }
+            crate::sleep::ActivityTracker::global().touch();
             return Ok(request);
         }
 
@@ -167,6 +168,7 @@ pub fn grpc_auth_interceptor(
                 .map_err(|_| Status::internal("failed to encode agent metadata"))?,
         );
 
+        crate::sleep::ActivityTracker::global().touch();
         Ok(request)
     }
 }

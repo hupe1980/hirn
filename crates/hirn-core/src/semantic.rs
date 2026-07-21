@@ -152,6 +152,15 @@ impl SemanticRecordBuilder {
         self
     }
 
+    /// Mark this record as a subjective belief (`KnowledgeType::Belief`).
+    ///
+    /// A belief's `confidence` is interpreted as a credence and is adjusted
+    /// by the Reflect operation as new evidence arrives.
+    #[must_use]
+    pub const fn belief(self) -> Self {
+        self.knowledge_type(KnowledgeType::Belief)
+    }
+
     /// Set the concept description.
     #[must_use]
     pub fn description(mut self, description: impl Into<String>) -> Self {
@@ -300,6 +309,20 @@ mod tests {
         assert_eq!(rec.concept, "caching");
         assert_eq!(rec.knowledge_type, KnowledgeType::Propositional);
         assert!((rec.confidence - 0.9).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn belief_builder_sets_knowledge_type() {
+        let rec = SemanticRecord::builder()
+            .concept("db-preference")
+            .description("Postgres is the best default choice for new services")
+            .belief()
+            .confidence(0.6)
+            .agent_id(agent())
+            .build()
+            .unwrap();
+        assert_eq!(rec.knowledge_type, KnowledgeType::Belief);
+        assert!((rec.confidence - 0.6).abs() < f32::EPSILON);
     }
 
     #[test]

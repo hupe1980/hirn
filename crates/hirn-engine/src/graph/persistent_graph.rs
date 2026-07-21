@@ -705,6 +705,17 @@ impl PersistentGraph {
             }
         }
 
+        // Reject non-finite weights before they reach storage: `f32::NAN`
+        // survives `clamp` (clamp of NaN is NaN) and then poisons every
+        // downstream PPR / spreading-activation computation in the connected
+        // component. Clamp range matches the hot-tier `PropertyGraph` ([0, 1])
+        // so both tiers store identical weights for the same insert.
+        if !weight.is_finite() {
+            return Err(hirn_core::HirnError::InvalidInput(format!(
+                "graph edge weight must be finite, got {weight}"
+            )));
+        }
+
         let now = Timestamp::now();
         let id = MemoryId::new();
 
@@ -719,7 +730,7 @@ impl PersistentGraph {
             source,
             target,
             relation,
-            weight: weight.clamp(0.01, 1.0),
+            weight: weight.clamp(0.0, 1.0),
             co_retrieval_count: 0,
             created_at: now,
             updated_at: now,
@@ -1039,6 +1050,62 @@ impl PersistentGraph {
 
         self.filter_edges_by_target_namespace(edges, allowed_namespaces)
             .await
+    }
+
+    /// Batch incoming-adjacency read: fetch all edges pointing AT a set of
+    /// frontier nodes in a single scan using a `target IN (...)` predicate.
+    ///
+    /// The backward counterpart of [`Self::batch_adjacency_read`], used to
+    /// build the forward+backward reachable set for Personalized PageRank
+    /// (seeds should pull in upstream causes, not only downstream effects).
+    pub async fn batch_incoming_adjacency_read(
+        &self,
+        frontier: &[MemoryId],
+    ) -> HirnResult<Vec<GraphEdge>> {
+        self.batch_incoming_adjacency_read_scoped(frontier, None)
+            .await
+    }
+
+    /// Batch incoming-adjacency read with a namespace filter.
+    ///
+    /// Every edge row stores its source node's namespace, so pushing
+    /// `namespace IN (...)` into the scan restricts the discovered upstream
+    /// neighbors (`edge.source`) to the allowed namespaces without per-node
+    /// lookups. Targets are the frontier itself and need no re-check.
+    pub async fn batch_incoming_adjacency_read_scoped(
+        &self,
+        frontier: &[MemoryId],
+        allowed_namespaces: Option<&[Namespace]>,
+    ) -> HirnResult<Vec<GraphEdge>> {
+        if frontier.is_empty() {
+            return Ok(vec![]);
+        }
+        if allowed_namespaces.is_some_and(<[Namespace]>::is_empty) {
+            return Ok(vec![]);
+        }
+        if !self.storage.exists(DATASET_EDGES_NAME).await? {
+            return Ok(vec![]);
+        }
+
+        let mut predicate = format!(
+            "target IN ({})",
+            Self::quoted_in_values(frontier).join(", ")
+        );
+        if let Some(allowed_namespaces) = allowed_namespaces {
+            predicate.push_str(" AND namespace IN (");
+            predicate.push_str(&Self::quoted_namespace_values(allowed_namespaces).join(", "));
+            predicate.push(')');
+        }
+
+        self.scan_edges(ScanOptions {
+            columns: None,
+            filter: Some(predicate),
+            exact_filter: None,
+            order_by: None,
+            limit: None,
+            offset: None,
+        })
+        .await
     }
 
     /// Batch adjacency read with a relation type filter.

@@ -838,20 +838,25 @@ impl HirnDB {
     /// Prepare a parameterized HirnQL query for later execution.
     ///
     /// Parameters use `$1`, `$2` (positional) or `$name` (named) syntax.
-    /// The returned `PreparedStatement` holds a pre-compiled plan that is
-    /// reused across multiple `execute_prepared` calls.
+    /// The returned `PreparedStatement` holds the AST template parsed once
+    /// here; it is reused (cloned and bound) across multiple
+    /// `execute_prepared` calls.
     pub(crate) fn prepare(&self, query: &str) -> HirnResult<crate::ql::PreparedStatement> {
         crate::ql::prepare(query, None).map_err(HirnError::from)
     }
 
     /// Execute a prepared statement with bound parameter values.
+    ///
+    /// Binding substitutes values into the template AST and the bound AST is
+    /// executed directly through the same compiled pipeline as `execute_ql`
+    /// — it is never serialized back to query text and re-parsed.
     pub(crate) async fn execute_prepared(
         &self,
         prepared: &crate::ql::PreparedStatement,
         params: &std::collections::HashMap<String, String>,
     ) -> HirnResult<crate::ql::results::QueryResult> {
-        let compiled = crate::ql::bind(prepared, params).map_err(HirnError::from)?;
-        self.execute_ql(&compiled.source).await
+        let bound = crate::ql::bind(prepared, params).map_err(HirnError::from)?;
+        self.execute_statement(bound).await
     }
 
     /// Start building a HirnQL query via the programmatic API.

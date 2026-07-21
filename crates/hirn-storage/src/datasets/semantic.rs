@@ -416,6 +416,7 @@ const fn knowledge_type_to_str(kt: KnowledgeType) -> &'static str {
         KnowledgeType::Inferred => "Inferred",
         KnowledgeType::Community => "Community",
         KnowledgeType::RaptorSummary => "RaptorSummary",
+        KnowledgeType::Belief => "Belief",
     }
 }
 
@@ -427,6 +428,7 @@ fn str_to_knowledge_type(s: &str) -> Result<KnowledgeType, HirnDbError> {
         "Inferred" => Ok(KnowledgeType::Inferred),
         "Community" => Ok(KnowledgeType::Community),
         "RaptorSummary" => Ok(KnowledgeType::RaptorSummary),
+        "Belief" => Ok(KnowledgeType::Belief),
         _ => Err(HirnDbError::InvalidArgument(format!(
             "unknown knowledge type: {s}"
         ))),

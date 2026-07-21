@@ -236,6 +236,32 @@ impl<'a> SemanticView<'a> {
     ) -> HirnResult<SemanticRecord> {
         self.0.get_semantic_by_concept_ns(name, namespace).await
     }
+
+    /// Reflect an evidence record (episodic or semantic) against the top-K
+    /// nearest beliefs in the same namespace, adjusting their confidence via
+    /// auditable corrective revisions.
+    ///
+    /// Uses the heuristic classifier; see [`Self::reflect_with_llm`] for
+    /// LLM-backed classification.
+    #[inline]
+    pub async fn reflect(
+        &self,
+        evidence_id: MemoryId,
+    ) -> HirnResult<Vec<crate::consolidation::ReflectionUpdate>> {
+        self.0.reflect_semantic(evidence_id, None, None).await
+    }
+
+    /// Reflect an evidence record against nearby beliefs using an LLM to
+    /// judge whether the evidence reinforces, weakens, or contradicts each
+    /// belief. Falls back to the heuristic when the provider fails.
+    #[inline]
+    pub async fn reflect_with_llm(
+        &self,
+        evidence_id: MemoryId,
+        llm: &dyn hirn_core::embed::LlmProvider,
+    ) -> HirnResult<Vec<crate::consolidation::ReflectionUpdate>> {
+        self.0.reflect_semantic(evidence_id, None, Some(llm)).await
+    }
 }
 
 // ---------------------------------------------------------------------------

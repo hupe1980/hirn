@@ -21,10 +21,10 @@ use hirn_core::offline::{
 use hirn_core::procedural::ProceduralRecord;
 use hirn_core::provenance::EvidenceRef;
 use hirn_core::resource::{EvidenceLink, EvidenceRole, ResourceId};
-use hirn_core::revision::RevisionOperation;
+use hirn_core::revision::{LogicalMemoryId, RevisionId, RevisionOperation};
 use hirn_core::semantic::SemanticRecord;
 use hirn_core::tokenizer::EstimatingTokenizer;
-use hirn_core::types::{AgentId, KnowledgeType, Namespace, Origin};
+use hirn_core::types::{AgentId, KnowledgeType, MutationTrigger, Namespace, Origin};
 use hirn_core::{
     ConflictResolutionPolicy, ConflictResolutionPolicyOverrides, HirnError, HirnResult, MemoryId,
     QuarantinedRecordKind, Timestamp, TokenCounter,
@@ -39,7 +39,11 @@ use parking_lot::Mutex;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
-use crate::consolidation::{DreamCycleConfig, generate_text_with_timeout};
+use crate::consolidation::{
+    DreamCycleConfig, ReflectionOutcome, apply_reflection_outcome, build_reflection_prompt,
+    generate_text_with_timeout, heuristic_reflection_outcome, parse_reflection_response,
+    reflection_cosine_similarity,
+};
 use crate::provider_registry::ProviderRegistry;
 use crate::ql::context::{
     ConflictArbitrationStatus, ConflictGroup, ConflictMemberStatus, build_semantic_conflict_groups,
@@ -177,6 +181,9 @@ impl OfflineSchedulerRuntime {
         plan_quality_threshold: f32,
         decay_factor: f64,
         decay_sweep_window_secs: u64,
+        reflection_similarity_threshold: f32,
+        reflection_top_k: usize,
+        embedding_dimensions: usize,
     ) -> HirnResult<Self> {
         let fallback_default_realm = default_realm.clone();
         let state = Arc::new(SchedulerState {
@@ -210,6 +217,9 @@ impl OfflineSchedulerRuntime {
                 plan_quality_threshold,
                 decay_factor,
                 decay_sweep_window_secs,
+                reflection_similarity_threshold,
+                reflection_top_k,
+                embedding_dimensions,
             )),
         });
         let runtime = Self {
@@ -951,6 +961,12 @@ struct DefaultOfflineJobExecutor {
     decay_factor: f64,
     /// Only memories with last_accessed_at older than this window are touched.
     decay_sweep_window_secs: u64,
+    /// Similarity gate below which evidence/belief pairs are `Unrelated`.
+    reflection_similarity_threshold: f32,
+    /// Number of nearest beliefs each evidence record is reflected against.
+    reflection_top_k: usize,
+    /// Embedding width used when re-encoding semantic revision rows.
+    embedding_dimensions: usize,
 }
 
 impl DefaultOfflineJobExecutor {
@@ -964,6 +980,9 @@ impl DefaultOfflineJobExecutor {
         plan_quality_threshold: f32,
         decay_factor: f64,
         decay_sweep_window_secs: u64,
+        reflection_similarity_threshold: f32,
+        reflection_top_k: usize,
+        embedding_dimensions: usize,
     ) -> Self {
         let registry = ProviderRegistry::from_env();
         let llm = registry
@@ -981,6 +1000,9 @@ impl DefaultOfflineJobExecutor {
             plan_quality_threshold,
             decay_factor,
             decay_sweep_window_secs,
+            reflection_similarity_threshold,
+            reflection_top_k,
+            embedding_dimensions,
         }
     }
 
@@ -1612,6 +1634,311 @@ impl DefaultOfflineJobExecutor {
         Ok(())
     }
 
+    /// Hindsight-style reflection sweep (`CognitiveJobKind::Reflect`).
+    ///
+    /// Sweeps recent episodic evidence in the target namespace — bounded by
+    /// the job's `temporal_window` cursor when present, most recent first
+    /// otherwise — and reflects each evidence record against the nearest
+    /// active beliefs (`KnowledgeType::Belief` heads). Confidence dynamics
+    /// are applied as appended `Correct` revisions with the rationale as the
+    /// revision reason and the evidence id as the revision causation, so the
+    /// belief chain stays bi-temporally auditable.
+    ///
+    /// Storage-direct like `run_evolve`: the in-process semantic head cache
+    /// and the property graph are not reachable from the offline executor,
+    /// so contradictions found here are recorded in `contradiction_ids`
+    /// without a `Contradicts` graph edge (the online `reflect()` entry point
+    /// draws the edge as well).
+    async fn run_reflect(&self, record: OfflineJobRecord) -> HirnResult<OfflineJobRunResult> {
+        if record.job.target.event_segment.is_some() {
+            return Ok(Err(OfflineJobSkip {
+                reason: "offline reflect operator supports namespace, temporal_window, and memory_ids targets only".to_string(),
+            }));
+        }
+
+        // ── Belief candidates ────────────────────────────────────────────
+        let beliefs: Vec<SemanticRecord> = self
+            .load_active_semantic_heads(record.namespace)
+            .await?
+            .into_iter()
+            .filter(|head| head.knowledge_type == KnowledgeType::Belief)
+            .collect();
+        if beliefs.is_empty() {
+            return Ok(Err(OfflineJobSkip {
+                reason: format!(
+                    "offline reflect operator found no active beliefs in namespace '{}'",
+                    record.namespace
+                ),
+            }));
+        }
+
+        // ── Evidence sweep (episodic heads since the cursor) ─────────────
+        let evidence = self.load_reflect_evidence(&record).await?;
+        if evidence.is_empty() {
+            return Ok(Err(OfflineJobSkip {
+                reason: "offline reflect operator found no episodic evidence with embeddings for the selected target".to_string(),
+            }));
+        }
+
+        // Live belief heads keyed by chain so consecutive evidence items keep
+        // extending the same revision chain within this sweep.
+        let mut belief_heads: HashMap<LogicalMemoryId, SemanticRecord> = beliefs
+            .into_iter()
+            .map(|head| (head.logical_memory_id, head))
+            .collect();
+
+        let top_k = self.reflection_top_k.max(1);
+        let max_updates = record.job.budget.max_result_volume.max(1) as usize;
+        let mut total_tokens = 0u32;
+        let mut new_revisions: Vec<SemanticRecord> = Vec::new();
+        let mut affected_memory_ids: Vec<MemoryId> = Vec::new();
+        let mut outcome_counts: BTreeMap<&'static str, usize> = BTreeMap::new();
+        let mut budget_exhausted = false;
+
+        'evidence: for episode in &evidence {
+            let Some(ref evidence_embedding) = episode.embedding else {
+                continue;
+            };
+            let evidence_text = if episode.content.is_empty() {
+                episode.summary.as_str()
+            } else {
+                episode.content.as_str()
+            };
+            if evidence_text.trim().is_empty() {
+                continue;
+            }
+
+            // Rank this episode against the current belief heads.
+            let mut ranked: Vec<(LogicalMemoryId, f32)> = belief_heads
+                .values()
+                .map(|belief| {
+                    let similarity = belief
+                        .embedding
+                        .as_deref()
+                        .map(|embedding| {
+                            reflection_cosine_similarity(evidence_embedding, embedding)
+                        })
+                        .unwrap_or(0.0);
+                    (belief.logical_memory_id, similarity)
+                })
+                .collect();
+            ranked.sort_by(|left, right| {
+                right
+                    .1
+                    .partial_cmp(&left.1)
+                    .unwrap_or(Ordering::Equal)
+                    .then_with(|| left.0.cmp(&right.0))
+            });
+            ranked.truncate(top_k);
+
+            for (logical_memory_id, similarity) in ranked {
+                if similarity < self.reflection_similarity_threshold {
+                    // Below the cheap gate: unrelated, nothing to record.
+                    continue;
+                }
+                let Some(belief) = belief_heads.get(&logical_memory_id) else {
+                    continue;
+                };
+
+                let (outcome, rationale, used_fallback, tokens) = self
+                    .classify_reflection_outcome(belief, evidence_text)
+                    .await;
+                if total_tokens.saturating_add(tokens) > record.job.budget.token_limit {
+                    budget_exhausted = true;
+                    break 'evidence;
+                }
+                total_tokens = total_tokens.saturating_add(tokens);
+
+                if outcome == ReflectionOutcome::Unrelated {
+                    continue;
+                }
+
+                let successor = build_reflection_successor(
+                    belief,
+                    outcome,
+                    &rationale,
+                    episode.id,
+                    if used_fallback {
+                        "heuristic-offline-reflect".to_string()
+                    } else {
+                        format!("offline-reflect:{}", self.llm.model_id())
+                    },
+                );
+                *outcome_counts.entry(outcome.as_str()).or_default() += 1;
+                affected_memory_ids.push(successor.id);
+                belief_heads.insert(logical_memory_id, successor.clone());
+                new_revisions.push(successor);
+
+                if new_revisions.len() >= max_updates {
+                    budget_exhausted = true;
+                    break 'evidence;
+                }
+            }
+        }
+
+        if new_revisions.is_empty() {
+            return Ok(Err(OfflineJobSkip {
+                reason: "offline reflect operator classified all evidence/belief pairs as unrelated; no belief updated".to_string(),
+            }));
+        }
+
+        let batch = semantic::to_batch(&new_revisions, self.embedding_dimensions)
+            .map_err(HirnError::storage)?;
+        self.storage
+            .append(semantic::DATASET_NAME, batch)
+            .await
+            .map_err(HirnError::storage)?;
+
+        let result_count = new_revisions.len() as u32;
+        Ok(Ok(OfflineJobOutcome {
+            tokens_consumed: total_tokens,
+            provider_spend_usd: 0.0,
+            result_count,
+            affected_memory_ids,
+            input_summary: Some(format!(
+                "reflect target {}; evidence={}; beliefs={}",
+                describe_target(&record),
+                evidence.len(),
+                belief_heads.len()
+            )),
+            output_summary: Some(format!(
+                "appended {result_count} belief revision(s): {}{}",
+                summarize_action_counts(&outcome_counts),
+                if budget_exhausted {
+                    "; stopped at budget"
+                } else {
+                    ""
+                }
+            )),
+            generated_review: None,
+            change_summary: Some(format!(
+                "adjusted belief confidence via {result_count} corrective revision(s); revision reasons carry the reflection rationale"
+            )),
+        }))
+    }
+
+    /// Load the newest live episodic revisions for the reflect sweep.
+    ///
+    /// The job's `temporal_window` acts as the sweep cursor over event time
+    /// (`timestamp_ms`); explicit `memory_ids` narrow the sweep further.
+    /// Without a window the most recent records are considered, capped by the
+    /// job's `max_result_volume`.
+    async fn load_reflect_evidence(
+        &self,
+        record: &OfflineJobRecord,
+    ) -> HirnResult<Vec<EpisodicRecord>> {
+        let namespace = record.namespace.as_str().replace('\'', "''");
+        let mut filter = format!("namespace = '{namespace}'");
+        if let Some(window) = record.job.target.temporal_window {
+            filter.push_str(&format!(
+                " AND timestamp_ms >= {} AND timestamp_ms <= {}",
+                window.start.timestamp_ms(),
+                window.end.timestamp_ms()
+            ));
+        }
+
+        let batches = self
+            .storage
+            .scan(
+                hirn_storage::datasets::episodic::DATASET_NAME,
+                ScanOptions {
+                    filter: Some(filter),
+                    ..ScanOptions::default()
+                },
+            )
+            .await
+            .map_err(HirnError::storage)?;
+
+        let mut heads: HashMap<LogicalMemoryId, EpisodicRecord> = HashMap::new();
+        for batch in &batches {
+            for episode in
+                hirn_storage::datasets::episodic::from_batch(batch).map_err(HirnError::storage)?
+            {
+                heads
+                    .entry(episode.logical_memory_id)
+                    .and_modify(|current: &mut EpisodicRecord| {
+                        if episode.version > current.version
+                            || (episode.version == current.version
+                                && episode.created_at > current.created_at)
+                        {
+                            *current = episode.clone();
+                        }
+                    })
+                    .or_insert(episode);
+            }
+        }
+
+        let mut evidence: Vec<EpisodicRecord> = heads
+            .into_values()
+            .filter(|episode| episode.is_live() && !episode.archived)
+            .filter(|episode| episode.embedding.is_some())
+            .collect();
+
+        if !record.job.target.memory_ids.is_empty() {
+            let allowed: HashSet<_> = record.job.target.memory_ids.iter().copied().collect();
+            evidence.retain(|episode| allowed.contains(&episode.id));
+        }
+
+        // Most recent evidence first; the cap keeps unbounded stores from
+        // dominating a single sweep.
+        evidence.sort_by(|left, right| {
+            right
+                .timestamp
+                .cmp(&left.timestamp)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        evidence.truncate(record.job.budget.max_result_volume.max(1) as usize);
+        Ok(evidence)
+    }
+
+    /// Two-stage classification for the offline sweep, mirroring the online
+    /// path: LLM judgment (strictly parsed, `Unrelated` on parse failure)
+    /// with a heuristic fallback when the provider returns nothing — the
+    /// default scheduler wiring runs with a mock provider unless a real one
+    /// is configured via the environment.
+    ///
+    /// Returns `(outcome, rationale, used_fallback, estimated_tokens)`.
+    async fn classify_reflection_outcome(
+        &self,
+        belief: &SemanticRecord,
+        evidence_text: &str,
+    ) -> (ReflectionOutcome, String, bool, u32) {
+        let tokenizer = EstimatingTokenizer;
+        let prompt = build_reflection_prompt(belief, evidence_text);
+        let prompt_tokens = estimate_messages_tokens(&tokenizer, &prompt);
+
+        let response = generate_text_with_timeout(
+            self.llm.as_ref(),
+            &prompt,
+            &LlmOptions {
+                temperature: 0.0,
+                max_tokens: 120,
+                ..Default::default()
+            },
+            self.dream_config.consolidation_config.llm_timeout,
+        )
+        .await
+        .unwrap_or_default();
+
+        let trimmed = response.trim();
+        if trimmed.is_empty() {
+            let (outcome, rationale) =
+                heuristic_reflection_outcome(&belief.description, evidence_text);
+            return (outcome, rationale, true, prompt_tokens);
+        }
+
+        let total_tokens = prompt_tokens.saturating_add(tokenizer.count_tokens(trimmed) as u32);
+        match parse_reflection_response(trimmed) {
+            Some((outcome, rationale)) => (outcome, rationale, false, total_tokens),
+            None => (
+                ReflectionOutcome::Unrelated,
+                "llm response did not match the expected label format".to_string(),
+                false,
+                total_tokens,
+            ),
+        }
+    }
+
     async fn load_dream_candidates(
         &self,
         record: &OfflineJobRecord,
@@ -1896,6 +2223,7 @@ impl OfflineJobExecutor for DefaultOfflineJobExecutor {
             hirn_core::CognitiveJobKind::Reconcile => self.run_reconcile(record).await,
             hirn_core::CognitiveJobKind::Plan => self.run_plan(record).await,
             hirn_core::CognitiveJobKind::Evolve => self.run_evolve(record).await,
+            hirn_core::CognitiveJobKind::Reflect => self.run_reflect(record).await,
             hirn_core::CognitiveJobKind::Decay => self.run_decay(record).await,
             other => Ok(Err(OfflineJobSkip {
                 reason: format!(
@@ -1905,6 +2233,70 @@ impl OfflineJobExecutor for DefaultOfflineJobExecutor {
             })),
         }
     }
+}
+
+/// Build an appended `Correct` revision for a belief adjusted by reflection.
+///
+/// Mirrors the revision-chain invariants of the online `correct_semantic`
+/// path: new memory/revision ids, version + 1, transaction time now (storage
+/// millisecond precision), preserved `valid_from`, rationale as the revision
+/// reason, evidence id as the revision causation, and a provenance mutation
+/// entry documenting the confidence change.
+fn build_reflection_successor(
+    current: &SemanticRecord,
+    outcome: ReflectionOutcome,
+    rationale: &str,
+    evidence_id: MemoryId,
+    extraction_model: String,
+) -> SemanticRecord {
+    let now = Timestamp::from_millis(Timestamp::now().millis());
+    let new_confidence = apply_reflection_outcome(current.confidence, outcome);
+    let reason = format!(
+        "reflection: evidence {evidence_id} {} belief ({rationale})",
+        outcome.as_str()
+    );
+
+    let mut next = current.clone();
+    let new_id = MemoryId::new();
+    next.id = new_id;
+    next.revision_id = RevisionId::from_memory_id(new_id);
+    next.version = current.version + 1;
+    next.revision_operation = RevisionOperation::Correct;
+    next.revision_reason = Some(reason.clone());
+    next.revision_causation_id = Some(evidence_id);
+    next.created_at = now;
+    next.updated_at = now;
+    next.valid_until = None;
+    next.superseded_by = None;
+    next.merged_into = None;
+    next.confidence = new_confidence;
+    next.provenance
+        .record_mutation(hirn_core::provenance::Mutation {
+            timestamp: now,
+            trigger: MutationTrigger::Consolidation,
+            field: "confidence".to_string(),
+            old_value: current.confidence.to_string(),
+            new_value: new_confidence.to_string(),
+            reason,
+        });
+    next.provenance.extraction_model = Some(extraction_model);
+
+    match outcome {
+        ReflectionOutcome::Reinforces => {
+            next.evidence_count = current.evidence_count.saturating_add(1);
+            next.source_episodes.push(evidence_id);
+            next.source_episodes.sort_unstable();
+            next.source_episodes.dedup();
+        }
+        ReflectionOutcome::Contradicts => {
+            next.contradiction_ids.push(evidence_id);
+            next.contradiction_ids.sort_unstable();
+            next.contradiction_ids.dedup();
+        }
+        ReflectionOutcome::Weakens | ReflectionOutcome::Unrelated => {}
+    }
+
+    next
 }
 
 fn select_relevant_conflict_groups<'a>(
@@ -3126,6 +3518,9 @@ mod tests {
                 0.45,
                 0.95,
                 86_400,
+                0.75,
+                5,
+                768,
             )
             .await
             .unwrap(),

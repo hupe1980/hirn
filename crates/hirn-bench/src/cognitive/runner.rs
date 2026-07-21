@@ -272,6 +272,11 @@ struct StrategyRunData {
     context_tokens: usize,
     prompt_tokens: usize,
     completion_tokens: usize,
+    /// Per-query tokens returned to the (hypothetical) reader:
+    /// THINK context tokens plus RECALL result-content tokens.
+    returned_tokens_per_query: Vec<usize>,
+    /// Which estimator produced the per-query token counts.
+    token_estimator: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -291,6 +296,8 @@ struct QueryExecution {
     context: String,
     ranked_results: Vec<RetrievedCandidate>,
     context_tokens: usize,
+    /// Tokens returned to the reader for this query (THINK context + RECALL contents).
+    returned_tokens: usize,
     compiled_phase_sample: Option<CompiledPhaseSample>,
 }
 
@@ -875,6 +882,8 @@ fn finalize_result(
         context_tokens,
         prompt_tokens,
         completion_tokens,
+        mut returned_tokens_per_query,
+        token_estimator,
     } = query_results;
 
     // Aggregate by category.
@@ -947,6 +956,20 @@ fn finalize_result(
     let end_to_end_latency = latency_percentiles(&end_to_end_latencies);
     let token_cost =
         TokenCostEstimate::from_totals(context_tokens, prompt_tokens, completion_tokens, total);
+
+    returned_tokens_per_query.sort_unstable();
+    let tokens_per_query_mean = if returned_tokens_per_query.is_empty() {
+        0.0
+    } else {
+        returned_tokens_per_query.iter().sum::<usize>() as f64
+            / returned_tokens_per_query.len() as f64
+    };
+    let tokens_per_query_p50 = token_percentile(&returned_tokens_per_query, 50);
+    let tokens_per_query_p95 = token_percentile(&returned_tokens_per_query, 95);
+
+    // Honesty flag: only the hirn strategy applies oracle-derived routing
+    // hints (baselines never consult QueryRoutingProfile).
+    let oracle_assisted = strategy == HIRN_STRATEGY && dataset.benchmark.uses_oracle_routing();
     let compiled_phase_timings = if compiled_optimize_latencies.is_empty() {
         None
     } else {
@@ -977,6 +1000,12 @@ fn finalize_result(
         evaluation_latency,
         end_to_end_latency,
         token_cost,
+        tokens_per_query_mean,
+        tokens_per_query_p50,
+        tokens_per_query_p95,
+        token_estimator,
+        oracle_assisted,
+        truncated: dataset.truncated,
         total_queries: total,
         ingest_time_secs: ingest_time.as_secs_f64(),
         query_time_secs: query_time.as_secs_f64(),
@@ -1057,15 +1086,56 @@ fn resolve_embedding(
     embedding_runtime.resolve_embedding(text, dims)
 }
 
-fn estimate_tokens(text: &str) -> usize {
-    static TOKENIZER: std::sync::LazyLock<Option<tiktoken_rs::CoreBPE>> =
-        std::sync::LazyLock::new(|| tiktoken_rs::cl100k_base().ok());
+static BENCH_TOKENIZER: std::sync::LazyLock<Option<tiktoken_rs::CoreBPE>> =
+    std::sync::LazyLock::new(|| tiktoken_rs::cl100k_base().ok());
 
-    if let Some(tokenizer) = &*TOKENIZER {
+fn estimate_tokens(text: &str) -> usize {
+    if let Some(tokenizer) = &*BENCH_TOKENIZER {
         tokenizer.encode_ordinary(text).len()
     } else {
         text.split_whitespace().count()
     }
+}
+
+/// Label for the token estimator behind `estimate_tokens`, published with
+/// every tokens-per-query number so results are comparable across runs.
+pub fn bench_token_estimator_label() -> &'static str {
+    if BENCH_TOKENIZER.is_some() {
+        "tiktoken-rs/cl100k_base"
+    } else {
+        "whitespace-split"
+    }
+}
+
+/// Estimator label for a run: the direct-builders surface takes THINK token
+/// counts from the engine's own counter, while the recall leg (and the
+/// compiled surface entirely) uses the bench estimator.
+fn token_estimator_label_for_surface(surface: BenchmarkExecutionSurface) -> String {
+    match surface {
+        BenchmarkExecutionSurface::DirectBuilders => format!(
+            "think=engine ThinkResult.token_count; recall={}",
+            bench_token_estimator_label()
+        ),
+        BenchmarkExecutionSurface::CompiledHirnql => bench_token_estimator_label().to_string(),
+    }
+}
+
+/// Tokens of the assembled RECALL result contents, counted with the bench estimator.
+fn ranked_results_token_count(results: &[RetrievedCandidate]) -> usize {
+    results
+        .iter()
+        .map(|candidate| estimate_tokens(&candidate.content))
+        .sum()
+}
+
+/// Percentile over a sorted slice of per-query token counts, mirroring the
+/// index convention of `latency_percentiles`.
+fn token_percentile(sorted: &[usize], percentile: usize) -> usize {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let n = sorted.len();
+    sorted[(n * percentile / 100).min(n - 1)]
 }
 
 fn lexical_terms(text: &str) -> BTreeSet<String> {
@@ -1366,6 +1436,9 @@ fn execute_direct_query(
         .iter()
         .map(|result| retrieved_candidate_from_record(&result.record))
         .collect::<Vec<_>>();
+    // Tokens returned to the reader: the engine's own THINK token count plus
+    // the estimated tokens of the RECALL result contents.
+    let returned_tokens = think_result.token_count + ranked_results_token_count(&ranked_results);
     let context = think_result.context;
     let context_tokens = estimate_tokens(&context);
 
@@ -1373,6 +1446,7 @@ fn execute_direct_query(
         context,
         ranked_results,
         context_tokens,
+        returned_tokens,
         compiled_phase_sample: None,
     }
 }
@@ -1407,8 +1481,10 @@ fn execute_compiled_query(
     let recall_diagnostics = require_compiled_diagnostics(&query.id, "RECALL", recall_diagnostics);
     let (_, ranked_results) = unpack_compiled_records(&query.id, "RECALL", recall_result);
 
+    let context_tokens = estimate_tokens(&context);
     QueryExecution {
-        context_tokens: estimate_tokens(&context),
+        context_tokens,
+        returned_tokens: context_tokens + ranked_results_token_count(&ranked_results),
         context,
         ranked_results,
         compiled_phase_sample: compiled_phase_sample(&think_diagnostics, &recall_diagnostics),
@@ -1700,6 +1776,7 @@ fn execute_full_context_baseline(
         used_tokens += doc.token_count;
     }
 
+    let returned_tokens = used_tokens + ranked_results_token_count(&selected);
     QueryExecution {
         context: selected
             .iter()
@@ -1708,6 +1785,7 @@ fn execute_full_context_baseline(
             .join("\n"),
         ranked_results: selected,
         context_tokens: used_tokens,
+        returned_tokens,
         compiled_phase_sample: None,
     }
 }
@@ -1788,7 +1866,7 @@ fn execute_iterative_baseline(
             .then_with(|| left_idx.cmp(right_idx))
     });
 
-    let ranked_contents = ranked
+    let ranked_contents: Vec<RetrievedCandidate> = ranked
         .into_iter()
         .take(config.k.max(selected_indices.len()))
         .map(|(idx, _)| RetrievedCandidate {
@@ -1802,10 +1880,12 @@ fn execute_iterative_baseline(
         .collect::<Vec<_>>()
         .join("\n");
 
+    let returned_tokens = used_tokens + ranked_results_token_count(&ranked_contents);
     QueryExecution {
         context,
         ranked_results: ranked_contents,
         context_tokens: used_tokens,
+        returned_tokens,
         compiled_phase_sample: None,
     }
 }
@@ -1817,7 +1897,10 @@ fn evaluate_baseline_queries(
     strategy: BaselineStrategy,
     embedding_runtime: &BenchmarkEmbeddingRuntime,
 ) -> StrategyRunData {
-    let mut results = StrategyRunData::default();
+    let mut results = StrategyRunData {
+        token_estimator: bench_token_estimator_label().to_string(),
+        ..StrategyRunData::default()
+    };
 
     for query in &dataset.queries {
         let query_emb =
@@ -1853,6 +1936,9 @@ fn evaluate_baseline_queries(
             .push(execution_latency + evaluation_latency);
         results.context_tokens += execution.context_tokens;
         results.prompt_tokens += question_tokens + execution.context_tokens;
+        results
+            .returned_tokens_per_query
+            .push(execution.returned_tokens);
     }
 
     results
@@ -2443,7 +2529,10 @@ fn evaluate_queries(
     config: &CognitiveConfig,
     embedding_runtime: &BenchmarkEmbeddingRuntime,
 ) -> StrategyRunData {
-    let mut results = StrategyRunData::default();
+    let mut results = StrategyRunData {
+        token_estimator: token_estimator_label_for_surface(config.execution_surface),
+        ..StrategyRunData::default()
+    };
     let benchmark_start = Instant::now();
     let total_queries = dataset.queries.len();
 
@@ -2497,6 +2586,9 @@ fn evaluate_queries(
         let question_tokens = estimate_tokens(&q.question);
         results.context_tokens += execution.context_tokens;
         results.prompt_tokens += question_tokens + execution.context_tokens;
+        results
+            .returned_tokens_per_query
+            .push(execution.returned_tokens);
 
         let completed = query_index + 1;
         if completed == 1 || completed == total_queries || completed % QUERY_PROGRESS_INTERVAL == 0
@@ -2754,6 +2846,12 @@ mod tests {
         assert!(result.overall_containment >= 0.0);
         assert!(result.overall_token_f1 >= 0.0);
         assert!(!result.categories.is_empty());
+        // Tokens/query is recorded for every executed query with a labelled estimator.
+        assert!(result.tokens_per_query_mean > 0.0);
+        assert!(result.tokens_per_query_p95 >= result.tokens_per_query_p50);
+        assert_eq!(result.token_estimator, bench_token_estimator_label());
+        assert!(!result.oracle_assisted);
+        assert!(result.truncated.is_none());
     }
 
     #[test]
@@ -2860,6 +2958,118 @@ mod tests {
         assert_eq!(reproducibility.max_relative_delta, 0.0);
     }
 
+    fn finalize_fixture_dataset(
+        benchmark: Benchmark,
+        truncated: Option<crate::cognitive::TruncationSummary>,
+    ) -> crate::cognitive::CognitiveDataset {
+        crate::cognitive::CognitiveDataset {
+            name: "finalize-fixture".to_string(),
+            benchmark,
+            sessions: Vec::new(),
+            queries: Vec::new(),
+            truncated,
+        }
+    }
+
+    fn strategy_run_data_with_tokens(tokens: &[usize]) -> StrategyRunData {
+        StrategyRunData {
+            returned_tokens_per_query: tokens.to_vec(),
+            token_estimator: "test-estimator".to_string(),
+            ..StrategyRunData::default()
+        }
+    }
+
+    fn finalize_fixture_result(
+        benchmark: Benchmark,
+        strategy: &str,
+        truncated: Option<crate::cognitive::TruncationSummary>,
+        tokens: &[usize],
+    ) -> CognitiveResult {
+        finalize_result(
+            &finalize_fixture_dataset(benchmark, truncated),
+            strategy,
+            "finalize-test",
+            strategy_run_data_with_tokens(tokens),
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::ZERO,
+            0,
+        )
+    }
+
+    #[test]
+    fn finalize_result_aggregates_tokens_per_query() {
+        // 20 samples: 10, 20, ..., 200 (deliberately unsorted on input).
+        let mut tokens: Vec<usize> = (1..=20).map(|i| i * 10).collect();
+        tokens.reverse();
+
+        let result = finalize_fixture_result(Benchmark::H1Retrieval, HIRN_STRATEGY, None, &tokens);
+
+        assert!((result.tokens_per_query_mean - 105.0).abs() < 1e-9);
+        assert_eq!(result.tokens_per_query_p50, 110);
+        assert_eq!(result.tokens_per_query_p95, 200);
+        assert_eq!(result.token_estimator, "test-estimator");
+    }
+
+    #[test]
+    fn finalize_result_handles_empty_token_series() {
+        let result = finalize_fixture_result(Benchmark::H1Retrieval, HIRN_STRATEGY, None, &[]);
+        assert_eq!(result.tokens_per_query_mean, 0.0);
+        assert_eq!(result.tokens_per_query_p50, 0);
+        assert_eq!(result.tokens_per_query_p95, 0);
+    }
+
+    #[test]
+    fn oracle_assisted_flag_set_for_oracle_routed_suites_only() {
+        for benchmark in [
+            Benchmark::H2Temporal,
+            Benchmark::H4Agent,
+            Benchmark::H6Safety,
+        ] {
+            let result = finalize_fixture_result(benchmark, HIRN_STRATEGY, None, &[]);
+            assert!(result.oracle_assisted, "{benchmark} should be flagged");
+
+            // Baselines never consult QueryRoutingProfile, so they stay unflagged.
+            let baseline =
+                finalize_fixture_result(benchmark, BaselineStrategy::FullContext.name(), None, &[]);
+            assert!(!baseline.oracle_assisted);
+        }
+
+        for benchmark in [
+            Benchmark::H1Retrieval,
+            Benchmark::H3Graph,
+            Benchmark::H5Action,
+        ] {
+            let result = finalize_fixture_result(benchmark, HIRN_STRATEGY, None, &[]);
+            assert!(!result.oracle_assisted, "{benchmark} must not be flagged");
+        }
+    }
+
+    #[test]
+    fn finalize_result_propagates_dataset_truncation() {
+        let truncated = crate::cognitive::TruncationSummary {
+            sessions: 2,
+            queries: 5,
+            records: 17,
+        };
+        let result =
+            finalize_fixture_result(Benchmark::H1Retrieval, HIRN_STRATEGY, Some(truncated), &[]);
+        assert_eq!(result.truncated, Some(truncated));
+
+        let full = finalize_fixture_result(Benchmark::H1Retrieval, HIRN_STRATEGY, None, &[]);
+        assert!(full.truncated.is_none());
+    }
+
+    #[test]
+    fn token_percentile_uses_latency_percentile_convention() {
+        assert_eq!(token_percentile(&[], 95), 0);
+        assert_eq!(token_percentile(&[7], 50), 7);
+        assert_eq!(token_percentile(&[7], 95), 7);
+        let sorted: Vec<usize> = (1..=100).collect();
+        assert_eq!(token_percentile(&sorted, 50), 51);
+        assert_eq!(token_percentile(&sorted, 95), 96);
+    }
+
     #[test]
     fn benchmark_turn_profile_prioritizes_summaries_and_observations() {
         let mut direct = sample_turn("Alice");
@@ -2908,6 +3118,7 @@ mod tests {
             benchmark: Benchmark::H1Retrieval,
             sessions: Vec::new(),
             queries: Vec::new(),
+            truncated: None,
         };
         let query = crate::cognitive::QAQuery {
             id: "locomo-q2".to_string(),
@@ -2934,6 +3145,7 @@ mod tests {
             benchmark: Benchmark::H1Retrieval,
             sessions: Vec::new(),
             queries: Vec::new(),
+            truncated: None,
         };
         let query = crate::cognitive::QAQuery {
             id: "q-routing".to_string(),
@@ -3257,6 +3469,7 @@ mod tests {
                 evidence_snippets: Vec::new(),
                 negative: false,
             }],
+            truncated: None,
         };
         let embedding_runtime = provider_backed_benchmark_runtime(
             &dataset,

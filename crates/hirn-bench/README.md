@@ -83,6 +83,8 @@ cargo run -p hirn-bench -- external --format-name dmr --auto-download --embeddin
 
 cargo run -p hirn-bench -- external --format-name longmemeval --auto-download --embeddings embeddings/longmemeval_embeddings.json --embedding-model-label text-embedding-3-small --runs 2 --repro-threshold-percent 15
 
+cargo run -p hirn-bench -- external --format-name beam --data-dir /path/to/BEAM/chats/100K --embeddings embeddings/beam_embeddings.json --embedding-model-label text-embedding-3-small --runs 2 --repro-threshold-percent 15
+
 # Advanced offline cognition suite
 cargo run -p hirn-bench -- advanced --benchmark all --format markdown --output bench-results/advanced.md --json-output bench-results/advanced.json --tracker bench-results/advanced-history.json
 
@@ -102,10 +104,14 @@ DMR auto-download is intentionally disabled until a verified public canonical da
 
 LongMemEval is downloaded from the dataset repo's published raw files rather than the rows API, because HuggingFace does not expose a working rows endpoint for that corpus. Set `HF_TOKEN` (or the deprecated `HUGGING_FACE_HUB_TOKEN`) or run `huggingface-cli login` if your environment requires authenticated access. The public files are large, so prefer a warm local cache or `--data-dir` for repeated runs.
 
+BEAM (Tavakoli et al., ICLR 2026, arXiv:2510.27246) has no auto-download; clone `github.com/mohammadtavakoli78/BEAM` (or mirror the HuggingFace datasets `Mohammadta/BEAM` / `Mohammadta/BEAM-10M`) and pass `--data-dir` at a tier directory or a directory of conversation folders containing `chat.json` plus `probing_questions/probing_questions.json`.
+
 By default, `external` runs now enforce safety caps to avoid laptop memory exhaustion:
 - `--max-sessions 500`
 - `--max-records 10000`
 - `--max-queries 200`
+
+When any limit drops data, the loader logs a warning and the emitted artifacts carry a machine-readable `truncated {sessions, records, queries}` note; runs also publish tokens/query (mean/p50/p95 plus the estimator label) and per-suite `oracle_assisted` flags.
 
 Use `--full-corpus` only when you intentionally want an unrestricted run and have enough RAM. For stricter smoke checks, lower limits explicitly, for example:
 

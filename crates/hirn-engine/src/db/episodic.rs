@@ -1814,6 +1814,11 @@ impl HirnDB {
         }
 
         // ── Admission Control ──
+        // Reservation guard: on Accept, resource-tracking controllers (token
+        // budget) hold a reservation that must be committed exactly when the
+        // record is durably persisted, or released on any failure exit — the
+        // guard's Drop covers every early `return Err` below.
+        let mut admission_reservation: Option<crate::admission::AdmissionReservation> = None;
         if !bypass_admission {
             let admission_result = self
                 .admission_runtime()
@@ -1856,6 +1861,13 @@ impl HirnDB {
                     explanation.status = remember_status_for_admission(&decision);
                     explanation.error = Some(error.to_string());
                     return Err(crate::RememberFailure::new(error, explanation));
+                }
+                if decision.is_accept()
+                    && let Some(pipeline) = self.admission_runtime().admission_pipeline_arc()
+                {
+                    admission_reservation = Some(crate::admission::AdmissionReservation::new(
+                        pipeline, candidate,
+                    ));
                 }
             }
         }
@@ -2250,6 +2262,12 @@ impl HirnDB {
                 }
             }
             hirn_core::EvolutionMode::None => {}
+        }
+
+        // The record is durably persisted — convert admission reservations
+        // (token budget) into confirmed usage.
+        if let Some(reservation) = admission_reservation {
+            reservation.commit().await;
         }
 
         Ok((id, explanation))

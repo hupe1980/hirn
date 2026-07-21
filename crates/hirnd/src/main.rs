@@ -821,6 +821,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    // ── Sleep-time consolidation (idle-time cognitive maintenance) ──
+    // Runs the consolidation pipeline and enqueues bounded offline cognition
+    // jobs whenever the daemon has been quiet long enough; exits on the same
+    // shutdown watch channel as the listeners.
+    if config.sleep.enabled {
+        let scheduler =
+            hirnd::sleep::SleepScheduler::new(config.sleep.clone(), Arc::clone(&realm_manager));
+        tokio::spawn(scheduler.run(shutdown_rx.clone()));
+        info!(
+            idle_after_secs = config.sleep.idle_after_secs,
+            min_pass_interval_secs = config.sleep.min_pass_interval_secs,
+            "sleep-time consolidation enabled"
+        );
+    } else {
+        info!("sleep-time consolidation disabled");
+    }
+
     // ── HTTP server with optional TLS ──
     let http_tls = tls_acceptor.clone();
     let http_shutdown_rx = shutdown_rx.clone();

@@ -10,6 +10,15 @@
 //!
 //! - **DMR** (Dialog Memory Retrieval): Multi-turn dialog fact retrieval.
 //!
+//! - **LongMemEval** (Wu et al., 2024, arXiv:2410.10813): long-term memory across
+//!   5 task types with per-question haystack sessions.
+//!
+//! - **BEAM** (Tavakoli et al., ICLR 2026, arXiv:2510.27246): coherent conversations
+//!   up to 10M tokens probing 10 memory abilities.
+//!
+//! Loaders that accept [`ExternalLoadLimits`] report dropped data through
+//! `CognitiveDataset::truncated` so downstream artifacts can flag partial runs.
+//!
 //! # Usage
 //!
 //! ```text
@@ -20,7 +29,7 @@
 //! hirn-bench cognitive --data data/locomo/ --suite h1
 //! ```
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::BufReader;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
@@ -28,7 +37,7 @@ use std::path::{Path, PathBuf};
 use serde::de::{self, DeserializeOwned, Deserializer as _, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 
-use super::{Benchmark, CognitiveDataset, QAQuery, Session, Turn};
+use super::{Benchmark, CognitiveDataset, QAQuery, Session, TruncationSummary, Turn};
 
 fn read_huggingface_token_file(path: &Path) -> Option<String> {
     let token = std::fs::read_to_string(path).ok()?;
@@ -401,6 +410,7 @@ fn build_locomo_dataset(data_dir: &Path, conversations: &[LoCoMoConversation]) -
         benchmark: Benchmark::H1Retrieval,
         sessions,
         queries,
+        truncated: None,
     }
 }
 
@@ -783,6 +793,7 @@ pub fn load_dmr(data_dir: &Path) -> Result<CognitiveDataset, String> {
         benchmark: Benchmark::H1Retrieval,
         sessions,
         queries,
+        truncated: None,
     })
 }
 
@@ -792,6 +803,7 @@ pub enum ExternalFormat {
     LoCoMo,
     Dmr,
     LongMemEval,
+    Beam,
 }
 
 impl std::str::FromStr for ExternalFormat {
@@ -801,8 +813,9 @@ impl std::str::FromStr for ExternalFormat {
             "locomo" => Ok(Self::LoCoMo),
             "dmr" => Ok(Self::Dmr),
             "longmemeval" | "lme" => Ok(Self::LongMemEval),
+            "beam" => Ok(Self::Beam),
             _ => Err(format!(
-                "unknown external format: {s} (expected: locomo, dmr, longmemeval)"
+                "unknown external format: {s} (expected: locomo, dmr, longmemeval, beam)"
             )),
         }
     }
@@ -814,6 +827,7 @@ pub fn load_external(format: ExternalFormat, data_dir: &Path) -> Result<Cognitiv
         ExternalFormat::LoCoMo => load_locomo(data_dir),
         ExternalFormat::Dmr => load_dmr(data_dir),
         ExternalFormat::LongMemEval => load_longmemeval(data_dir),
+        ExternalFormat::Beam => load_beam(data_dir),
     }
 }
 
@@ -944,6 +958,7 @@ pub fn load_longmemeval_with_limits(
             benchmark: Benchmark::H1Retrieval,
             sessions,
             queries,
+            truncated: None,
         });
     }
 
@@ -1185,6 +1200,7 @@ fn append_longmemeval_raw_row(
     registry: &mut LongMemEvalSessionRegistry,
     current_records: &mut usize,
     limits: Option<ExternalLoadLimits>,
+    truncation: &mut TruncationSummary,
 ) -> Result<(), String> {
     let LongMemEvalRawRow {
         question_id,
@@ -1251,15 +1267,14 @@ fn append_longmemeval_raw_row(
             register_longmemeval_session(registry, &case_id, source_id, &turns);
         if is_new {
             if let Some(limits) = limits {
-                if sessions.len() >= limits.max_sessions {
-                    continue;
-                }
-
-                if *current_records >= limits.max_records {
-                    continue;
-                }
-
-                if *current_records + turns.len() > limits.max_records {
+                if sessions.len() >= limits.max_sessions
+                    || *current_records >= limits.max_records
+                    || *current_records + turns.len() > limits.max_records
+                {
+                    // Limits fired: record what was dropped instead of
+                    // silently skipping, so the run can be flagged as partial.
+                    truncation.sessions += 1;
+                    truncation.records += turns.len();
                     continue;
                 }
             }
@@ -1288,6 +1303,7 @@ fn append_longmemeval_raw_row(
 
     if let Some(limits) = limits {
         if queries.len() >= limits.max_queries {
+            truncation.queries += 1;
             return Ok(());
         }
     }
@@ -1318,8 +1334,7 @@ fn load_longmemeval_raw(
     let mut registry = LongMemEvalSessionRegistry::default();
     let mut processed_files = 0usize;
     let mut current_records = 0usize;
-
-    const LIMIT_REACHED: &str = "__longmemeval_limit_reached__";
+    let mut truncation = TruncationSummary::default();
 
     for file_name in LME_HF_FILES {
         let file_path = data_dir.join(file_name);
@@ -1330,17 +1345,11 @@ fn load_longmemeval_raw(
         processed_files += 1;
         let file = std::fs::File::open(&file_path)
             .map_err(|error| format!("cannot read {}: {error}", file_path.display()))?;
+        // The full file is scanned even after limits fire so the truncation
+        // summary reports exact drop counts; skipped rows only tally counters
+        // and never allocate sessions or queries.
         let parse_result =
             process_json_array_reader::<LongMemEvalRawRow, _, _>(BufReader::new(file), |row| {
-                if let Some(limits) = limits {
-                    if sessions.len() >= limits.max_sessions
-                        || queries.len() >= limits.max_queries
-                        || current_records >= limits.max_records
-                    {
-                        return Err(LIMIT_REACHED.to_string());
-                    }
-                }
-
                 raw_row_idx += 1;
                 append_longmemeval_raw_row(
                     row,
@@ -1351,24 +1360,12 @@ fn load_longmemeval_raw(
                     &mut registry,
                     &mut current_records,
                     limits,
+                    &mut truncation,
                 )
             });
 
-        match parse_result {
-            Ok(_) => {}
-            Err(error) if error.contains(LIMIT_REACHED) => break,
-            Err(error) => {
-                return Err(format!("parse error in {}: {error}", file_path.display()));
-            }
-        }
-
-        if let Some(limits) = limits {
-            if sessions.len() >= limits.max_sessions
-                || queries.len() >= limits.max_queries
-                || current_records >= limits.max_records
-            {
-                break;
-            }
+        if let Err(error) = parse_result {
+            return Err(format!("parse error in {}: {error}", file_path.display()));
         }
     }
 
@@ -1380,12 +1377,35 @@ fn load_longmemeval_raw(
         ));
     }
 
+    let truncated = truncation_note("LongMemEval", &truncation);
+
     Ok(CognitiveDataset {
         name: format!("LongMemEval ({})", data_dir.display()),
         benchmark: Benchmark::H1Retrieval,
         sessions,
         queries,
+        truncated,
     })
+}
+
+/// Convert a drop tally into an optional truncation note, warning when data was dropped.
+fn truncation_note(
+    dataset_label: &str,
+    truncation: &TruncationSummary,
+) -> Option<TruncationSummary> {
+    if truncation.is_empty() {
+        return None;
+    }
+
+    let warning = format!(
+        "{dataset_label} load limits dropped data: sessions={} records={} queries={}; \
+         scores from this run cover a partial corpus and must be published with the truncation note",
+        truncation.sessions, truncation.records, truncation.queries,
+    );
+    eprintln!("Warning: {warning}");
+    tracing::warn!(target: "hirn_bench::external", "{warning}");
+
+    Some(*truncation)
 }
 
 /// Download the LongMemEval dataset from HuggingFace and cache it locally.
@@ -1447,6 +1467,459 @@ pub fn download_longmemeval(cache_dir: &Path) -> Result<PathBuf, String> {
 pub fn load_longmemeval_cached(cache_dir: &Path) -> Result<CognitiveDataset, String> {
     let data_dir = download_longmemeval(cache_dir)?;
     load_longmemeval(&data_dir)
+}
+
+// ─── BEAM Adapter ────────────────────────────────────────────
+//
+// BEAM (Tavakoli et al., ICLR 2026, arXiv:2510.27246) publishes its corpus as
+// per-conversation directories (github.com/mohammadtavakoli78/BEAM under
+// `chats/<tier>/<conversation>/`, mirrored on HuggingFace as Mohammadta/BEAM
+// and Mohammadta/BEAM-10M):
+//
+// ```text
+// <conversation>/
+//   chat.json                                # array of batches
+//   probing_questions/probing_questions.json # map: dimension -> [questions]
+// ```
+//
+// `chat.json` is an array of `{batch_number, time_anchor?, turns}` objects
+// where `turns` is a list of message groups, each message being
+// `{role, id, content, time_anchor?, ...}`. Message `id` is the chat id that
+// probing questions reference through `source_chat_ids`.
+//
+// `probing_questions.json` maps each of the 10 memory dimensions
+// (abstention, contradiction_resolution, event_ordering,
+// information_extraction, instruction_following, knowledge_update,
+// multi_session_reasoning, preference_following, summarization,
+// temporal_reasoning) to question objects whose gold-answer field varies by
+// dimension: `answer`, `ideal_answer`, `ideal_response`, `ideal_summary`, or
+// `expected_compliance`.
+
+/// Canonical chat file inside a BEAM conversation directory.
+const BEAM_CHAT_FILE: &str = "chat.json";
+
+/// Probing questions file, nested under `probing_questions/`.
+const BEAM_PROBING_FILE: &str = "probing_questions.json";
+
+const BEAM_PROBING_DIR: &str = "probing_questions";
+
+/// A single message inside a BEAM chat batch.
+#[derive(Debug, Deserialize)]
+pub struct BeamChatMessage {
+    #[serde(default, deserialize_with = "deserialize_optional_stringlike")]
+    pub role: Option<String>,
+    /// Chat id referenced by probing-question `source_chat_ids`.
+    #[serde(default)]
+    pub id: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_optional_stringlike")]
+    pub content: Option<String>,
+    /// Date anchor like `March-15-2024`, present on some user messages.
+    #[serde(default, deserialize_with = "deserialize_optional_stringlike")]
+    pub time_anchor: Option<String>,
+}
+
+/// One batch of a BEAM conversation (`chat.json` is an array of these).
+#[derive(Debug, Deserialize)]
+pub struct BeamChatBatch {
+    #[serde(default)]
+    pub batch_number: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_optional_stringlike")]
+    pub time_anchor: Option<String>,
+    /// Message groups; each group is a short list of role-tagged messages.
+    #[serde(default)]
+    pub turns: Vec<Vec<BeamChatMessage>>,
+}
+
+/// One BEAM probing question. The gold-answer field name varies by dimension,
+/// so all published variants are accepted.
+#[derive(Debug, Deserialize)]
+pub struct BeamProbingQuestion {
+    #[serde(default, deserialize_with = "deserialize_optional_stringlike")]
+    pub question: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_stringlike")]
+    pub answer: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_stringlike")]
+    pub ideal_answer: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_stringlike")]
+    pub ideal_response: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_stringlike")]
+    pub ideal_summary: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_stringlike")]
+    pub expected_compliance: Option<String>,
+    /// Chat ids of the supporting evidence. Published either as a flat list
+    /// (`[4, 60]`) or as a role-keyed map (`{"first_event": [2], ...}`).
+    #[serde(default)]
+    pub source_chat_ids: Option<serde_json::Value>,
+}
+
+impl BeamProbingQuestion {
+    fn gold_answer(&self) -> Option<&str> {
+        [
+            self.answer.as_deref(),
+            self.ideal_answer.as_deref(),
+            self.ideal_response.as_deref(),
+            self.ideal_summary.as_deref(),
+            self.expected_compliance.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|answer| !answer.is_empty())
+    }
+}
+
+/// Map a BEAM memory dimension onto the existing query-category model.
+///
+/// Dimensions with a direct LoCoMo-style equivalent reuse that label so
+/// per-category scoring and routing heuristics behave consistently across
+/// adapters; the remaining dimensions keep their BEAM name in kebab-case.
+fn beam_category_label(dimension: &str) -> String {
+    match dimension {
+        "information_extraction" => "single-hop".to_string(),
+        "multi_session_reasoning" => "multi-hop".to_string(),
+        "temporal_reasoning" => "temporal".to_string(),
+        other => other.trim().replace('_', "-"),
+    }
+}
+
+/// Parse a BEAM time anchor such as `March-15-2024` to epoch milliseconds.
+fn parse_beam_time_anchor_ms(text: &str) -> Option<u64> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+
+    let date = chrono::NaiveDate::parse_from_str(text, "%B-%d-%Y")
+        .or_else(|_| chrono::NaiveDate::parse_from_str(text, "%b-%d-%Y"))
+        .ok()?;
+    let ms = date.and_hms_opt(0, 0, 0)?.and_utc().timestamp_millis();
+    u64::try_from(ms).ok()
+}
+
+/// Flatten `source_chat_ids` (flat list or role-keyed map of lists) to ids.
+fn beam_source_chat_ids(value: Option<&serde_json::Value>) -> Vec<u64> {
+    fn collect(value: &serde_json::Value, ids: &mut Vec<u64>) {
+        match value {
+            serde_json::Value::Number(number) => {
+                if let Some(id) = number.as_u64() {
+                    ids.push(id);
+                }
+            }
+            serde_json::Value::String(text) => {
+                if let Ok(id) = text.trim().parse::<u64>() {
+                    ids.push(id);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    collect(item, ids);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for item in map.values() {
+                    collect(item, ids);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut ids = Vec::new();
+    if let Some(value) = value {
+        collect(value, &mut ids);
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+/// Chat ids are only unique within one conversation, so evidence/source ids
+/// are namespaced with the conversation label.
+fn beam_source_id(conversation: &str, chat_id: u64) -> String {
+    format!("{conversation}:{chat_id}")
+}
+
+fn beam_sorted_subdirectories(dir: &Path) -> Result<Vec<(String, PathBuf)>, String> {
+    let entries = std::fs::read_dir(dir)
+        .map_err(|error| format!("cannot read {}: {error}", dir.display()))?;
+
+    let mut subdirs = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("cannot read {}: {error}", dir.display()))?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        subdirs.push((name.to_string(), path));
+    }
+
+    subdirs.sort_by(|(left, _), (right, _)| left.cmp(right));
+    Ok(subdirs)
+}
+
+/// Discover BEAM conversation directories under `data_dir`.
+///
+/// Accepts three layouts: `data_dir` itself is a conversation (contains
+/// `chat.json`), `data_dir/<conversation>/chat.json`, or the published
+/// `data_dir/<tier>/<conversation>/chat.json` (tiers 100K/500K/1M/10M).
+fn beam_conversation_dirs(data_dir: &Path) -> Result<Vec<(String, PathBuf)>, String> {
+    if data_dir.join(BEAM_CHAT_FILE).exists() {
+        let label = data_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("conversation")
+            .to_string();
+        return Ok(vec![(label, data_dir.to_path_buf())]);
+    }
+
+    let mut conversations = Vec::new();
+    for (name, path) in beam_sorted_subdirectories(data_dir)? {
+        if path.join(BEAM_CHAT_FILE).exists() {
+            conversations.push((name, path));
+            continue;
+        }
+
+        for (sub_name, sub_path) in beam_sorted_subdirectories(&path)? {
+            if sub_path.join(BEAM_CHAT_FILE).exists() {
+                conversations.push((format!("{name}-{sub_name}"), sub_path));
+            }
+        }
+    }
+
+    if conversations.is_empty() {
+        return Err(format!(
+            "no BEAM conversations found under {}: expected {BEAM_CHAT_FILE} in the directory itself, \
+             in <conversation>/ subdirectories, or in <tier>/<conversation>/ subdirectories",
+            data_dir.display(),
+        ));
+    }
+
+    Ok(conversations)
+}
+
+fn read_beam_json<T: DeserializeOwned>(path: &Path) -> Result<T, String> {
+    let file = std::fs::File::open(path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    serde_json::from_reader(BufReader::new(file))
+        .map_err(|error| format!("parse error in {}: {error}", path.display()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_beam_conversation(
+    conversation: &str,
+    conversation_dir: &Path,
+    sessions: &mut Vec<Session>,
+    queries: &mut Vec<QAQuery>,
+    query_idx: &mut u32,
+    current_records: &mut usize,
+    limits: Option<ExternalLoadLimits>,
+    truncation: &mut TruncationSummary,
+) -> Result<(), String> {
+    let batches: Vec<BeamChatBatch> = read_beam_json(&conversation_dir.join(BEAM_CHAT_FILE))?;
+
+    let mut conversation_session_ids = Vec::new();
+    let mut chat_id_to_session: HashMap<u64, String> = HashMap::new();
+
+    for (batch_index, batch) in batches.iter().enumerate() {
+        let batch_number = batch
+            .batch_number
+            .unwrap_or_else(|| (batch_index + 1) as u64);
+        let session_id = format!("beam-{conversation}-b{batch_number}");
+        let mut current_anchor = batch.time_anchor.clone();
+        let mut turns = Vec::new();
+        let mut batch_chat_ids = Vec::new();
+
+        for group in &batch.turns {
+            for message in group {
+                if let Some(anchor) = message
+                    .time_anchor
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|anchor| !anchor.is_empty())
+                {
+                    current_anchor = Some(anchor.to_string());
+                }
+
+                let Some(content) = message
+                    .content
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|content| !content.is_empty())
+                else {
+                    continue;
+                };
+                let speaker = message
+                    .role
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|role| !role.is_empty())
+                    .unwrap_or("unknown");
+
+                if let Some(chat_id) = message.id {
+                    batch_chat_ids.push(chat_id);
+                }
+
+                turns.push(Turn {
+                    speaker: speaker.to_string(),
+                    content: content.to_string(),
+                    timestamp: current_anchor
+                        .as_deref()
+                        .and_then(parse_beam_time_anchor_ms),
+                    timestamp_text: current_anchor.clone(),
+                    source_id: message
+                        .id
+                        .map(|chat_id| beam_source_id(conversation, chat_id)),
+                });
+            }
+        }
+
+        if turns.is_empty() {
+            continue;
+        }
+
+        if let Some(limits) = limits {
+            if sessions.len() >= limits.max_sessions
+                || *current_records >= limits.max_records
+                || *current_records + turns.len() > limits.max_records
+            {
+                truncation.sessions += 1;
+                truncation.records += turns.len();
+                continue;
+            }
+        }
+
+        for chat_id in batch_chat_ids {
+            chat_id_to_session.insert(chat_id, session_id.clone());
+        }
+        *current_records += turns.len();
+        conversation_session_ids.push(session_id.clone());
+        sessions.push(Session {
+            id: session_id,
+            turns,
+        });
+    }
+
+    let probing_path = conversation_dir
+        .join(BEAM_PROBING_DIR)
+        .join(BEAM_PROBING_FILE);
+    let probing_path = if probing_path.exists() {
+        probing_path
+    } else {
+        conversation_dir.join(BEAM_PROBING_FILE)
+    };
+    if !probing_path.exists() {
+        return Ok(());
+    }
+
+    let probing: BTreeMap<String, Vec<BeamProbingQuestion>> = read_beam_json(&probing_path)?;
+
+    for (dimension, dimension_questions) in &probing {
+        let category = beam_category_label(dimension);
+        let negative = dimension == "abstention";
+
+        for probing_question in dimension_questions {
+            let Some(question) = probing_question
+                .question
+                .as_deref()
+                .map(str::trim)
+                .filter(|question| !question.is_empty())
+            else {
+                continue;
+            };
+            let Some(answer) = probing_question.gold_answer() else {
+                continue;
+            };
+
+            if let Some(limits) = limits {
+                if queries.len() >= limits.max_queries {
+                    truncation.queries += 1;
+                    continue;
+                }
+            }
+
+            let chat_ids = beam_source_chat_ids(probing_question.source_chat_ids.as_ref());
+            let evidence_ids: Vec<String> = chat_ids
+                .iter()
+                .map(|chat_id| beam_source_id(conversation, *chat_id))
+                .collect();
+            let mut relevant_session_ids: Vec<String> = chat_ids
+                .iter()
+                .filter_map(|chat_id| chat_id_to_session.get(chat_id).cloned())
+                .collect();
+            relevant_session_ids.sort();
+            relevant_session_ids.dedup();
+            if relevant_session_ids.is_empty() {
+                relevant_session_ids.clone_from(&conversation_session_ids);
+            }
+
+            *query_idx += 1;
+            queries.push(QAQuery {
+                id: format!("beam-{conversation}-{query_idx}"),
+                question: question.to_string(),
+                expected_answers: vec![answer.to_string()],
+                category: category.clone(),
+                relevant_session_ids,
+                evidence_ids,
+                evidence_snippets: Vec::new(),
+                negative,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+/// Convert a BEAM dataset directory to a `CognitiveDataset`.
+///
+/// See the module-level BEAM section for the accepted on-disk layout.
+/// Batches map to sessions, messages to episodic turns (chat ids preserved as
+/// per-conversation source ids), and probing questions to queries whose
+/// dimension is mapped onto the existing query-category model. Abstention
+/// questions load as negative queries. Scoring is retrieval containment like
+/// the other adapters — NOT the official BEAM LLM-judged rubric evaluation.
+pub fn load_beam(data_dir: &Path) -> Result<CognitiveDataset, String> {
+    load_beam_with_limits(data_dir, None)
+}
+
+/// [`load_beam`] with optional load limits; dropped data is reported through
+/// `CognitiveDataset::truncated`.
+pub fn load_beam_with_limits(
+    data_dir: &Path,
+    limits: Option<ExternalLoadLimits>,
+) -> Result<CognitiveDataset, String> {
+    let conversations = beam_conversation_dirs(data_dir)?;
+
+    let mut sessions = Vec::new();
+    let mut queries = Vec::new();
+    let mut query_idx = 0u32;
+    let mut current_records = 0usize;
+    let mut truncation = TruncationSummary::default();
+
+    for (conversation, conversation_dir) in &conversations {
+        append_beam_conversation(
+            conversation,
+            conversation_dir,
+            &mut sessions,
+            &mut queries,
+            &mut query_idx,
+            &mut current_records,
+            limits,
+            &mut truncation,
+        )?;
+    }
+
+    let truncated = truncation_note("BEAM", &truncation);
+
+    Ok(CognitiveDataset {
+        name: format!("BEAM ({})", data_dir.display()),
+        benchmark: Benchmark::H1Retrieval,
+        sessions,
+        queries,
+        truncated,
+    })
 }
 
 #[cfg(test)]
@@ -1701,5 +2174,253 @@ mod tests {
             vec!["alice-0", "alice-1"]
         );
         assert!(dataset.queries[1].negative);
+        assert!(dataset.truncated.is_none());
+    }
+
+    #[test]
+    fn load_longmemeval_with_limits_populates_truncation_note() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let raw_rows = serde_json::json!([
+            {
+                "question_id": "q-1",
+                "question": "Where does Alice work now?",
+                "answer": "Microsoft",
+                "question_type": "knowledge_update",
+                "answer_session_ids": ["alice-1"],
+                "haystack_session_ids": ["alice-0", "alice-1", "alice-2"],
+                "haystack_sessions": [
+                    [{"role": "user", "content": "I used to work at Google in Seattle."}],
+                    [{"role": "user", "content": "I joined Microsoft last month."}],
+                    [{"role": "user", "content": "The Bellevue office has great coffee."}]
+                ]
+            },
+            {
+                "question_id": "q-2",
+                "question": "Where did Alice used to work?",
+                "answer": "Google",
+                "question_type": "single-session-user",
+                "answer_session_ids": ["alice-0"],
+                "haystack_session_ids": ["alice-0"],
+                "haystack_sessions": [
+                    [{"role": "user", "content": "I used to work at Google in Seattle."}]
+                ]
+            }
+        ]);
+        std::fs::write(
+            dir.path().join("longmemeval_oracle"),
+            serde_json::to_vec(&raw_rows).unwrap(),
+        )
+        .unwrap();
+
+        let limits = ExternalLoadLimits {
+            max_sessions: 2,
+            max_records: 100,
+            max_queries: 1,
+        };
+        let dataset = load_longmemeval_with_limits(dir.path(), Some(limits)).unwrap();
+
+        assert_eq!(dataset.sessions.len(), 2);
+        assert_eq!(dataset.queries.len(), 1);
+        let truncated = dataset.truncated.expect("limits fired");
+        assert_eq!(truncated.sessions, 1);
+        assert_eq!(truncated.records, 1);
+        assert_eq!(truncated.queries, 1);
+    }
+
+    // ─── BEAM fixtures ───────────────────────────────────────
+
+    fn write_beam_conversation(conversation_dir: &Path) {
+        std::fs::create_dir_all(conversation_dir.join("probing_questions")).unwrap();
+
+        // Two batches mirroring the published chat.json shape: message
+        // groups with role/id/content, time anchors on user messages.
+        let chat = serde_json::json!([
+            {
+                "batch_number": 1,
+                "turns": [
+                    [
+                        {
+                            "role": "user",
+                            "id": 0,
+                            "time_anchor": "March-15-2024",
+                            "index": "1,1",
+                            "question_type": "main_question",
+                            "content": "I finished the transaction management features on January 15, 2024."
+                        },
+                        {"role": "assistant", "id": 1, "content": "Great progress on the tracker."}
+                    ],
+                    [
+                        {"role": "user", "id": 2, "content": "My first sprint ends on March 29."},
+                        {"role": "assistant", "id": 3, "content": "Noted: sprint one closes March 29."}
+                    ]
+                ]
+            },
+            {
+                "batch_number": 2,
+                "turns": [
+                    [
+                        {"role": "user", "id": 4, "content": "I renamed the budget tracker to LedgerLite."},
+                        {"role": "assistant", "id": 5, "content": "LedgerLite it is."}
+                    ]
+                ]
+            }
+        ]);
+        std::fs::write(
+            conversation_dir.join("chat.json"),
+            serde_json::to_vec(&chat).unwrap(),
+        )
+        .unwrap();
+
+        let probing = serde_json::json!({
+            "abstention": [
+                {
+                    "question": "Can you tell me about my previous development projects?",
+                    "ideal_response": "Based on the provided chat, there is no information related to your previous development projects.",
+                    "difficulty": "easy",
+                    "abstention_type": "unavailable_information",
+                    "rubric": ["there is no information related to previous development projects"]
+                }
+            ],
+            "information_extraction": [
+                {
+                    "question": "When does my first sprint end?",
+                    "answer": "My first sprint ends on March 29.",
+                    "difficulty": "easy",
+                    "source_chat_ids": [2],
+                    "rubric": ["March 29"]
+                }
+            ],
+            "temporal_reasoning": [
+                {
+                    "question": "How long between finishing transaction management and the sprint end?",
+                    "answer": "About ten weeks.",
+                    "difficulty": "medium",
+                    "source_chat_ids": {"first_event": [0], "second_event": [2]},
+                    "rubric": ["ten weeks"]
+                }
+            ],
+            "knowledge_update": [
+                {
+                    "question": "What is the tracker called now?",
+                    "answer": "LedgerLite",
+                    "difficulty": "easy",
+                    "source_chat_ids": {"original_info": [0], "updated_info": [4]},
+                    "rubric": ["LedgerLite"]
+                }
+            ]
+        });
+        std::fs::write(
+            conversation_dir
+                .join("probing_questions")
+                .join("probing_questions.json"),
+            serde_json::to_vec(&probing).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn load_beam_maps_batches_and_probing_dimensions() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let conversation_dir = dir.path().join("100K").join("1");
+        write_beam_conversation(&conversation_dir);
+
+        let dataset = load_beam(dir.path()).unwrap();
+
+        assert_eq!(dataset.sessions.len(), 2);
+        assert_eq!(dataset.sessions[0].id, "beam-100K-1-b1");
+        assert_eq!(dataset.sessions[1].id, "beam-100K-1-b2");
+        assert_eq!(dataset.sessions[0].turns.len(), 4);
+        assert_eq!(
+            dataset.sessions[0].turns[0].source_id.as_deref(),
+            Some("100K-1:0")
+        );
+        // The batch-1 time anchor carries forward to later batch-1 turns.
+        assert_eq!(
+            dataset.sessions[0].turns[2].timestamp_text.as_deref(),
+            Some("March-15-2024")
+        );
+        assert!(dataset.sessions[0].turns[0].timestamp.is_some());
+        assert_eq!(dataset.queries.len(), 4);
+        assert!(dataset.truncated.is_none());
+
+        let abstention = dataset
+            .queries
+            .iter()
+            .find(|query| query.category == "abstention")
+            .unwrap();
+        assert!(abstention.negative);
+        assert_eq!(
+            abstention.relevant_session_ids,
+            vec!["beam-100K-1-b1", "beam-100K-1-b2"]
+        );
+
+        let extraction = dataset
+            .queries
+            .iter()
+            .find(|query| query.category == "single-hop")
+            .unwrap();
+        assert!(!extraction.negative);
+        assert_eq!(
+            extraction.expected_answers,
+            vec!["My first sprint ends on March 29."]
+        );
+        assert_eq!(extraction.evidence_ids, vec!["100K-1:2"]);
+        assert_eq!(extraction.relevant_session_ids, vec!["beam-100K-1-b1"]);
+
+        let temporal = dataset
+            .queries
+            .iter()
+            .find(|query| query.category == "temporal")
+            .unwrap();
+        assert_eq!(temporal.evidence_ids, vec!["100K-1:0", "100K-1:2"]);
+
+        let update = dataset
+            .queries
+            .iter()
+            .find(|query| query.category == "knowledge-update")
+            .unwrap();
+        assert_eq!(
+            update.relevant_session_ids,
+            vec!["beam-100K-1-b1", "beam-100K-1-b2"]
+        );
+    }
+
+    #[test]
+    fn load_beam_accepts_single_conversation_directory() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_beam_conversation(dir.path());
+
+        let dataset = load_beam(dir.path()).unwrap();
+        assert_eq!(dataset.sessions.len(), 2);
+        assert_eq!(dataset.queries.len(), 4);
+    }
+
+    #[test]
+    fn load_beam_with_limits_populates_truncation_note() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let conversation_dir = dir.path().join("1");
+        write_beam_conversation(&conversation_dir);
+
+        let limits = ExternalLoadLimits {
+            max_sessions: 1,
+            max_records: 100,
+            max_queries: 2,
+        };
+        let dataset = load_beam_with_limits(dir.path(), Some(limits)).unwrap();
+
+        assert_eq!(dataset.sessions.len(), 1);
+        assert_eq!(dataset.queries.len(), 2);
+        let truncated = dataset.truncated.expect("limits fired");
+        assert_eq!(truncated.sessions, 1);
+        assert_eq!(truncated.records, 2);
+        assert_eq!(truncated.queries, 2);
+    }
+
+    #[test]
+    fn load_beam_reports_missing_layout() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let error = load_beam(dir.path()).unwrap_err();
+        assert!(error.contains("no BEAM conversations found"));
+        assert!(error.contains("chat.json"));
     }
 }

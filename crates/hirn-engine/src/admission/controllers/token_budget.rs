@@ -2,12 +2,21 @@
 //!
 //! Tracks the total token count for each agent and rejects new memories
 //! that would push the agent over its budget.
+//!
+//! Accounting is reserve/commit: `evaluate` atomically reserves the
+//! candidate's tokens against `persisted + reserved` (so two concurrent
+//! evaluations can never jointly exceed the budget), and the reservation is
+//! converted to persisted usage by `commit` or dropped by `release` — the
+//! admission pipeline guarantees exactly one of the two happens. Without
+//! this, a candidate rejected by a *later* controller (or a failed write)
+//! left the speculative total inflated until the next invalidation.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures::TryStreamExt;
 use hirn_core::HirnResult;
+use hirn_core::id::MemoryId;
 use hirn_core::tokenizer::Tokenizer;
 use hirn_core::types::AgentId;
 use hirn_storage::PhysicalStore;
@@ -16,6 +25,21 @@ use tokio::sync::RwLock;
 
 use crate::admission::{AdmissionController, AdmissionDecision, MemoryCandidate};
 
+/// Per-agent usage: confirmed persisted tokens + in-flight reservations.
+#[derive(Debug, Default, Clone, Copy)]
+struct AgentTokens {
+    persisted: usize,
+    reserved: usize,
+}
+
+/// All mutable gate state behind one lock so read-check-reserve is atomic.
+#[derive(Debug, Default)]
+struct BudgetState {
+    agents: HashMap<AgentId, AgentTokens>,
+    /// Candidate id → (agent, reserved amount) for commit/release.
+    reservations: HashMap<MemoryId, (AgentId, usize)>,
+}
+
 /// Per-agent token budget enforcement.
 pub struct TokenBudgetGate {
     storage: Arc<dyn PhysicalStore>,
@@ -23,8 +47,7 @@ pub struct TokenBudgetGate {
     dataset: String,
     /// Maximum tokens per agent. Default: 500_000.
     max_tokens: usize,
-    /// Cached token counts per agent (invalidated on forget).
-    cache: RwLock<HashMap<AgentId, usize>>,
+    state: RwLock<BudgetState>,
 }
 
 impl TokenBudgetGate {
@@ -39,7 +62,7 @@ impl TokenBudgetGate {
             tokenizer,
             dataset: dataset.into(),
             max_tokens,
-            cache: RwLock::new(HashMap::new()),
+            state: RwLock::new(BudgetState::default()),
         }
     }
 
@@ -52,14 +75,21 @@ impl TokenBudgetGate {
         Self::new(storage, tokenizer, dataset, 500_000)
     }
 
-    /// Invalidate the cache for an agent (e.g., after a forget operation).
+    /// Invalidate the cached usage for an agent (e.g., after a forget
+    /// operation). The agent's in-flight reservations are dropped too — a
+    /// pending commit for one of them becomes a no-op, and the next
+    /// evaluation re-scans storage, which by then reflects the write.
     pub async fn invalidate(&self, agent_id: &AgentId) {
-        self.cache.write().await.remove(agent_id);
+        let mut state = self.state.write().await;
+        state.agents.remove(agent_id);
+        state.reservations.retain(|_, (agent, _)| agent != agent_id);
     }
 
-    /// Invalidate all cached counts.
+    /// Invalidate all cached counts and reservations.
     pub async fn invalidate_all(&self) {
-        self.cache.write().await.clear();
+        let mut state = self.state.write().await;
+        state.agents.clear();
+        state.reservations.clear();
     }
 
     /// Compute the current token count for an agent by scanning storage.
@@ -119,20 +149,24 @@ impl TokenBudgetGate {
         Ok(total_tokens)
     }
 
-    /// Get or compute the current token count for an agent.
-    async fn get_tokens(&self, agent_id: &AgentId) -> HirnResult<usize> {
-        // Check cache first.
+    /// Ensure the agent has a persisted-usage baseline in the state map,
+    /// computing it from storage if absent. The storage scan runs OUTSIDE the
+    /// state lock; insertion is `or_insert` so a concurrent computation
+    /// cannot clobber reservations taken in the meantime.
+    async fn ensure_baseline(&self, agent_id: &AgentId) -> HirnResult<()> {
         {
-            let cache = self.cache.read().await;
-            if let Some(&count) = cache.get(agent_id) {
-                return Ok(count);
+            let state = self.state.read().await;
+            if state.agents.contains_key(agent_id) {
+                return Ok(());
             }
         }
-
-        // Compute and cache.
-        let count = self.compute_tokens(agent_id).await?;
-        self.cache.write().await.insert(agent_id.clone(), count);
-        Ok(count)
+        let computed = self.compute_tokens(agent_id).await?;
+        let mut state = self.state.write().await;
+        state.agents.entry(agent_id.clone()).or_insert(AgentTokens {
+            persisted: computed,
+            reserved: 0,
+        });
+        Ok(())
     }
 }
 
@@ -143,8 +177,19 @@ impl AdmissionController for TokenBudgetGate {
     }
 
     async fn evaluate(&self, candidate: &MemoryCandidate) -> HirnResult<AdmissionDecision> {
-        let current = self.get_tokens(&candidate.agent_id).await?;
         let candidate_tokens = self.tokenizer.count_tokens(&candidate.content);
+        self.ensure_baseline(&candidate.agent_id).await?;
+
+        // Single critical section: read usage, decide, and reserve — so two
+        // concurrent evaluations for the same agent serialize and cannot both
+        // be admitted against the same headroom.
+        let mut state = self.state.write().await;
+        let usage = state
+            .agents
+            .get(&candidate.agent_id)
+            .copied()
+            .unwrap_or_default();
+        let current = usage.persisted + usage.reserved;
         let projected = current + candidate_tokens;
 
         if projected > self.max_tokens {
@@ -157,14 +202,36 @@ impl AdmissionController for TokenBudgetGate {
                 ),
             })
         } else {
-            // Speculatively update the cache with the projected total.
-            self.cache
-                .write()
-                .await
-                .insert(candidate.agent_id.clone(), projected);
+            let entry = state
+                .agents
+                .entry(candidate.agent_id.clone())
+                .or_insert(usage);
+            entry.reserved += candidate_tokens;
+            state
+                .reservations
+                .insert(candidate.id, (candidate.agent_id.clone(), candidate_tokens));
             Ok(AdmissionDecision::Accept {
                 importance_override: None,
             })
+        }
+    }
+
+    async fn commit(&self, candidate: &MemoryCandidate) {
+        let mut state = self.state.write().await;
+        if let Some((agent, amount)) = state.reservations.remove(&candidate.id)
+            && let Some(entry) = state.agents.get_mut(&agent)
+        {
+            entry.reserved = entry.reserved.saturating_sub(amount);
+            entry.persisted += amount;
+        }
+    }
+
+    async fn release(&self, candidate: &MemoryCandidate) {
+        let mut state = self.state.write().await;
+        if let Some((agent, amount)) = state.reservations.remove(&candidate.id)
+            && let Some(entry) = state.agents.get_mut(&agent)
+        {
+            entry.reserved = entry.reserved.saturating_sub(amount);
         }
     }
 }
@@ -279,6 +346,97 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_accept());
+    }
+
+    #[tokio::test]
+    async fn downstream_reject_releases_reservation() {
+        use crate::admission::AdmissionPipeline;
+
+        /// Always-reject controller placed AFTER the gate.
+        struct RejectAll;
+        #[async_trait::async_trait]
+        impl crate::admission::AdmissionController for RejectAll {
+            fn name(&self) -> &str {
+                "reject_all"
+            }
+            async fn evaluate(
+                &self,
+                _: &MemoryCandidate,
+            ) -> HirnResult<crate::admission::AdmissionDecision> {
+                Ok(crate::admission::AdmissionDecision::Reject {
+                    reason: "downstream".into(),
+                })
+            }
+        }
+
+        let (storage, _dir) = temp_storage().await;
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(EstimatingTokenizer);
+        // Budget fits ~one candidate at a time.
+        let gate = TokenBudgetGate::new(storage, tokenizer, "episodic", 60);
+        let pipeline = AdmissionPipeline::new().with(gate).with(RejectAll);
+
+        // Each attempt reserves ~50 tokens in the gate, then the downstream
+        // controller rejects. Without release-on-short-circuit the second
+        // attempt would be rejected by the gate on leaked reservations.
+        for _ in 0..3 {
+            let candidate = candidate_with_agent(&"t ".repeat(100), "agent-a");
+            let result = pipeline.evaluate(&candidate).await.unwrap();
+            assert!(result.decision.is_reject());
+            assert_eq!(
+                result.verdicts.last().unwrap().controller,
+                "reject_all",
+                "the gate must keep accepting — its reservation was released \
+                 after each downstream reject"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_evaluations_cannot_jointly_exceed_budget() {
+        let (storage, _dir) = temp_storage().await;
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(EstimatingTokenizer);
+        // Each candidate is ~60% of the budget: admitting both would exceed it.
+        let gate = Arc::new(TokenBudgetGate::new(storage, tokenizer, "episodic", 100));
+
+        let content = "c ".repeat(120); // ~60 tokens via estimator
+        let a = candidate_with_agent(&content, "agent-a");
+        let b = candidate_with_agent(&content, "agent-a");
+
+        let (ra, rb) = tokio::join!(gate.evaluate(&a), gate.evaluate(&b));
+        let accepts = [ra.unwrap(), rb.unwrap()]
+            .iter()
+            .filter(|d| d.is_accept())
+            .count();
+        assert_eq!(
+            accepts, 1,
+            "read-check-reserve must be atomic: only one 60%-of-budget \
+             candidate may be admitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_and_release_settle_reservations() {
+        let (storage, _dir) = temp_storage().await;
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(EstimatingTokenizer);
+        let gate = TokenBudgetGate::new(storage, tokenizer, "episodic", 100);
+
+        // Reserve ~60, release → headroom restored.
+        let a = candidate_with_agent(&"a ".repeat(120), "agent-a");
+        assert!(gate.evaluate(&a).await.unwrap().is_accept());
+        gate.release(&a).await;
+        let b = candidate_with_agent(&"b ".repeat(120), "agent-a");
+        assert!(
+            gate.evaluate(&b).await.unwrap().is_accept(),
+            "released reservation must free headroom"
+        );
+
+        // Commit b → its usage is persistent; the next 60%-candidate rejects.
+        gate.commit(&b).await;
+        let c = candidate_with_agent(&"c ".repeat(120), "agent-a");
+        assert!(
+            gate.evaluate(&c).await.unwrap().is_reject(),
+            "committed usage must keep counting against the budget"
+        );
     }
 
     #[tokio::test]

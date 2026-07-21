@@ -293,6 +293,7 @@ fn generate_h1() -> CognitiveDataset {
         benchmark: Benchmark::H1Retrieval,
         sessions,
         queries,
+        truncated: None,
     }
 }
 
@@ -516,6 +517,7 @@ fn generate_h2() -> CognitiveDataset {
         benchmark: Benchmark::H2Temporal,
         sessions,
         queries,
+        truncated: None,
     }
 }
 
@@ -747,6 +749,7 @@ fn generate_h3() -> CognitiveDataset {
         benchmark: Benchmark::H3Graph,
         sessions,
         queries,
+        truncated: None,
     }
 }
 
@@ -956,6 +959,7 @@ fn generate_h4() -> CognitiveDataset {
         benchmark: Benchmark::H4Agent,
         sessions,
         queries,
+        truncated: None,
     }
 }
 
@@ -1162,6 +1166,7 @@ fn generate_h5() -> CognitiveDataset {
         benchmark: Benchmark::H5Action,
         sessions,
         queries,
+        truncated: None,
     }
 }
 
@@ -1375,6 +1380,7 @@ fn generate_h6() -> CognitiveDataset {
         benchmark: Benchmark::H6Safety,
         sessions,
         queries,
+        truncated: None,
     }
 }
 
