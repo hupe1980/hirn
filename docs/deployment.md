@@ -141,7 +141,7 @@ The `hirnd` CLI accepts only these flags (see `hirnd --help`): `--config <file>`
 ports, and auth are configured in the TOML file, not via flags.
 
 ```bash
-# Basic start — bind address sets the base port; HTTP = base, gRPC = base+1, MCP (SSE) = base+2
+# Basic start — bind address sets the base port; HTTP = base, gRPC = base+1, MCP = base+2
 hirnd --config hirnd.toml --data ./brain --bind 127.0.0.1:3000
 
 # Local insecure development only (no auth, loopback bind)
@@ -166,7 +166,7 @@ The `--bind` address is the base port; the other interfaces are derived from it.
 |-----------|------|----------|----------|
 | HTTP | `3000` (base) | REST + JSON | Web clients, curl, simple integrations |
 | gRPC | `3001` (base+1) | HTTP/2 + Protobuf | High-throughput programmatic access |
-| MCP (SSE) | `3002` (base+2) | Model Context Protocol over SSE | LLM tool calling (Claude, GPT, etc.) |
+| MCP | `3002` (base+2) | MCP Streamable HTTP at `/mcp` | LLM tool calling (Claude, GPT, etc.) |
 
 Binding all three interfaces to a single base port keeps firewall rules and
 service discovery simple: expose `--bind` and the daemon derives the rest. The
@@ -217,41 +217,67 @@ curl -sX POST http://127.0.0.1:3000/v1/remember \
 > directly (`Hirn::open`) or call the daemon's HTTP/gRPC endpoints with a
 > standard client.
 
+### Token Revocation
+
+Every issued JWT carries a unique `jti` and an `iss_kid` claim binding it to
+the credential that issued it (tokens minted *by* a restricted token inherit
+the root credential's kid). `POST /v1/auth/revoke` revokes:
+
+- a specific token (`{"token": "<jwt>"}` — signature-verified, same-realm),
+- a `jti` directly, or
+- an entire credential's issuance tree (`{"api_key": "..."}` or
+  `{"iss_kid": "..."}`) — every JWT it issued is rejected immediately, while
+  tokens minted after the credential is re-trusted validate again.
+
+Revocation takes effect on all three surfaces (HTTP, gRPC, MCP) because it is
+enforced inside token validation itself. The deny-list is node-local and
+naturally bounded (entries expire with the token's `exp`); in a cluster, revoke
+against each node.
+
 ### MCP Integration
 
-hirnd exposes hirn as an MCP tool server. Configure your LLM client to connect:
+hirnd serves the MCP **Streamable HTTP** transport at `http://<bind>:<base+2>/mcp`
+(HTTPS when `[tls]` is configured). Point any MCP client at the endpoint and
+pass a bearer credential:
 
 ```json
 {
   "mcpServers": {
     "hirn": {
-      "command": "hirnd",
-      "args": ["--data", "./brain", "--bind", "127.0.0.1:3000"]
+      "type": "http",
+      "url": "http://127.0.0.1:3002/mcp",
+      "headers": { "Authorization": "Bearer <api-key-or-jwt>" }
     }
   }
 }
 ```
 
-Available MCP tools: `remember`, `recall`, `think`, `forget`, `connect`, `inspect`, `trace`, `consolidate`.
-
-{: .warning }
-> **Browser-based DNS-rebinding exposure.** The current MCP transport does not
-> validate the `Host` header, so while the MCP listener is running, a malicious
-> website opened in a local browser can potentially reach it via DNS rebinding —
-> even on loopback. Keep MCP disabled unless you use it, and front it with a
-> reverse proxy that validates `Host`/`Origin` for anything beyond throwaway
-> local development. A transport upgrade that validates `Host` natively is
-> planned.
+Available MCP tools: `hirn_remember`, `hirn_recall`, `hirn_think`,
+`hirn_forget`, `hirn_inspect`, `hirn_consolidate`, `hirn_execute`,
+`hirn_watch`, plus the agent-toolkit tools `memory_store`, `memory_recall`,
+`memory_update`, `memory_delete`, `memory_link`, `memory_introspect`.
 
 {: .important }
-> **MCP authentication.** The MCP listener authenticates **once at startup**:
-> outside `insecure_dev_mode` you must set `mcp.auth_token` in the config to an
-> API key or JWT accepted by your `[auth]`/`[token]` settings. Every MCP tool
-> call then runs as that validated identity — realm, agent, operation scope,
-> and namespace scope come from the credential, never from tool parameters —
-> and is rate-limited with the same route classes as the HTTP API. HirnQL run
-> through `hirn_execute` is verb-classified, so a read-scoped credential cannot
-> execute write or admin statements.
+> **Per-request MCP authentication.** Every MCP call carries its own
+> `Authorization: Bearer` credential (API key or JWT), resolved through the
+> same `[auth]`/`[token]` machinery as the HTTP API. The credential decides
+> realm, agent, operation scope, and namespace scope for that single call —
+> tool parameters can never override it — and each call is rate-limited with
+> the same route classes as the HTTP API. Different MCP clients (or rotated
+> credentials) on one daemon each get exactly the authority they present, and
+> the credential's realm routes the call to its tenant database. HirnQL run
+> through `hirn_execute` is verb-classified, so a read-scoped credential
+> cannot execute write or admin statements. Requests without a resolvable
+> credential are rejected with `401` before the protocol handler (unless
+> `insecure_dev_mode` is set).
+
+{: .note }
+> **DNS-rebinding protection is built in.** The transport validates the
+> `Host` header natively (rmcp ≥ 1.4, RUSTSEC-2026-0189): by default only
+> loopback hosts (`localhost`, `127.0.0.1`, `::1`) are accepted and anything
+> else gets `403`. To expose MCP beyond loopback, set `mcp.allowed_hosts`
+> (e.g. `["mcp.example.com"]`) — startup fails on a non-loopback bind without
+> it. `mcp.allowed_origins` optionally restricts browser origins per RFC 6454.
 
 ### Sleep-Time Consolidation
 
@@ -268,10 +294,11 @@ realm:
 1. **Consolidation pipeline** — segmentation → pattern extraction → community
    detection → RAPTOR summaries → forgetting, via the same engine pipeline as
    `POST /v1/consolidate`.
-2. **Offline cognition jobs** — one `dream` and one `reconcile` job are
-   enqueued *only if* the engine's offline scheduler is enabled, using its
-   configured default budget (see [Offline Intelligence](offline-intelligence.md)).
-   The scheduler is off by default; turn it on per daemon via
+2. **Offline cognition jobs** — one `dream`, one `reconcile`, and one
+   `reflect` job (belief revision over recent evidence) are enqueued *only if*
+   the engine's offline scheduler is enabled, using its configured default
+   budget (see [Offline Intelligence](offline-intelligence.md)). The scheduler
+   is off by default; turn it on per daemon via
    `[engine] offline_scheduler_enabled = true`.
 
 The pass re-checks the idle clock between phases and aborts as soon as a
@@ -309,7 +336,7 @@ timestamp as `sleep_last_pass_ms` in `GET /debug/brain-stats`.
 
 ## Distributed Cluster (Multi-Node)
 
-`hirnd` supports multi-node deployment with OpenRaft-based metadata consensus. All nodes share a remote object store (S3, GCS, Azure) while Raft handles cluster coordination, realm ownership, and consolidation leases.
+`hirnd` supports multi-node deployment with OpenRaft-based metadata consensus. All nodes share a remote object store (S3, GCS, Azure). **Concurrent writes from multiple nodes are coordinated by Lance manifest compare-and-swap (CAS), not by Raft** — see [Write Coordination Model](#write-coordination-model) below. Raft's job is limited to node-membership consensus and the consolidation lease.
 
 **Use when:** High availability, horizontal scaling across realms, cloud-native deployment.
 
@@ -329,7 +356,7 @@ timestamp as `sleep_last_pass_ms` in `GET /debug/brain-stats`.
                    └─────────────┘
 ```
 
-**Raft consensus** manages cluster metadata only — realm-to-node ownership, node registry, and consolidation leases. Data is stored in Lance on shared object storage (S3/GCS/Azure) using MVCC for consistency.
+**Raft consensus** manages cluster metadata only — the node registry and the consolidation lease. It does **not** gate the write path. Memory data is stored in Lance on shared object storage (S3/GCS/Azure); concurrent writers are serialized by Lance's manifest CAS (optimistic concurrency + retry), the same model Iceberg/Delta/SlateDB use.
 
 ### Cluster Configuration (TOML)
 
@@ -342,8 +369,6 @@ data_dir = "/data/hirn"
 [storage]
 uri = "s3://my-bucket/hirn-data"
 properties = { "storage.region" = "us-east-1" }
-fragment_cache_dir = "/data/cache"
-fragment_cache_max_bytes = 2147483648  # 2 GiB
 
 [raft]
 node_id = 1
@@ -368,7 +393,6 @@ data_dir = "/data/hirn"
 [storage]
 uri = "s3://my-bucket/hirn-data"
 properties = { "storage.region" = "us-east-1" }
-fragment_cache_dir = "/data/cache"
 
 [raft]
 node_id = 2
@@ -434,23 +458,44 @@ advertise_addr = "http://127.0.0.1:3000"
 # peers = []  ← empty or omitted → auto-init
 ```
 
-### Shard-Per-Realm Affinity
+### Write Coordination Model
 
-Each realm is assigned to a preferred node for write operations. Writes to non-owner nodes are forwarded transparently:
+Every node accepts reads **and writes** for every realm. There is **no single-writer
+realm owner and no write forwarding** — concurrent writes to the same realm from
+different nodes are made safe by **Lance manifest compare-and-swap**: each commit
+performs a conditional put (`If-None-Match`) on the dataset manifest, so if two nodes
+commit concurrently the loser gets a retryable commit conflict and retries. This is
+optimistic concurrency, the same model used by Iceberg, Delta Lake, Turbopuffer, and
+SlateDB.
 
-- **Reads:** Served by any node (Lance MVCC on shared storage)
-- **Writes:** Forwarded to the realm's owner node via HTTP proxy
-- **Failover:** If the owner is down, any node can serve reads from shared storage
+Deliberately **not** layered on top of Lance CAS:
+
+- **No Raft realm-owner / write-forwarding.** Adding a single-writer owner would create
+  a second failure domain — a Raft leader loss could block writes that Lance would have
+  accepted. The write path therefore never depends on Raft being healthy.
+- Realm-affinity routing (steering a realm's writes to one node to *reduce* CAS retries
+  under very high contention) is a possible **future, metrics-gated throughput
+  optimisation**, not a correctness mechanism. The HTTP owner-forwarding scaffolding is
+  present but dormant (no realm owners are ever assigned), so it never gates writes.
 
 ```mermaid
 flowchart LR
-    W[Write for realm A]:::s --> N2[hirnd node 2<br/>non-owner]:::s
-    N2 -->|forward via HTTP proxy| N1[hirnd node 1<br/>owner of realm A]:::s
-    N1 --> ST[(Shared object store)]:::s
+    W1[Write for realm A]:::s --> N1[hirnd node 1]:::s
+    W2[Write for realm A]:::s --> N2[hirnd node 2]:::s
+    N1 -->|Lance manifest CAS| ST[(Shared object store)]:::s
+    N2 -->|Lance manifest CAS + retry on conflict| ST
     RD[Read for realm A]:::s --> N3[hirnd node 3<br/>any node]:::s
     N3 -->|Lance MVCC| ST
     classDef s fill:#1a1b26,stroke:#7c9cff,color:#e6e8f0;
 ```
+
+What Raft **does** provide in this cluster:
+
+- **Node membership consensus** — the leader keeps the Raft `nodes` registry in sync with
+  the voting membership (`RegisterNode` on join / startup, `DeregisterNode` on graceful
+  shutdown), for observability and lease attribution.
+- **The consolidation lease** (below) — so the *expensive maintenance pass* runs on only
+  one node per realm.
 
 {: .warning }
 > Every node in a cluster must share the same `raft.transport_secret`, and
@@ -461,11 +506,31 @@ flowchart LR
 
 ### Consolidation Leases
 
-Only one node runs consolidation/compaction per realm at a time. Leases are coordinated through Raft:
+The [sleep-time consolidation](#sleep-time-consolidation-idle-time-maintenance) pass
+(segmentation → patterns → communities → RAPTOR → forgetting, plus offline cognition) is
+expensive and idempotent, so running it on every node is wasted compute. Each node
+therefore acquires a **consolidation lease** for a realm before consolidating it; only the
+lease holder runs the pass, others skip that realm for the window. This avoids duplicated
+compute — it is **not** a write-correctness fence (the pass's own Lance commits are
+CAS-fenced regardless).
 
-- Lease duration: 5 minutes (auto-renewed by the holder)
-- If the holder crashes, the lease expires and another node can acquire it
-- Different nodes can compact different realms concurrently
+- **Cluster (Raft) mode:** the lease is a Raft state-machine entry
+  (`AcquireLease`/`RenewLease`/`ReleaseLease`), gating `run_sleep_pass`. Acquisition is
+  proposed via `client_write`; a follower's proposal is forwarded to the leader over the
+  authenticated `/raft/propose` transport endpoint.
+- **Fencing token:** every acquisition is stamped with a monotonic, consensus-issued
+  fencing token (strictly increasing cluster-wide; renewal preserves it). A stalled
+  ex-holder that resumes after a GC/VM pause carries a stale fence — the correctness
+  backstop remains Lance CAS, per Kleppmann's fencing-token guidance.
+- **Serverless mode:** the equivalent lease is a DynamoDB conditional-write item with a
+  TTL and a server-side `ADD fence :one` fencing counter
+  (`DynamoConsolidationLease`, `serverless` feature).
+- **Duration:** 5 minutes, renewed by the holder between pass phases and released when the
+  pass finishes. If the holder crashes, the lease expires and another node picks the realm
+  up on the next window.
+- **Single-node / non-cluster:** no lease is taken — consolidation always runs locally, so
+  the embedded and standalone paths are unchanged.
+- Different nodes can consolidate different realms concurrently.
 
 ### Internal Raft Trust Assumptions
 
@@ -483,7 +548,7 @@ Raft HTTP routes are internal cluster transport endpoints. Treat them as control
 - Horizontal scaling across realms (shard-per-realm)
 - High availability via Raft leader election
 - Shared storage eliminates data replication overhead
-- Fragment cache accelerates reads from remote storage
+- Lance manifest CAS coordinates concurrent writers (no external write lock)
 - Sub-second leader election (300–500ms timeout)
 
 ---
@@ -508,8 +573,6 @@ bind = "0.0.0.0:3000"
 [storage]
 uri = "s3://my-bucket/hirn-data"
 properties = { "storage.region" = "us-east-1" }
-fragment_cache_dir = "/tmp/hirn-cache"
-fragment_cache_max_bytes = 536870912  # 512 MiB
 
 # No [raft] section — serverless mode uses DynamoDB instead
 ```
@@ -535,7 +598,7 @@ hirn automatically creates tables on first access (`ensure_tables()`):
 - DynamoDB conditional writes for optimistic concurrency
 - TTL-based lock expiry (no cleanup needed)
 - Works with AWS Lambda, Fargate, ECS, or any ephemeral compute
-- S3 storage with local fragment caching for hot data
+- S3 storage for durable, shared object-store persistence
 
 ---
 
@@ -562,8 +625,6 @@ data_dir = "/data/hirn"
 [storage]
 uri = "s3://my-bucket/hirn-data"
 properties = { "storage.region" = "us-east-1" }
-fragment_cache_dir = "/cache/hirn"
-fragment_cache_max_bytes = 2147483648  # 2 GiB
 
 [raft]
 node_id = 1
@@ -628,8 +689,6 @@ The `[storage]` section configures the shared object store used by all nodes:
 |-------|-------------|---------|
 | `uri` | Object store root: `s3://bucket/path`, `gs://bucket/path`, `az://container/path` | — (required) |
 | `properties` | Vendor-specific properties (region, endpoint, credentials) | `{}` |
-| `fragment_cache_dir` | Local NVMe/SSD path for caching fragments | — (disabled) |
-| `fragment_cache_max_bytes` | Maximum cache size in bytes | 1 GiB |
 
 **MinIO / Local S3:**
 
@@ -738,4 +797,4 @@ brain/
 └── _brain_manifest     # Lance table — database metadata
 ```
 
-All datasets use Lance 4.0 columnar format with IVF-PQ vector indices.
+All datasets use Lance 9.0 columnar format with IVF-PQ vector indices.

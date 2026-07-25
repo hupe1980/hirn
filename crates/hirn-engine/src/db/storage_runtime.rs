@@ -145,10 +145,15 @@ impl StorageRuntime {
         }
     }
 
-    pub(crate) fn file_size_bytes(&self) -> u64 {
-        std::fs::metadata(&self.path)
-            .map(|meta| meta.len())
-            .unwrap_or(0)
+    /// R-73: run the blocking `metadata` syscall on a blocking thread so it
+    /// does not stall a tokio worker inside the async `stats` path.
+    pub(crate) async fn file_size_bytes(&self) -> u64 {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0)
+        })
+        .await
+        .unwrap_or(0)
     }
 
     pub(crate) fn fts_initialized(&self) -> bool {

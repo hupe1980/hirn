@@ -24,11 +24,10 @@ use crate::operators::{
     ContextBudgetExec, GlobalSearchExec, GlobalSearchParams, GraphActivationExec,
     GraphTraverseExec, HebbianBufferExec, HybridSearchParams, InterferenceConfig,
     InterferenceDetectorExec, IterativeConfig, IterativeRetrievalExec, LanceHybridSearchExec,
-    McfaConfig, McfaDefenseExec, NliConfig, NliContradictionExec, PolicyQueryReadExec,
-    PolicyReadKind, ProspectiveConfig, ProspectiveIndexingExec, QualityGateConfig, QualityGateExec,
-    RaptorSearchExec, RaptorSearchParams, RecallMergeExec, RpeConfig, RpeScoreExec,
-    SemanticHistoryScanExec, SvoConfig, SvoEventScanExec, SvoExtractionExec, TargetedQueryReadExec,
-    TargetedReadKind,
+    NliConfig, NliContradictionExec, PolicyQueryReadExec, PolicyReadKind, ProspectiveConfig,
+    ProspectiveIndexingExec, QualityGateConfig, QualityGateExec, RaptorSearchExec,
+    RaptorSearchParams, RecallMergeExec, RpeConfig, RpeScoreExec, SemanticHistoryScanExec,
+    SvoConfig, SvoEventScanExec, SvoExtractionExec, TargetedQueryReadExec, TargetedReadKind,
 };
 use crate::rules::{DEFAULT_PROSPECTIVE_THRESHOLD, ProspectiveShortCircuitExec};
 
@@ -248,9 +247,22 @@ impl ExtensionPlanner for HirnExtensionPlanner {
 
             HirnOp::HebbianBuffer => {
                 let input = require_single_input(physical_inputs, "HebbianBuffer")?;
-                // Create a shared co-retrieval queue. The engine drains this
-                // periodically to update Hebbian weights in the graph.
-                let queue = Arc::new(crossbeam_queue::SegQueue::new());
+                // R-19: pull the SHARED co-retrieval queue from the session
+                // extension. The engine owns this queue (it lives on
+                // `HirnSessionExt`, created by `QueryRuntime`) and drains it
+                // after recall to apply Hebbian strengthening to the graph.
+                // Previously a local queue was created here and never drained,
+                // so recall-path Hebbian learning was silently inert. Fall back
+                // to a fresh (orphaned) queue only if the extension is absent
+                // (e.g. a bare test SessionContext) — the operator stays a
+                // correct pass-through either way.
+                let queue = session_state
+                    .config()
+                    .options()
+                    .extensions
+                    .get::<HirnSessionExt>()
+                    .map(HirnSessionExt::co_retrieval_queue)
+                    .unwrap_or_else(|| Arc::new(crossbeam_queue::SegQueue::new()));
                 Arc::new(HebbianBufferExec::new(input, queue))
             }
 
@@ -321,11 +333,6 @@ impl ExtensionPlanner for HirnExtensionPlanner {
                         InterferenceConfig::default(),
                     )),
                 }
-            }
-
-            HirnOp::McfaDefense => {
-                let input = require_single_input(physical_inputs, "McfaDefense")?;
-                Arc::new(McfaDefenseExec::new(input, McfaConfig::default(), None))
             }
 
             // ── Mutation operators (pass-through at physical level) ──

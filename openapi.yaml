@@ -390,6 +390,63 @@ paths:
         "403":
           description: Requested scope exceeds the caller's own scope
 
+  /v1/auth/revoke:
+    post:
+      operationId: revokeToken
+      summary: Revoke issued JWTs before their natural expiry
+      tags: [Ops]
+      description: |
+        Revokes tokens on the node-local revocation list. Provide any
+        combination of: a full `token` (preferred — the server extracts the
+        jti and expiry, and enforces that the token belongs to the caller's
+        realm), a bare `jti`, an issuer credential fingerprint `iss_kid`, or
+        a raw `api_key` to invalidate every token that key ever issued (key
+        rotation/removal). Restricted (token-authenticated) callers need the
+        `admin` operation; API-key and mTLS principals may always revoke.
+        In a cluster the endpoint must be called on each node.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                token:
+                  type: string
+                  description: Full JWT to revoke (jti and expiry are extracted server-side)
+                jti:
+                  type: string
+                  description: Revoke by bare token id
+                exp:
+                  type: integer
+                  description: Expiry of the token identified by `jti` (bounds entry retention)
+                iss_kid:
+                  type: string
+                  description: Revoke all tokens issued by this credential fingerprint
+                api_key:
+                  type: string
+                  description: Revoke all tokens issued by this API key
+      responses:
+        "200":
+          description: Revoked identifiers
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  revoked_jtis:
+                    type: array
+                    items: { type: string }
+                  revoked_issuers:
+                    type: array
+                    items: { type: string }
+        "400":
+          description: Nothing to revoke, or the token was not issued by this server
+        "403":
+          description: Caller lacks the admin operation or targets another realm
+
   /v1/cluster:
     get:
       operationId: clusterStatus

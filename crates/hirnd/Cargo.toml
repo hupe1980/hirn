@@ -6,9 +6,6 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-[package.metadata.cargo-machete]
-ignored = ["schemars"]  # Required by #[derive(JsonSchema)] from rmcp
-
 [features]
 default = []
 serverless = ["aws-sdk-dynamodb", "aws-sdk-s3", "aws-config"]
@@ -64,6 +61,8 @@ x509-parser = { workspace = true }
 # MCP
 rmcp = { workspace = true }
 schemars = { workspace = true }
+http = { workspace = true }
+tokio-util = { workspace = true }
 
 # JWT
 jsonwebtoken = { workspace = true }
@@ -99,7 +98,12 @@ reqwest = { version = "0.12", features = ["json"] }
 [dev-dependencies]
 tempfile = { workspace = true }
 reqwest = { version = "0.12", features = ["json", "blocking"] }
-rmcp = { version = "0.1", features = ["server", "client", "transport-sse-server"] }
+rmcp = { version = "2.2", features = [
+    "server",
+    "client",
+    "transport-streamable-http-server",
+    "transport-streamable-http-client-reqwest",
+] }
 
 [build-dependencies]
 tonic-build = { workspace = true }

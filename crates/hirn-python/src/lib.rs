@@ -1059,7 +1059,9 @@ impl Hirn {
         let edge_id = py
             .detach(move || block_on(db.graph_view().connect(src, tgt)))
             .map_err(to_py_err)?;
-        Ok(format!("{edge_id:?}"))
+        // Return the stable canonical id string (same form the HTTP/gRPC
+        // interfaces and the Node binding expose), not Rust's `{:?}` debug form.
+        Ok(edge_id.to_string())
     }
 
     /// Watch for memory events.

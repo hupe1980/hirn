@@ -8,7 +8,6 @@
 //! When no residual predicates are configured, this operator is a zero-cost
 //! pass-through: it forwards all input batches without inspection.
 
-use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
@@ -42,7 +41,7 @@ pub trait PolicyPredicate: Send + Sync + fmt::Debug {
 #[derive(Debug)]
 pub struct PolicyFilterExec {
     input: Arc<dyn ExecutionPlan>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     /// Optional residual predicate. `None` → pass-through.
     predicate: Option<Arc<dyn PolicyPredicate>>,
 }
@@ -50,12 +49,12 @@ pub struct PolicyFilterExec {
 impl PolicyFilterExec {
     pub fn new(input: Arc<dyn ExecutionPlan>, predicate: Option<Arc<dyn PolicyPredicate>>) -> Self {
         let schema = input.schema();
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             datafusion_physical_expr::EquivalenceProperties::new(schema),
             datafusion_physical_plan::Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
 
         Self {
             input,
@@ -85,15 +84,11 @@ impl ExecutionPlan for PolicyFilterExec {
         "PolicyFilterExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.input.schema()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

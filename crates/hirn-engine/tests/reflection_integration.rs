@@ -243,21 +243,24 @@ async fn offline_reflect_job_honors_temporal_window_cursor() -> TestResult<()> {
 // ── Cedar enforcement ────────────────────────────────────────────────────
 
 const REFLECT_POLICIES: &str = r#"
-// Writers may remember and connect, but have no "correct" right —
-// reflection must be denied for them.
+// Writers may remember, connect, and even hold the "correct" right — but
+// NOT the dedicated "reflect" right. Reflection must be denied for them:
+// correct does not imply reflect (policy distinguishability).
 permit(
     principal in Hirn::Team::"writers",
     action in [Hirn::Action::"remember", Hirn::Action::"recall",
-               Hirn::Action::"think", Hirn::Action::"connect"],
+               Hirn::Action::"think", Hirn::Action::"connect",
+               Hirn::Action::"correct"],
     resource in Hirn::Realm::"production"
 );
 
-// Revisers additionally hold the "correct" right used by reflect updates.
+// Revisers additionally hold the dedicated "reflect" right used by
+// reflect updates.
 permit(
     principal in Hirn::Team::"revisers",
     action in [Hirn::Action::"remember", Hirn::Action::"recall",
                Hirn::Action::"think", Hirn::Action::"connect",
-               Hirn::Action::"correct"],
+               Hirn::Action::"correct", Hirn::Action::"reflect"],
     resource in Hirn::Realm::"production"
 );
 "#;
@@ -286,7 +289,7 @@ fn reflect_policy_engine() -> PolicyEngine {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn cedar_denies_reflect_updates_without_correct_rights() -> TestResult<()> {
+async fn cedar_denies_reflect_updates_without_reflect_rights() -> TestResult<()> {
     let store = Arc::new(MemoryStore::new());
     let config = hirn_core::HirnConfig::builder()
         .db_path("reflect-cedar-test")
@@ -324,7 +327,8 @@ async fn cedar_denies_reflect_updates_without_correct_rights() -> TestResult<()>
     evidence.provenance.created_by = writer;
     let evidence_id = db.episodic().remember(evidence).await?;
 
-    // ...but reflect acts through the `correct` right, which writers lack.
+    // ...but reflect requires the dedicated `reflect` right, which writers
+    // lack — even though they DO hold `correct` (distinguishability).
     let denied = db.semantic().reflect(evidence_id).await.unwrap_err();
     assert!(
         matches!(denied, HirnError::AccessDenied(_)),
@@ -339,7 +343,7 @@ async fn cedar_denies_reflect_updates_without_correct_rights() -> TestResult<()>
     assert_eq!(belief.version, 1);
     assert!((belief.confidence - 0.8).abs() < 1e-6);
 
-    // An agent holding the `correct` right can reflect-update the belief:
+    // An agent holding the `reflect` right can reflect-update the belief:
     // the evidence author is the acting principal for DB-level reflect.
     let mut reviser_evidence = hirn_core::episodic::EpisodicRecord::builder()
         .event_type(EventType::Observation)

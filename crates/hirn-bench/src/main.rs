@@ -279,6 +279,46 @@ struct ArtifactOutputArgs {
     markdown_output: Option<String>,
 }
 
+/// Opt-in LLM reader/judge and reproducibility options for `external` runs.
+#[derive(Args, Clone, Debug)]
+struct ReaderJudgeArgs {
+    /// Opt-in LLM QA reader model (e.g. `gpt-4o`). Generates an answer per
+    /// query from the same retrieved context the harness scores, recording
+    /// EXACT prompt/completion token usage from the API. Requires
+    /// OPENAI_API_KEY. Default: disabled (retrieval-only run).
+    #[arg(long)]
+    reader: Option<String>,
+
+    /// Opt-in LLM judge model (e.g. `gpt-4o`). Requires --reader. LongMemEval
+    /// runs use the official question-type-aware judge prompts (incl.
+    /// abstention); BEAM runs use a gold-answer-cited reader-judged prompt.
+    #[arg(long)]
+    judge: Option<String>,
+
+    /// OpenAI-compatible base URL for reader/judge calls
+    /// (default: $OPENAI_BASE_URL, else https://api.openai.com/v1).
+    #[arg(long)]
+    reader_base_url: Option<String>,
+
+    /// Reader sampling temperature. Keep 0.0 for deterministic, publishable runs.
+    #[arg(long, default_value_t = 0.0)]
+    reader_temperature: f64,
+
+    /// Maximum concurrent reader/judge requests.
+    #[arg(long, default_value_t = hirn_bench::cognitive::reader::DEFAULT_READER_CONCURRENCY)]
+    reader_concurrency: usize,
+
+    /// Fail fast unless the combined blake3 hash of the loaded dataset files
+    /// matches this hex value (published as `dataset_hash_blake3` in provenance).
+    #[arg(long)]
+    expect_dataset_hash: Option<String>,
+
+    /// Seed recorded in run provenance. The external benchmarks currently have
+    /// no sampling/subsetting paths, so this pins provenance for future use.
+    #[arg(long)]
+    seed: Option<u64>,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Synthetic IR benchmark (remember / recall / think).
@@ -500,6 +540,9 @@ enum Command {
         /// Disable safety limits and run the full external corpus.
         #[arg(long)]
         full_corpus: bool,
+
+        #[command(flatten)]
+        reader_judge: ReaderJudgeArgs,
 
         #[command(flatten)]
         outputs: ArtifactOutputArgs,
@@ -799,6 +842,7 @@ fn main() {
             max_records,
             max_queries,
             full_corpus,
+            reader_judge,
             outputs,
         } => run_external(
             format_name,
@@ -821,6 +865,7 @@ fn main() {
             max_records,
             max_queries,
             full_corpus,
+            reader_judge,
             outputs,
         ),
         Command::BenchCompare {
@@ -1447,6 +1492,12 @@ fn run_cognitive(
                     .map(|strategy| strategy.name().to_string())
                     .collect()
             },
+            seed: None,
+            dataset_files: Vec::new(),
+            dataset_hash_blake3: None,
+            dataset_revision: None,
+            reader_model: None,
+            judge_model: None,
             environment,
         },
         results,
@@ -1514,6 +1565,7 @@ fn run_external(
     max_records: usize,
     max_queries: usize,
     full_corpus: bool,
+    reader_judge: ReaderJudgeArgs,
     outputs: ArtifactOutputArgs,
 ) {
     use cognitive::{BenchmarkRetrievalProfile, CognitiveConfig};
@@ -1521,6 +1573,22 @@ fn run_external(
     let outputs = OutputTargets::from_args(outputs).unwrap_or_else(|error| {
         eprintln!("Error: {error}");
         std::process::exit(1);
+    });
+
+    if reader_judge.judge.is_some() && reader_judge.reader.is_none() {
+        eprintln!("Error: --judge requires --reader (nothing to judge without generated answers)");
+        std::process::exit(1);
+    }
+
+    // Fail fast on missing credentials before any expensive work.
+    let reader_api_key = reader_judge.reader.as_ref().map(|_| {
+        let _ = dotenvy::dotenv();
+        std::env::var("OPENAI_API_KEY").unwrap_or_else(|_| {
+            eprintln!(
+                "Error: --reader requires OPENAI_API_KEY (set the variable or create a .env file)."
+            );
+            std::process::exit(1);
+        })
     });
 
     // Resolve cache directory (expand ~ to home).
@@ -1569,6 +1637,45 @@ fn run_external(
     } else {
         eprintln!("Error: either --data-dir or --auto-download is required");
         std::process::exit(1);
+    };
+
+    // Dataset pinning: checksum the files the loader will read, record them in
+    // provenance, and fail fast when --expect-dataset-hash mismatches.
+    let external_format = format_name
+        .parse::<cognitive::external::ExternalFormat>()
+        .unwrap_or_else(|error| {
+            eprintln!("Error: {error}");
+            std::process::exit(1);
+        });
+    let (dataset_files, dataset_hash) =
+        cognitive::external::dataset_files_for_format(external_format, &data_path)
+            .and_then(|files| provenance::dataset_checksums(&files, &data_path))
+            .unwrap_or_else(|error| {
+                eprintln!("Error: failed to checksum dataset files: {error}");
+                std::process::exit(1);
+            });
+    eprintln!(
+        "Dataset hash (blake3 over {} file(s)): {dataset_hash}",
+        dataset_files.len()
+    );
+    if let Some(expected) = reader_judge.expect_dataset_hash.as_deref() {
+        provenance::verify_dataset_hash(expected, &dataset_hash).unwrap_or_else(|error| {
+            eprintln!("Error: {error}");
+            std::process::exit(1);
+        });
+        eprintln!("  dataset hash matches --expect-dataset-hash");
+    }
+    let dataset_revision = if auto_download
+        && matches!(
+            external_format,
+            cognitive::external::ExternalFormat::LongMemEval
+        ) {
+        Some(format!(
+            "huggingface:{}",
+            cognitive::external::longmemeval_revision()
+        ))
+    } else {
+        None
     };
 
     let limit_hint = if full_corpus {
@@ -1789,6 +1896,19 @@ fn run_external(
         result.baselines = average_baseline_results(&run_results, repro_threshold);
     }
 
+    // Opt-in LLM reader/judge over the first run's retrieved contexts
+    // (retrieval is deterministic, so contexts are identical across runs).
+    if let Some(reader_model) = reader_judge.reader.as_deref() {
+        result.reader = Some(run_reader_and_judge(
+            &format_name,
+            reader_model,
+            &reader_judge,
+            reader_api_key.as_deref().expect("api key checked above"),
+            &run_results[0].reader_inputs,
+            result.overall_containment,
+        ));
+    }
+
     eprintln!(
         "  containment={:.4} token_f1={:.4} recall={:.4} mrr={:.4} ndcg={:.4} fpr={:.4} p95={:.2}ms tokens={} tokens/query={:.0} (p50 {} / p95 {}, estimator {}) ({:.2}s)",
         result.overall_containment,
@@ -1879,6 +1999,12 @@ fn run_external(
                     .map(|strategy| strategy.name().to_string())
                     .collect()
             },
+            seed: reader_judge.seed,
+            dataset_files,
+            dataset_hash_blake3: Some(dataset_hash),
+            dataset_revision,
+            reader_model: reader_judge.reader.clone(),
+            judge_model: reader_judge.judge.clone(),
             environment,
         },
         results: vec![result],
@@ -1890,6 +2016,102 @@ fn run_external(
     };
 
     emit_outputs(&outputs, &suite_result, output::write_cognitive_result);
+}
+
+/// Generate answers with the opt-in LLM reader and (optionally) judge them,
+/// returning the published report. `retrieval_containment` is only used for
+/// the honest side-by-side log line — the metrics are never merged.
+fn run_reader_and_judge(
+    format_name: &str,
+    reader_model: &str,
+    args: &ReaderJudgeArgs,
+    api_key: &str,
+    inputs: &[cognitive::reader::ReaderInput],
+    retrieval_containment: f64,
+) -> cognitive::reader::ReaderJudgeReport {
+    use hirn_bench::cognitive::reader;
+
+    let base_url = reader::resolve_base_url(args.reader_base_url.as_deref());
+    let reader_config = reader::ChatClientConfig::new(
+        base_url.clone(),
+        api_key.to_string(),
+        reader_model.to_string(),
+        args.reader_temperature,
+    );
+
+    eprintln!(
+        "Running LLM reader over {} retrieved contexts (model={reader_model}, temperature={}, concurrency={})",
+        inputs.len(),
+        args.reader_temperature,
+        args.reader_concurrency,
+    );
+    let answers = reader::generate_answers(inputs, &reader_config, args.reader_concurrency)
+        .unwrap_or_else(|error| {
+            eprintln!("Error: {error}");
+            std::process::exit(1);
+        });
+
+    let protocol = reader::JudgeProtocol::for_format_name(format_name);
+    let judged = args.judge.as_deref().map(|judge_model| {
+        eprintln!(
+            "Judging {} generated answers (model={judge_model}, protocol={})",
+            answers.len(),
+            protocol.label(),
+        );
+        let judge_config = reader::ChatClientConfig::new(
+            base_url.clone(),
+            api_key.to_string(),
+            judge_model.to_string(),
+            0.0,
+        );
+        reader::judge_answers(
+            protocol,
+            inputs,
+            &answers,
+            &judge_config,
+            args.reader_concurrency,
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("Error: {error}");
+            std::process::exit(1);
+        })
+    });
+
+    let report = reader::summarize(
+        reader_model,
+        args.judge.as_deref(),
+        args.judge.as_deref().map(|_| protocol),
+        args.reader_temperature,
+        &answers,
+        judged.as_deref(),
+    );
+
+    match report.official_reader_accuracy {
+        Some(accuracy) => eprintln!(
+            "  official_reader_accuracy={accuracy:.4} ({}; judged {} queries, abstention {}/{}) — \
+             retrieval-only containment={retrieval_containment:.4}; these are DIFFERENT metrics, never conflate them",
+            protocol.label(),
+            report.judged_queries,
+            report.abstention_correct,
+            report.abstention_queries,
+        ),
+        None => eprintln!(
+            "  reader answers generated without judging (pass --judge for official accuracy)"
+        ),
+    }
+    eprintln!(
+        "  reader tokens/query (EXACT API usage): prompt mean={:.0} (p50 {} / p95 {}), completion mean={:.0} (p50 {} / p95 {}); totals prompt={} completion={}",
+        report.reader_prompt_tokens_per_query_mean,
+        report.reader_prompt_tokens_per_query_p50,
+        report.reader_prompt_tokens_per_query_p95,
+        report.reader_completion_tokens_per_query_mean,
+        report.reader_completion_tokens_per_query_p50,
+        report.reader_completion_tokens_per_query_p95,
+        report.reader_prompt_tokens_total,
+        report.reader_completion_tokens_total,
+    );
+
+    report
 }
 
 fn run_precompute(
@@ -2228,6 +2450,25 @@ fn average_cognitive_results(runs: &[cognitive::CognitiveResult]) -> cognitive::
             / n)
             .round() as usize,
         token_estimator: first.token_estimator.clone(),
+        context_tokens_per_query_mean: runs
+            .iter()
+            .map(|r| r.context_tokens_per_query_mean)
+            .sum::<f64>()
+            / n,
+        context_tokens_per_query_p50: (runs
+            .iter()
+            .map(|r| r.context_tokens_per_query_p50)
+            .sum::<usize>() as f64
+            / n)
+            .round() as usize,
+        context_tokens_per_query_p95: (runs
+            .iter()
+            .map(|r| r.context_tokens_per_query_p95)
+            .sum::<usize>() as f64
+            / n)
+            .round() as usize,
+        // Reader results are attached once per run set, after averaging.
+        reader: None,
         oracle_assisted: first.oracle_assisted,
         truncated: first.truncated,
         total_queries: first.total_queries,
@@ -2270,6 +2511,8 @@ struct CognitiveRunBundle {
     active_retrieval_surfaces: cognitive::ActiveRetrievalSurfaces,
     query_embedding_source: cognitive::QueryEmbeddingSource,
     query_embedding_model_label: Option<String>,
+    /// Question + retrieved context per query, for the opt-in LLM reader.
+    reader_inputs: Vec<cognitive::reader::ReaderInput>,
 }
 
 fn track_query_embedding_runtime(
@@ -2347,6 +2590,7 @@ fn execute_cognitive_bundle(
         active_retrieval_surfaces: report.active_retrieval_surfaces,
         query_embedding_source: report.query_embedding_source,
         query_embedding_model_label: report.query_embedding_model_label,
+        reader_inputs: report.reader_inputs,
     }
 }
 

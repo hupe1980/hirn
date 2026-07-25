@@ -367,15 +367,24 @@ impl HirnDB {
                     );
                 }
             }
-            // Retract all expired entries after optional encoding.
+            // Retract all expired entries after optional encoding. A failed
+            // retract is logged rather than silently discarded so the entry is
+            // retried on the next pass instead of vanishing.
             for entry in &expired_entries {
-                let _ = self
+                if let Err(e) = self
                     .append_working_successor(
                         entry,
                         RevisionOperation::Retract,
                         Some("working memory expired".to_string()),
                     )
-                    .await;
+                    .await
+                {
+                    tracing::warn!(
+                        id = %entry.id,
+                        error = %e,
+                        "failed to retract expired working memory; will retry on next eviction pass"
+                    );
+                }
             }
         }
 
@@ -479,18 +488,36 @@ impl HirnDB {
                 break;
             }
 
-            let _ = self
+            // Only free the budget and schedule episodic encoding once the
+            // durable retract actually succeeds. On a transient failure the
+            // entry is still live, so freeing its tokens (and duplicating it
+            // into episodic) would corrupt the budget and leak the still-live
+            // entry.
+            match self
                 .append_working_successor(
                     entry,
                     RevisionOperation::Retract,
                     Some("working memory evicted".to_string()),
                 )
-                .await;
-            remaining -= entry.token_count;
+                .await
+            {
+                Ok(_) => {
+                    remaining -= entry.token_count;
 
-            // Mark high-relevance entries for episodic encoding.
-            if entry.relevance_score >= self.consolidation_config().working_to_episodic_threshold {
-                to_encode.push(entry.clone());
+                    // Mark high-relevance entries for episodic encoding.
+                    if entry.relevance_score
+                        >= self.consolidation_config().working_to_episodic_threshold
+                    {
+                        to_encode.push(entry.clone());
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        id = %entry.id,
+                        error = %e,
+                        "failed to retract evicted working memory; keeping it live and its budget reserved"
+                    );
+                }
             }
         }
 
@@ -513,6 +540,11 @@ impl HirnDB {
     /// This preserves the content and maps relevance → importance.
     /// The provenance traces back to the working memory source.
     async fn encode_working_to_episodic(&self, entry: &WorkingMemoryEntry) -> HirnResult<MemoryId> {
+        // Scope the promoted episode to the owning agent's private namespace.
+        // Without this the record defaults to `Namespace::default()`, which both
+        // leaks private working content into the cross-agent `default` namespace
+        // AND makes it unfindable by the owner (agent recalls scope to
+        // private+shared, never `default`).
         let episode = EpisodicRecord::builder()
             .content(&entry.content)
             .summary(format!(
@@ -522,6 +554,7 @@ impl HirnDB {
             .event_type(EventType::Observation)
             .importance(entry.relevance_score)
             .agent_id(entry.agent_id.clone())
+            .namespace(Namespace::private_for(&entry.agent_id))
             .timestamp(entry.created_at)
             .build()?;
 
@@ -536,12 +569,317 @@ impl HirnDB {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use arrow_array::RecordBatch;
+    use async_trait::async_trait;
+    use datafusion::catalog::TableProvider;
+    use hirn_core::HirnConfig;
     use hirn_core::Timestamp;
     use hirn_core::id::MemoryId;
     use hirn_core::revision::{LogicalMemoryId, RevisionId, RevisionOperation};
-    use hirn_core::types::AgentId;
+    use hirn_core::types::{AgentId, Namespace};
+    use hirn_storage::HirnDbError;
+    use hirn_storage::PhysicalStore;
+    use hirn_storage::datasets::working::DATASET_NAME as WORKING_DATASET_NAME;
+    use hirn_storage::memory_store::MemoryStore;
+    use hirn_storage::store::{
+        ColumnTransform, CompactOptions, CompactResult, DatasetInfo, FtsSearchOptions,
+        HybridSearchOptions, IndexConfig, MultivectorSearchOptions, ScanOptions,
+        VectorSearchOptions, VersionTag,
+    };
 
     use super::*;
+
+    /// Store wrapper that fails appends to the `working` dataset once
+    /// `fail_working_append` is toggled on. Used to simulate a transient retract
+    /// failure during working-memory eviction.
+    struct RetractFailStore {
+        inner: MemoryStore,
+        fail_working_append: AtomicBool,
+    }
+
+    impl RetractFailStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryStore::new(),
+                fail_working_append: AtomicBool::new(false),
+            }
+        }
+
+        fn arm(&self) {
+            self.fail_working_append.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl PhysicalStore for RetractFailStore {
+        async fn append(&self, dataset: &str, batch: RecordBatch) -> Result<(), HirnDbError> {
+            if dataset == WORKING_DATASET_NAME && self.fail_working_append.load(Ordering::SeqCst) {
+                return Err(HirnDbError::Unsupported(
+                    "simulated working retract append failure".to_string(),
+                ));
+            }
+            self.inner.append(dataset, batch).await
+        }
+
+        async fn append_batches(
+            &self,
+            dataset: &str,
+            batches: Vec<RecordBatch>,
+        ) -> Result<(), HirnDbError> {
+            for batch in batches {
+                self.append(dataset, batch).await?;
+            }
+            Ok(())
+        }
+
+        async fn scan(
+            &self,
+            dataset: &str,
+            opts: ScanOptions,
+        ) -> Result<Vec<RecordBatch>, HirnDbError> {
+            self.inner.scan(dataset, opts).await
+        }
+
+        async fn scan_stream(
+            &self,
+            dataset: &str,
+            opts: ScanOptions,
+        ) -> Result<hirn_storage::store::RecordBatchStream, HirnDbError> {
+            self.inner.scan_stream(dataset, opts).await
+        }
+
+        async fn delete(&self, dataset: &str, predicate: &str) -> Result<u64, HirnDbError> {
+            self.inner.delete(dataset, predicate).await
+        }
+
+        async fn update_where(
+            &self,
+            dataset: &str,
+            filter: &str,
+            updates: &[(&str, &str)],
+        ) -> Result<u64, HirnDbError> {
+            self.inner.update_where(dataset, filter, updates).await
+        }
+
+        async fn merge_insert(
+            &self,
+            dataset: &str,
+            on: &[&str],
+            batch: RecordBatch,
+        ) -> Result<(), HirnDbError> {
+            self.inner.merge_insert(dataset, on, batch).await
+        }
+
+        async fn count(&self, dataset: &str, filter: Option<&str>) -> Result<u64, HirnDbError> {
+            self.inner.count(dataset, filter).await
+        }
+
+        async fn vector_search(
+            &self,
+            dataset: &str,
+            opts: VectorSearchOptions,
+        ) -> Result<Vec<RecordBatch>, HirnDbError> {
+            self.inner.vector_search(dataset, opts).await
+        }
+
+        async fn vector_search_many(
+            &self,
+            dataset: &str,
+            queries: Vec<VectorSearchOptions>,
+        ) -> Result<Vec<Vec<RecordBatch>>, HirnDbError> {
+            self.inner.vector_search_many(dataset, queries).await
+        }
+
+        async fn fts_search(
+            &self,
+            dataset: &str,
+            opts: FtsSearchOptions,
+        ) -> Result<Vec<RecordBatch>, HirnDbError> {
+            self.inner.fts_search(dataset, opts).await
+        }
+
+        async fn hybrid_search(
+            &self,
+            dataset: &str,
+            opts: HybridSearchOptions,
+        ) -> Result<Vec<RecordBatch>, HirnDbError> {
+            self.inner.hybrid_search(dataset, opts).await
+        }
+
+        async fn multivector_search(
+            &self,
+            dataset: &str,
+            opts: MultivectorSearchOptions,
+        ) -> Result<Vec<RecordBatch>, HirnDbError> {
+            self.inner.multivector_search(dataset, opts).await
+        }
+
+        async fn create_index(
+            &self,
+            dataset: &str,
+            config: IndexConfig,
+        ) -> Result<(), HirnDbError> {
+            self.inner.create_index(dataset, config).await
+        }
+
+        async fn optimize_indices(&self, dataset: &str) -> Result<(), HirnDbError> {
+            self.inner.optimize_indices(dataset).await
+        }
+
+        async fn compact(
+            &self,
+            dataset: &str,
+            opts: CompactOptions,
+        ) -> Result<CompactResult, HirnDbError> {
+            self.inner.compact(dataset, opts).await
+        }
+
+        async fn version(&self, dataset: &str) -> Result<u64, HirnDbError> {
+            self.inner.version(dataset).await
+        }
+
+        async fn tag(&self, dataset: &str, tag: &str) -> Result<(), HirnDbError> {
+            self.inner.tag(dataset, tag).await
+        }
+
+        #[allow(deprecated)] // forwarding a deprecated trait method on a test mock
+        async fn checkout(&self, dataset: &str, version: u64) -> Result<(), HirnDbError> {
+            self.inner.checkout(dataset, version).await
+        }
+
+        async fn list_tags(&self, dataset: &str) -> Result<Vec<VersionTag>, HirnDbError> {
+            self.inner.list_tags(dataset).await
+        }
+
+        async fn list_datasets(&self) -> Result<Vec<DatasetInfo>, HirnDbError> {
+            self.inner.list_datasets().await
+        }
+
+        async fn exists(&self, dataset: &str) -> Result<bool, HirnDbError> {
+            self.inner.exists(dataset).await
+        }
+
+        async fn list_namespaces(&self) -> Result<Vec<String>, HirnDbError> {
+            self.inner.list_namespaces().await
+        }
+
+        async fn create_namespace(&self, name: &str) -> Result<(), HirnDbError> {
+            self.inner.create_namespace(name).await
+        }
+
+        async fn drop_namespace(&self, name: &str) -> Result<(), HirnDbError> {
+            self.inner.drop_namespace(name).await
+        }
+
+        async fn add_columns(
+            &self,
+            dataset: &str,
+            transforms: Vec<ColumnTransform>,
+        ) -> Result<(), HirnDbError> {
+            self.inner.add_columns(dataset, transforms).await
+        }
+
+        async fn drop_columns(&self, dataset: &str, columns: &[&str]) -> Result<(), HirnDbError> {
+            self.inner.drop_columns(dataset, columns).await
+        }
+
+        async fn table_provider(&self, dataset: &str) -> Option<Arc<dyn TableProvider>> {
+            self.inner.table_provider(dataset).await
+        }
+    }
+
+    async fn temp_db_with_store(store: Arc<dyn PhysicalStore>) -> (HirnDB, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("working-tests");
+        let config = HirnConfig::builder()
+            .db_path(&path)
+            .embedding_dimensions(4)
+            .working_memory_token_limit(10)
+            .build()
+            .unwrap();
+        let db = HirnDB::open_with_config(config, store).await.unwrap();
+        (db, dir)
+    }
+
+    fn seed_entry(agent: &AgentId, token_count: u32) -> WorkingMemoryEntry {
+        WorkingMemoryEntry::builder()
+            .content("high-value working content")
+            .expires_at(Timestamp::from_millis(
+                Timestamp::now().millis() + 3_600_000,
+            ))
+            .agent_id(agent.clone())
+            .relevance_score(1.0)
+            .token_count(token_count)
+            .build()
+            .unwrap()
+    }
+
+    /// R-08 regression: a working entry promoted to episodic lands in the
+    /// owner's private namespace, not the cross-agent `default` namespace.
+    #[tokio::test]
+    async fn working_promotion_lands_in_private_namespace() {
+        let (db, _dir) = temp_db_with_store(Arc::new(MemoryStore::new())).await;
+        let agent = AgentId::new("agent-a").unwrap();
+        let entry = seed_entry(&agent, 5);
+
+        let episodic_id = db.encode_working_to_episodic(&entry).await.unwrap();
+
+        let record = match db.get_memory(episodic_id).await.unwrap() {
+            hirn_core::record::MemoryRecord::Episodic(e) => e,
+            other => panic!("expected episodic record, got {other:?}"),
+        };
+        assert_eq!(
+            record.namespace,
+            Namespace::private_for(&agent),
+            "promoted episode must be scoped to the owner's private namespace"
+        );
+        assert_ne!(record.namespace, Namespace::default_ns());
+    }
+
+    /// R-59 regression: when the durable retract append fails during eviction,
+    /// the entry's budget is NOT freed and it is NOT enqueued for episodic
+    /// encoding (no duplicate episode is written, entry stays live).
+    #[tokio::test]
+    async fn failed_retract_does_not_free_budget_or_encode() {
+        let store = Arc::new(RetractFailStore::new());
+        let (db, _dir) = temp_db_with_store(store.clone() as Arc<dyn PhysicalStore>).await;
+        let agent = AgentId::new("agent-a").unwrap();
+
+        // Seed two over-budget entries directly (bypassing focus()'s own evict).
+        let e1 = seed_entry(&agent, 100);
+        let e2 = seed_entry(&agent, 100);
+        db.append_working_record(&e1).await.unwrap();
+        db.append_working_record(&e2).await.unwrap();
+
+        // Arm the fault: any subsequent working append (the retract successor)
+        // fails.
+        store.arm();
+
+        // Eviction must not error, must not free budget, must not encode.
+        db.evict_working_memory().await.unwrap();
+
+        // Both entries are still live — the failed retract left them intact.
+        let live = db.working_memory().await.unwrap();
+        assert_eq!(
+            live.len(),
+            2,
+            "failed retract must leave both entries live, got {}",
+            live.len()
+        );
+
+        // No episodic record was written (entry was never enqueued for encode).
+        let episodic_count = store
+            .count(hirn_storage::datasets::episodic::DATASET_NAME, None)
+            .await
+            .unwrap_or(0);
+        assert_eq!(
+            episodic_count, 0,
+            "a still-live entry must not be duplicated into episodic on retract failure"
+        );
+    }
 
     fn working_entry(
         id: MemoryId,

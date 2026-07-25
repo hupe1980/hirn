@@ -4,7 +4,6 @@
 //! each memory is an argument with assumptions (source, recency, evidence count).
 //! The grounded extension determines the "winner".
 
-use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
@@ -43,19 +42,19 @@ pub struct AbaResolution {
 pub struct AbaReconsolidationExec {
     input: Arc<dyn ExecutionPlan>,
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     namespace: String,
 }
 
 impl AbaReconsolidationExec {
     pub fn new(input: Arc<dyn ExecutionPlan>, namespace: String) -> Self {
         let schema = Self::output_schema();
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             datafusion_physical_expr::EquivalenceProperties::new(schema.clone()),
             datafusion_physical_plan::Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
         Self {
             input,
             schema,
@@ -85,15 +84,11 @@ impl ExecutionPlan for AbaReconsolidationExec {
         "AbaReconsolidationExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -341,4 +336,76 @@ pub fn resolve_aba_multi(args: &[(&str, f32)]) -> (Vec<String>, Vec<AbaResolutio
         .collect();
 
     (winners, losers)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow_array::{Float32Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion_execution::TaskContext;
+    use futures::StreamExt;
+
+    use super::*;
+    use crate::operators::nli_contradiction::{NliConfig, NliContradictionExec};
+
+    /// R-20 regression: wiring `NliContradictionExec` → `AbaReconsolidationExec`
+    /// must produce a resolution. Previously the two operators disagreed on the
+    /// column contract (NLI emitted `content_*`/`contradiction_score`, ABA read
+    /// `id_*`/`score_*`), so the pipeline silently produced zero resolutions.
+    #[tokio::test]
+    async fn nli_feeds_aba_and_produces_resolution() {
+        // Input carries per-side ids and retrieval scores alongside content.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id_a", DataType::Utf8, false),
+            Field::new("id_b", DataType::Utf8, false),
+            Field::new("content_a", DataType::Utf8, false),
+            Field::new("content_b", DataType::Utf8, false),
+            Field::new("score_a", DataType::Float32, true),
+            Field::new("score_b", DataType::Float32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["mem-a"])),
+                Arc::new(StringArray::from(vec!["mem-b"])),
+                Arc::new(StringArray::from(vec!["The service is running"])),
+                Arc::new(StringArray::from(vec!["The service is not running"])),
+                Arc::new(Float32Array::from(vec![0.9_f32])),
+                Arc::new(Float32Array::from(vec![0.4_f32])),
+            ],
+        )
+        .unwrap();
+
+        let source = Arc::new(crate::test_utils::MemoryBatchExec::new(schema, vec![batch]));
+        let nli = Arc::new(NliContradictionExec::new(source, NliConfig::default()));
+        let aba = AbaReconsolidationExec::new(nli, "default".to_string());
+
+        let mut stream = aba.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let result = stream.next().await.unwrap().unwrap();
+
+        assert_eq!(
+            result.num_rows(),
+            1,
+            "the negation contradiction should yield exactly one resolution"
+        );
+
+        let winners = result
+            .column_by_name("winner_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let losers = result
+            .column_by_name("loser_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        // Higher retrieval score (0.9) wins per ABA grounded semantics.
+        assert_eq!(winners.value(0), "mem-a");
+        assert_eq!(losers.value(0), "mem-b");
+    }
 }

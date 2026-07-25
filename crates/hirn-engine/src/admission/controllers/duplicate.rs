@@ -67,6 +67,7 @@ impl AdmissionController for DuplicateDetector {
             None => {
                 return Ok(AdmissionDecision::Accept {
                     importance_override: None,
+                    flags: Vec::new(),
                 });
             }
         };
@@ -79,13 +80,19 @@ impl AdmissionController for DuplicateDetector {
         if !exists {
             return Ok(AdmissionDecision::Accept {
                 importance_override: None,
+                flags: Vec::new(),
             });
         }
 
+        // Scope the nearest-neighbour search to the candidate's own namespace so
+        // a near-identical record in a foreign tenant's namespace can never be
+        // returned as a duplicate/merge target (which would disclose a foreign
+        // `MemoryId` or produce a cross-namespace `Merge`).
         let options = VectorSearchOptions {
             query: embedding.clone(),
             column: "embedding".into(),
             limit: 1,
+            filter: Some(super::namespace_eq_filter(&candidate.namespace)),
             ..Default::default()
         };
 
@@ -98,6 +105,7 @@ impl AdmissionController for DuplicateDetector {
         match extract_nearest(&batches) {
             None => Ok(AdmissionDecision::Accept {
                 importance_override: None,
+                flags: Vec::new(),
             }),
             Some((distance, target_id)) => {
                 if distance <= self.threshold {
@@ -112,6 +120,7 @@ impl AdmissionController for DuplicateDetector {
                 } else {
                     Ok(AdmissionDecision::Accept {
                         importance_override: None,
+                        flags: Vec::new(),
                     })
                 }
             }
@@ -176,13 +185,18 @@ mod tests {
     use hirn_storage::{HirnDb, HirnDbConfig};
 
     fn candidate(embedding: Option<Vec<f32>>) -> MemoryCandidate {
+        candidate_in(embedding, Namespace::shared())
+    }
+
+    fn candidate_in(embedding: Option<Vec<f32>>, namespace: Namespace) -> MemoryCandidate {
         MemoryCandidate {
             id: MemoryId::new(),
             content: "test content".into(),
             entities: vec![],
             embedding,
             agent_id: AgentId::new("test").unwrap(),
-            namespace: Namespace::shared(),
+            provenance: hirn_core::provenance::Provenance::direct(AgentId::new("test").unwrap()),
+            namespace,
             importance: 0.5,
             surprise: 0.5,
             metadata: Metadata::default(),
@@ -204,10 +218,19 @@ mod tests {
     }
 
     async fn insert_record(storage: &Arc<dyn PhysicalStore>, emb: Vec<f32>) -> MemoryId {
+        insert_record_ns(storage, emb, Namespace::shared()).await
+    }
+
+    async fn insert_record_ns(
+        storage: &Arc<dyn PhysicalStore>,
+        emb: Vec<f32>,
+        namespace: Namespace,
+    ) -> MemoryId {
         let rec = hirn_core::episodic::EpisodicRecord::builder()
             .content("existing memory")
             .embedding(emb)
             .agent_id(AgentId::new("test").unwrap())
+            .namespace(namespace)
             .build()
             .unwrap();
         let id = rec.id;
@@ -302,6 +325,30 @@ mod tests {
         assert!(
             result.is_reject(),
             "near-duplicate should be detected as duplicate"
+        );
+    }
+
+    /// R-02 regression: a candidate in namespace A that is near-identical to a
+    /// record living in a *different* namespace B must NOT be flagged as a
+    /// duplicate — the search is scoped to the candidate's own namespace.
+    #[tokio::test]
+    async fn cross_namespace_near_duplicate_not_flagged() {
+        let (storage, _dir) = temp_storage().await;
+        let emb = rand_vec(42);
+        // Existing record lives in a foreign namespace (private:agent-b).
+        let foreign_ns = Namespace::private_for(&AgentId::new("agent-b").unwrap());
+        insert_record_ns(&storage, emb.clone(), foreign_ns).await;
+
+        // Candidate is written into a different namespace (private:agent-a).
+        let own_ns = Namespace::private_for(&AgentId::new("agent-a").unwrap());
+        let det = DuplicateDetector::new(storage, "episodic", 0.05, DuplicateAction::Reject);
+        let result = det
+            .evaluate(&candidate_in(Some(emb), own_ns))
+            .await
+            .unwrap();
+        assert!(
+            result.is_accept(),
+            "identical record in a foreign namespace must not be a duplicate, got {result:?}"
         );
     }
 }

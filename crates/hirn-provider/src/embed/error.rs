@@ -78,6 +78,7 @@ impl EmbedError {
     ))]
     pub(crate) fn from_reqwest(provider: impl Into<String>, e: reqwest::Error) -> Self {
         let provider = provider.into();
+        // Genuine connectivity failures are transient and worth retrying.
         if e.is_timeout() {
             return Self::Timeout {
                 provider,
@@ -90,6 +91,26 @@ impl EmbedError {
                 source: Box::new(e),
             };
         }
+        // A response arrived carrying an error status: let the status decide
+        // whether a retry could help (5xx/429 transient, 4xx permanent).
+        if e.is_status() {
+            if let Some(status) = e.status() {
+                return Self::from_status(provider, status.as_u16(), e.to_string(), None);
+            }
+        }
+        // The response body was malformed, truncated, or undecodable. Retrying
+        // an undecodable response only wastes retries and latency, so classify
+        // these as a permanent InvalidResponse rather than a transient
+        // ConnectionFailed.
+        if e.is_body() || e.is_decode() {
+            return Self::InvalidResponse {
+                provider,
+                details: e.to_string(),
+            };
+        }
+        // Anything left (e.g. an error mid-request that is neither a clean
+        // connect nor a timeout) is treated as a transient connection failure,
+        // preserving the previous retry behavior for genuine network hiccups.
         Self::ConnectionFailed {
             provider,
             source: Box::new(e),
@@ -292,5 +313,34 @@ mod tests {
             time_until_probe: Duration::from_secs(30),
         };
         assert!(err.to_string().contains("circuit open"));
+    }
+
+    // A malformed/undecodable provider response must classify as a permanent
+    // InvalidResponse, not a transient ConnectionFailed.
+    #[cfg(any(
+        feature = "openai",
+        feature = "ollama",
+        feature = "cohere",
+        feature = "voyage"
+    ))]
+    #[tokio::test]
+    async fn from_reqwest_decode_error_is_non_transient() {
+        let http_resp = http::Response::builder()
+            .status(200)
+            .body("this is not json")
+            .unwrap();
+        let resp = reqwest::Response::from(http_resp);
+        let err = resp.json::<serde_json::Value>().await.unwrap_err();
+        assert!(err.is_decode(), "expected a decode-kind reqwest error");
+
+        let classified = EmbedError::from_reqwest("openai", err);
+        assert!(
+            matches!(classified, EmbedError::InvalidResponse { .. }),
+            "decode error should map to InvalidResponse, got {classified:?}"
+        );
+        assert!(
+            !classified.is_transient(),
+            "a decode error must not be retried"
+        );
     }
 }

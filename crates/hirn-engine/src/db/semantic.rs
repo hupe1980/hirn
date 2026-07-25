@@ -4526,7 +4526,7 @@ impl HirnDB {
     pub(crate) async fn stats(&self) -> HirnResult<DbStats> {
         let counts = self.count().await?;
 
-        let file_size_bytes = self.file_size_bytes();
+        let file_size_bytes = self.file_size_bytes().await;
 
         let edge_count = self.cached_graph().edge_count().await.unwrap_or(0) as u64;
 
@@ -4732,12 +4732,14 @@ impl HirnDB {
         let actor = actor_override.unwrap_or(evidence_author);
 
         // ── Cedar policy enforcement ──
-        // Reflection mutates beliefs via corrective revisions, so it requires
-        // the same right as `correct_semantic`. Checked up front so a denied
-        // agent fails before any classification work.
+        // Reflection mutates beliefs via corrective revisions, but it is a
+        // dedicated right (`reflect`) distinct from `correct`: policies can
+        // grant manual correction without granting (potentially LLM-driven)
+        // reflection, and vice versa. Checked up front so a denied agent
+        // fails before any classification work.
         self.enforce(
             actor.as_str(),
-            crate::policy::Action::Correct,
+            crate::policy::Action::Reflect,
             &self.config.default_realm,
             namespace.as_str(),
         )
@@ -4864,7 +4866,16 @@ impl HirnDB {
                 for _ in 0..*count {
                     record.record_access();
                 }
-                let _ = self.overwrite_semantic_record(&record).await;
+                // R-74: do not silently discard the durable-write Result. This
+                // is a best-effort access-count flush, so keep going for the
+                // other records, but surface the failure instead of dropping it.
+                if let Err(e) = self.overwrite_semantic_record(&record).await {
+                    tracing::warn!(
+                        id = %id,
+                        error = %e,
+                        "flush_semantic_access: failed to persist updated access count"
+                    );
+                }
             }
         }
 

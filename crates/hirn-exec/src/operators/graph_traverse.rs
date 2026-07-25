@@ -1,6 +1,5 @@
 //! `GraphTraverseExec` — DataFusion operator for graph traversal reads.
 
-use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
@@ -19,7 +18,7 @@ use crate::extensions::{GraphTraverseRow, HirnSessionExt};
 #[derive(Debug, Clone)]
 pub struct GraphTraverseExec {
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     start_id: String,
     relation_filter: Vec<EdgeRelation>,
     depth: u32,
@@ -34,12 +33,12 @@ impl GraphTraverseExec {
         depth: u32,
         namespace: Option<String>,
     ) -> Self {
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             datafusion_physical_expr::EquivalenceProperties::new(schema.clone()),
             datafusion_physical_plan::Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
 
         Self {
             schema,
@@ -68,15 +67,11 @@ impl ExecutionPlan for GraphTraverseExec {
         "GraphTraverseExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -238,6 +233,7 @@ mod tests {
     use datafusion::execution::SessionStateBuilder;
     use datafusion::prelude::SessionContext;
     use hirn_core::HirnResult;
+    use std::any::Any;
 
     use crate::extensions::{GraphActivationOutput, GraphCausalChainRow, GraphReadRuntime};
     use crate::operators::ActivationMode;

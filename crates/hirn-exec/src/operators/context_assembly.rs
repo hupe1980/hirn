@@ -9,7 +9,6 @@
 //! containing the JSON-serialised `ThinkAssemblyOutput`.  This makes context
 //! assembly a true DataFusion pipeline step visible in EXPLAIN ANALYZE output.
 
-use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
@@ -36,7 +35,7 @@ pub struct ContextAssemblyExec {
     input: Arc<dyn ExecutionPlan>,
     /// Output schema: single `assembly_json LargeBinary` column.
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl ContextAssemblyExec {
@@ -52,13 +51,13 @@ impl ContextAssemblyExec {
         }
     }
 
-    fn make_properties(schema: SchemaRef) -> PlanProperties {
-        PlanProperties::new(
+    fn make_properties(schema: SchemaRef) -> Arc<PlanProperties> {
+        Arc::new(PlanProperties::new(
             datafusion_physical_expr::EquivalenceProperties::new(schema),
             datafusion_physical_plan::Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        )
+        ))
     }
 }
 
@@ -73,15 +72,11 @@ impl ExecutionPlan for ContextAssemblyExec {
         "ContextAssemblyExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

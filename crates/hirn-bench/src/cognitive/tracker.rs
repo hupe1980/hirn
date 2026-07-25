@@ -30,6 +30,12 @@ pub struct HistoryEntry {
     pub overall_ndcg: f64,
     #[serde(default)]
     pub false_positive_rate: f64,
+    /// LLM-judged reader accuracy (opt-in `--reader`/`--judge` runs only).
+    /// Distinct from `overall_containment`; never conflate the two.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub official_reader_accuracy: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reader_model: Option<String>,
     pub total_queries: usize,
     pub timestamp: String,
 }
@@ -68,6 +74,14 @@ pub fn save(path: &Path, result: &CognitiveResult) -> Result<(), String> {
         overall_mrr: result.overall_mrr,
         overall_ndcg: result.overall_ndcg,
         false_positive_rate: result.false_positive_rate,
+        official_reader_accuracy: result
+            .reader
+            .as_ref()
+            .and_then(|reader| reader.official_reader_accuracy),
+        reader_model: result
+            .reader
+            .as_ref()
+            .map(|reader| reader.reader_model.clone()),
         total_queries: result.total_queries,
         timestamp: chrono_now(),
     };
@@ -147,6 +161,24 @@ pub fn check_regressions(result: &CognitiveResult, history: &ScoreHistory) -> Ve
         regressions.push(r);
     }
 
+    // Reader-judged accuracy is only comparable across runs that judged with
+    // the same machinery, so it is checked only when both sides recorded it.
+    if let Some(current_reader) = result
+        .reader
+        .as_ref()
+        .and_then(|reader| reader.official_reader_accuracy)
+    {
+        let best_reader = previous
+            .iter()
+            .filter_map(|entry| entry.official_reader_accuracy)
+            .fold(f64::NAN, f64::max);
+        if best_reader.is_finite() {
+            if let Some(r) = check("official_reader_accuracy", best_reader, current_reader) {
+                regressions.push(r);
+            }
+        }
+    }
+
     regressions
 }
 
@@ -183,6 +215,10 @@ mod tests {
             tokens_per_query_p50: 0,
             tokens_per_query_p95: 0,
             token_estimator: String::new(),
+            context_tokens_per_query_mean: 0.0,
+            context_tokens_per_query_p50: 0,
+            context_tokens_per_query_p95: 0,
+            reader: None,
             oracle_assisted: false,
             truncated: None,
             total_queries: 10,
@@ -226,6 +262,8 @@ mod tests {
                 overall_mrr: 0.0,
                 overall_ndcg: 0.0,
                 false_positive_rate: 0.0,
+                official_reader_accuracy: None,
+                reader_model: None,
                 total_queries: 10,
                 timestamp: "0s".into(),
             }],
@@ -249,6 +287,8 @@ mod tests {
                 overall_mrr: 0.0,
                 overall_ndcg: 0.0,
                 false_positive_rate: 0.0,
+                official_reader_accuracy: None,
+                reader_model: None,
                 total_queries: 10,
                 timestamp: "0s".into(),
             }],
@@ -273,5 +313,60 @@ mod tests {
     fn load_missing_file() {
         let result = load(Path::new("/nonexistent/scores.json"));
         assert!(result.is_err());
+    }
+
+    fn reader_report(accuracy: f64) -> crate::cognitive::reader::ReaderJudgeReport {
+        crate::cognitive::reader::ReaderJudgeReport {
+            reader_model: "gpt-4o".into(),
+            judge_model: Some("gpt-4o".into()),
+            judge_protocol: Some("longmemeval-official".into()),
+            reader_temperature: 0.0,
+            official_reader_accuracy: Some(accuracy),
+            answered_queries: 10,
+            judged_queries: 10,
+            abstention_queries: 0,
+            abstention_correct: 0,
+            category_accuracy: vec![],
+            reader_prompt_tokens_total: 0,
+            reader_completion_tokens_total: 0,
+            reader_prompt_tokens_per_query_mean: 0.0,
+            reader_prompt_tokens_per_query_p50: 0,
+            reader_prompt_tokens_per_query_p95: 0,
+            reader_completion_tokens_per_query_mean: 0.0,
+            reader_completion_tokens_per_query_p50: 0,
+            reader_completion_tokens_per_query_p95: 0,
+            judge_prompt_tokens_total: 0,
+            judge_completion_tokens_total: 0,
+        }
+    }
+
+    #[test]
+    fn save_records_reader_accuracy_and_regressions_detect_reader_drops() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("scores.json");
+
+        let mut first = sample_result("run-1", 0.8);
+        first.reader = Some(reader_report(0.9));
+        save(&path, &first).unwrap();
+
+        let history = load(&path).unwrap();
+        assert_eq!(history.entries[0].official_reader_accuracy, Some(0.9));
+        assert_eq!(history.entries[0].reader_model.as_deref(), Some("gpt-4o"));
+
+        // Same retrieval score, collapsed reader accuracy → reader regression.
+        let mut second = sample_result("run-2", 0.8);
+        second.reader = Some(reader_report(0.4));
+        let regressions = check_regressions(&second, &history);
+        assert!(
+            regressions
+                .iter()
+                .any(|r| r.metric == "official_reader_accuracy"),
+            "expected reader regression, got: {regressions:?}"
+        );
+
+        // A retrieval-only follow-up run is never compared against reader accuracy.
+        let retrieval_only = sample_result("run-3", 0.8);
+        let regressions = check_regressions(&retrieval_only, &history);
+        assert!(regressions.is_empty());
     }
 }

@@ -389,7 +389,7 @@ impl<'a> AgentContext<'a> {
         let record = self.db.get_memory(evidence_id).await?;
         let ns = record_namespace(&record);
         self.check_access(&ns)?;
-        self.enforce(crate::policy::Action::Correct, &ns).await?;
+        self.enforce(crate::policy::Action::Reflect, &ns).await?;
         self.db
             .reflect_semantic(evidence_id, Some(self.agent_id), None)
             .await

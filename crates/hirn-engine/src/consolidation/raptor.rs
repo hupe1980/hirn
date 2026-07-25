@@ -115,11 +115,21 @@ pub async fn build_raptor_tree(
             break;
         }
 
-        let clusters = kmeans_cluster(
-            &current_level,
-            config.raptor_cluster_size,
-            config.raptor_min_cluster_size,
-        );
+        // R-64: k-means is pure CPU. Run it on a blocking thread so it never
+        // stalls the async executor while it holds the consolidation lock.
+        // `kmeans_cluster` borrows its input, so the clusters are cloned into
+        // owned `RaptorNode`s before leaving the blocking closure.
+        let cluster_target = config.raptor_cluster_size;
+        let min_cluster = config.raptor_min_cluster_size;
+        let level_nodes = std::mem::take(&mut current_level);
+        let clusters: Vec<Vec<RaptorNode>> = tokio::task::spawn_blocking(move || {
+            kmeans_cluster(&level_nodes, cluster_target, min_cluster)
+                .into_iter()
+                .map(|cluster| cluster.into_iter().cloned().collect())
+                .collect()
+        })
+        .await
+        .map_err(|e| hirn_core::HirnError::storage(format!("raptor k-means task failed: {e}")))?;
         if clusters.is_empty() {
             break;
         }
@@ -292,6 +302,25 @@ pub async fn build_raptor_tree(
         current_level = next_level;
     }
 
+    // If the build produced no summaries at all — e.g. a transient LLM or
+    // embedding outage made every cluster `continue`, leaving `next_level`
+    // empty and breaking out of the level loop — skip the sweep entirely so
+    // the previous good generation stays live. Sweeping here would delete the
+    // whole prior tree (summaries + DerivedFrom/PartOf edges) and leave the
+    // namespace with no RAPTOR tree, silently destroying data on an outage.
+    if total_summaries == 0 || generation_ids.is_empty() {
+        warn!(
+            %namespace,
+            "RAPTOR rebuild produced no summaries (likely transient LLM/embed \
+             outage); preserving the previous generation and skipping the sweep"
+        );
+        return Ok(RaptorResult {
+            summaries_stored: total_summaries,
+            levels_created,
+            edges_created: total_edges,
+        });
+    }
+
     // The new generation is complete — sweep every other generation in this
     // namespace (previous trees and partial generations left by crashed or
     // timed-out runs).
@@ -361,6 +390,7 @@ pub(crate) async fn semantic_leaf_namespaces(db: &HirnDB) -> HirnResult<Vec<Name
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// A node in the RAPTOR tree (either a leaf record or a summary).
+#[derive(Clone)]
 struct RaptorNode {
     id: MemoryId,
     description: String,
@@ -654,6 +684,25 @@ mod tests {
 
         fn model_id(&self) -> &str {
             "mock-raptor"
+        }
+    }
+
+    /// LLM stub whose every `generate_text` call fails, simulating a transient
+    /// provider outage during a RAPTOR rebuild.
+    struct FailingRaptorLlm;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for FailingRaptorLlm {
+        async fn generate_text(
+            &self,
+            _messages: &[ChatMessage],
+            _options: &LlmOptions,
+        ) -> hirn_core::HirnResult<String> {
+            Err(hirn_core::HirnError::provider("simulated LLM outage"))
+        }
+
+        fn model_id(&self) -> &str {
+            "failing-raptor"
         }
     }
 
@@ -976,6 +1025,48 @@ mod tests {
             raptor_records.len(),
             1,
             "full rebuild should leave exactly one RAPTOR summary"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn transient_llm_outage_preserves_prior_generation() {
+        // R-11: a rebuild in which every LLM call fails must NOT sweep the
+        // previous good generation — otherwise a single outage silently
+        // deletes the namespace's entire RAPTOR tree.
+        let db = test_db().await;
+        let good_llm: Arc<dyn LlmProvider> = Arc::new(MockRaptorLlm::new("RAPTOR summary"));
+        store_leaf_semantics(&db).await;
+        let namespace = Namespace::default_ns();
+
+        // 1. Build a good tree.
+        let first = build_raptor_tree(&db, &good_llm, &test_config(), &namespace)
+            .await
+            .unwrap();
+        assert_eq!(first.summaries_stored, 1);
+        let originals = raptor_summaries_in(&db, None).await;
+        assert_eq!(originals.len(), 1);
+        let original_id = originals[0].id;
+
+        // 2. Rebuild while the provider is down (every generate_text fails).
+        let failing_llm: Arc<dyn LlmProvider> = Arc::new(FailingRaptorLlm);
+        let second = build_raptor_tree(&db, &failing_llm, &test_config(), &namespace)
+            .await
+            .expect("outage must not error");
+        assert_eq!(
+            second.summaries_stored, 0,
+            "an outage produces no new summaries"
+        );
+
+        // 3. The prior good generation must still be live and unchanged.
+        let after = raptor_summaries_in(&db, None).await;
+        assert_eq!(
+            after.len(),
+            1,
+            "the prior generation must be preserved on a transient outage"
+        );
+        assert_eq!(
+            after[0].id, original_id,
+            "the exact prior summary record must remain"
         );
     }
 

@@ -27,6 +27,7 @@ use hirn_storage::store::DistanceMetric;
 use parking_lot::RwLock;
 
 use crate::operators::ActivationMode;
+use crate::operators::CoRetrievalQueue;
 use crate::operators::SearchNumericFilter;
 use crate::operators::nli_contradiction::NliClassifier;
 
@@ -273,9 +274,9 @@ fn lookup_query_read_runtime(key: &str) -> Option<Arc<dyn QueryReadRuntime>> {
 pub trait ContextAssemblyRuntime: Send + Sync {
     /// Assemble context from scored candidate batches.
     ///
-    /// Receives the raw Arrow output from `ContextBudgetExec` (or `McfaDefenseExec`
-    /// if MCFA defense is enabled).  Returns opaque JSON bytes that the engine
-    /// decodes into a fully-hydrated `ThinkAssemblyOutput`.
+    /// Receives the raw Arrow output from `ContextBudgetExec`.  Returns opaque
+    /// JSON bytes that the engine decodes into a fully-hydrated
+    /// `ThinkAssemblyOutput`.
     async fn assemble_from_batches(
         &self,
         candidate_batches: Vec<RecordBatch>,
@@ -401,6 +402,16 @@ pub struct HirnSessionExt {
     /// `Some(clf)` — operator uses the injected classifier, enabling ONNX upgrade
     /// without recompiling or changing `InterferenceConfig`.
     nli_classifier: Option<Arc<dyn NliClassifier>>,
+
+    /// Shared co-retrieval queue drained by the engine after a recall (R-19).
+    ///
+    /// `HebbianBufferExec` pushes co-retrieved memory-id pairs here during plan
+    /// execution; the engine drains it after `collect(...)` and applies the
+    /// Hebbian strengthening to the graph. The queue lives on the session ext
+    /// (owned by the engine's `QueryRuntime`) so the operator and the engine
+    /// share ONE queue — previously the operator created a local queue that was
+    /// never drained, so recall-path Hebbian learning was silently inert.
+    co_retrieval_queue: CoRetrievalQueue,
 }
 
 // SAFETY: Arc fields are Send + Sync.
@@ -465,6 +476,7 @@ impl HirnSessionExt {
             recall_search_binding: None,
             rpe_population_stats: Arc::new(RwLock::new(hirn_core::WelfordStats::new())),
             nli_classifier: None,
+            co_retrieval_queue: Arc::new(crossbeam_queue::SegQueue::new()),
         }
     }
 
@@ -484,6 +496,23 @@ impl HirnSessionExt {
     pub fn with_agent_id(mut self, agent_id: impl Into<String>) -> Self {
         self.agent_id = Some(agent_id.into());
         self
+    }
+
+    /// Override the shared co-retrieval queue (R-19).
+    ///
+    /// The engine passes a queue it also retains a handle to, so it can drain
+    /// the pairs `HebbianBufferExec` records and apply them to the graph.
+    pub fn with_co_retrieval_queue(mut self, queue: CoRetrievalQueue) -> Self {
+        self.co_retrieval_queue = queue;
+        self
+    }
+
+    /// The shared co-retrieval queue for Hebbian recall-path learning (R-19).
+    ///
+    /// `HebbianBufferExec` pulls this at plan time and pushes co-retrieved id
+    /// pairs into it; the engine drains it after recall.
+    pub fn co_retrieval_queue(&self) -> CoRetrievalQueue {
+        Arc::clone(&self.co_retrieval_queue)
     }
 
     /// Inject an NLI classifier for `InterferenceDetectorExec` Check 3.

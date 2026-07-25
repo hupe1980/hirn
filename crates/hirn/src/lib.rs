@@ -336,7 +336,7 @@ pub mod ql {
         ConflictPair, ContextConfig, ContextFormat, ThinkResult,
     };
     pub use hirn_engine::ql::revision_query_result_to_json;
-    pub use hirn_engine::{ParseError, QueryPlan, QueryResult, Statement};
+    pub use hirn_engine::{ParseError, QueryResult, Statement};
 }
 
 /// Provenance tracking and audit trail.

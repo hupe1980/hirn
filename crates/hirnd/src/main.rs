@@ -8,10 +8,9 @@ use hirnd::auth::AuthState;
 use hirnd::config::ServerConfig;
 use hirnd::grpc::HirnGrpcService;
 use hirnd::http::HttpState;
-use hirnd::mcp::HirnMcpService;
+use hirnd::mcp::{HirnMcpService, McpTransportOptions};
 use hirnd::proto::hirn_service_server::HirnServiceServer;
 use hirnd::watch::WatchEvent;
-use rmcp::transport::sse_server::SseServer;
 use tokio::net::TcpListener;
 use tokio::signal;
 use tokio::sync::broadcast;
@@ -677,6 +676,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             raft.transport_profile == hirnd::config::ClusterTransportProfile::DevLocal
         });
 
+    // Shared HTTP client for both write-forwarding scaffolding and the cluster
+    // coordinator's leader-proposal forwarding.
+    let forward_client = hirnd::http::default_forward_client()?;
+
+    // ── Cluster write-coordination driver ──
+    // In cluster mode the coordinator (a) keeps the Raft node registry in sync
+    // with membership, and (b) backs the consolidation lease. It does NOT gate
+    // the write path: concurrent multi-node writes are coordinated by Lance
+    // manifest CAS (optimistic concurrency + retry), not by a single-writer
+    // owner. See `crate::raft::coordinator` and docs/deployment.md.
+    let cluster_coordinator = match (&raft_node, &raft_sm) {
+        (Some(raft), Some(sm)) => Some(hirnd::raft::ClusterCoordinator::new(
+            raft.clone(),
+            Arc::clone(sm),
+            forward_client.clone(),
+            raft_transport_secret.clone(),
+        )),
+        _ => None,
+    };
+
     let http_state = Arc::new(HttpState {
         realms: Arc::clone(&realm_manager),
         auth_state: Arc::clone(&auth_state),
@@ -690,7 +709,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         raft_state_machine: raft_sm,
         raft_transport_secret,
         allow_insecure_raft_transport,
-        forward_client: hirnd::http::default_forward_client()?,
+        forward_client,
         idempotency_cache: Arc::new(hirnd::http::IdempotencyCache::default()),
     });
 
@@ -751,10 +770,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!(bind = %grpc_addr, "gRPC server listening");
 
-    // ── MCP SSE server (on port + 2) ──
-    // F-05 FIX: MCP binds to configured address (default: 127.0.0.1 / localhost only).
-    // For production with network exposure, use a TLS-terminating reverse proxy with auth.
-    let mcp_ct = if config.mcp.enabled {
+    // ── MCP Streamable HTTP server (on port + 2, path /mcp) ──
+    // Per-request bearer auth + per-request realm routing; the transport
+    // validates Host (loopback-only unless mcp.allowed_hosts is configured —
+    // the RUSTSEC-2026-0189 DNS-rebinding fix) and serves the daemon's TLS.
+    let mcp_ct = tokio_util::sync::CancellationToken::new();
+    let mut mcp_handle: Option<tokio::task::JoinHandle<()>> = None;
+    if config.mcp.enabled {
         let mcp_ip: std::net::IpAddr = config
             .mcp
             .bind
@@ -767,76 +789,112 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         })?;
         let mcp_addr = std::net::SocketAddr::new(mcp_ip, mcp_port);
-        let mcp_db = realm_manager
-            .get("default")
-            .await
-            .map_err(|e| format!("default realm must be open for MCP server: {e}"))?;
-        // Resolve the configured MCP credential through the same machinery as
-        // the HTTP API. The SSE transport cannot carry per-request headers to
-        // tool handlers, so every tool call runs as this validated identity —
-        // never as a caller-asserted one. Config validation already requires
-        // `mcp.auth_token` outside insecure_dev_mode.
-        let mcp_identity = match config.mcp.auth_token.as_ref() {
-            Some(token) => auth_state
-                .resolve_bearer(token.as_str())
-                .map_err(|e| format!("mcp.auth_token does not resolve to an identity: {e}"))?,
-            None => {
-                // insecure_dev_mode only (config validation enforces this):
-                // fall back to the system agent in the default realm.
-                hirnd::auth::BearerIdentity {
-                    realm: "default".to_string(),
-                    agent_id: "system".to_string(),
-                    namespaces: None,
-                    operations: Vec::new(),
-                }
-            }
-        };
-        let mcp_watch_tx = watch_tx.clone();
-        let mcp_rate_limiter = Arc::clone(&shared_rate_limiter);
-        let mcp_server = SseServer::serve(mcp_addr).await?;
-        let service_template = HirnMcpService::new(
-            Arc::clone(&mcp_db),
-            mcp_watch_tx,
-            mcp_rate_limiter,
-            mcp_identity,
-        )?;
-        let ct = mcp_server.with_service(move || service_template.clone());
-        // Warn about plaintext SSE transport.
-        tracing::warn!(
-            bind = %mcp_addr,
-            "MCP SSE transport is plaintext (no TLS); place behind a TLS-terminating \
-             reverse proxy (e.g. nginx, Caddy, Envoy) for production deployments"
+        let mcp_service = HirnMcpService::new(
+            Arc::clone(&realm_manager),
+            watch_tx.clone(),
+            Arc::clone(&shared_rate_limiter),
+            Arc::clone(&auth_state),
         );
-        if !mcp_ip.is_loopback() {
+        let mcp_router = hirnd::mcp::http_router(
+            mcp_service,
+            Arc::clone(&auth_state),
+            McpTransportOptions {
+                allowed_hosts: config.mcp.allowed_hosts.clone(),
+                allowed_origins: config.mcp.allowed_origins.clone(),
+                cancellation_token: mcp_ct.child_token(),
+            },
+        );
+        let mcp_listener = TcpListener::bind(mcp_addr).await?;
+        let mcp_tls = tls_acceptor.clone();
+        let mcp_shutdown_rx = shutdown_rx.clone();
+        mcp_handle = Some(tokio::spawn(async move {
+            let result = if let Some(acceptor) = mcp_tls {
+                hirnd::http::serve_http_tls(mcp_listener, mcp_router, acceptor, mcp_shutdown_rx)
+                    .await
+            } else {
+                axum::serve(mcp_listener, mcp_router)
+                    .with_graceful_shutdown(wait_for_shutdown(mcp_shutdown_rx))
+                    .await
+                    .map_err(std::io::Error::other)
+            };
+            if let Err(e) = result {
+                error!(error = %e, "MCP server error");
+            }
+        }));
+        if tls_acceptor.is_none() && !mcp_ip.is_loopback() {
             tracing::warn!(
                 bind = %mcp_addr,
-                "MCP SSE server is exposed on a non-loopback interface; its tools run as the \
-                 single identity resolved from mcp.auth_token"
+                "MCP transport is plaintext (no [tls] configured) on a non-loopback \
+                 interface; bearer credentials will cross the network unencrypted"
             );
         }
-        info!(bind = %mcp_addr, "MCP SSE server listening");
-        Some(ct)
+        info!(
+            bind = %mcp_addr,
+            path = hirnd::mcp::MCP_PATH,
+            tls = tls_acceptor.is_some(),
+            "MCP streamable HTTP server listening"
+        );
     } else {
-        info!("MCP SSE server disabled");
-        None
-    };
+        info!("MCP server disabled");
+    }
 
     // ── Sleep-time consolidation (idle-time cognitive maintenance) ──
     // Runs the consolidation pipeline and enqueues bounded offline cognition
     // jobs whenever the daemon has been quiet long enough; exits on the same
     // shutdown watch channel as the listeners.
+    // In cluster mode the sleep pass is gated on the Raft consolidation lease
+    // so only one node consolidates a given realm per window. In serverless
+    // mode (no Raft, DynamoDB configured) it is gated on a DynamoDB
+    // conditional-write lease. Single-node / non-cluster deployments always
+    // consolidate locally (no coordinator), unchanged.
+    let consolidation_coordinator = if let Some(coord) = &cluster_coordinator {
+        hirnd::sleep::ConsolidationCoordinator::Raft(coord.clone())
+    } else {
+        #[cfg(feature = "serverless")]
+        {
+            if let Some(ref dynamo_cfg) = config.dynamo {
+                let store = Arc::new(hirnd::dynamo::DynamoMetadataStore::new(dynamo_cfg).await);
+                if let Err(e) = store.ensure_tables().await {
+                    warn!(error = %e, "failed to ensure DynamoDB tables — consolidation lease may be unavailable");
+                }
+                // Node identity for lease attribution: the bind address is
+                // unique per node in a serverless fleet.
+                let lease =
+                    hirnd::dynamo::DynamoConsolidationLease::new(store, config.bind.clone());
+                info!("serverless consolidation lease enabled (DynamoDB)");
+                hirnd::sleep::ConsolidationCoordinator::Dynamo(Arc::new(lease))
+            } else {
+                hirnd::sleep::ConsolidationCoordinator::Local
+            }
+        }
+        #[cfg(not(feature = "serverless"))]
+        {
+            hirnd::sleep::ConsolidationCoordinator::Local
+        }
+    };
+    let mut sleep_handle: Option<tokio::task::JoinHandle<()>> = None;
     if config.sleep.enabled {
-        let scheduler =
-            hirnd::sleep::SleepScheduler::new(config.sleep.clone(), Arc::clone(&realm_manager));
-        tokio::spawn(scheduler.run(shutdown_rx.clone()));
+        let scheduler = hirnd::sleep::SleepScheduler::with_coordinator(
+            config.sleep.clone(),
+            Arc::clone(&realm_manager),
+            consolidation_coordinator,
+        );
+        sleep_handle = Some(tokio::spawn(scheduler.run(shutdown_rx.clone())));
         info!(
             idle_after_secs = config.sleep.idle_after_secs,
             min_pass_interval_secs = config.sleep.min_pass_interval_secs,
+            clustered = cluster_coordinator.is_some(),
             "sleep-time consolidation enabled"
         );
     } else {
         info!("sleep-time consolidation disabled");
     }
+
+    // ── Cluster coordination driver ──
+    // Keeps the Raft node registry in sync with membership and deregisters this
+    // node on graceful shutdown. Only active in cluster (Raft) mode.
+    let coordination_handle: Option<tokio::task::JoinHandle<()>> = cluster_coordinator
+        .map(|coord| tokio::spawn(coord.run(Arc::clone(&realm_manager), shutdown_rx.clone())));
 
     // ── HTTP server with optional TLS ──
     let http_tls = tls_acceptor.clone();
@@ -846,10 +904,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             hirnd::http::serve_http_tls(http_listener, http_router, acceptor, http_shutdown_rx)
                 .await
         } else {
-            axum::serve(http_listener, http_router)
-                .with_graceful_shutdown(wait_for_shutdown(http_shutdown_rx))
-                .await
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+            // Connect-info make-service exposes the peer address for the
+            // per-IP throttle on unauthenticated public routes (R-72).
+            axum::serve(
+                http_listener,
+                http_router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(wait_for_shutdown(http_shutdown_rx))
+            .await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
         }
     };
 
@@ -857,25 +920,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ready.store(true, Ordering::Release);
     info!("server ready");
 
-    // Run HTTP, gRPC, and MCP concurrently
-    tokio::select! {
-        result = http_future => {
-            if let Err(e) = result {
-                error!(error = %e, "HTTP server error");
-            }
-        }
-        result = grpc_server => {
-            if let Err(e) = result {
-                error!(error = %e, "gRPC server error");
-            }
-        }
+    // Run HTTP and gRPC to completion together. `join!` (not `select!`) so a
+    // shutdown drains BOTH listeners — `select!` would return as soon as the
+    // faster one finished and cancel the slower mid-drain (R-71).
+    let (http_result, grpc_result) = tokio::join!(http_future, grpc_server);
+    if let Err(e) = http_result {
+        error!(error = %e, "HTTP server error");
     }
-    if let Some(ct) = mcp_ct {
-        ct.cancel();
+    if let Err(e) = grpc_result {
+        error!(error = %e, "gRPC server error");
     }
+
+    // Terminate active MCP sessions, then wait (bounded) for the spawned
+    // background tasks to drain instead of dropping them when `main` returns.
+    mcp_ct.cancel();
+    await_background_task("mcp", mcp_handle, SHUTDOWN_DRAIN_TIMEOUT).await;
+    await_background_task("sleep", sleep_handle, SHUTDOWN_DRAIN_TIMEOUT).await;
+    await_background_task("coordination", coordination_handle, SHUTDOWN_DRAIN_TIMEOUT).await;
 
     info!("server shutdown complete");
     Ok(())
+}
+
+/// Bounded drain deadline for spawned background tasks (MCP, sleep scheduler,
+/// coordination driver) on shutdown.
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Await a spawned background task with a bounded deadline so a stuck task
+/// cannot hang process shutdown indefinitely.
+async fn await_background_task(
+    name: &str,
+    handle: Option<tokio::task::JoinHandle<()>>,
+    deadline: Duration,
+) {
+    let Some(handle) = handle else {
+        return;
+    };
+    match tokio::time::timeout(deadline, handle).await {
+        Ok(Ok(())) => info!(task = name, "background task drained"),
+        Ok(Err(e)) => warn!(task = name, error = %e, "background task join error on shutdown"),
+        Err(_) => warn!(
+            task = name,
+            "background task did not drain within deadline; abandoning"
+        ),
+    }
 }
 
 /// Open a LanceDB storage backend for a data directory (used by CLI check/repair).

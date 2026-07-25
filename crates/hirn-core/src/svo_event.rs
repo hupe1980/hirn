@@ -82,6 +82,12 @@ impl SvoEvent {
 
     /// Create an SVO event from extraction output, preserving raw time text
     /// and normalizing timestamps when the text can be parsed.
+    ///
+    /// **Non-deterministic anchor:** relative dates ("yesterday", "last week")
+    /// are resolved against `Timestamp::now()`, so replaying the same
+    /// extraction at a different wall-clock time yields different timestamps.
+    /// Prefer [`from_extraction_anchored`](Self::from_extraction_anchored),
+    /// threading the source record's own timestamp, for deterministic replay.
     #[must_use]
     pub fn from_extraction(
         subject: impl Into<String>,
@@ -92,8 +98,36 @@ impl SvoEvent {
         confidence: f32,
         source_ids: Vec<MemoryId>,
     ) -> Self {
+        Self::from_extraction_anchored(
+            subject,
+            verb,
+            object,
+            time_start_text,
+            time_end_text,
+            confidence,
+            source_ids,
+            Timestamp::now(),
+        )
+    }
+
+    /// Deterministic variant of [`from_extraction`](Self::from_extraction):
+    /// relative dates are resolved against the explicit `reference` anchor
+    /// (typically the source memory's creation timestamp) rather than the
+    /// current wall-clock time, so extraction replays reproducibly.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_extraction_anchored(
+        subject: impl Into<String>,
+        verb: impl Into<String>,
+        object: impl Into<String>,
+        time_start_text: Option<String>,
+        time_end_text: Option<String>,
+        confidence: f32,
+        source_ids: Vec<MemoryId>,
+        reference: Timestamp,
+    ) -> Self {
         Self::new_without_time(subject, verb, object)
-            .with_time_text(time_start_text, time_end_text)
+            .with_time_text(time_start_text, time_end_text, reference)
             .with_confidence(confidence)
             .with_source_ids(source_ids)
     }
@@ -105,14 +139,19 @@ impl SvoEvent {
         self
     }
 
-    /// Store raw temporal extraction text and normalize timestamps when possible.
+    /// Store raw temporal extraction text and normalize timestamps when
+    /// possible, resolving relative dates against the `reference` anchor.
+    ///
+    /// The anchor is threaded in (rather than captured via `Timestamp::now()`)
+    /// so that extraction is deterministic on replay — pass the source
+    /// record's timestamp.
     #[must_use]
     pub fn with_time_text(
         mut self,
         time_start_text: Option<String>,
         time_end_text: Option<String>,
+        reference: Timestamp,
     ) -> Self {
-        let reference = Timestamp::now();
         if self.time_start.is_none() {
             self.time_start = time_start_text
                 .as_deref()
@@ -238,6 +277,33 @@ mod tests {
     fn parses_iso_temporal_text() {
         let ts = parse_temporal_text("2026-03-15", Timestamp::now()).unwrap();
         assert_eq!(ts.to_string(), "2026-03-15T00:00:00+00:00");
+    }
+
+    #[test]
+    fn from_extraction_anchored_resolves_relative_dates_deterministically() {
+        // Relative dates resolve against the explicit anchor, not now(), so the
+        // same extraction is reproducible on replay.
+        let reference = Timestamp::from_datetime(DateTime::from_naive_utc_and_offset(
+            NaiveDate::from_ymd_opt(2026, 4, 17)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap(),
+            Utc,
+        ));
+        let event = SvoEvent::from_extraction_anchored(
+            "agent",
+            "observed",
+            "event",
+            Some("yesterday".into()),
+            None,
+            0.9,
+            Vec::new(),
+            reference,
+        );
+        assert_eq!(
+            event.time_start.unwrap().to_string(),
+            "2026-04-16T00:00:00+00:00"
+        );
     }
 
     #[test]

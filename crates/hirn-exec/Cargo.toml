@@ -1,6 +1,6 @@
 [package]
 name = "hirn-exec"
-description = "DataFusion physical operators, scoring UDFs, and optimizer rules for hirn"
+description = "DataFusion physical operators and optimizer rules for hirn"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -38,11 +38,6 @@ serde_json = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }
 tempfile = { workspace = true }
 datafusion-datasource = { workspace = true }
-criterion = { workspace = true }
-
-[[bench]]
-name = "udf_ops"
-harness = false
 
 [lints]
 workspace = true

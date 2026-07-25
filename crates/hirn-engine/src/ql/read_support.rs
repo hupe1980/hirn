@@ -28,9 +28,10 @@ pub(crate) async fn postprocess_scored_recall_results(
     db: &HirnDB,
     stmt: &RecallStmt,
     mut scored: Vec<ScoredMemory>,
+    actor_id: AgentId,
     allowed_query_namespaces: Option<&[Namespace]>,
 ) -> HirnResult<Vec<ScoredMemory>> {
-    apply_mcfa_filter_to_scored(&mut scored, stmt.with_mcfa);
+    apply_mcfa_filter_to_scored(db, &mut scored, stmt.with_mcfa, actor_id).await;
 
     if let Some(ref modalities) = stmt.modality {
         scored.retain(|record| scored_memory_matches_modalities(record, modalities));
@@ -257,7 +258,14 @@ pub(crate) fn classify_recall_depth(stmt: &RecallStmt) -> hirn_exec::operators::
     use hirn_exec::operators::{ComplexityConfig, QueryFeatures};
 
     let features = QueryFeatures {
-        token_count: stmt.about.split_whitespace().count(),
+        // By execution time the AST is bound, so `about` is a resolved literal
+        // (unbound `$param` placeholders are rejected at analyze time — R-50).
+        token_count: stmt
+            .about
+            .as_literal()
+            .unwrap_or_default()
+            .split_whitespace()
+            .count(),
         has_temporal: stmt.temporal.is_some(),
         entity_count: stmt.involving.as_ref().map_or(0, |value| value.len()),
         graph_depth: stmt.expand.as_ref().map_or(0, |expand| expand.depth as u32),
@@ -412,16 +420,228 @@ fn recall_has_narrowing_postload(stmt: &RecallStmt) -> bool {
         || stmt.topic.is_some()
 }
 
-fn apply_mcfa_filter_to_scored(scored: &mut Vec<ScoredMemory>, enabled: Option<bool>) {
+/// Drop MCFA-flagged rows from scored recall results and persist each flag to
+/// the `mcfa_audit_log` Lance dataset.
+///
+/// Detection delegates to the single-source detector in
+/// `hirn_exec::operators::detect_threat`; this function is the production
+/// audit sink for the read path.
+async fn apply_mcfa_filter_to_scored(
+    db: &HirnDB,
+    scored: &mut Vec<ScoredMemory>,
+    enabled: Option<bool>,
+    actor_id: AgentId,
+) {
     if !enabled.unwrap_or(false) {
         return;
     }
 
     let config = hirn_exec::operators::McfaConfig::default();
-    scored.retain(|record| {
-        hirn_exec::operators::detect_threat(scored_memory_content(&record.record), &config)
-            .is_none()
+    let now_ms = chrono::Utc::now().timestamp_millis();
+
+    // R-55: seed the tamper-evident hash chain from the tag of the most recent
+    // persisted audit entry so appends chain across flushes, not just within a
+    // batch. Deleting or truncating rows then breaks recomputation of every
+    // subsequent entry's tag.
+    let mut prev_hmac = last_mcfa_hmac(db).await;
+
+    let mut flagged = Vec::new();
+    scored.retain(|scored_record| {
+        let content = scored_memory_content(&scored_record.record);
+        match hirn_exec::operators::detect_threat(content, &config) {
+            None => true,
+            Some(reason) => {
+                let entry = build_mcfa_audit_entry(
+                    db,
+                    &scored_record.record,
+                    content,
+                    reason,
+                    actor_id,
+                    now_ms,
+                    &prev_hmac,
+                );
+                // Chain the next entry onto this one's tag.
+                prev_hmac.clone_from(&entry.hmac);
+                flagged.push(entry);
+                false
+            }
+        }
     });
+
+    if flagged.is_empty() {
+        return;
+    }
+
+    let batch = match hirn_storage::datasets::mcfa_audit_log::to_batch(&flagged) {
+        Ok(batch) => batch,
+        Err(error) => {
+            // The RESULT rows were already dropped above (fail-closed); surface
+            // the encode failure loudly rather than losing it silently (R-55).
+            tracing::error!(%error, count = flagged.len(), "failed to encode MCFA audit entries — audit records LOST");
+            return;
+        }
+    };
+
+    // R-55: a lost security-audit append must not be silent. Retry a few times
+    // before giving up; the flagged rows stay dropped from the result either
+    // way (fail-closed).
+    let mut last_error = None;
+    for attempt in 0..MCFA_AUDIT_APPEND_RETRIES {
+        match db
+            .storage_backend()
+            .append(
+                hirn_storage::datasets::mcfa_audit_log::DATASET_NAME,
+                batch.clone(),
+            )
+            .await
+        {
+            Ok(()) => return,
+            Err(error) => {
+                tracing::warn!(%error, attempt, "failed to persist MCFA audit entries; retrying");
+                last_error = Some(error);
+            }
+        }
+    }
+    if let Some(error) = last_error {
+        tracing::error!(
+            %error,
+            count = flagged.len(),
+            retries = MCFA_AUDIT_APPEND_RETRIES,
+            "failed to persist MCFA audit entries after retries — audit records LOST"
+        );
+    }
+}
+
+/// Number of times a failed MCFA audit-log append is retried before it is
+/// reported as a lost audit record (R-55).
+const MCFA_AUDIT_APPEND_RETRIES: u32 = 3;
+
+/// Return the tag of the most recent persisted MCFA audit entry, or an empty
+/// vector if none exists (or the log is unreadable). Ordering is by the entry
+/// `id`, a monotonic ULID, so the greatest id is the most recent (R-55).
+async fn last_mcfa_hmac(db: &HirnDB) -> Vec<u8> {
+    let opts = hirn_storage::store::ScanOptions {
+        columns: Some(vec!["id".into(), "hmac".into()]),
+        ..Default::default()
+    };
+    let batches = match db
+        .storage_backend()
+        .scan(hirn_storage::datasets::mcfa_audit_log::DATASET_NAME, opts)
+        .await
+    {
+        Ok(batches) => batches,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut best: Option<(String, Vec<u8>)> = None;
+    for batch in &batches {
+        let Ok(entries) = hirn_storage::datasets::mcfa_audit_log::from_batch(batch) else {
+            continue;
+        };
+        for entry in entries {
+            let is_newer = best.as_ref().is_none_or(|(best_id, _)| entry.id > *best_id);
+            if is_newer {
+                best = Some((entry.id, entry.hmac));
+            }
+        }
+    }
+    best.map(|(_, hmac)| hmac).unwrap_or_default()
+}
+
+/// Compute the tamper-evident tag over ALL security-relevant fields of an MCFA
+/// audit entry, folding in the previous entry's tag to form a hash chain
+/// (R-55). Fields are length-delimited with a `\0` separator so no field's
+/// content can shift into an adjacent field.
+#[allow(clippy::too_many_arguments)]
+fn mcfa_audit_hmac(
+    key: &[u8; 32],
+    prev_hmac: &[u8],
+    id: &str,
+    memory_id: &str,
+    flag_reason: &str,
+    agent_id: &str,
+    namespace: &str,
+    content_snippet: &str,
+    action_blocked: bool,
+    timestamp_ms: i64,
+) -> Vec<u8> {
+    let mut signable = Vec::new();
+    let mut field = |bytes: &[u8]| {
+        signable.extend_from_slice(bytes);
+        signable.push(0);
+    };
+    field(prev_hmac);
+    field(id.as_bytes());
+    field(memory_id.as_bytes());
+    field(flag_reason.as_bytes());
+    field(agent_id.as_bytes());
+    field(namespace.as_bytes());
+    field(content_snippet.as_bytes());
+    field(&[u8::from(action_blocked)]);
+    signable.extend_from_slice(&timestamp_ms.to_le_bytes());
+    blake3::keyed_hash(key, &signable).as_bytes().to_vec()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_mcfa_audit_entry(
+    db: &HirnDB,
+    record: &MemoryRecord,
+    content: &str,
+    flag_reason: String,
+    actor_id: AgentId,
+    timestamp_ms: i64,
+    prev_hmac: &[u8],
+) -> hirn_storage::datasets::mcfa_audit_log::McfaAuditEntry {
+    let memory_id = record.id().to_string();
+    let content_snippet: String = content.chars().take(200).collect();
+    let namespace = record
+        .namespace()
+        .map(|namespace| namespace.as_str().to_string())
+        .unwrap_or_else(|| Namespace::default_ns().as_str().to_string());
+    let id = format!("mcfa_{}", MemoryId::new());
+    let agent_id = actor_id.as_str().to_string();
+    let action_blocked = true;
+
+    // Tamper-evidence reuses the event-log secret with a domain-separated
+    // derived key; without a configured secret the tag is empty.
+    //
+    // R-55: the signable buffer now covers EVERY security-relevant field —
+    // previously it was only (memory_id ‖ flag_reason ‖ timestamp_ms), so an
+    // attacker could rewrite agent_id / namespace / content_snippet /
+    // action_blocked without breaking the tag. The previous entry's tag is
+    // folded in as `prev_hmac` to form a tamper-evident hash chain.
+    let hmac = db
+        .config()
+        .event_hmac_key()
+        .map(|secret| {
+            let key = blake3::derive_key("hirn mcfa audit hmac v1", secret);
+            mcfa_audit_hmac(
+                &key,
+                prev_hmac,
+                &id,
+                &memory_id,
+                &flag_reason,
+                &agent_id,
+                &namespace,
+                &content_snippet,
+                action_blocked,
+                timestamp_ms,
+            )
+        })
+        .unwrap_or_default();
+
+    hirn_storage::datasets::mcfa_audit_log::McfaAuditEntry {
+        id,
+        memory_id,
+        content_snippet,
+        flag_reason,
+        user_instruction: None,
+        action_blocked,
+        timestamp_ms,
+        agent_id,
+        hmac,
+        namespace,
+    }
 }
 
 fn scored_memory_content(record: &MemoryRecord) -> &str {
@@ -1405,10 +1625,121 @@ mod tests {
 
     use crate::ql::ast::{DepthModeAst, RetrievalMode};
 
+    /// R-55: the MAC must cover every security-relevant field, and entries must
+    /// chain. Rewriting the actor/namespace (or any field) must break the tag,
+    /// and each entry's tag must depend on its predecessor's.
+    #[test]
+    fn mcfa_audit_hmac_covers_all_fields_and_chains() {
+        let key = blake3::derive_key("hirn mcfa audit hmac v1", b"test-secret");
+
+        let base = mcfa_audit_hmac(
+            &key,
+            b"",
+            "mcfa_1",
+            "mem_1",
+            "prompt_injection",
+            "agent-a",
+            "ns-a",
+            "snippet",
+            true,
+            1_000,
+        );
+
+        // Rewriting the actor must break the tag (previously excluded).
+        let tampered_actor = mcfa_audit_hmac(
+            &key,
+            b"",
+            "mcfa_1",
+            "mem_1",
+            "prompt_injection",
+            "agent-EVIL",
+            "ns-a",
+            "snippet",
+            true,
+            1_000,
+        );
+        assert_ne!(base, tampered_actor, "agent_id must be covered by the MAC");
+
+        // Rewriting the namespace must break the tag (previously excluded).
+        let tampered_ns = mcfa_audit_hmac(
+            &key,
+            b"",
+            "mcfa_1",
+            "mem_1",
+            "prompt_injection",
+            "agent-a",
+            "ns-HIJACK",
+            "snippet",
+            true,
+            1_000,
+        );
+        assert_ne!(base, tampered_ns, "namespace must be covered by the MAC");
+
+        // Rewriting content / action_blocked must break the tag.
+        let tampered_action = mcfa_audit_hmac(
+            &key,
+            b"",
+            "mcfa_1",
+            "mem_1",
+            "prompt_injection",
+            "agent-a",
+            "ns-a",
+            "snippet",
+            false,
+            1_000,
+        );
+        assert_ne!(base, tampered_action, "action_blocked must be covered");
+
+        // Chaining: folding a non-empty prev tag must change the result.
+        let chained = mcfa_audit_hmac(
+            &key,
+            &base,
+            "mcfa_2",
+            "mem_1",
+            "prompt_injection",
+            "agent-a",
+            "ns-a",
+            "snippet",
+            true,
+            1_000,
+        );
+        let unchained = mcfa_audit_hmac(
+            &key,
+            b"",
+            "mcfa_2",
+            "mem_1",
+            "prompt_injection",
+            "agent-a",
+            "ns-a",
+            "snippet",
+            true,
+            1_000,
+        );
+        assert_ne!(
+            chained, unchained,
+            "the previous tag must be folded into the chain"
+        );
+
+        // Deterministic: same inputs → same tag (verification is reproducible).
+        let repeat = mcfa_audit_hmac(
+            &key,
+            b"",
+            "mcfa_1",
+            "mem_1",
+            "prompt_injection",
+            "agent-a",
+            "ns-a",
+            "snippet",
+            true,
+            1_000,
+        );
+        assert_eq!(base, repeat, "tag computation must be deterministic");
+    }
+
     fn minimal_recall_stmt() -> RecallStmt {
         RecallStmt {
             layers: vec![Layer::Episodic],
-            about: "incident analysis".to_owned(),
+            about: hirn_query::StringOrParam::Literal("incident analysis".to_owned()),
             involving: None,
             temporal: None,
             as_of: None,
@@ -1442,7 +1773,7 @@ mod tests {
     #[test]
     fn recall_stmt_from_think_preserves_query_shape() {
         let think = ThinkStmt {
-            about: "incident analysis".to_owned(),
+            about: hirn_query::StringOrParam::Literal("incident analysis".to_owned()),
             involving: Some(vec!["auth".to_owned()]),
             temporal: None,
             expand: None,
@@ -1483,7 +1814,7 @@ mod tests {
     #[test]
     fn recall_stmt_from_think_preserves_hybrid_flag() {
         let mut think = ThinkStmt {
-            about: "incident analysis".to_owned(),
+            about: hirn_query::StringOrParam::Literal("incident analysis".to_owned()),
             involving: None,
             temporal: None,
             expand: None,

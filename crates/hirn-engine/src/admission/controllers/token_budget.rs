@@ -40,11 +40,24 @@ struct BudgetState {
     reservations: HashMap<MemoryId, (AgentId, usize)>,
 }
 
+/// Cognitive datasets whose per-agent content counts against the budget.
+///
+/// R-57: the budget previously counted only `episodic`, so semantic and
+/// procedural writes escaped it entirely. All three long-term cognitive tiers
+/// are summed so an agent cannot bypass its budget by writing to another tier.
+const COGNITIVE_DATASETS: [&str; 3] = [
+    hirn_storage::datasets::episodic::DATASET_NAME,
+    hirn_storage::datasets::semantic::DATASET_NAME,
+    hirn_storage::datasets::procedural::DATASET_NAME,
+];
+
 /// Per-agent token budget enforcement.
 pub struct TokenBudgetGate {
     storage: Arc<dyn PhysicalStore>,
     tokenizer: Arc<dyn Tokenizer>,
-    dataset: String,
+    /// Datasets summed for an agent's usage. Multiple entries are added
+    /// together (R-57) so writes across cognitive tiers all count.
+    datasets: Vec<String>,
     /// Maximum tokens per agent. Default: 500_000.
     max_tokens: usize,
     state: RwLock<BudgetState>,
@@ -60,7 +73,28 @@ impl TokenBudgetGate {
         Self {
             storage,
             tokenizer,
-            dataset: dataset.into(),
+            datasets: vec![dataset.into()],
+            max_tokens,
+            state: RwLock::new(BudgetState::default()),
+        }
+    }
+
+    /// Enforce the budget across ALL cognitive datasets (episodic + semantic +
+    /// procedural). This is the constructor the default write pipeline uses so
+    /// a per-agent budget cannot be bypassed by writing to a non-episodic tier
+    /// (R-57).
+    pub fn new_cognitive(
+        storage: Arc<dyn PhysicalStore>,
+        tokenizer: Arc<dyn Tokenizer>,
+        max_tokens: usize,
+    ) -> Self {
+        Self {
+            storage,
+            tokenizer,
+            datasets: COGNITIVE_DATASETS
+                .iter()
+                .map(|d| (*d).to_string())
+                .collect(),
             max_tokens,
             state: RwLock::new(BudgetState::default()),
         }
@@ -92,19 +126,50 @@ impl TokenBudgetGate {
         state.reservations.clear();
     }
 
-    /// Compute the current token count for an agent by scanning storage.
+    /// Compute the current token count for an agent by scanning storage,
+    /// summed across every configured dataset (R-57).
     async fn compute_tokens(&self, agent_id: &AgentId) -> HirnResult<usize> {
+        let mut total_tokens = 0usize;
+        for dataset in &self.datasets {
+            total_tokens += self.compute_tokens_for_dataset(dataset, agent_id).await?;
+        }
+        Ok(total_tokens)
+    }
+
+    /// Sum the tokens an agent's content occupies in a single dataset.
+    ///
+    /// Episodic exposes top-level `agent_id`/`content` columns, so its scan
+    /// pushes the agent filter down to Lance and reads only `content`. Semantic
+    /// and procedural keep the authoring agent inside `provenance_json` and have
+    /// no single `content` column, so they are decoded to typed records and the
+    /// authoring agent is matched in-process (R-57).
+    async fn compute_tokens_for_dataset(
+        &self,
+        dataset: &str,
+        agent_id: &AgentId,
+    ) -> HirnResult<usize> {
         let exists = self
             .storage
-            .exists(&self.dataset)
+            .exists(dataset)
             .await
             .map_err(hirn_core::HirnError::storage)?;
         if !exists {
             return Ok(0);
         }
 
-        // Use the top-level agent_id column to push the filter down to Lance,
-        // reading only the content column for matching rows.
+        if dataset == hirn_storage::datasets::episodic::DATASET_NAME {
+            self.compute_episodic_tokens(dataset, agent_id).await
+        } else {
+            self.compute_decoded_tokens(dataset, agent_id).await
+        }
+    }
+
+    /// Episodic: push the agent filter down and read only the `content` column.
+    async fn compute_episodic_tokens(
+        &self,
+        dataset: &str,
+        agent_id: &AgentId,
+    ) -> HirnResult<usize> {
         let agent_str = agent_id.as_str();
         let options = ScanOptions {
             columns: Some(vec!["content".into()]),
@@ -117,7 +182,7 @@ impl TokenBudgetGate {
 
         let mut batches = self
             .storage
-            .scan_stream(&self.dataset, options)
+            .scan_stream(dataset, options)
             .await
             .map_err(hirn_core::HirnError::storage)?;
 
@@ -141,6 +206,42 @@ impl TokenBudgetGate {
                 for i in 0..arr.len() {
                     if !arr.is_null(i) {
                         total_tokens += self.tokenizer.count_tokens(arr.value(i));
+                    }
+                }
+            }
+        }
+
+        Ok(total_tokens)
+    }
+
+    /// Semantic/procedural: the agent lives in `provenance_json` and there is no
+    /// single text column, so decode typed records and match the author
+    /// in-process, counting the tokens of each record's text fields.
+    async fn compute_decoded_tokens(&self, dataset: &str, agent_id: &AgentId) -> HirnResult<usize> {
+        let batches = self
+            .storage
+            .scan(dataset, ScanOptions::default())
+            .await
+            .map_err(hirn_core::HirnError::storage)?;
+
+        let mut total_tokens = 0usize;
+        for batch in &batches {
+            if dataset == hirn_storage::datasets::semantic::DATASET_NAME {
+                for record in hirn_storage::datasets::semantic::from_batch(batch)
+                    .map_err(hirn_core::HirnError::storage)?
+                {
+                    if record.provenance.created_by == *agent_id {
+                        total_tokens += self.tokenizer.count_tokens(&record.concept);
+                        total_tokens += self.tokenizer.count_tokens(&record.description);
+                    }
+                }
+            } else if dataset == hirn_storage::datasets::procedural::DATASET_NAME {
+                for record in hirn_storage::datasets::procedural::from_batch(batch)
+                    .map_err(hirn_core::HirnError::storage)?
+                {
+                    if record.provenance.created_by == *agent_id {
+                        total_tokens += self.tokenizer.count_tokens(&record.name);
+                        total_tokens += self.tokenizer.count_tokens(&record.description);
                     }
                 }
             }
@@ -212,6 +313,7 @@ impl AdmissionController for TokenBudgetGate {
                 .insert(candidate.id, (candidate.agent_id.clone(), candidate_tokens));
             Ok(AdmissionDecision::Accept {
                 importance_override: None,
+                flags: Vec::new(),
             })
         }
     }
@@ -252,6 +354,7 @@ mod tests {
             entities: vec![],
             embedding: None,
             agent_id: AgentId::new(agent).unwrap(),
+            provenance: hirn_core::provenance::Provenance::direct(AgentId::new(agent).unwrap()),
             namespace: Namespace::shared(),
             importance: 0.5,
             surprise: 0.5,
@@ -278,6 +381,62 @@ mod tests {
         let batch =
             hirn_storage::datasets::episodic::to_batch(std::slice::from_ref(&rec), 32).unwrap();
         storage.append("episodic", batch).await.unwrap();
+    }
+
+    async fn insert_semantic(storage: &Arc<dyn PhysicalStore>, description: &str, agent: &str) {
+        let emb: Vec<f32> = vec![0.0; 32];
+        let rec = hirn_core::semantic::SemanticRecord::builder()
+            .concept("concept")
+            .description(description)
+            .embedding(emb)
+            .agent_id(AgentId::new(agent).unwrap())
+            .build()
+            .unwrap();
+        let batch =
+            hirn_storage::datasets::semantic::to_batch(std::slice::from_ref(&rec), 32).unwrap();
+        storage
+            .append(hirn_storage::datasets::semantic::DATASET_NAME, batch)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cognitive_budget_counts_semantic_writes() {
+        // R-57: semantic (and procedural) writes must count against the budget,
+        // not only episodic. A single-dataset gate would miss the semantic
+        // usage and admit; the cognitive gate rejects.
+        let (storage, _dir) = temp_storage().await;
+
+        // ~2500 tokens of semantic content for agent-a.
+        let big_description = "a ".repeat(5000);
+        insert_semantic(&storage, &big_description, "agent-a").await;
+
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(EstimatingTokenizer);
+
+        // Episodic-only gate ignores the semantic footprint → admits.
+        let episodic_only =
+            TokenBudgetGate::new(storage.clone(), tokenizer.clone(), "episodic", 3000);
+        assert!(
+            episodic_only
+                .evaluate(&candidate_with_agent("more content", "agent-a"))
+                .await
+                .unwrap()
+                .is_accept(),
+            "episodic-only gate wrongly ignores semantic usage"
+        );
+
+        // Cognitive gate sums the semantic footprint → the same candidate now
+        // pushes over the 3000-token budget.
+        let cognitive = TokenBudgetGate::new_cognitive(storage, tokenizer, 3000);
+        let more_content = "b ".repeat(1200); // ~600 tokens; 2500 + 600 > 3000
+        assert!(
+            cognitive
+                .evaluate(&candidate_with_agent(&more_content, "agent-a"))
+                .await
+                .unwrap()
+                .is_reject(),
+            "cognitive gate must count semantic usage against the budget"
+        );
     }
 
     #[tokio::test]

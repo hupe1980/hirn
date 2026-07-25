@@ -46,13 +46,17 @@ impl CausalEdge {
         }
     }
 
-    /// Compute `strength × confidence × ln(1 + evidence_count)`.
+    /// Compute `strength × confidence × ln(1 + evidence_count)`, clamped to
+    /// `[0.0, 1.0]`.
     ///
     /// This is the per-link causal relevance score used in the composite
-    /// scoring formula (ε weight).
+    /// scoring formula (ε weight). The raw product is unbounded above (the
+    /// `ln(1 + evidence_count)` factor grows without limit as evidence
+    /// accumulates), but composite-scoring consumers treat every term as a
+    /// `[0.0, 1.0]` value, so the result is clamped to that range here.
     #[must_use]
     pub fn relevance_score(&self) -> f32 {
-        self.strength * self.confidence * (1.0 + self.evidence_count as f32).ln()
+        (self.strength * self.confidence * (1.0 + self.evidence_count as f32).ln()).clamp(0.0, 1.0)
     }
 }
 
@@ -96,12 +100,29 @@ mod tests {
             evidence_count: 5,
             ..Default::default()
         };
-        // 0.8 * 0.9 * ln(6) ≈ 0.72 * 1.7918 ≈ 1.290
-        let expected = 0.8 * 0.9 * (6.0_f32).ln();
+        // 0.8 * 0.9 * ln(6) ≈ 1.290, but the score is clamped to [0.0, 1.0]
+        // because composite-scoring consumers treat every term as a unit value.
         let actual = ce.relevance_score();
         assert!(
-            (actual - expected).abs() < 1e-5,
-            "expected {expected}, got {actual}"
+            (actual - 1.0).abs() < 1e-5,
+            "high-evidence score must clamp to 1.0, got {actual}"
+        );
+    }
+
+    #[test]
+    fn relevance_score_is_bounded_in_unit_range() {
+        // Even with maximal strength/confidence and huge evidence, the score
+        // never exceeds 1.0.
+        let ce = CausalEdge {
+            strength: 1.0,
+            confidence: 1.0,
+            evidence_count: u32::MAX,
+            ..Default::default()
+        };
+        let score = ce.relevance_score();
+        assert!(
+            (0.0..=1.0).contains(&score),
+            "relevance_score must be in [0.0, 1.0], got {score}"
         );
     }
 

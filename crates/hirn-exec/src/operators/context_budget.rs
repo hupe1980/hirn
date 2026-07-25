@@ -1,6 +1,5 @@
 //! `ContextBudgetExec` - token-budget enforcement as a DataFusion operator.
 
-use std::any::Any;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::fmt;
@@ -16,6 +15,7 @@ use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use hirn_core::config::HirnConfig;
+use hirn_core::scoring::{self, ScoringWeights};
 use hirn_core::tokenizer::{EstimatingTokenizer, Tokenizer};
 
 use crate::extensions::HirnSessionExt;
@@ -25,7 +25,12 @@ struct BudgetCandidate {
     score: f32,
     token_count: u32,
     input_ordinal: u64,
-    row_batch: RecordBatch,
+    /// The source batch this row came from (shared, never copied) plus the
+    /// row's index within it. Survivors are gathered in a single `interleave`
+    /// pass per column at the end rather than materializing one RecordBatch
+    /// per candidate row.
+    source: Arc<RecordBatch>,
+    row: usize,
 }
 
 impl PartialEq for BudgetCandidate {
@@ -62,7 +67,7 @@ impl Ord for BudgetCandidate {
 pub struct ContextBudgetExec {
     input: Arc<dyn ExecutionPlan>,
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     token_budget: u32,
 }
 
@@ -73,12 +78,12 @@ impl ContextBudgetExec {
         fields.push(Arc::new(Field::new("token_count", DataType::UInt32, false)));
         let schema = Arc::new(Schema::new(fields));
 
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             datafusion_physical_expr::EquivalenceProperties::new(schema.clone()),
             datafusion_physical_plan::Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
 
         Self {
             input,
@@ -89,46 +94,54 @@ impl ContextBudgetExec {
     }
 }
 
+/// Ranking parameters resolved from `HirnConfig`.
+///
+/// Scoring delegates to the canonical formula in [`hirn_core::scoring`] so
+/// the operator path and the engine's imperative recall path produce
+/// identical scores for identical inputs.
 #[derive(Debug, Clone, Copy)]
 struct BudgetRankingConfig {
-    similarity_weight: f32,
-    importance_weight: f32,
-    recency_weight: f32,
-    activation_weight: f32,
-    causal_weight: f32,
+    weights: ScoringWeights,
     decay_lambda: f64,
 }
 
 impl BudgetRankingConfig {
     fn from_hirn_config(config: &HirnConfig) -> Self {
         Self {
-            similarity_weight: config.scoring_similarity_weight,
-            importance_weight: config.scoring_importance_weight,
-            recency_weight: config.scoring_recency_weight,
-            activation_weight: config.scoring_activation_weight,
-            causal_weight: config.scoring_causal_relevance_weight,
+            weights: ScoringWeights::from_config(config),
             decay_lambda: config.decay_lambda,
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn recall_rank_score(
         self,
         similarity: f32,
         importance: f32,
         activation: f32,
         causal_relevance: f32,
+        surprise: f32,
+        access_count: u64,
         created_at_ms: i64,
         now_ms: i64,
     ) -> f32 {
         let age_ms = now_ms.saturating_sub(created_at_ms).max(0);
         let age_hours = age_ms as f64 / 3_600_000.0;
-        let recency = (-self.decay_lambda * age_hours).exp() as f32;
 
-        self.similarity_weight * similarity
-            + self.importance_weight * importance
-            + self.recency_weight * recency
-            + self.activation_weight * activation
-            + self.causal_weight * causal_relevance
+        // The batch carries no source-reliability column; pass the neutral
+        // 0.0 so the weighted term contributes nothing.
+        scoring::composite_score(
+            similarity,
+            importance,
+            age_hours,
+            self.decay_lambda,
+            access_count,
+            activation,
+            causal_relevance,
+            surprise,
+            0.0,
+            &self.weights,
+        )
     }
 }
 
@@ -137,6 +150,8 @@ struct BudgetBatchView<'a> {
     activation_scores: Option<&'a Float32Array>,
     causal_scores: Option<&'a Float32Array>,
     importance_scores: Option<&'a Float32Array>,
+    surprise_scores: Option<&'a Float32Array>,
+    access_counts: Option<&'a UInt32Array>,
     created_at_ms: Option<&'a Int64Array>,
     tokens: Option<&'a UInt32Array>,
     content: Option<&'a StringArray>,
@@ -150,6 +165,8 @@ impl<'a> BudgetBatchView<'a> {
         let activation_scores = optional_f32_column(batch, "activation_score")?;
         let causal_scores = optional_f32_column(batch, "causal_score")?;
         let importance_scores = optional_f32_column(batch, "importance")?;
+        let surprise_scores = optional_f32_column(batch, "surprise")?;
+        let access_counts = optional_u32_column(batch, "access_count")?;
         let created_at_ms = optional_i64_column(batch, "created_at_ms")?;
         let tokens = optional_u32_column(batch, "token_count")?;
         let content = optional_string_column(batch, "content")?;
@@ -172,6 +189,8 @@ impl<'a> BudgetBatchView<'a> {
             activation_scores,
             causal_scores,
             importance_scores,
+            surprise_scores,
+            access_counts,
             created_at_ms,
             tokens,
             content,
@@ -194,6 +213,8 @@ impl<'a> BudgetBatchView<'a> {
                 optional_f32_value(self.importance_scores, row).unwrap_or(0.0),
                 activation,
                 causal_relevance,
+                optional_f32_value(self.surprise_scores, row).unwrap_or(0.0),
+                u64::from(optional_u32_value(self.access_counts, row).unwrap_or(0)),
                 optional_i64_value(self.created_at_ms, row).unwrap_or(now_ms),
                 now_ms,
             )
@@ -249,6 +270,12 @@ fn optional_i64_value(array: Option<&Int64Array>, row: usize) -> Option<i64> {
         .map(|array| array.value(row))
 }
 
+fn optional_u32_value(array: Option<&UInt32Array>, row: usize) -> Option<u32> {
+    array
+        .filter(|array| !array.is_null(row))
+        .map(|array| array.value(row))
+}
+
 fn optional_f32_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<Option<&'a Float32Array>> {
     optional_typed_column::<Float32Array>(batch, name, DataType::Float32)
 }
@@ -296,25 +323,6 @@ fn optional_typed_column<'a, T: Array + 'static>(
         })
 }
 
-fn take_single_row(
-    input_schema: SchemaRef,
-    batch: &RecordBatch,
-    row: usize,
-) -> Result<RecordBatch> {
-    let row = u32::try_from(row).map_err(|_| {
-        datafusion_common::DataFusionError::Execution(
-            "ContextBudgetExec row index exceeds u32::MAX".to_string(),
-        )
-    })?;
-    let indices = UInt32Array::from(vec![row]);
-    let columns = batch
-        .columns()
-        .iter()
-        .map(|column| arrow_select::take::take(column.as_ref(), &indices, None))
-        .collect::<std::result::Result<Vec<ArrayRef>, arrow_schema::ArrowError>>()?;
-    RecordBatch::try_new(input_schema, columns).map_err(Into::into)
-}
-
 fn retain_budget_candidate(
     candidates_by_token: &mut std::collections::HashMap<u32, BinaryHeap<Reverse<BudgetCandidate>>>,
     candidate: BudgetCandidate,
@@ -351,18 +359,35 @@ fn build_selected_batch(
         return Ok(RecordBatch::new_empty(schema));
     }
 
+    // Deduplicate the distinct source batches so each is referenced exactly
+    // once, then map every surviving row to `(batch_index, row_index)`,
+    // preserving the selection order. A single `interleave` per column then
+    // gathers all survivors at once instead of the previous per-row `take` +
+    // final `concat`.
+    let mut source_batches: Vec<&Arc<RecordBatch>> = Vec::new();
+    let mut indices: Vec<(usize, usize)> = Vec::with_capacity(selected.len());
+    for candidate in selected {
+        let batch_index = match source_batches
+            .iter()
+            .position(|batch| Arc::ptr_eq(batch, &candidate.source))
+        {
+            Some(index) => index,
+            None => {
+                source_batches.push(&candidate.source);
+                source_batches.len() - 1
+            }
+        };
+        indices.push((batch_index, candidate.row));
+    }
+
     let num_fields = input_schema.fields().len();
     let mut columns = Vec::with_capacity(num_fields + 1);
     for field_idx in 0..num_fields {
-        let arrays = selected
+        let values = source_batches
             .iter()
-            .map(|candidate| candidate.row_batch.column(field_idx).clone())
-            .collect::<Vec<_>>();
-        let refs = arrays
-            .iter()
-            .map(|array| array.as_ref())
-            .collect::<Vec<_>>();
-        columns.push(arrow_select::concat::concat(&refs)?);
+            .map(|batch| batch.column(field_idx).as_ref())
+            .collect::<Vec<&dyn Array>>();
+        columns.push(arrow_select::interleave::interleave(&values, &indices)?);
     }
 
     let modes = selected
@@ -399,15 +424,11 @@ impl ExecutionPlan for ContextBudgetExec {
         "ContextBudgetExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -468,12 +489,11 @@ impl ExecutionPlan for ContextBudgetExec {
             let mut input_ordinal = 0_u64;
 
             while let Some(batch) = stream.next().await {
-                let batch = batch?;
-                let view = BudgetBatchView::try_new(&batch)?;
+                let batch = Arc::new(batch?);
+                let view = BudgetBatchView::try_new(batch.as_ref())?;
                 for row in 0..batch.num_rows() {
                     let score = view.score_at(row, ranking_config, now_ms)?;
                     let token_count = view.token_count_at(row, tokenizer.as_ref())?;
-                    let row_batch = take_single_row(input_schema.clone(), &batch, row)?;
 
                     retain_budget_candidate(
                         &mut candidates_by_token,
@@ -481,7 +501,8 @@ impl ExecutionPlan for ContextBudgetExec {
                             score,
                             token_count,
                             input_ordinal,
-                            row_batch,
+                            source: Arc::clone(&batch),
+                            row,
                         },
                         budget,
                     );
@@ -793,6 +814,76 @@ mod tests {
         );
     }
 
+    /// The logical `ContextBudget` extension node must declare exactly the
+    /// schema the physical `ContextBudgetExec` produces (input + the two
+    /// appended columns).
+    #[test]
+    fn logical_context_budget_schema_matches_physical() {
+        let stmt = hirn_query::parse(r#"RECALL episodic ABOUT "x" BUDGET 128 LIMIT 5"#).unwrap();
+        let typed = hirn_query::analyze(&stmt, &hirn_query::AnalyzeContext::default()).unwrap();
+        let plan = hirn_query::compile(&typed).unwrap();
+
+        let datafusion_expr::LogicalPlan::Extension(ext) = &plan else {
+            panic!("expected ContextBudget extension at plan root, got {plan}");
+        };
+        let node = ext
+            .node
+            .as_any()
+            .downcast_ref::<hirn_query::HirnPlanNode>()
+            .expect("hirn plan node");
+        assert!(matches!(node.op, hirn_query::HirnOp::ContextBudget { .. }));
+
+        let logical_schema = node.schema.as_ref().inner().clone();
+        let input_schema = node.inputs[0].schema().as_ref().inner().clone();
+
+        let input = MemorySourceConfig::try_new_exec(&[vec![]], input_schema, None).unwrap();
+        let exec = ContextBudgetExec::new(input, 128);
+
+        assert_eq!(
+            exec.schema(),
+            logical_schema,
+            "logical and physical ContextBudget schemas must agree"
+        );
+    }
+
+    /// The operator's ranking path must produce the exact same score as the
+    /// engine path (both delegate to `hirn_core::scoring::composite_score`).
+    #[test]
+    fn operator_rank_score_matches_engine_composite_score() {
+        let config = HirnConfig::default();
+        let ranking = BudgetRankingConfig::from_hirn_config(&config);
+
+        let now_ms = 1_700_000_000_000_i64;
+        let cases = [
+            // (similarity, importance, activation, causal, surprise, access, age_hours)
+            (0.9_f32, 0.8_f32, 0.5_f32, 0.3_f32, 0.1_f32, 4_u64, 0.0_f64),
+            (0.4, 0.2, 0.0, 0.0, 0.0, 0, 24.0),
+            (1.0, 1.0, 1.0, 1.0, 1.0, 100, 720.0),
+        ];
+
+        for (sim, imp, act, caus, surp, access, age_hours) in cases {
+            let created_at_ms = now_ms - (age_hours * 3_600_000.0) as i64;
+            let operator_score =
+                ranking.recall_rank_score(sim, imp, act, caus, surp, access, created_at_ms, now_ms);
+            let engine_score = scoring::composite_score(
+                sim,
+                imp,
+                age_hours,
+                config.decay_lambda,
+                access,
+                act,
+                caus,
+                surp,
+                0.0,
+                &ScoringWeights::from_config(&config),
+            );
+            assert_eq!(
+                operator_score, engine_score,
+                "operator and engine scores diverge for sim={sim}, imp={imp}, age={age_hours}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn bad_score_type_is_rejected() {
         let schema = Arc::new(Schema::new(vec![
@@ -813,5 +904,73 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("column `score` must be Float32"));
+    }
+
+    /// Survivors are gathered in a single `interleave` pass per column instead
+    /// of one `take`-materialized RecordBatch per row. The gather must preserve
+    /// the exact greedy top-k selection order, even when survivors are drawn
+    /// from several distinct source batches. The expected ordering below is the
+    /// same one the old per-row `take` + `concat` path produced for this input.
+    #[tokio::test]
+    async fn batch_take_preserves_row_order() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("score", DataType::Float32, false),
+            Field::new("token_count", DataType::UInt32, false),
+        ]));
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b"])),
+                Arc::new(Float32Array::from(vec![0.9_f32, 0.5])),
+                Arc::new(UInt32Array::from(vec![1_u32, 1])),
+            ],
+        )
+        .unwrap();
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["c", "d"])),
+                Arc::new(Float32Array::from(vec![0.7_f32, 0.3])),
+                Arc::new(UInt32Array::from(vec![1_u32, 1])),
+            ],
+        )
+        .unwrap();
+        // Two batches in one partition: survivors interleave across distinct
+        // source batches (a,b from batch1; c,d from batch2).
+        let input =
+            MemorySourceConfig::try_new_exec(&[vec![batch1, batch2]], schema, None).unwrap();
+
+        let result = execute_one(ContextBudgetExec::new(input, 100))
+            .await
+            .unwrap();
+
+        // All tokens are 1, so score-per-token equals score: greedy top-k
+        // yields a(0.9), c(0.7), b(0.5), d(0.3).
+        let ids = result
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let got_ids: Vec<&str> = (0..result.num_rows()).map(|i| ids.value(i)).collect();
+        assert_eq!(
+            got_ids,
+            vec!["a", "c", "b", "d"],
+            "gathered rows must keep greedy top-k order across source batches"
+        );
+
+        // Each gathered row must carry its own source data (interleave picked
+        // the right row from the right batch).
+        let scores = result
+            .column_by_name("score")
+            .unwrap()
+            .as_primitive::<Float32Type>();
+        let got_scores: Vec<f32> = (0..result.num_rows()).map(|i| scores.value(i)).collect();
+        assert_eq!(
+            got_scores,
+            vec![0.9_f32, 0.7, 0.5, 0.3],
+            "each gathered row must carry its own source data"
+        );
     }
 }

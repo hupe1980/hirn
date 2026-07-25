@@ -5,7 +5,6 @@
 //! shape, hydrates followed targets from storage, and appends `causal_score`
 //! plus `causal_depth`.
 
-use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
@@ -36,7 +35,7 @@ use crate::operators::lance_hybrid_search::{RecallRow, fetch_recall_rows_by_ids}
 pub struct CausalChainExec {
     input: Arc<dyn ExecutionPlan>,
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     max_depth: u32,
     confidence_threshold: f32,
     preserve_recall_rows: bool,
@@ -54,12 +53,12 @@ impl CausalChainExec {
         } else {
             Self::output_schema()
         };
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             datafusion_physical_expr::EquivalenceProperties::new(schema.clone()),
             datafusion_physical_plan::Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
 
         Self {
             input,
@@ -101,15 +100,11 @@ impl ExecutionPlan for CausalChainExec {
         "CausalChainExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -720,6 +715,7 @@ mod tests {
     use hirn_core::types::Layer;
     use hirn_graph::PropertyGraph;
     use parking_lot::RwLock;
+    use std::any::Any;
 
     use crate::{GraphActivationOutput, GraphCausalChainRow, GraphReadRuntime};
 

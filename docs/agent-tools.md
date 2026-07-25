@@ -43,7 +43,7 @@ sequenceDiagram
   participant T as MemoryToolkit
   participant C as Cedar engine
   participant DB as HirnDB
-  A->>M: tools/call memory_store (content, x-agent-id)
+  A->>M: tools/call memory_store (Authorization: Bearer)
   M->>T: store(request)
   T->>T: validate input (size, fields)
   T->>C: authorize(agent, action=remember, resource)
@@ -62,9 +62,11 @@ sequenceDiagram
 ```
 
 {: .note }
-> Over MCP the agent identity travels in the tool arguments (`agent_id`); over
-> gRPC it travels in the `x-agent-id` metadata header. Either way, Cedar sees
-> the same principal and the same action.
+> Over MCP the agent identity comes from the per-request `Authorization:
+> Bearer` credential (API key or JWT) — tool arguments can never assert an
+> identity; over gRPC it travels in the `x-agent-id` metadata header of an
+> authenticated connection. Either way, Cedar sees the same principal and the
+> same action.
 
 ## MemoryToolkit — 6 Functions
 
@@ -80,7 +82,7 @@ Stores an episodic memory with RPE-gated admission.
 | `event_type`   | `EventType`       | No       | `Conversation`, `ToolCall`, `Observation`, `Experiment`, `Error`, `Decision` (default: `Observation`) |
 | `importance`   | `f32`             | No       | Override importance score, 0.0–1.0 |
 | `embedding`    | `Vec<f32>`        | No       | Pre-computed embedding (bypasses built-in embedder) |
-| `namespace`    | `Namespace`       | No       | Target namespace (default: `"default"`) |
+| `namespace`    | `Namespace`       | No       | Target namespace (default: the agent's private namespace) |
 | `metadata`     | `Metadata`        | No       | Key-value metadata pairs |
 | `entities`     | `Vec<String>`     | No       | Entity names to associate |
 
@@ -98,7 +100,7 @@ Performs hybrid BM25 + vector search across episodic memories.
 |------------------|-------------|----------|-------------|
 | `query`          | `&str`      | Yes      | Natural-language search query (non-empty) |
 | `limit`          | `usize`     | No       | Maximum results (default: 10) |
-| `namespace`      | `Namespace` | No       | Namespace filter (default: `"default"`) |
+| `namespace`      | `Namespace` | No       | Namespace filter (default: the agent's private + shared namespaces) |
 | `topic`          | `String`    | No       | Topic filter |
 | `with_conflicts` | `bool`      | No       | Include contradiction annotations |
 
@@ -175,7 +177,11 @@ Returns aggregate statistics and (optionally) the graph neighborhood of a specif
 
 ## MCP Tools
 
-All 6 toolkit functions are exposed as MCP tools in `hirnd` via [rmcp](https://github.com/nicorithm/rmcp). Transport: stdio and SSE.
+All 6 toolkit functions are exposed as MCP tools in `hirnd` via
+[rmcp](https://github.com/modelcontextprotocol/rust-sdk). Transport: MCP
+Streamable HTTP at `http://<bind>:<base+2>/mcp`, authenticated per request
+with `Authorization: Bearer` (see [Deployment — MCP
+Integration](deployment.html#mcp-integration)).
 
 | MCP Tool Name       | Toolkit Function | Description |
 |----------------------|------------------|-------------|
@@ -197,7 +203,6 @@ All 6 toolkit functions are exposed as MCP tools in `hirnd` via [rmcp](https://g
       "content": "Kubernetes deployment strategies require blue-green or canary patterns.",
       "event_type": "Observation",
       "importance": 0.8,
-      "agent_id": "my-agent",
       "namespace": "devops"
     }
   }

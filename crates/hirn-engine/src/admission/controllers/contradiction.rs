@@ -118,6 +118,7 @@ impl AdmissionController for ContradictionGate {
             None => {
                 return Ok(AdmissionDecision::Accept {
                     importance_override: None,
+                    flags: Vec::new(),
                 });
             }
         };
@@ -130,17 +131,22 @@ impl AdmissionController for ContradictionGate {
         if !exists {
             return Ok(AdmissionDecision::Accept {
                 importance_override: None,
+                flags: Vec::new(),
             });
         }
 
-        // Find the most similar high-confidence semantic records.
+        // Find the most similar high-confidence semantic records. The search is
+        // scoped to the candidate's namespace so a contradiction (and any
+        // `Contradicts` edge) can never be drawn against a foreign tenant's
+        // record.
         let options = VectorSearchOptions {
             query: embedding.clone(),
             column: "embedding".into(),
             limit: self.top_k,
             filter: Some(format!(
-                "confidence >= {} AND (archived IS NULL OR archived = false)",
-                self.confidence_threshold
+                "confidence >= {} AND (archived IS NULL OR archived = false) AND {}",
+                self.confidence_threshold,
+                super::namespace_eq_filter(&candidate.namespace)
             )),
             ..Default::default()
         };
@@ -151,17 +157,32 @@ impl AdmissionController for ContradictionGate {
             .await
             .map_err(hirn_core::HirnError::storage)?;
 
-        let existing_facts = extract_descriptions(&batches);
-        let existing_ids = extract_ids(&batches);
+        // Extract `(id, description)` as aligned pairs in a single pass so the
+        // LLM's 1-based fact index always maps back to the correct record. A row
+        // missing *either* a parseable id or a description is skipped entirely —
+        // independent null-skipping passes could otherwise misalign the index and
+        // draw a `Contradicts` edge to the wrong record.
+        let candidates = extract_id_description_pairs(&batches);
 
-        if existing_facts.is_empty() {
+        if candidates.is_empty() {
             return Ok(AdmissionDecision::Accept {
                 importance_override: None,
+                flags: Vec::new(),
             });
         }
 
+        let existing_ids: Vec<MemoryId> = candidates.iter().map(|(id, _)| *id).collect();
+        // Sanitize candidate content and existing facts before embedding them in
+        // the LLM prompt to neutralize prompt-injection payloads carried in
+        // stored content.
+        let existing_facts: Vec<String> = candidates
+            .iter()
+            .map(|(_, desc)| hirn_core::sanitize::sanitize_for_llm(desc))
+            .collect();
+
         // Ask LLM about contradictions.
-        let messages = Self::build_prompt(&candidate.content, &existing_facts);
+        let sanitized_content = hirn_core::sanitize::sanitize_for_llm(&candidate.content);
+        let messages = Self::build_prompt(&sanitized_content, &existing_facts);
         let llm_options = LlmOptions {
             temperature: 0.0,
             max_tokens: 64,
@@ -196,60 +217,50 @@ impl AdmissionController for ContradictionGate {
         } else {
             Ok(AdmissionDecision::Accept {
                 importance_override: None,
+                flags: Vec::new(),
             })
         }
     }
 }
 
-/// Extract description strings from result batches.
-fn extract_descriptions(batches: &[arrow_array::RecordBatch]) -> Vec<String> {
+/// Extract aligned `(id, description)` pairs from result batches.
+///
+/// Both columns are read in a single pass and a row is emitted only when it
+/// carries *both* a parseable `id` and a non-null `description`. This keeps the
+/// returned vector's index — which becomes the LLM's 1-based fact number —
+/// pointing at exactly the record it describes. Independent null-skipping passes
+/// over the two columns could drift out of alignment (e.g. a row with a null
+/// description but a valid id), so they are deliberately fused here.
+fn extract_id_description_pairs(batches: &[arrow_array::RecordBatch]) -> Vec<(MemoryId, String)> {
     use arrow_array::Array;
-    let mut out = Vec::new();
-    for batch in batches {
-        if let Some(col) = batch.column_by_name("description") {
-            if let Some(arr) = col.as_any().downcast_ref::<arrow_array::StringArray>() {
-                for i in 0..arr.len() {
-                    if !arr.is_null(i) {
-                        out.push(arr.value(i).to_string());
-                    }
-                }
-            }
-            if let Some(arr) = col.as_any().downcast_ref::<arrow_array::LargeStringArray>() {
-                for i in 0..arr.len() {
-                    if !arr.is_null(i) {
-                        out.push(arr.value(i).to_string());
-                    }
-                }
-            }
-        }
-    }
-    out
-}
 
-/// Extract memory IDs from result batches.
-fn extract_ids(batches: &[arrow_array::RecordBatch]) -> Vec<MemoryId> {
-    use arrow_array::Array;
+    fn string_at(col: &dyn Array, i: usize) -> Option<String> {
+        if let Some(arr) = col.as_any().downcast_ref::<arrow_array::StringArray>() {
+            return (!arr.is_null(i)).then(|| arr.value(i).to_string());
+        }
+        if let Some(arr) = col.as_any().downcast_ref::<arrow_array::LargeStringArray>() {
+            return (!arr.is_null(i)).then(|| arr.value(i).to_string());
+        }
+        None
+    }
+
     let mut out = Vec::new();
     for batch in batches {
-        if let Some(col) = batch.column_by_name("id") {
-            if let Some(arr) = col.as_any().downcast_ref::<arrow_array::StringArray>() {
-                for i in 0..arr.len() {
-                    if !arr.is_null(i) {
-                        if let Ok(id) = MemoryId::parse(arr.value(i)) {
-                            out.push(id);
-                        }
-                    }
-                }
-            }
-            if let Some(arr) = col.as_any().downcast_ref::<arrow_array::LargeStringArray>() {
-                for i in 0..arr.len() {
-                    if !arr.is_null(i) {
-                        if let Ok(id) = MemoryId::parse(arr.value(i)) {
-                            out.push(id);
-                        }
-                    }
-                }
-            }
+        let (Some(id_col), Some(desc_col)) = (
+            batch.column_by_name("id"),
+            batch.column_by_name("description"),
+        ) else {
+            continue;
+        };
+        for i in 0..batch.num_rows() {
+            let (Some(id_str), Some(description)) = (string_at(id_col, i), string_at(desc_col, i))
+            else {
+                continue;
+            };
+            let Ok(id) = MemoryId::parse(&id_str) else {
+                continue;
+            };
+            out.push((id, description));
         }
     }
     out
@@ -266,13 +277,18 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn candidate(content: &str, embedding: Vec<f32>) -> MemoryCandidate {
+        candidate_in(content, embedding, Namespace::shared())
+    }
+
+    fn candidate_in(content: &str, embedding: Vec<f32>, namespace: Namespace) -> MemoryCandidate {
         MemoryCandidate {
             id: MemoryId::new(),
             content: content.into(),
             entities: vec![],
             embedding: Some(embedding),
             agent_id: AgentId::new("test").unwrap(),
-            namespace: Namespace::shared(),
+            provenance: hirn_core::provenance::Provenance::direct(AgentId::new("test").unwrap()),
+            namespace,
             importance: 0.5,
             surprise: 0.5,
             metadata: Metadata::default(),
@@ -334,17 +350,30 @@ mod tests {
         emb: Vec<f32>,
         confidence: f32,
     ) {
+        insert_semantic_ns(storage, description, emb, confidence, Namespace::shared()).await;
+    }
+
+    async fn insert_semantic_ns(
+        storage: &Arc<dyn PhysicalStore>,
+        description: &str,
+        emb: Vec<f32>,
+        confidence: f32,
+        namespace: Namespace,
+    ) -> MemoryId {
         let rec = hirn_core::semantic::SemanticRecord::builder()
             .concept("test-concept")
             .description(description)
             .embedding(emb)
             .confidence(confidence)
             .agent_id(AgentId::new("test").unwrap())
+            .namespace(namespace)
             .build()
             .unwrap();
+        let id = rec.id;
         let batch =
             hirn_storage::datasets::semantic::to_batch(std::slice::from_ref(&rec), 32).unwrap();
         storage.append("semantic", batch).await.unwrap();
+        id
     }
 
     #[tokio::test]
@@ -471,6 +500,71 @@ mod tests {
         assert!(messages[1].content.contains("The sky is green"));
         assert!(messages[1].content.contains("1. The sky is blue"));
         assert!(messages[1].content.contains("2. Water is wet"));
+    }
+
+    /// R-10(a) regression: a candidate in namespace A must not be compared
+    /// against a high-confidence record in a foreign namespace B — the scoped
+    /// search returns no facts, so the LLM is never consulted and no
+    /// `Contradicts` edge can be drawn cross-tenant.
+    #[tokio::test]
+    async fn cross_namespace_contradiction_not_flagged() {
+        let (storage, _dir) = temp_storage().await;
+        let emb = rand_vec(1);
+        let foreign_ns = Namespace::private_for(&AgentId::new("agent-b").unwrap());
+        insert_semantic_ns(&storage, "The sky is blue", emb.clone(), 0.9, foreign_ns).await;
+
+        let llm = Arc::new(MockLlm::new("CONTRADICTION: 1"));
+        let gate = ContradictionGate::with_defaults(
+            storage,
+            llm.clone() as Arc<dyn LlmProvider>,
+            "semantic",
+        );
+        let own_ns = Namespace::private_for(&AgentId::new("agent-a").unwrap());
+        let result = gate
+            .evaluate(&candidate_in("The sky is green", emb, own_ns))
+            .await
+            .unwrap();
+        assert!(
+            result.is_accept(),
+            "cross-namespace record must not trigger a contradiction, got {result:?}"
+        );
+        assert_eq!(
+            llm.calls(),
+            0,
+            "LLM must not be consulted when no in-namespace facts exist"
+        );
+    }
+
+    /// R-10(c) regression: `(id, description)` pairs stay aligned when an
+    /// intermediate row is missing a description. A separate id-only pass would
+    /// have mapped fact #1 to the first id even though that row has no
+    /// description — the fused pass drops the row entirely instead.
+    #[test]
+    fn id_description_pairs_stay_aligned_on_null_description() {
+        use arrow_array::{RecordBatch, StringArray};
+        use std::sync::Arc as StdArc;
+
+        let id0 = MemoryId::new();
+        let id1 = MemoryId::new();
+        let ids = StringArray::from(vec![Some(id0.to_string()), Some(id1.to_string())]);
+        // First row has NO description; second row does.
+        let descriptions = StringArray::from(vec![None, Some("the sky is blue".to_string())]);
+
+        let schema = arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Utf8, true),
+            arrow_schema::Field::new("description", arrow_schema::DataType::Utf8, true),
+        ]);
+        let batch = RecordBatch::try_new(
+            StdArc::new(schema),
+            vec![StdArc::new(ids), StdArc::new(descriptions)],
+        )
+        .unwrap();
+
+        let pairs = extract_id_description_pairs(&[batch]);
+        // Only the fully-populated row survives, and it maps to id1 — not id0.
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, id1);
+        assert_eq!(pairs[0].1, "the sky is blue");
     }
 
     #[test]

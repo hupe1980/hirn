@@ -3,6 +3,7 @@
 use hirn_core::episodic::{EntityRef, EpisodicRecord};
 use hirn_core::id::MemoryId;
 use hirn_core::metadata::Metadata;
+use hirn_core::provenance::Provenance;
 use hirn_core::types::{AgentId, Namespace};
 
 /// A candidate memory to be evaluated by the admission pipeline.
@@ -20,6 +21,9 @@ pub struct MemoryCandidate {
     pub embedding: Option<Vec<f32>>,
     /// Source agent.
     pub agent_id: AgentId,
+    /// Full provenance chain (origin, evidence, mutation log) — the input to
+    /// provenance-derived trust scoring at admission time.
+    pub provenance: Provenance,
     /// Namespace scope.
     pub namespace: Namespace,
     /// Importance score assigned by the caller.
@@ -39,6 +43,7 @@ impl MemoryCandidate {
             entities: record.entities.clone(),
             embedding: record.embedding.clone(),
             agent_id: record.provenance.created_by.clone(),
+            provenance: record.provenance.clone(),
             namespace: record.namespace.clone(),
             importance: record.importance,
             surprise: record.surprise,

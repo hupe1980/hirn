@@ -7,6 +7,8 @@
 //!
 //! ```text
 //! MemoryCandidate
+//!   → [TrustGate]          (optional, provenance + agent reputation)
+//!   → [PoisoningGate]      (optional, ingest-time injection scan)
 //!   → [SurpriseGate]
 //!   → [DuplicateDetector]
 //!   → [TokenBudgetGate]
@@ -26,10 +28,12 @@ mod pipeline;
 pub use candidate::MemoryCandidate;
 pub use controllers::contradiction::ContradictionGate;
 pub use controllers::duplicate::{DuplicateAction, DuplicateDetector};
+pub use controllers::poisoning::PoisoningGate;
 pub use controllers::rate_limiter::RateLimiter;
 pub use controllers::surprise::SurpriseGate;
 pub use controllers::token_budget::TokenBudgetGate;
-pub use decision::{AdmissionDecision, ControllerVerdict};
+pub use controllers::trust::TrustGate;
+pub use decision::{AdmissionDecision, AdmissionFlag, ControllerVerdict};
 pub use pipeline::{AdmissionPipeline, AdmissionReservation, PipelineResult};
 
 use hirn_core::HirnResult;

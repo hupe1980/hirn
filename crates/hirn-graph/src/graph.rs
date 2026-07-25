@@ -264,6 +264,14 @@ struct NodeData {
 /// Prevents graph injection attacks where a malicious agent floods a node with edges.
 pub const MAX_EDGES_PER_NODE: usize = 512;
 
+/// The lazy eviction heap gains one entry per access and only sheds stale
+/// entries during eviction (which fires only at `max_node_count`). Below the
+/// cap it would otherwise grow without bound — bounded by access volume, not
+/// graph size. When it exceeds `COMPACT_FACTOR × max(node_count, FLOOR)` it is
+/// rebuilt from the live per-node access counts, discarding superseded entries.
+const EVICTION_HEAP_COMPACT_FACTOR: usize = 4;
+const EVICTION_HEAP_COMPACT_FLOOR: usize = 1024;
+
 /// Maximum logical metadata payload allowed on a single edge.
 /// Enforced on insert to keep hot-tier graph memory bounded.
 pub const MAX_EDGE_METADATA_BYTES: usize = 16 * 1024;
@@ -546,6 +554,10 @@ impl PropertyGraph {
                 }
             }
             self.graph.remove_node(idx);
+            // Drop any pending dirty-access entry for the removed node so it
+            // cannot leak (its stale eviction_heap entries are skipped lazily
+            // on pop, since the node is now absent from id_to_node).
+            self.dirty_access_counts.remove(&id);
             // StableDiGraph preserves indices across removals — no rebuild needed.
             true
         } else {
@@ -585,7 +597,29 @@ impl PropertyGraph {
                 .push(Reverse((self.graph[idx].access_count, id)));
             // Track for periodic cold-tier flush.
             *self.dirty_access_counts.entry(id).or_insert(0) = self.graph[idx].access_count;
+            self.compact_eviction_heap_if_needed();
         }
+    }
+
+    /// Rebuild the lazy eviction heap from the current live per-node access
+    /// counts once stale entries have made it grow far beyond the live node
+    /// count. Below `max_node_count` the heap never drains (eviction only fires
+    /// at the cap), so without this it would grow with total access volume
+    /// rather than graph size — an unbounded leak. Eviction semantics are
+    /// unchanged: the rebuilt heap still yields the lowest `access_count` first.
+    fn compact_eviction_heap_if_needed(&mut self) {
+        let live = self.id_to_node.len().max(EVICTION_HEAP_COMPACT_FLOOR);
+        if self.eviction_heap.len() <= EVICTION_HEAP_COMPACT_FACTOR * live {
+            return;
+        }
+        self.eviction_heap = self
+            .id_to_node
+            .values()
+            .map(|&idx| {
+                let nd = &self.graph[idx];
+                Reverse((nd.access_count, nd.id))
+            })
+            .collect();
     }
 
     /// Drain the set of nodes with updated `access_count` since the last flush.
@@ -609,6 +643,18 @@ impl PropertyGraph {
         self.graph.node_count()
     }
 
+    /// Current size of the lazy eviction heap (test/monitoring only).
+    #[cfg(test)]
+    pub(crate) fn eviction_heap_len(&self) -> usize {
+        self.eviction_heap.len()
+    }
+
+    /// Number of pending dirty access-count entries (test/monitoring only).
+    #[cfg(test)]
+    pub(crate) fn dirty_access_counts_len(&self) -> usize {
+        self.dirty_access_counts.len()
+    }
+
     /// Number of edges.
     /// Count of currently-active (non-expired) edges.
     ///
@@ -616,9 +662,12 @@ impl PropertyGraph {
     /// Use `self.graph.edge_count()` directly when a raw physical count (including
     /// soft-expired edges) is needed for audit or storage sizing purposes.
     pub fn edge_count(&self) -> usize {
+        // Snapshot `now` once (R-21): filtering per edge with `is_currently_active`
+        // would issue one `Timestamp::now()` syscall per edge.
+        let now = Timestamp::now();
         self.graph
             .edge_weights()
-            .filter(|e| e.is_currently_active())
+            .filter(|e| e.is_valid_at(now))
             .count()
     }
 
@@ -932,11 +981,14 @@ impl PropertyGraph {
         let Some(&idx) = self.id_to_node.get(&node_id) else {
             return Vec::new();
         };
+        // Snapshot `now` once (R-21) so every incident edge is judged against a
+        // single, consistent instant rather than one syscall per edge.
+        let now = Timestamp::now();
         self.graph
             .edges_directed(idx, Direction::Outgoing)
             .chain(self.graph.edges_directed(idx, Direction::Incoming))
             .map(|e| e.weight())
-            .filter(|e| e.is_currently_active())
+            .filter(|e| e.is_valid_at(now))
             .collect()
     }
 
@@ -978,12 +1030,13 @@ impl PropertyGraph {
         let Some(&idx) = self.id_to_node.get(&node_id) else {
             return Vec::new();
         };
+        let now = Timestamp::now();
         self.graph
             .edges_directed(idx, Direction::Outgoing)
             .chain(self.graph.edges_directed(idx, Direction::Incoming))
             .map(|e| e.weight())
             .filter(|e| {
-                e.is_currently_active()
+                e.is_valid_at(now)
                     && self
                         .node_namespace(e.source)
                         .is_some_and(|ns| allowed_namespaces.contains(ns))
@@ -1013,13 +1066,14 @@ impl PropertyGraph {
         let Some(&idx) = self.id_to_node.get(&node_id) else {
             return Vec::new();
         };
+        let now = Timestamp::now();
         self.graph
             .edges_directed(idx, Direction::Outgoing)
             .chain(self.graph.edges_directed(idx, Direction::Incoming))
             .map(|e| e.weight())
             .filter(|e| {
                 e.relation == relation
-                    && e.is_currently_active()
+                    && e.is_valid_at(now)
                     && self
                         .node_namespace(e.source)
                         .is_some_and(|ns| allowed_namespaces.contains(ns))
@@ -1036,18 +1090,19 @@ impl PropertyGraph {
         else {
             return Vec::new();
         };
+        let now = Timestamp::now();
         let mut edges: Vec<&GraphEdge> = self
             .graph
             .edges_connecting(a_idx, b_idx)
             .map(|e| e.weight())
-            .filter(|e| e.is_currently_active())
+            .filter(|e| e.is_valid_at(now))
             .collect();
         // Also include reverse direction.
         edges.extend(
             self.graph
                 .edges_connecting(b_idx, a_idx)
                 .map(|e| e.weight())
-                .filter(|e| e.is_currently_active()),
+                .filter(|e| e.is_valid_at(now)),
         );
         edges
     }
@@ -1082,10 +1137,11 @@ impl PropertyGraph {
     /// Expired edges (where `valid_until` has passed) are excluded.
     /// Use `all_edges_including_expired()` for audit / time-travel use.
     pub fn all_edges(&self) -> Vec<&GraphEdge> {
+        let now = Timestamp::now();
         self.graph
             .edge_indices()
             .map(|e| &self.graph[e])
-            .filter(|e| e.is_currently_active())
+            .filter(|e| e.is_valid_at(now))
             .collect()
     }
 
@@ -1111,10 +1167,35 @@ impl PropertyGraph {
         min_weight: f32,
         allowed_namespaces: Option<&[Namespace]>,
     ) -> Vec<MemoryId> {
+        // Snapshot `now` once for the entire BFS (R-21): a single traversal must
+        // be temporally atomic — an edge cannot be active at depth 1 and expired
+        // at depth 3 — and we avoid one syscall per visited edge.
+        self.get_neighbors_filtered_at(
+            start,
+            depth,
+            min_weight,
+            allowed_namespaces,
+            Timestamp::now(),
+        )
+    }
+
+    /// Like [`get_neighbors_filtered`](Self::get_neighbors_filtered) but judges
+    /// edge validity against an explicit `as_of` instant (R-21) so a caller that
+    /// runs several traversals as one logical operation (e.g. lateral inhibition
+    /// context building) can share a single snapshotted timestamp.
+    pub fn get_neighbors_filtered_at(
+        &self,
+        start: MemoryId,
+        depth: usize,
+        min_weight: f32,
+        allowed_namespaces: Option<&[Namespace]>,
+        as_of: Timestamp,
+    ) -> Vec<MemoryId> {
         let Some(&start_idx) = self.id_to_node.get(&start) else {
             return Vec::new();
         };
 
+        let now = as_of;
         let mut visited = HashSet::new();
         visited.insert(start_idx);
         let mut queue = VecDeque::new();
@@ -1127,7 +1208,7 @@ impl PropertyGraph {
             }
             for edge in self.graph.edges_directed(node, Direction::Outgoing) {
                 // Skip expired edges during BFS traversal.
-                if !edge.weight().is_currently_active() {
+                if !edge.weight().is_valid_at(now) {
                     continue;
                 }
                 if edge.weight().weight < min_weight {
@@ -1214,12 +1295,25 @@ impl PropertyGraph {
     /// consistent with `get_edges()`, so retracted memories do not keep
     /// propagating activation through their soft-expired edges.
     pub fn outgoing_weighted(&self, node_id: MemoryId) -> Vec<(MemoryId, f32, EdgeRelation)> {
+        self.outgoing_weighted_at(node_id, Timestamp::now())
+    }
+
+    /// Like [`outgoing_weighted`](Self::outgoing_weighted) but judges edge
+    /// validity against an explicit `as_of` instant (R-21). Callers that walk
+    /// many nodes in one logical operation snapshot `now` once and thread it
+    /// here so the whole traversal is temporally atomic and pays a single
+    /// `Timestamp::now()` syscall instead of one per edge.
+    pub fn outgoing_weighted_at(
+        &self,
+        node_id: MemoryId,
+        as_of: Timestamp,
+    ) -> Vec<(MemoryId, f32, EdgeRelation)> {
         let Some(&idx) = self.id_to_node.get(&node_id) else {
             return Vec::new();
         };
         self.graph
             .edges_directed(idx, Direction::Outgoing)
-            .filter(|e| e.weight().is_currently_active())
+            .filter(move |e| e.weight().is_valid_at(as_of))
             .map(|e| {
                 let w = e.weight();
                 (self.graph[e.target()].id, w.weight, w.relation)
@@ -1238,9 +1332,21 @@ impl PropertyGraph {
         &self,
         idx: NodeIndex,
     ) -> impl Iterator<Item = (NodeIndex, f32, &EdgeRelation)> {
+        self.outgoing_weighted_iter_at(idx, Timestamp::now())
+    }
+
+    /// Like [`outgoing_weighted_iter`](Self::outgoing_weighted_iter) but filters
+    /// edges against an explicit `as_of` instant (R-21). Spreading activation /
+    /// PPR snapshot `now` once at the start of a query and thread it through
+    /// every wavefront level so the whole traversal sees one consistent instant.
+    pub fn outgoing_weighted_iter_at(
+        &self,
+        idx: NodeIndex,
+        as_of: Timestamp,
+    ) -> impl Iterator<Item = (NodeIndex, f32, &EdgeRelation)> {
         self.graph
             .edges_directed(idx, Direction::Outgoing)
-            .filter(|e| e.weight().is_currently_active())
+            .filter(move |e| e.weight().is_valid_at(as_of))
             .map(|e| (e.target(), e.weight().weight, &e.weight().relation))
     }
 
@@ -1252,9 +1358,19 @@ impl PropertyGraph {
         &self,
         idx: NodeIndex,
     ) -> impl Iterator<Item = (NodeIndex, f32, &EdgeRelation)> {
+        self.incoming_weighted_iter_at(idx, Timestamp::now())
+    }
+
+    /// Like [`incoming_weighted_iter`](Self::incoming_weighted_iter) but filters
+    /// against an explicit `as_of` instant (R-21).
+    pub fn incoming_weighted_iter_at(
+        &self,
+        idx: NodeIndex,
+        as_of: Timestamp,
+    ) -> impl Iterator<Item = (NodeIndex, f32, &EdgeRelation)> {
         self.graph
             .edges_directed(idx, Direction::Incoming)
-            .filter(|e| e.weight().is_currently_active())
+            .filter(move |e| e.weight().is_valid_at(as_of))
             .map(|e| (e.source(), e.weight().weight, &e.weight().relation))
     }
 
@@ -1292,6 +1408,13 @@ impl PropertyGraph {
     /// Get node layer.
     pub fn node_layer(&self, id: MemoryId) -> Option<Layer> {
         self.id_to_node.get(&id).map(|&idx| self.graph[idx].layer)
+    }
+
+    /// Get the node's stored creation time.
+    pub fn node_created_at(&self, id: MemoryId) -> Option<Timestamp> {
+        self.id_to_node
+            .get(&id)
+            .map(|&idx| self.graph[idx].created_at)
     }
 
     /// Get node namespace (borrowed to avoid cloning in hot paths).
@@ -1381,6 +1504,79 @@ mod tests {
         let mut pg = PropertyGraph::new();
         let a = make_node(&mut pg);
         assert!(pg.get_neighbors(a, 1, 0.0).is_empty());
+    }
+
+    #[test]
+    fn eviction_heap_stays_bounded_under_heavy_access() {
+        // R-16: below max_node_count the lazy eviction heap never drains, so
+        // one entry per access would let it grow with access *volume* rather
+        // than graph size — an unbounded leak. Compaction must keep it bounded.
+        let mut pg = PropertyGraph::new();
+        let ids: Vec<MemoryId> = (0..8).map(|_| make_node(&mut pg)).collect();
+
+        let accesses = 200_000u64;
+        for i in 0..accesses {
+            pg.record_access(ids[(i as usize) % ids.len()]);
+        }
+
+        // Bound = COMPACT_FACTOR × max(node_count, FLOOR). The heap must stay
+        // near that bound, NOT grow toward `accesses`.
+        let bound = EVICTION_HEAP_COMPACT_FACTOR * pg.node_count().max(EVICTION_HEAP_COMPACT_FLOOR);
+        assert!(
+            pg.eviction_heap_len() <= bound,
+            "heap len {} exceeded bound {bound} after {accesses} accesses",
+            pg.eviction_heap_len()
+        );
+        assert!(
+            (pg.eviction_heap_len() as u64) < accesses / 10,
+            "heap must not grow with access volume: len={}",
+            pg.eviction_heap_len()
+        );
+    }
+
+    #[test]
+    fn eviction_evicts_least_accessed_after_compaction() {
+        // R-16: compaction must not change eviction semantics — the coldest
+        // (least-accessed) node is still evicted first even after the heap has
+        // been rebuilt many times.
+        let mut pg = PropertyGraph::with_max_nodes(4);
+        let ids: Vec<MemoryId> = (0..4).map(|_| make_node(&mut pg)).collect();
+
+        // ids[2] stays cold (zero extra accesses); everyone else is hammered
+        // enough to trigger several heap compactions.
+        for _ in 0..(EVICTION_HEAP_COMPACT_FLOOR * EVICTION_HEAP_COMPACT_FACTOR * 3) {
+            pg.record_access(ids[0]);
+            pg.record_access(ids[1]);
+            pg.record_access(ids[3]);
+        }
+
+        // Inserting a 5th node (over the cap of 4) must evict the coldest node.
+        let newcomer = MemoryId::new();
+        assert!(pg.add_node(newcomer, Layer::Episodic, 0.5, Timestamp::now()));
+        assert!(
+            !pg.has_node(ids[2]),
+            "the least-accessed node must be evicted first"
+        );
+        assert!(pg.has_node(newcomer));
+    }
+
+    #[test]
+    fn remove_node_clears_dirty_access_entry() {
+        // R-16: remove_node must drop the removed node's dirty_access_counts
+        // entry so it cannot leak (or resurrect on the next cold-tier flush).
+        let mut pg = PropertyGraph::new();
+        let a = make_node(&mut pg);
+        let b = make_node(&mut pg);
+        pg.record_access(a);
+        pg.record_access(b);
+        assert_eq!(pg.dirty_access_counts_len(), 2);
+
+        assert!(pg.remove_node(a));
+        assert_eq!(
+            pg.dirty_access_counts_len(),
+            1,
+            "removed node's dirty access entry must be purged"
+        );
     }
 
     #[test]
@@ -1866,6 +2062,58 @@ mod tests {
         let b_in: Vec<_> = pg.incoming_weighted_iter(b_idx).collect();
         assert_eq!(b_in.len(), 1);
         assert_eq!(b_in[0].0, a_idx);
+    }
+
+    #[test]
+    fn as_of_iterators_use_the_captured_timestamp_at_retraction_boundary() {
+        // R-21: a traversal snapshots ONE `now` and threads it into the edge
+        // filter, so the whole wavefront is judged against a single instant.
+        // Here we assert the `_at` accessors honour the passed timestamp
+        // deterministically across a retraction boundary.
+        let mut pg = PropertyGraph::new();
+        let a = make_node(&mut pg);
+        let b = make_node(&mut pg);
+        pg.add_edge(a, b, EdgeRelation::Causes, 0.8, Metadata::new())
+            .unwrap();
+
+        // Retract b at t = 1000ms → the a→b edge's `valid_until` becomes 1000ms.
+        let retraction = Timestamp::from_millis(1000);
+        pg.expire_edges_for_node(b, retraction);
+
+        let a_idx = pg.node_index(a).unwrap();
+
+        // Before the boundary: the edge is still valid, regardless of wall clock.
+        let before = Timestamp::from_millis(500);
+        assert_eq!(
+            pg.outgoing_weighted_iter_at(a_idx, before).count(),
+            1,
+            "edge must be visible at an as_of strictly before the retraction"
+        );
+        assert_eq!(pg.outgoing_weighted_at(a, before).len(), 1);
+        assert_eq!(
+            pg.get_neighbors_filtered_at(a, 1, 0.0, None, before),
+            vec![b]
+        );
+
+        // At/after the boundary: the edge is uniformly excluded.
+        for after in [Timestamp::from_millis(1000), Timestamp::from_millis(2000)] {
+            assert_eq!(
+                pg.outgoing_weighted_iter_at(a_idx, after).count(),
+                0,
+                "edge must be excluded at an as_of at/after the retraction"
+            );
+            assert!(pg.outgoing_weighted_at(a, after).is_empty());
+            assert!(
+                pg.get_neighbors_filtered_at(a, 1, 0.0, None, after)
+                    .is_empty()
+            );
+        }
+
+        // Determinism: repeated calls with the same as_of yield the same answer.
+        assert_eq!(
+            pg.outgoing_weighted_iter_at(a_idx, before).count(),
+            pg.outgoing_weighted_iter_at(a_idx, before).count(),
+        );
     }
 
     #[test]

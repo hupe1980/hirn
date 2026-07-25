@@ -105,6 +105,7 @@ impl AdmissionPipeline {
     pub async fn evaluate(&self, candidate: &MemoryCandidate) -> HirnResult<PipelineResult> {
         let mut verdicts = Vec::with_capacity(self.controllers.len());
         let mut final_importance_override: Option<f32> = None;
+        let mut final_flags: Vec<super::AdmissionFlag> = Vec::new();
         let mut accepted: Vec<&Box<dyn AdmissionController>> = Vec::new();
 
         for controller in &self.controllers {
@@ -124,11 +125,14 @@ impl AdmissionPipeline {
             match &decision {
                 AdmissionDecision::Accept {
                     importance_override,
+                    flags,
                 } => {
                     // Track the latest importance override (last one wins).
                     if importance_override.is_some() {
                         final_importance_override = *importance_override;
                     }
+                    // Flags accumulate across all accepting controllers.
+                    final_flags.extend(flags.iter().cloned());
                     verdicts.push(ControllerVerdict {
                         controller: name,
                         decision,
@@ -159,6 +163,7 @@ impl AdmissionPipeline {
         Ok(PipelineResult {
             decision: AdmissionDecision::Accept {
                 importance_override: final_importance_override,
+                flags: final_flags,
             },
             verdicts,
         })
@@ -196,12 +201,14 @@ mod tests {
     use hirn_core::types::{AgentId, Namespace};
 
     fn test_candidate() -> MemoryCandidate {
+        let agent_id = AgentId::new("test").unwrap();
         MemoryCandidate {
             id: MemoryId::new(),
             content: "test memory".to_string(),
             entities: vec![],
             embedding: None,
-            agent_id: AgentId::new("test").unwrap(),
+            agent_id: agent_id.clone(),
+            provenance: hirn_core::provenance::Provenance::direct(agent_id),
             namespace: Namespace::shared(),
             importance: 0.5,
             surprise: 0.5,
@@ -218,9 +225,7 @@ mod tests {
             "accept_all"
         }
         async fn evaluate(&self, _: &MemoryCandidate) -> HirnResult<AdmissionDecision> {
-            Ok(AdmissionDecision::Accept {
-                importance_override: None,
-            })
+            Ok(AdmissionDecision::accept())
         }
     }
 
@@ -252,6 +257,7 @@ mod tests {
         async fn evaluate(&self, _: &MemoryCandidate) -> HirnResult<AdmissionDecision> {
             Ok(AdmissionDecision::Accept {
                 importance_override: Some(self.0),
+                flags: Vec::new(),
             })
         }
     }
@@ -379,9 +385,44 @@ mod tests {
         let result = pipeline.evaluate(&test_candidate()).await.unwrap();
         if let AdmissionDecision::Accept {
             importance_override,
+            ..
         } = result.decision
         {
             assert_eq!(importance_override, Some(0.9));
+        } else {
+            panic!("expected Accept");
+        }
+    }
+
+    /// Controller that accepts with a flag attached.
+    struct FlagRaiser(&'static str);
+
+    #[async_trait::async_trait]
+    impl AdmissionController for FlagRaiser {
+        fn name(&self) -> &str {
+            "flag_raiser"
+        }
+        async fn evaluate(&self, _: &MemoryCandidate) -> HirnResult<AdmissionDecision> {
+            Ok(AdmissionDecision::accept_with_flags(vec![
+                crate::admission::AdmissionFlag {
+                    controller: "flag_raiser".to_string(),
+                    code: self.0.to_string(),
+                    detail: "detail".to_string(),
+                },
+            ]))
+        }
+    }
+
+    #[tokio::test]
+    async fn flags_from_all_accepting_controllers_aggregate() {
+        let pipeline = AdmissionPipeline::new()
+            .with(FlagRaiser("first.flag"))
+            .with(AcceptAll)
+            .with(FlagRaiser("second.flag"));
+        let result = pipeline.evaluate(&test_candidate()).await.unwrap();
+        if let AdmissionDecision::Accept { flags, .. } = result.decision {
+            let codes: Vec<&str> = flags.iter().map(|f| f.code.as_str()).collect();
+            assert_eq!(codes, vec!["first.flag", "second.flag"]);
         } else {
             panic!("expected Accept");
         }

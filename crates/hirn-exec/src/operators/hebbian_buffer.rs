@@ -1,6 +1,5 @@
 //! `HebbianBufferExec` — pass-through operator that records co-retrieval pairs.
 
-use std::any::Any;
 use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -30,19 +29,19 @@ const MAX_IDS_FOR_PAIRS: usize = 100;
 #[derive(Debug)]
 pub struct HebbianBufferExec {
     input: Arc<dyn ExecutionPlan>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     queue: CoRetrievalQueue,
 }
 
 impl HebbianBufferExec {
     pub fn new(input: Arc<dyn ExecutionPlan>, queue: CoRetrievalQueue) -> Self {
         let schema = input.schema();
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             datafusion_physical_expr::EquivalenceProperties::new(schema),
             datafusion_physical_plan::Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
 
         Self {
             input,
@@ -63,15 +62,11 @@ impl ExecutionPlan for HebbianBufferExec {
         "HebbianBufferExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.input.schema()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

@@ -60,7 +60,14 @@ impl MemoryToolkit {
             }
         }
 
-        let ns = request.namespace.unwrap_or_default();
+        // No namespace (or the literal default) → the agent's private
+        // namespace, mirroring `AgentContext::remember` and the HTTP/gRPC
+        // remember surfaces. Without this, unqualified agent writes would
+        // land in the shared "default" namespace and leak across agents.
+        let ns = match request.namespace {
+            Some(ns) if ns != Namespace::default() => ns,
+            _ => Namespace::private_for(&agent_id),
+        };
 
         // Cedar enforcement.
         self.db
@@ -124,22 +131,30 @@ impl MemoryToolkit {
             return Err(HirnError::InvalidInput("query must not be empty".into()));
         }
 
-        let ns = options.namespace.unwrap_or_default();
-
         // Embed the query text.
         let embedding = self.db.embed_text(query).await?;
 
         // Build recall via RecallBuilder — passes agent_id so Cedar enforcement
         // inside execute_with_diagnostics() uses the correct identity.
         let limit = options.limit.unwrap_or(10);
-        let builder = self
+        let mut builder = self
             .db
             .recall(embedding)
             .agent_id(agent_id.as_str())
-            .namespace(ns)
             .limit(limit)
             .query_text(query)
             .hybrid(true);
+
+        // Mirror `store`: an explicit namespace is searched as-is; no
+        // namespace (or the literal default) scopes the search to the
+        // agent's own view — its private namespace plus the shared one —
+        // matching `AgentContext` recall semantics instead of exposing the
+        // whole store.
+        builder = match options.namespace {
+            Some(ns) if ns != Namespace::default() => builder.namespace(ns),
+            _ => builder
+                .allowed_namespaces(vec![Namespace::private_for(&agent_id), Namespace::shared()]),
+        };
 
         let results = builder.execute().await?;
 
@@ -295,6 +310,15 @@ impl MemoryToolkit {
     /// whose far endpoint the agent can also access. Without an id (aggregate
     /// stats only), `Recall` is enforced against the agent's own private
     /// namespace rather than a fixed one.
+    ///
+    /// R-26/R-61: the returned counts are scoped to `scope_ns` (the introspected
+    /// record's namespace, or the agent's private namespace for the aggregate
+    /// case) using namespace-scoped counts — they no longer expose the global,
+    /// cross-tenant totals from `db.stats()`, which leaked other agents' record
+    /// counts. `edge_count` reflects only the access-visible neighborhood
+    /// returned in `edges` (zero for the aggregate case). Working memory is not
+    /// namespace-partitioned and is omitted (reported as 0) from this per-agent
+    /// surface.
     pub async fn introspect(
         &self,
         agent_id: AgentId,
@@ -318,7 +342,25 @@ impl MemoryToolkit {
             )
             .await?;
 
-        let stats = self.db.stats().await?;
+        // Namespace-scoped counts (R-26/R-61) — never the global cross-tenant
+        // aggregate. Counting via the namespaced id listings keeps the surface
+        // limited to what the agent is authorized to see in `scope_ns`.
+        let episodic_count = self
+            .db
+            .list_episodic_ids_in_namespace(&scope_ns)
+            .await?
+            .len() as u64;
+        let semantic_count = self
+            .db
+            .list_semantic_ids_in_namespace(&scope_ns)
+            .await?
+            .len() as u64;
+        let procedural_count = self
+            .db
+            .list_procedural_ids_in_namespace(&scope_ns)
+            .await?
+            .len() as u64;
+        let total_memories = episodic_count + semantic_count + procedural_count;
 
         let mut edges = Vec::new();
         if let Some(memory_id) = id {
@@ -351,12 +393,14 @@ impl MemoryToolkit {
         }
 
         Ok(IntrospectionResult {
-            total_memories: stats.total_count,
-            episodic_count: stats.episodic_count,
-            semantic_count: stats.semantic_count,
-            procedural_count: stats.procedural_count,
-            working_count: stats.working_count,
-            edge_count: stats.edge_count,
+            total_memories,
+            episodic_count,
+            semantic_count,
+            procedural_count,
+            // Working memory is not namespace-partitioned; omit it from the
+            // per-agent scoped surface rather than leak the global count.
+            working_count: 0,
+            edge_count: edges.len() as u64,
             edges,
         })
     }
@@ -397,5 +441,71 @@ impl MemoryToolkit {
                 ns.as_str()
             )))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use hirn_core::types::EventType;
+    use hirn_storage::memory_store::MemoryStore;
+
+    async fn test_db() -> Arc<HirnDB> {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = hirn_core::HirnConfig::default();
+        config.db_path = dir.path().join("toolkit-test");
+        config.embedding_dimensions = hirn_core::EmbeddingDimension::new_const(3);
+        let db = HirnDB::open_with_config(config, Arc::new(MemoryStore::new()))
+            .await
+            .unwrap();
+        std::mem::forget(dir);
+        Arc::new(db)
+    }
+
+    async fn store_episodes(db: &HirnDB, agent: &AgentId, ns: &Namespace, n: usize) {
+        for i in 0..n {
+            let rec = EpisodicRecord::builder()
+                .event_type(EventType::Observation)
+                .content(format!("record {i}"))
+                .summary(format!("record {i}"))
+                .importance(0.5)
+                .agent_id(agent.clone())
+                .namespace(ns.clone())
+                .embedding(vec![1.0, 0.0, 0.0])
+                .build()
+                .unwrap();
+            db.remember_bypass_admission(rec).await.unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn introspect_does_not_reveal_other_agents_counts() {
+        // R-26/R-61: agent A's introspect must not expose agent B's record
+        // counts. Previously the aggregate `db.stats()` leaked all namespaces.
+        let db = test_db().await;
+        let agent_a = AgentId::new("agent-a").unwrap();
+        let agent_b = AgentId::new("agent-b").unwrap();
+        let ns_a = Namespace::private_for(&agent_a);
+        let ns_b = Namespace::private_for(&agent_b);
+
+        store_episodes(&db, &agent_a, &ns_a, 2).await;
+        store_episodes(&db, &agent_b, &ns_b, 5).await;
+
+        let toolkit = MemoryToolkit::new(Arc::clone(&db));
+        let result = toolkit.introspect(agent_a.clone(), None).await.unwrap();
+
+        // Only A's two records are counted; B's five are invisible.
+        assert_eq!(result.episodic_count, 2);
+        assert_eq!(result.total_memories, 2);
+        assert!(
+            result.total_memories < 7,
+            "global cross-tenant total (7) must not leak through introspect"
+        );
+
+        // Agent B sees only its own five.
+        let result_b = toolkit.introspect(agent_b.clone(), None).await.unwrap();
+        assert_eq!(result_b.episodic_count, 5);
+        assert_eq!(result_b.total_memories, 5);
     }
 }

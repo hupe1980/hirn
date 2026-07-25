@@ -445,6 +445,35 @@ pub trait PhysicalStore: Send + Sync {
         batch: RecordBatch,
     ) -> Result<(), HirnDbError>;
 
+    /// Merge-insert with an optional `when_matched` guard.
+    ///
+    /// `when_matched_condition` is a SQL boolean expression that may reference
+    /// the already-stored row via `target.<col>` and the incoming row via
+    /// `source.<col>`. A matched (key-colliding) row is overwritten **only**
+    /// when the condition evaluates to true; otherwise the stored row is left
+    /// untouched and the incoming row is dropped.
+    ///
+    /// This is how [`crate::policy_store::PolicyEnforcedStore`] prevents a
+    /// principal from overwriting a row that lives in a namespace it may not
+    /// access: plain `merge_insert` matches purely on the `on` keys and ignores
+    /// the target row's namespace, so a crafted batch could clobber another
+    /// tenant's row. `None` updates every matched row, identical to
+    /// [`Self::merge_insert`].
+    async fn merge_insert_where(
+        &self,
+        dataset: &str,
+        on: &[&str],
+        batch: RecordBatch,
+        when_matched_condition: Option<&str>,
+    ) -> Result<(), HirnDbError> {
+        match when_matched_condition {
+            None => self.merge_insert(dataset, on, batch).await,
+            Some(_) => Err(HirnDbError::Unsupported(
+                "merge_insert_where with a match condition is not supported by this store".into(),
+            )),
+        }
+    }
+
     /// Targeted in-place column update.
     ///
     /// Executes a narrow `SET col = expr [, …] WHERE filter` statement — no
@@ -525,7 +554,57 @@ pub trait PhysicalStore: Send + Sync {
     /// Snapshot (tag) the current version.
     async fn tag(&self, dataset: &str, tag: &str) -> Result<(), HirnDbError>;
 
-    /// Checkout a historical version (read-only).
+    /// Open a historical version of a dataset **read-only** and return its rows.
+    ///
+    /// This opens a view of the dataset as it existed at `version` and reads it
+    /// back **without** mutating the live dataset: no rollback transaction is
+    /// committed and the current version is left untouched, so concurrent
+    /// readers and writers of the latest version are unaffected. Use this to
+    /// inspect or export a past snapshot.
+    ///
+    /// Contrast with [`Self::rollback_to`], which *destructively* makes a past
+    /// version the current state for every reader of the dataset.
+    ///
+    /// The default implementation returns [`HirnDbError::Unsupported`]; stores
+    /// that support time-travel (Lance, the in-memory test store) override it.
+    async fn open_at_version(
+        &self,
+        dataset: &str,
+        version: u64,
+    ) -> Result<Vec<RecordBatch>, HirnDbError> {
+        let _ = (dataset, version);
+        Err(HirnDbError::Unsupported(
+            "open_at_version is not supported by this store".into(),
+        ))
+    }
+
+    /// **Destructively** roll the dataset back to a historical `version`.
+    ///
+    /// This commits a new transaction that makes `version` the current state of
+    /// the dataset for **all** readers (all tenants/namespaces sharing the
+    /// dataset), discarding data written after it. It is a dataset-global,
+    /// irreversible-in-effect operation and must be gated behind an
+    /// administrative authorization check by wrapper stores (see
+    /// [`crate::policy_store::PolicyEnforcedStore`]).
+    ///
+    /// The default implementation delegates to the deprecated
+    /// [`Self::checkout`] so existing wrapper stores that only forward
+    /// `checkout` keep their historical (destructive) behaviour.
+    async fn rollback_to(&self, dataset: &str, version: u64) -> Result<(), HirnDbError> {
+        #[allow(deprecated)]
+        self.checkout(dataset, version).await
+    }
+
+    /// Roll the dataset back to a historical version.
+    ///
+    /// # Deprecated
+    ///
+    /// The name implied a *read-only* checkout, but the Lance implementation is
+    /// destructive: it commits a rollback that changes the current version for
+    /// every reader. Use [`Self::open_at_version`] for a genuinely read-only
+    /// historical view, or [`Self::rollback_to`] for the explicit destructive
+    /// rollback. Retained only so existing external implementors keep compiling.
+    #[deprecated(note = "use `open_at_version` (read-only) or `rollback_to` (destructive)")]
     async fn checkout(&self, dataset: &str, version: u64) -> Result<(), HirnDbError>;
 
     /// List all tags.

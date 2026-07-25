@@ -481,6 +481,43 @@ mod tests {
     }
 
     #[test]
+    fn cache_distinguishes_case_variant_literals() {
+        // R-47: `"Apple"` and `"apple"` differ only inside the string literal.
+        // They must NOT share a cache entry, and each must embed its own
+        // literal into the compiled plan (the literal feeds the embedding
+        // vector and FTS term).
+        let cache = Arc::new(PlanCache::new(100));
+        let p = pipeline().with_cache(cache.clone());
+        let a = p.compile(r#"RECALL episodic ABOUT "Apple""#).unwrap();
+        let b = p.compile(r#"RECALL episodic ABOUT "apple""#).unwrap();
+        assert_eq!(cache.len(), 2, "case-variant literals must not collide");
+
+        let query_of = |plan: &Arc<CompiledPlan>| match &plan.typed {
+            TypedStatement::Recall(r) => r.query.clone(),
+            other => panic!("expected Recall, got {other:?}"),
+        };
+        assert_eq!(query_of(&a), "Apple");
+        assert_eq!(query_of(&b), "apple");
+
+        // Re-compiling the first must return the first plan (a real hit), not
+        // the second's.
+        let a2 = p.compile(r#"RECALL episodic ABOUT "Apple""#).unwrap();
+        assert_eq!(query_of(&a2), "Apple");
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn cache_distinguishes_interior_literal_whitespace() {
+        // R-47: whitespace inside the literal is meaningful and must not be
+        // collapsed into a shared cache entry.
+        let cache = Arc::new(PlanCache::new(100));
+        let p = pipeline().with_cache(cache.clone());
+        p.compile(r#"RECALL episodic ABOUT "a  b""#).unwrap();
+        p.compile(r#"RECALL episodic ABOUT "a b""#).unwrap();
+        assert_eq!(cache.len(), 2, "interior whitespace must not collide");
+    }
+
+    #[test]
     fn cache_eviction() {
         let cache = Arc::new(PlanCache::new(2));
         let p = pipeline().with_cache(cache.clone());
@@ -644,7 +681,9 @@ mod tests {
         let mut ast = parser::parse(r#"RECALL episodic ABOUT "placeholder" LIMIT 5"#).unwrap();
         let payload = r#"x" LIMIT 1 NAMESPACE hijacked --"#;
         match &mut ast {
-            Statement::Recall(r) => r.about = payload.to_string(),
+            Statement::Recall(r) => {
+                r.about = parser::ast::StringOrParam::Literal(payload.to_string());
+            }
             _ => unreachable!(),
         }
         let compiled = p.compile_statement(ast).unwrap();

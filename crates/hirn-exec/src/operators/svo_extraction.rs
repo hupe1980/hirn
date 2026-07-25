@@ -6,7 +6,6 @@
 //! Pass-through operator: input batch is emitted unchanged plus an
 //! `svo_count (Int32)` column indicating how many SVO events were extracted.
 
-use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
@@ -62,7 +61,7 @@ pub struct SvoExtractionExec {
     input: Arc<dyn ExecutionPlan>,
     config: SvoConfig,
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl SvoExtractionExec {
@@ -71,12 +70,12 @@ impl SvoExtractionExec {
         fields.push(Arc::new(Field::new("svo_count", DataType::Int32, false)));
         let schema = Arc::new(Schema::new(fields));
 
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             datafusion_physical_expr::EquivalenceProperties::new(schema.clone()),
             datafusion_physical_plan::Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
 
         Self {
             input,
@@ -106,15 +105,11 @@ impl ExecutionPlan for SvoExtractionExec {
         "SvoExtractionExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

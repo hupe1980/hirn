@@ -60,6 +60,7 @@ impl AdmissionController for SurpriseGate {
             None => {
                 return Ok(AdmissionDecision::Accept {
                     importance_override: None,
+                    flags: Vec::new(),
                 });
             }
         };
@@ -74,6 +75,7 @@ impl AdmissionController for SurpriseGate {
             // Empty database — everything is novel.
             return Ok(AdmissionDecision::Accept {
                 importance_override: None,
+                flags: Vec::new(),
             });
         }
 
@@ -98,6 +100,7 @@ impl AdmissionController for SurpriseGate {
                 // No results → empty dataset or no embeddings → accept.
                 Ok(AdmissionDecision::Accept {
                     importance_override: None,
+                    flags: Vec::new(),
                 })
             }
             Some(distance) => {
@@ -112,6 +115,7 @@ impl AdmissionController for SurpriseGate {
                     // Propagate surprise score as importance override.
                     Ok(AdmissionDecision::Accept {
                         importance_override: Some(distance.clamp(0.0, 1.0)),
+                        flags: Vec::new(),
                     })
                 }
             }
@@ -155,6 +159,7 @@ mod tests {
             entities: vec![],
             embedding,
             agent_id: AgentId::new("test").unwrap(),
+            provenance: hirn_core::provenance::Provenance::direct(AgentId::new("test").unwrap()),
             namespace: Namespace::shared(),
             importance: 0.5,
             surprise: 0.5,
@@ -317,6 +322,7 @@ mod tests {
         match result {
             AdmissionDecision::Accept {
                 importance_override,
+                ..
             } => {
                 assert!(
                     importance_override.is_some(),

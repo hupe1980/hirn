@@ -108,7 +108,7 @@ pub use provider_registry::{
     ApiKeySource, DefaultsConfig, EmbedderConfig, LlmConfig, ProviderConfig, ProviderDefaults,
     ProviderRegistry, ProvidersSection, RerankerConfig, TokenizerConfig,
 };
-pub use ql::{ParseError, QueryPlan, QueryResult, Statement};
+pub use ql::{ParseError, QueryResult, Statement};
 pub use recall::{
     LayerFilter, RecallBuilder, RecallPresentation, RecallPresentationItem, RecallResult,
     RecallViewMode, ResourceEvidenceSummary,

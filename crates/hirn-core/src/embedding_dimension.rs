@@ -15,13 +15,18 @@ use crate::error::HirnError;
 
 /// A validated embedding-vector dimension.
 ///
-/// Valid range: `1..=65_535`.
-/// Stored as a `u32` — larger than the largest production embedding models
-/// (OpenAI text-embedding-3-large: 3072 dims) while still fitting in `u16`
-/// if ever needed.
+/// Valid range: `1..=262_144`.
+/// Stored as a `u32`. The upper bound is deliberately **not** the old
+/// `u16`-era ceiling of 65_535 (an arbitrary artifact — the field is a `u32`
+/// and the dimension never packs into a `u16`). It is set to `2^18 = 262_144`,
+/// which comfortably exceeds every production embedding model (OpenAI
+/// text-embedding-3-large: 3072 dims; the largest research models are a few
+/// tens of thousands) while still guarding against absurd values that would
+/// blow up vector-index memory. A single 262_144-dim `f32` vector is 1 MiB, a
+/// sane ceiling for one row's embedding.
 // `try_from`/`into` (not `transparent`) so that deserialization — including the
 // TOML config path, which `HirnConfig::validate()` deliberately skips on the
-// assumption that this type self-validates — runs the `1..=65_535` range check.
+// assumption that this type self-validates — runs the `1..=262_144` range check.
 // A `transparent` derive would forward straight to `u32` and let
 // `embedding_dimensions = 0` through, propagating a zero-width vector schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -29,8 +34,12 @@ use crate::error::HirnError;
 pub struct EmbeddingDimension(u32);
 
 impl EmbeddingDimension {
-    /// Maximum legal dimension.
-    pub const MAX: u32 = 65_535;
+    /// Maximum legal dimension (`2^18 = 262_144`).
+    ///
+    /// Chosen as a modern, non-`u16` bound: one `f32` vector at this width is
+    /// exactly 1 MiB, which bounds per-row embedding memory while admitting
+    /// every real embedding model.
+    pub const MAX: u32 = 262_144;
 
     /// Minimum legal dimension.
     pub const MIN: u32 = 1;
@@ -39,7 +48,7 @@ impl EmbeddingDimension {
     /// range.
     ///
     /// # Errors
-    /// Returns `HirnError::InvalidConfig` when `dims == 0` or `dims > 65_535`.
+    /// Returns `HirnError::InvalidConfig` when `dims == 0` or `dims > 262_144`.
     pub fn new(dims: u32) -> Result<Self, HirnError> {
         if dims < Self::MIN || dims > Self::MAX {
             return Err(HirnError::InvalidConfig {
@@ -55,12 +64,12 @@ impl EmbeddingDimension {
     ///
     /// # Panics
     /// Panics at const-evaluation time (compile error) if `dims == 0` or
-    /// `dims > 65_535`.  Intended for literals in tests and config defaults;
+    /// `dims > 262_144`.  Intended for literals in tests and config defaults;
     /// use [`new`](Self::new) for runtime values.
     #[must_use]
     pub const fn new_const(dims: u32) -> Self {
         assert!(dims >= Self::MIN, "embedding_dimensions must be >= 1");
-        assert!(dims <= Self::MAX, "embedding_dimensions must be <= 65_535");
+        assert!(dims <= Self::MAX, "embedding_dimensions must be <= 262_144");
         Self(dims)
     }
 
@@ -144,7 +153,11 @@ mod tests {
 
     #[test]
     fn new_over_max_is_err() {
-        assert!(EmbeddingDimension::new(65_536).is_err());
+        // 65_536 (the old u16-era ceiling + 1) is now valid; only values above
+        // the modern 262_144 bound are rejected.
+        assert!(EmbeddingDimension::new(65_536).is_ok());
+        assert!(EmbeddingDimension::new(EmbeddingDimension::MAX).is_ok());
+        assert!(EmbeddingDimension::new(EmbeddingDimension::MAX + 1).is_err());
     }
 
     #[test]
@@ -167,6 +180,6 @@ mod tests {
         // The `transparent` derive used to let `0` through on every
         // deserialization path (including TOML config).
         assert!(serde_json::from_str::<EmbeddingDimension>("0").is_err());
-        assert!(serde_json::from_str::<EmbeddingDimension>("65536").is_err());
+        assert!(serde_json::from_str::<EmbeddingDimension>("262145").is_err());
     }
 }

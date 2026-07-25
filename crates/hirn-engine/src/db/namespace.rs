@@ -1398,6 +1398,7 @@ mod tests {
             self.inner.tag(dataset, tag).await
         }
 
+        #[allow(deprecated)] // forwarding a deprecated trait method on a test mock
         async fn checkout(&self, dataset: &str, version: u64) -> Result<(), HirnDbError> {
             self.inner.checkout(dataset, version).await
         }

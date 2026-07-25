@@ -784,22 +784,47 @@ impl<'a> CausalView<'a> {
     }
 
     /// Approve a quarantined record, promoting or applying it with the reviewer identity.
+    ///
+    /// R-28: the quarantine review gate promotes anomalous/potentially poisoned
+    /// records into the main store, so it requires the dedicated
+    /// [`Action::Review`] right — distinct from general `correct`/`admin`. The
+    /// check is enforced against the `approved_by` identity (the authenticated
+    /// agent on the hirnd surfaces); it is a no-op when no policy engine is
+    /// configured (embedded mode).
     #[inline]
     pub async fn approve_quarantine(
         &self,
         id: MemoryId,
         approved_by: AgentId,
     ) -> HirnResult<crate::security::QuarantineApprovalOutcome> {
+        self.0
+            .enforce(
+                approved_by.as_str(),
+                Action::Review,
+                &self.0.config().default_realm,
+                "",
+            )
+            .await?;
         self.0.approve_quarantine(id, approved_by).await
     }
 
     /// Reject a quarantined record, permanently removing it.
+    ///
+    /// R-28: unlike [`Self::approve_quarantine`], rejection only deletes the
+    /// quarantined record — it never promotes (potentially poisoned) data into
+    /// the main store — and the current API carries no reviewer identity to
+    /// enforce a [`Action::Review`] check against. Surfaces that expose this to
+    /// external principals must gate it upstream (as the hirnd surfaces do).
     #[inline]
     pub async fn reject_quarantine(&self, id: MemoryId) -> HirnResult<()> {
         self.0.reject_quarantine(id).await
     }
 
     /// Roll back a previously approved generated output using its durable receipt.
+    ///
+    /// R-28: rolling back reverses a promotion decision and is part of the same
+    /// review gate, so it requires [`Action::Review`], enforced against the
+    /// `rolled_back_by` identity. A no-op when no policy engine is configured.
     #[inline]
     pub async fn rollback_quarantine_approval(
         &self,
@@ -807,6 +832,14 @@ impl<'a> CausalView<'a> {
         rolled_back_by: AgentId,
         reason: String,
     ) -> HirnResult<crate::security::QuarantineRollbackOutcome> {
+        self.0
+            .enforce(
+                rolled_back_by.as_str(),
+                Action::Review,
+                &self.0.config().default_realm,
+                "",
+            )
+            .await?;
         self.0
             .rollback_quarantine_approval(id, rolled_back_by, reason)
             .await

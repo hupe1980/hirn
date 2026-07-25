@@ -275,8 +275,13 @@ struct StrategyRunData {
     /// Per-query tokens returned to the (hypothetical) reader:
     /// THINK context tokens plus RECALL result-content tokens.
     returned_tokens_per_query: Vec<usize>,
+    /// Per-query assembled THINK context tokens (retrieval-context size only).
+    context_tokens_per_query: Vec<usize>,
     /// Which estimator produced the per-query token counts.
     token_estimator: String,
+    /// Per-query reader inputs (question + the same assembled context that was
+    /// scored) for the opt-in LLM reader. Only populated by the hirn strategy.
+    reader_inputs: Vec<super::reader::ReaderInput>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -307,6 +312,9 @@ pub struct CognitiveRunReport {
     pub active_retrieval_surfaces: ActiveRetrievalSurfaces,
     pub query_embedding_source: QueryEmbeddingSource,
     pub query_embedding_model_label: Option<String>,
+    /// Question + assembled retrieval context per query, for the opt-in LLM
+    /// reader. Identical to the contexts scored by the containment metrics.
+    pub reader_inputs: Vec<super::reader::ReaderInput>,
 }
 
 #[derive(Debug, Clone)]
@@ -784,11 +792,12 @@ pub fn run_with_prepared_embeddings(
 
     // Phase 2: Run queries and score.
     let query_start = Instant::now();
-    let query_results = evaluate_queries(&db, dataset, config, embedding_runtime);
+    let mut query_results = evaluate_queries(&db, dataset, config, embedding_runtime);
     let query_time = query_start.elapsed();
 
     let total_time = total_start.elapsed();
 
+    let reader_inputs = std::mem::take(&mut query_results.reader_inputs);
     CognitiveRunReport {
         result: finalize_result(
             dataset,
@@ -803,6 +812,7 @@ pub fn run_with_prepared_embeddings(
         active_retrieval_surfaces: retrieval_setup.active_retrieval_surfaces,
         query_embedding_source: retrieval_setup.query_embedding_source,
         query_embedding_model_label: retrieval_setup.query_embedding_model_label,
+        reader_inputs,
     }
 }
 
@@ -883,7 +893,9 @@ fn finalize_result(
         prompt_tokens,
         completion_tokens,
         mut returned_tokens_per_query,
+        mut context_tokens_per_query,
         token_estimator,
+        reader_inputs: _,
     } = query_results;
 
     // Aggregate by category.
@@ -967,6 +979,16 @@ fn finalize_result(
     let tokens_per_query_p50 = token_percentile(&returned_tokens_per_query, 50);
     let tokens_per_query_p95 = token_percentile(&returned_tokens_per_query, 95);
 
+    context_tokens_per_query.sort_unstable();
+    let context_tokens_per_query_mean = if context_tokens_per_query.is_empty() {
+        0.0
+    } else {
+        context_tokens_per_query.iter().sum::<usize>() as f64
+            / context_tokens_per_query.len() as f64
+    };
+    let context_tokens_per_query_p50 = token_percentile(&context_tokens_per_query, 50);
+    let context_tokens_per_query_p95 = token_percentile(&context_tokens_per_query, 95);
+
     // Honesty flag: only the hirn strategy applies oracle-derived routing
     // hints (baselines never consult QueryRoutingProfile).
     let oracle_assisted = strategy == HIRN_STRATEGY && dataset.benchmark.uses_oracle_routing();
@@ -1004,6 +1026,10 @@ fn finalize_result(
         tokens_per_query_p50,
         tokens_per_query_p95,
         token_estimator,
+        context_tokens_per_query_mean,
+        context_tokens_per_query_p50,
+        context_tokens_per_query_p95,
+        reader: None,
         oracle_assisted,
         truncated: dataset.truncated,
         total_queries: total,
@@ -1314,7 +1340,7 @@ fn build_compiled_think_query(
     config: &CognitiveConfig,
 ) -> String {
     ql_ast::Statement::Think(Box::new(ql_ast::ThinkStmt {
-        about: query.question.clone(),
+        about: query.question.clone().into(),
         involving: None,
         temporal: compiled_temporal_clause(profile),
         expand: compiled_expand_clause(profile),
@@ -1344,7 +1370,7 @@ fn build_compiled_recall_query(
 ) -> String {
     ql_ast::Statement::Recall(Box::new(ql_ast::RecallStmt {
         layers: vec![Layer::Episodic, Layer::Semantic],
-        about: query.question.clone(),
+        about: query.question.clone().into(),
         involving: None,
         temporal: compiled_temporal_clause(profile),
         as_of: None,
@@ -1939,6 +1965,9 @@ fn evaluate_baseline_queries(
         results
             .returned_tokens_per_query
             .push(execution.returned_tokens);
+        results
+            .context_tokens_per_query
+            .push(execution.context_tokens);
     }
 
     results
@@ -2589,6 +2618,17 @@ fn evaluate_queries(
         results
             .returned_tokens_per_query
             .push(execution.returned_tokens);
+        results
+            .context_tokens_per_query
+            .push(execution.context_tokens);
+        results.reader_inputs.push(super::reader::ReaderInput {
+            query_id: q.id.clone(),
+            question: q.question.clone(),
+            context: execution.context.clone(),
+            expected_answers: q.expected_answers.clone(),
+            category: q.category.clone(),
+            negative: q.negative,
+        });
 
         let completed = query_index + 1;
         if completed == 1 || completed == total_queries || completed % QUERY_PROGRESS_INTERVAL == 0
@@ -3017,6 +3057,33 @@ mod tests {
         assert_eq!(result.tokens_per_query_mean, 0.0);
         assert_eq!(result.tokens_per_query_p50, 0);
         assert_eq!(result.tokens_per_query_p95, 0);
+        assert_eq!(result.context_tokens_per_query_mean, 0.0);
+        assert!(result.reader.is_none());
+    }
+
+    #[test]
+    fn finalize_result_aggregates_context_tokens_per_query_separately() {
+        // Returned tokens differ from context tokens: the context series is
+        // the retrieval-context size only.
+        let mut data = strategy_run_data_with_tokens(&[400, 500, 600]);
+        data.context_tokens_per_query = vec![300, 100, 200];
+
+        let result = finalize_result(
+            &finalize_fixture_dataset(Benchmark::H1Retrieval, None),
+            HIRN_STRATEGY,
+            "finalize-test",
+            data,
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::ZERO,
+            0,
+        );
+
+        assert!((result.context_tokens_per_query_mean - 200.0).abs() < 1e-9);
+        assert_eq!(result.context_tokens_per_query_p50, 200);
+        assert_eq!(result.context_tokens_per_query_p95, 300);
+        // The reader-facing series stays untouched.
+        assert!((result.tokens_per_query_mean - 500.0).abs() < 1e-9);
     }
 
     #[test]

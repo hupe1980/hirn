@@ -22,6 +22,7 @@ pub mod record;
 pub mod resource;
 pub mod revision;
 pub mod sanitize;
+pub mod scoring;
 pub mod semantic;
 pub mod stats;
 pub mod svo_event;
@@ -34,9 +35,10 @@ pub mod working;
 // Re-exports for convenience.
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState};
 pub use config::{
-    ConflictResolutionPolicy, ConflictResolutionPolicyOverrides, DistanceMetric,
-    EmbedderCircuitBreakerRuntimeConfig, EmbedderPersistentCacheRuntimeConfig, EmbedderRetryConfig,
-    EmbedderRuntimeConfig, EvolutionMode, HirnConfig, TextRetention, TierPolicy,
+    AdmissionPoisoningAction, ConflictResolutionPolicy, ConflictResolutionPolicyOverrides,
+    DistanceMetric, EmbedderCircuitBreakerRuntimeConfig, EmbedderPersistentCacheRuntimeConfig,
+    EmbedderRetryConfig, EmbedderRuntimeConfig, EvolutionMode, HirnConfig, TextRetention,
+    TierPolicy,
 };
 pub use content::{ExternalFetchPolicy, MemoryContent};
 pub use embed::{

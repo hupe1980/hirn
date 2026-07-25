@@ -95,15 +95,9 @@ impl HirnDB {
         }
 
         let metric = self.distance_metric();
-        let weights = weights.cloned().unwrap_or(ScoringWeights {
-            similarity: self.config.scoring_similarity_weight,
-            importance: self.config.scoring_importance_weight,
-            recency: self.config.scoring_recency_weight,
-            activation: self.config.scoring_activation_weight,
-            causal_relevance: self.config.scoring_causal_relevance_weight,
-            surprise: self.config.scoring_surprise_weight,
-            source_reliability: self.config.scoring_source_reliability_weight,
-        });
+        let weights = weights
+            .cloned()
+            .unwrap_or_else(|| ScoringWeights::from_config(&self.config));
         let now = Timestamp::now();
         let has_temporal_filter = after.is_some() || before.is_some();
         let mut diag = QueryDiagnostics::default();
@@ -513,6 +507,41 @@ impl HirnDB {
             events.push(ids);
         }
 
+        self.apply_hebbian_events(&events).await
+    }
+
+    /// R-19: Drain the recall-path co-retrieval queue populated by
+    /// `HebbianBufferExec` (compiled DataFusion recall/think plans) and apply
+    /// the Hebbian strengthening to the graph.
+    ///
+    /// The operator records co-retrieved `(id_a, id_b)` *pairs*; each pair
+    /// becomes a two-element co-retrieval event. Ids that fail to parse are
+    /// skipped (they cannot correspond to a graph node). Before this fix the
+    /// operator pushed into an orphaned queue that nothing drained, so
+    /// recall-path Hebbian learning never reached the graph.
+    pub(crate) async fn drain_co_retrieval_hebbian(&self) -> HirnResult<()> {
+        let Ok(ext) = hirn_exec::HirnSessionExt::get(self.session()) else {
+            return Ok(());
+        };
+        let queue = ext.co_retrieval_queue();
+
+        let mut events = Vec::new();
+        while let Some((a, b)) = queue.pop() {
+            if let (Ok(id_a), Ok(id_b)) = (MemoryId::parse(&a), MemoryId::parse(&b)) {
+                events.push(vec![id_a, id_b]);
+            }
+        }
+
+        self.apply_hebbian_events(&events).await
+    }
+
+    /// Apply a batch of Hebbian co-retrieval events to both graph tiers.
+    ///
+    /// R-68: the DURABLE cold tier is written FIRST. Only if it succeeds is the
+    /// in-memory hot tier advanced, so a cold write failure can never leave hot
+    /// weights ahead of cold (silent hot/cold drift until reload). Previously
+    /// hot was advanced before the cold write with no compensation on failure.
+    async fn apply_hebbian_events(&self, events: &[Vec<MemoryId>]) -> HirnResult<()> {
         if events.is_empty() {
             return Ok(());
         }
@@ -523,19 +552,15 @@ impl HirnDB {
             ..Default::default()
         };
 
-        {
-            let mut hot_graph = self.cached_graph().hot_graph_mut();
-            for ids in &events {
-                crate::hebbian::hebbian_update(&mut hot_graph, ids, &hebb_cfg);
-            }
-        }
+        // Cold (durable) tier first — propagate its error before touching hot.
+        crate::persistent_hebbian::hebbian_update_batch(self.persistent_graph(), events, &hebb_cfg)
+            .await?;
 
-        crate::persistent_hebbian::hebbian_update_batch(
-            self.persistent_graph(),
-            &events,
-            &hebb_cfg,
-        )
-        .await?;
+        // Cold succeeded — now advance the hot tier to match.
+        let mut hot_graph = self.cached_graph().hot_graph_mut();
+        for ids in events {
+            crate::hebbian::hebbian_update(&mut hot_graph, ids, &hebb_cfg);
+        }
 
         Ok(())
     }
@@ -1227,6 +1252,12 @@ mod tests {
         fail_semantic_scan_stream: AtomicBool,
         fail_procedural_scan_stream: AtomicBool,
         fail_multivector_search: AtomicBool,
+        /// R-68: fail merge_insert on the graph-edges dataset (cold hebbian
+        /// upsert) to simulate a durable cold-tier write failure.
+        fail_edge_merge_insert: AtomicBool,
+        /// R-58: fail append on the episodic dataset to simulate a durable
+        /// episodic-record write failure after the graph node was added.
+        fail_episodic_append: AtomicBool,
     }
 
     impl FailingRecallHydrationStore {
@@ -1238,11 +1269,23 @@ mod tests {
                 fail_semantic_scan_stream: AtomicBool::new(false),
                 fail_procedural_scan_stream: AtomicBool::new(false),
                 fail_multivector_search: AtomicBool::new(false),
+                fail_edge_merge_insert: AtomicBool::new(false),
+                fail_episodic_append: AtomicBool::new(false),
             }
         }
 
         fn fail_recall_hydration(&self) {
             self.fail_episodic_scan_stream
+                .store(true, AtomicOrdering::Release);
+        }
+
+        fn fail_cold_edge_upsert(&self) {
+            self.fail_edge_merge_insert
+                .store(true, AtomicOrdering::Release);
+        }
+
+        fn fail_episodic_record_append(&self) {
+            self.fail_episodic_append
                 .store(true, AtomicOrdering::Release);
         }
 
@@ -1326,6 +1369,13 @@ mod tests {
     #[async_trait]
     impl PhysicalStore for FailingRecallHydrationStore {
         async fn append(&self, dataset: &str, batch: RecordBatch) -> Result<(), HirnDbError> {
+            if dataset == hirn_storage::datasets::episodic::DATASET_NAME
+                && self.fail_episodic_append.load(AtomicOrdering::Acquire)
+            {
+                return Err(HirnDbError::Unsupported(
+                    "simulated episodic append failure".to_string(),
+                ));
+            }
             self.inner.append(dataset, batch).await
         }
 
@@ -1393,6 +1443,13 @@ mod tests {
             on: &[&str],
             batch: RecordBatch,
         ) -> Result<(), HirnDbError> {
+            if dataset == hirn_storage::datasets::graph::DATASET_EDGES_NAME
+                && self.fail_edge_merge_insert.load(AtomicOrdering::Acquire)
+            {
+                return Err(HirnDbError::Unsupported(
+                    "simulated cold hebbian edge upsert failure".to_string(),
+                ));
+            }
             self.inner.merge_insert(dataset, on, batch).await
         }
 
@@ -1473,6 +1530,7 @@ mod tests {
             self.inner.tag(dataset, tag).await
         }
 
+        #[allow(deprecated)] // forwarding a deprecated trait method on a test mock
         async fn checkout(&self, dataset: &str, version: u64) -> Result<(), HirnDbError> {
             self.inner.checkout(dataset, version).await
         }
@@ -1610,6 +1668,177 @@ mod tests {
             final_weight > initial_weight,
             "threshold-driven flush must strengthen co-retrieved edge during \
              operation: initial={initial_weight}, final={final_weight}"
+        );
+    }
+
+    /// R-68: a failing cold (durable) hebbian write must not leave the hot
+    /// tier advanced. With cold-first ordering the error surfaces before hot is
+    /// touched, so the two tiers cannot drift.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cold_hebbian_failure_leaves_hot_weight_unchanged() {
+        let store = Arc::new(FailingRecallHydrationStore::new());
+        let (db, _dir) = temp_db_with_storage(store.clone()).await;
+
+        let emb = vec![1.0, 0.0, 0.0, 0.0];
+        let mut ids = Vec::new();
+        for name in ["cold fail a", "cold fail b"] {
+            let id = db
+                .remember(
+                    EpisodicRecord::builder()
+                        .event_type(EventType::Observation)
+                        .content(name)
+                        .summary(name)
+                        .embedding(emb.clone())
+                        .importance(0.8)
+                        .agent_id(agent())
+                        .build()
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            ids.push(id);
+        }
+
+        db.graph_view()
+            .connect_with(
+                ids[0],
+                ids[1],
+                EdgeRelation::RelatedTo,
+                0.5,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+
+        let edge_weight = |db: &HirnDB| {
+            let graph = db.cached_graph().hot_graph();
+            graph
+                .get_edges_between(ids[0], ids[1])
+                .iter()
+                .find(|e| e.relation == EdgeRelation::RelatedTo)
+                .expect("RelatedTo edge must exist")
+                .weight
+        };
+        let initial_weight = edge_weight(&db);
+
+        // Force the cold-tier edge upsert to fail, then flush a co-retrieval
+        // event. The flush must return an error AND leave the hot weight put.
+        store.fail_cold_edge_upsert();
+        db.graph_runtime().push_hebbian(vec![ids[0], ids[1]]);
+        let result = db.flush_hebbian().await;
+        assert!(
+            result.is_err(),
+            "a failing cold hebbian write must surface as an error"
+        );
+
+        let after_weight = edge_weight(&db);
+        assert_eq!(
+            initial_weight, after_weight,
+            "hot weight must not advance when the cold write fails \
+             (initial={initial_weight}, after={after_weight})"
+        );
+    }
+
+    /// R-58: a forced episodic-append failure must not leave an orphaned graph
+    /// node. The node is added before the episodic record is persisted; if the
+    /// persist fails, `remember_inner` removes the node before returning.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn episodic_append_failure_leaves_no_orphan_node() {
+        let store = Arc::new(FailingRecallHydrationStore::new());
+        let (db, _dir) = temp_db_with_storage(store.clone()).await;
+
+        store.fail_episodic_record_append();
+
+        let record = EpisodicRecord::builder()
+            .event_type(EventType::Observation)
+            .content("orphan check")
+            .summary("orphan check")
+            .embedding(vec![1.0, 0.0, 0.0, 0.0])
+            .importance(0.8)
+            .agent_id(agent())
+            .build()
+            .unwrap();
+        let id = record.id;
+
+        let result = db.remember(record).await;
+        assert!(
+            result.is_err(),
+            "forced episodic append failure must surface as an error"
+        );
+
+        assert!(
+            !db.cached_graph().hot_graph().has_node(id),
+            "a failed episodic append must not leave an orphaned graph node"
+        );
+    }
+
+    /// R-19: co-retrieval pairs recorded by `HebbianBufferExec` into the shared
+    /// session-ext queue are drained by the engine and reach the graph as edge
+    /// strengthening. Previously the operator pushed into an orphaned queue that
+    /// nothing drained, so recall-path Hebbian learning was silently inert.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn co_retrieval_queue_drain_strengthens_graph_edge() {
+        let (db, _dir) = temp_db().await;
+
+        let emb = vec![1.0, 0.0, 0.0, 0.0];
+        let mut ids = Vec::new();
+        for name in ["coretr a", "coretr b"] {
+            let id = db
+                .remember(
+                    EpisodicRecord::builder()
+                        .event_type(EventType::Observation)
+                        .content(name)
+                        .summary(name)
+                        .embedding(emb.clone())
+                        .importance(0.8)
+                        .agent_id(agent())
+                        .build()
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            ids.push(id);
+        }
+
+        db.graph_view()
+            .connect_with(
+                ids[0],
+                ids[1],
+                EdgeRelation::RelatedTo,
+                0.5,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+
+        let edge_weight = |db: &HirnDB| {
+            let graph = db.cached_graph().hot_graph();
+            graph
+                .get_edges_between(ids[0], ids[1])
+                .iter()
+                .find(|e| e.relation == EdgeRelation::RelatedTo)
+                .expect("RelatedTo edge must exist")
+                .weight
+        };
+        let initial_weight = edge_weight(&db);
+
+        // Simulate HebbianBufferExec pushing a co-retrieval pair into the
+        // SHARED queue that lives on the session extension.
+        let ext = hirn_exec::HirnSessionExt::get(db.session()).unwrap();
+        let queue = ext.co_retrieval_queue();
+        queue.push((ids[0].to_string(), ids[1].to_string()));
+
+        db.drain_co_retrieval_hebbian().await.unwrap();
+
+        assert!(
+            queue.is_empty(),
+            "the shared co-retrieval queue must be drained after apply"
+        );
+        let after_weight = edge_weight(&db);
+        assert!(
+            after_weight > initial_weight,
+            "drained co-retrieval must strengthen the edge in the graph: \
+             initial={initial_weight}, after={after_weight}"
         );
     }
 

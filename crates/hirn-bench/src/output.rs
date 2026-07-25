@@ -510,7 +510,7 @@ fn write_cognitive_csv(result: &CognitiveSuiteResult, w: &mut dyn Write) -> io::
         w,
         "benchmark,strategy,run_id,dataset_source,corpus_embedding_source,corpus_embedding_model,query_embedding_source,query_embedding_model,retrieval_profile,execution_surface,active_surfaces,disabled_surfaces,os,arch,logical_cpus,\
             containment,token_f1,recall_accuracy,mrr,ndcg,fpr,exec_p50_us,exec_p95_us,exec_p99_us,eval_p50_us,eval_p95_us,eval_p99_us,e2e_p50_us,e2e_p95_us,e2e_p99_us,\
-            context_tokens,prompt_tokens,total_tokens,tokens_per_query_mean,tokens_per_query_p50,tokens_per_query_p95,token_estimator,oracle_assisted,truncated_sessions,truncated_records,truncated_queries,total_queries,ingest_time_s,query_time_s,total_time_s,\
+            context_tokens,prompt_tokens,total_tokens,tokens_per_query_mean,tokens_per_query_p50,tokens_per_query_p95,token_estimator,context_tokens_per_query_mean,context_tokens_per_query_p50,context_tokens_per_query_p95,official_reader_accuracy,reader_model,judge_model,reader_prompt_tokens_per_query_mean,reader_completion_tokens_per_query_mean,oracle_assisted,truncated_sessions,truncated_records,truncated_queries,total_queries,ingest_time_s,query_time_s,total_time_s,\
             repro_runs,repro_threshold,repro_max_relative_delta,repro_materially_similar"
     )?;
     for r in &result.results {
@@ -522,8 +522,8 @@ fn write_cognitive_csv(result: &CognitiveSuiteResult, w: &mut dyn Write) -> io::
     // Aggregate summary row.
     writeln!(
         w,
-        "TOTAL,{},{},{},{},{},{},{},{},{},{},{},{},{},{},\\
-         {:.4},{:.4},{:.4},0.0000,0.0000,0.0000,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0,0,0,0.0,0,0,,false,0,0,0,{},0.000,0.000,{:.3},0,0.0000,0.0000,false",
+        "TOTAL,{},{},{},{},{},{},{},{},{},{},{},{},{},{},\
+         {:.4},{:.4},{:.4},0.0000,0.0000,0.0000,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0,0,0,0.0,0,0,,0.0,0,0,,,,0.0,0.0,false,0,0,0,{},0.000,0.000,{:.3},0,0.0000,0.0000,false",
         summary_strategy,
         result.run_id,
         result.metadata.dataset_source,
@@ -681,7 +681,32 @@ fn write_cognitive_markdown(result: &CognitiveSuiteResult, w: &mut dyn Write) ->
             result.metadata.baseline_strategies.join(", ")
         }
     )?;
+    if let Some(seed) = result.metadata.seed {
+        writeln!(w, "| Seed | {} |", seed)?;
+    }
+    if let Some(dataset_hash) = result.metadata.dataset_hash_blake3.as_deref() {
+        writeln!(w, "| Dataset hash (blake3) | {} |", dataset_hash)?;
+    }
+    if let Some(dataset_revision) = result.metadata.dataset_revision.as_deref() {
+        writeln!(w, "| Dataset revision | {} |", dataset_revision)?;
+    }
+    if let Some(reader_model) = result.metadata.reader_model.as_deref() {
+        writeln!(w, "| Reader model | {} |", reader_model)?;
+    }
+    if let Some(judge_model) = result.metadata.judge_model.as_deref() {
+        writeln!(w, "| Judge model | {} |", judge_model)?;
+    }
     writeln!(w)?;
+    if !result.metadata.dataset_files.is_empty() {
+        writeln!(w, "### Dataset Files")?;
+        writeln!(w)?;
+        writeln!(w, "| File | Blake3 |")?;
+        writeln!(w, "|------|:-------|")?;
+        for file in &result.metadata.dataset_files {
+            writeln!(w, "| {} | {} |", file.path, file.blake3)?;
+        }
+        writeln!(w)?;
+    }
 
     // Summary table with SOTA comparison.
     writeln!(w, "## Summary")?;
@@ -729,6 +754,7 @@ fn write_cognitive_markdown(result: &CognitiveSuiteResult, w: &mut dyn Write) ->
     }
     writeln!(w)?;
     write_cognitive_honesty_footnotes(result, w)?;
+    write_cognitive_reader_sections(result, w)?;
 
     writeln!(w, "## Strategy Comparisons")?;
     writeln!(w)?;
@@ -953,9 +979,10 @@ fn write_cognitive_csv_row(
 ) -> io::Result<()> {
     let repro = result.reproducibility.as_ref();
     let truncated = result.truncated.unwrap_or_default();
+    let reader = result.reader.as_ref();
     writeln!(
         w,
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{},{},{},{:.1},{},{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{},{:.4},{:.4},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{},{},{},{:.1},{},{},{},{:.1},{},{},{},{},{},{:.1},{:.1},{},{},{},{},{},{:.3},{:.3},{:.3},{},{:.4},{:.4},{}",
         result.benchmark,
         result.strategy,
         result.run_id,
@@ -999,6 +1026,23 @@ fn write_cognitive_csv_row(
         result.tokens_per_query_p50,
         result.tokens_per_query_p95,
         result.token_estimator,
+        result.context_tokens_per_query_mean,
+        result.context_tokens_per_query_p50,
+        result.context_tokens_per_query_p95,
+        reader
+            .and_then(|reader| reader.official_reader_accuracy)
+            .map(|accuracy| format!("{accuracy:.4}"))
+            .unwrap_or_default(),
+        reader
+            .map(|reader| reader.reader_model.clone())
+            .unwrap_or_default(),
+        reader
+            .and_then(|reader| reader.judge_model.clone())
+            .unwrap_or_default(),
+        reader.map_or(0.0, |reader| reader.reader_prompt_tokens_per_query_mean),
+        reader.map_or(0.0, |reader| {
+            reader.reader_completion_tokens_per_query_mean
+        }),
         result.oracle_assisted,
         truncated.sessions,
         truncated.records,
@@ -1030,6 +1074,95 @@ fn format_tokens_per_query(result: &CognitiveResult) -> String {
         "{:.0} (p50 {} / p95 {})",
         result.tokens_per_query_mean, result.tokens_per_query_p50, result.tokens_per_query_p95,
     )
+}
+
+/// Reader-judged results, kept in a separate section so LLM-judged QA
+/// accuracy is never conflated with retrieval-only containment.
+fn write_cognitive_reader_sections(
+    result: &CognitiveSuiteResult,
+    w: &mut dyn Write,
+) -> io::Result<()> {
+    let reader_rows: Vec<(
+        &CognitiveResult,
+        &crate::cognitive::reader::ReaderJudgeReport,
+    )> = result
+        .results
+        .iter()
+        .filter_map(|r| r.reader.as_ref().map(|reader| (r, reader)))
+        .collect();
+    if reader_rows.is_empty() {
+        return Ok(());
+    }
+
+    writeln!(w, "## Reader-Judged Results (LLM QA)")?;
+    writeln!(w)?;
+    writeln!(
+        w,
+        "`official_reader_accuracy` is LLM-judged end-to-end QA accuracy over answers the reader \
+         generated from the retrieved context. It is a DIFFERENT measurement from the \
+         retrieval-only `containment` column above — never compare the two directly."
+    )?;
+    writeln!(w)?;
+    writeln!(
+        w,
+        "| Benchmark | Reader | Judge | Protocol | official_reader_accuracy | containment (retrieval-only) | Judged | Abstention correct | Reader prompt tok/query (mean, p50/p95) | Reader completion tok/query (mean, p50/p95) |"
+    )?;
+    writeln!(
+        w,
+        "|-----------|--------|-------|----------|-------------------------:|-----------------------------:|-------:|-------------------:|----------------------------------------:|--------------------------------------------:|"
+    )?;
+    for (r, reader) in &reader_rows {
+        writeln!(
+            w,
+            "| {} | {} | {} | {} | {} | {:.4} | {} | {}/{} | {:.0} (p50 {} / p95 {}) | {:.0} (p50 {} / p95 {}) |",
+            r.benchmark,
+            reader.reader_model,
+            reader.judge_model.as_deref().unwrap_or("-"),
+            reader.judge_protocol.as_deref().unwrap_or("-"),
+            reader
+                .official_reader_accuracy
+                .map(|accuracy| format!("{accuracy:.4}"))
+                .unwrap_or_else(|| "not judged".to_string()),
+            r.overall_containment,
+            reader.judged_queries,
+            reader.abstention_correct,
+            reader.abstention_queries,
+            reader.reader_prompt_tokens_per_query_mean,
+            reader.reader_prompt_tokens_per_query_p50,
+            reader.reader_prompt_tokens_per_query_p95,
+            reader.reader_completion_tokens_per_query_mean,
+            reader.reader_completion_tokens_per_query_p50,
+            reader.reader_completion_tokens_per_query_p95,
+        )?;
+    }
+    writeln!(w)?;
+    for (r, reader) in &reader_rows {
+        if reader.category_accuracy.is_empty() {
+            continue;
+        }
+        writeln!(w, "Reader-judged accuracy by category ({}):", r.benchmark)?;
+        writeln!(w)?;
+        writeln!(w, "| Category | Accuracy | Queries |")?;
+        writeln!(w, "|----------|---------:|--------:|")?;
+        for category in &reader.category_accuracy {
+            writeln!(
+                w,
+                "| {} | {:.4} | {} |",
+                category.name, category.accuracy, category.total,
+            )?;
+        }
+        writeln!(w)?;
+    }
+    writeln!(
+        w,
+        "Reader token counts are EXACT `usage` values from the chat-completions API \
+         (publishable cost = reader prompt + completion tokens); \
+         `context_tokens_per_query_*` and `tokens_per_query_*` remain estimator-based \
+         retrieval-side sizes."
+    )?;
+    writeln!(w)?;
+
+    Ok(())
 }
 
 /// Machine-derived honesty footnotes: oracle-assisted routing, dataset
@@ -1228,6 +1361,10 @@ mod tests {
             tokens_per_query_p50: total_tokens / 10,
             tokens_per_query_p95: total_tokens / 8,
             token_estimator: "tiktoken-rs/cl100k_base".to_string(),
+            context_tokens_per_query_mean: total_tokens.saturating_sub(100) as f64 / 10.0,
+            context_tokens_per_query_p50: total_tokens.saturating_sub(100) / 10,
+            context_tokens_per_query_p95: total_tokens.saturating_sub(100) / 8,
+            reader: None,
             oracle_assisted: false,
             truncated: None,
             total_queries: 10,
@@ -1296,6 +1433,12 @@ mod tests {
                     "full-context".to_string(),
                     "iterative-retrieval".to_string(),
                 ],
+                seed: None,
+                dataset_files: vec![],
+                dataset_hash_blake3: None,
+                dataset_revision: None,
+                reader_model: None,
+                judge_model: None,
                 environment: EnvironmentInfo {
                     label: Some("ci-runner".to_string()),
                     image: Some("ubuntu-24.04".to_string()),
@@ -1580,6 +1723,96 @@ mod tests {
         assert!(csv.contains("full-context"));
         assert!(csv.contains("iterative-retrieval"));
         assert!(csv.lines().any(|line| line.starts_with("TOTAL,")));
+    }
+
+    #[test]
+    fn cognitive_csv_column_counts_match_header_on_every_row() {
+        let mut result = sample_cognitive_suite();
+        result.results[0].reader = Some(sample_reader_report());
+        let mut buf = Vec::new();
+        write_cognitive_result(&result, OutputFormat::Csv, &mut buf).unwrap();
+        let csv = String::from_utf8(buf).unwrap();
+
+        let mut lines = csv.lines();
+        let header_fields = lines.next().unwrap().split(',').count();
+        for line in lines {
+            assert_eq!(
+                line.split(',').count(),
+                header_fields,
+                "row column count mismatch: {line}"
+            );
+        }
+
+        let header = csv.lines().next().unwrap();
+        assert!(header.contains("context_tokens_per_query_mean"));
+        assert!(header.contains("official_reader_accuracy"));
+        assert!(header.contains("reader_prompt_tokens_per_query_mean"));
+        assert!(header.contains("reader_completion_tokens_per_query_mean"));
+    }
+
+    fn sample_reader_report() -> crate::cognitive::reader::ReaderJudgeReport {
+        crate::cognitive::reader::ReaderJudgeReport {
+            reader_model: "gpt-4o".to_string(),
+            judge_model: Some("gpt-4o".to_string()),
+            judge_protocol: Some("longmemeval-official".to_string()),
+            reader_temperature: 0.0,
+            official_reader_accuracy: Some(0.62),
+            answered_queries: 10,
+            judged_queries: 10,
+            abstention_queries: 2,
+            abstention_correct: 1,
+            category_accuracy: vec![crate::cognitive::reader::ReaderCategoryAccuracy {
+                name: "multi-session".to_string(),
+                accuracy: 0.5,
+                total: 4,
+            }],
+            reader_prompt_tokens_total: 41_000,
+            reader_completion_tokens_total: 350,
+            reader_prompt_tokens_per_query_mean: 4_100.0,
+            reader_prompt_tokens_per_query_p50: 4_000,
+            reader_prompt_tokens_per_query_p95: 5_200,
+            reader_completion_tokens_per_query_mean: 35.0,
+            reader_completion_tokens_per_query_p50: 30,
+            reader_completion_tokens_per_query_p95: 60,
+            judge_prompt_tokens_total: 2_500,
+            judge_completion_tokens_total: 10,
+        }
+    }
+
+    #[test]
+    fn cognitive_markdown_labels_reader_judged_results_separately() {
+        let mut result = sample_cognitive_suite();
+        result.results[0].reader = Some(sample_reader_report());
+        result.metadata.reader_model = Some("gpt-4o".to_string());
+        result.metadata.judge_model = Some("gpt-4o".to_string());
+        result.metadata.seed = Some(0);
+        result.metadata.dataset_hash_blake3 = Some("cafe1234".to_string());
+        result.metadata.dataset_files = vec![crate::cognitive::DatasetFileChecksum {
+            path: "longmemeval_s".to_string(),
+            blake3: "deadbeef".to_string(),
+        }];
+
+        let mut buf = Vec::new();
+        write_cognitive_result(&result, OutputFormat::Markdown, &mut buf).unwrap();
+        let markdown = String::from_utf8(buf).unwrap();
+
+        assert!(markdown.contains("## Reader-Judged Results (LLM QA)"));
+        assert!(markdown.contains("official_reader_accuracy"));
+        assert!(markdown.contains("longmemeval-official"));
+        assert!(markdown.contains("never compare the two directly"));
+        assert!(markdown.contains("| Seed | 0 |"));
+        assert!(markdown.contains("| Dataset hash (blake3) | cafe1234 |"));
+        assert!(markdown.contains("| longmemeval_s | deadbeef |"));
+        assert!(markdown.contains("| Reader model | gpt-4o |"));
+    }
+
+    #[test]
+    fn cognitive_markdown_omits_reader_section_for_retrieval_only_runs() {
+        let result = sample_cognitive_suite();
+        let mut buf = Vec::new();
+        write_cognitive_result(&result, OutputFormat::Markdown, &mut buf).unwrap();
+        let markdown = String::from_utf8(buf).unwrap();
+        assert!(!markdown.contains("Reader-Judged Results"));
     }
 
     #[test]

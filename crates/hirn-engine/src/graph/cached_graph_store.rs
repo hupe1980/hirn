@@ -208,6 +208,18 @@ impl CachedGraphStore {
             return Ok(());
         }
 
+        // Snapshot cold-tier existence BEFORE the batch write: on failure only
+        // rows this call would have created may be rolled back by deletion —
+        // deleting a pre-existing row would destroy durable data and
+        // cascade-expire its edges. If the lookup itself fails, treat every id
+        // as pre-existing (never delete what we cannot prove we created).
+        let node_ids: Vec<MemoryId> = nodes.iter().map(|node| node.id).collect();
+        let cold_preexisting: HashSet<MemoryId> = match self.cold.existing_node_ids(&node_ids).await
+        {
+            Ok(existing) => existing,
+            Err(_) => node_ids.into_iter().collect(),
+        };
+
         let mut inserted_ids = Vec::with_capacity(nodes.len());
         {
             let mut graph = self.hot.write();
@@ -226,7 +238,9 @@ impl CachedGraphStore {
 
         if let Err(error) = self.cold.add_nodes(nodes).await {
             for node in nodes {
-                let _ = self.cold.remove_node(node.id).await;
+                if !cold_preexisting.contains(&node.id) {
+                    let _ = self.cold.remove_node(node.id).await;
+                }
             }
             if !inserted_ids.is_empty() {
                 let mut graph = self.hot.write();
@@ -434,6 +448,7 @@ impl GraphReadRuntime for CachedGraphStore {
             inhibition_mu,
             allowed_namespaces,
         )
+        .await
     }
 
     async fn activate_graph_min_weight(
@@ -641,19 +656,17 @@ impl CachedGraphStore {
                 break;
             }
 
-            let edges = self.cold().batch_adjacency_read(&frontier).await?;
+            // R-67: push the namespace filter into the scan (one batched
+            // target-namespace lookup) instead of one `node_namespace` scan per
+            // edge, matching `persistent_activation`'s scoped-read pattern.
+            let edges = self
+                .cold()
+                .batch_adjacency_read_scoped(&frontier, allowed_namespaces)
+                .await?;
             let mut next_frontier = Vec::new();
             for edge in edges {
                 if edge.weight < min_weight {
                     continue;
-                }
-                if let Some(allowed_namespaces) = allowed_namespaces {
-                    let Some(namespace) = self.cold().node_namespace(edge.target).await? else {
-                        continue;
-                    };
-                    if !allowed_namespaces.contains(&namespace) {
-                        continue;
-                    }
                 }
                 if visited.insert(edge.target) {
                     next_frontier.push(edge.target);
@@ -667,8 +680,45 @@ impl CachedGraphStore {
         Ok(())
     }
 
-    fn activate_via_hot_graph(
+    async fn activate_via_hot_graph(
         &self,
+        seeds: &[MemoryId],
+        mode: ExecActivationMode,
+        ppr_config: Option<&hirn_graph::PprConfig>,
+        max_depth: u32,
+        epsilon: f32,
+        inhibition_mu: f32,
+        allowed_namespaces: Option<&[Namespace]>,
+    ) -> HirnResult<GraphActivationOutput> {
+        // Spreading / PPR power iteration is CPU-bound and holds the hot-graph
+        // read guard for its full duration. Run it on a blocking thread so a
+        // large activation cannot stall a tokio worker; the guard is acquired
+        // inside the closure and therefore held on the blocking thread only.
+        let hot = Arc::clone(&self.hot);
+        let seeds = seeds.to_vec();
+        let ppr_config = ppr_config.cloned();
+        let allowed_namespaces = allowed_namespaces.map(<[Namespace]>::to_vec);
+        tokio::task::spawn_blocking(move || {
+            let graph = hot.read();
+            Self::activate_on_hot_graph(
+                &graph,
+                &seeds,
+                mode,
+                ppr_config.as_ref(),
+                max_depth,
+                epsilon,
+                inhibition_mu,
+                allowed_namespaces.as_deref(),
+            )
+        })
+        .await
+        .map_err(|e| {
+            hirn_core::HirnError::storage(format!("hot-tier activation task failed: {e}"))
+        })?
+    }
+
+    fn activate_on_hot_graph(
+        graph: &PropertyGraph,
         seeds: &[MemoryId],
         mode: ExecActivationMode,
         ppr_config: Option<&hirn_graph::PprConfig>,
@@ -685,11 +735,10 @@ impl CachedGraphStore {
         };
         config.validate()?;
 
-        let graph = self.hot_graph();
         match mode {
             ExecActivationMode::Static => {
                 let mut entries: Vec<_> =
-                    hirn_graph::static_activation(&graph, seeds, allowed_namespaces)
+                    hirn_graph::static_activation(graph, seeds, allowed_namespaces)
                         .into_iter()
                         .collect();
                 hirn_graph::sort_by_score_then_id(&mut entries);
@@ -707,13 +756,8 @@ impl CachedGraphStore {
                 })
             }
             ExecActivationMode::Spreading => {
-                let result = hirn_graph::spread_activation(
-                    &graph,
-                    seeds,
-                    &config,
-                    None,
-                    allowed_namespaces,
-                )?;
+                let result =
+                    hirn_graph::spread_activation(graph, seeds, &config, None, allowed_namespaces)?;
                 let mut entries: Vec<_> = result.activations.into_iter().collect();
                 hirn_graph::sort_by_score_then_id(&mut entries);
 
@@ -739,7 +783,7 @@ impl CachedGraphStore {
                 let default_ppr = hirn_graph::PprConfig::default();
                 let ppr_config = ppr_config.unwrap_or(&default_ppr);
                 let mut entries: Vec<_> = hirn_graph::personalized_pagerank(
-                    &graph,
+                    graph,
                     seeds,
                     ppr_config,
                     allowed_namespaces,
@@ -912,7 +956,7 @@ impl CachedGraphStore {
         relation: EdgeRelation,
         allowed_namespaces: Option<&[Namespace]>,
     ) -> HirnResult<Vec<GraphCausalChainRow>> {
-        let rows = self
+        let (bfs_rows, truncated) = self
             .cold()
             .deep_causal_bfs(
                 start_ids,
@@ -921,7 +965,19 @@ impl CachedGraphStore {
                 relation,
                 allowed_namespaces,
             )
-            .await?
+            .await?;
+        // R-69: surface cold-tier truncation to the caller. The delegated deep
+        // query silently dropped chains before; now truncation is at least
+        // observable (the cold BFS returns the flag; ready to thread into the
+        // result row/diagnostic once the schema carries it).
+        if truncated {
+            tracing::warn!(
+                start_ids = start_ids.len(),
+                max_depth,
+                "cold causal chain query truncated (chain or explored-state cap reached)"
+            );
+        }
+        let rows = bfs_rows
             .into_iter()
             .map(|row| GraphCausalChainRow {
                 chain_id: row.chain_id,
@@ -952,23 +1008,29 @@ impl CachedGraphStore {
             return Ok(rows);
         }
 
-        let mut visible_nodes = HashMap::new();
+        // R-67: resolve all node namespaces in ONE batched projection scan
+        // instead of one `node_namespace` scan per distinct node.
+        let mut distinct_ids: Vec<MemoryId> = Vec::new();
+        let mut seen: HashSet<MemoryId> = HashSet::new();
         for row in &rows {
             for node_id in [&row.source_id, &row.target_id] {
-                let Ok(node_id) = MemoryId::parse(node_id) else {
-                    continue;
-                };
-                if visible_nodes.contains_key(&node_id) {
-                    continue;
+                if let Ok(node_id) = MemoryId::parse(node_id)
+                    && seen.insert(node_id)
+                {
+                    distinct_ids.push(node_id);
                 }
-                let is_visible = self
-                    .cold()
-                    .node_namespace(node_id)
-                    .await?
-                    .is_some_and(|namespace| allowed_namespaces.contains(&namespace));
-                visible_nodes.insert(node_id, is_visible);
             }
         }
+        let namespaces = self.cold().node_namespaces(&distinct_ids).await?;
+        let visible_nodes: HashMap<MemoryId, bool> = distinct_ids
+            .into_iter()
+            .map(|node_id| {
+                let is_visible = namespaces
+                    .get(&node_id)
+                    .is_some_and(|namespace| allowed_namespaces.contains(namespace));
+                (node_id, is_visible)
+            })
+            .collect();
 
         let mut visible_chain_ids = HashSet::new();
         let mut hidden_chain_ids = HashSet::new();
@@ -1065,27 +1127,29 @@ impl CachedGraphStore {
                 break;
             }
 
+            // R-67: push the namespace filter into the scan (batched target
+            // namespace lookup) instead of one `node_namespace` scan per edge.
             let edges = match relation_filter {
                 Some([relation]) => {
                     self.cold()
-                        .batch_adjacency_read_filtered(&frontier, *relation)
+                        .batch_adjacency_read_filtered_scoped(
+                            &frontier,
+                            *relation,
+                            allowed_namespaces,
+                        )
                         .await?
                 }
-                _ => self.cold().batch_adjacency_read(&frontier).await?,
+                _ => {
+                    self.cold()
+                        .batch_adjacency_read_scoped(&frontier, allowed_namespaces)
+                        .await?
+                }
             };
 
             let mut next_frontier = Vec::new();
             for edge in edges {
                 if relation_filter.is_some_and(|relations| !relations.contains(&edge.relation)) {
                     continue;
-                }
-                if let Some(allowed_namespaces) = allowed_namespaces {
-                    let Some(namespace) = self.cold().node_namespace(edge.target).await? else {
-                        continue;
-                    };
-                    if !allowed_namespaces.contains(&namespace) {
-                        continue;
-                    }
                 }
                 if visited.insert(edge.target) {
                     next_frontier.push(edge.target);
@@ -1159,6 +1223,13 @@ impl GraphStore for CachedGraphStore {
         created_at: Timestamp,
         namespace: Namespace,
     ) -> HirnResult<bool> {
+        // Snapshot cold-tier existence BEFORE the write: `add_node` is an
+        // upsert, so a failed write on a pre-existing node must never be
+        // "rolled back" by deletion — that would destroy the durable row and
+        // cascade-expire its edges. If the lookup itself fails, assume the
+        // node pre-exists (never delete what we cannot prove we created).
+        let cold_preexisting = self.cold.has_node(id).await.unwrap_or(true);
+
         // Write-through: hot first, then cold.
         let added = {
             let mut graph = self.hot.write();
@@ -1169,7 +1240,9 @@ impl GraphStore for CachedGraphStore {
             .add_node(id, layer, importance, created_at, namespace)
             .await
         {
-            let _ = self.cold.remove_node(id).await;
+            if !cold_preexisting {
+                let _ = self.cold.remove_node(id).await;
+            }
             if added {
                 let mut graph = self.hot.write();
                 graph.remove_node(id);
@@ -1202,7 +1275,9 @@ impl GraphStore for CachedGraphStore {
                 id,
                 layer: lay,
                 importance: imp,
-                created_at: Timestamp::now(),
+                // Return the real stored creation time (the hot-tier NodeData
+                // carries it) rather than fabricating `now()`.
+                created_at: graph.node_created_at(id).unwrap_or_else(Timestamp::now),
                 namespace: graph.node_namespace(id).cloned().unwrap_or_default(),
                 access_count: graph.access_count(id),
             })),
@@ -1387,13 +1462,25 @@ impl GraphStore for CachedGraphStore {
         new_weight: f32,
         co_retrieval_count: Option<u64>,
     ) -> HirnResult<()> {
+        // Reject non-finite weights before either tier is touched: NaN survives
+        // `clamp` (clamp of NaN is NaN) and then poisons every downstream
+        // activation/PPR computation. This mirrors the finite-check in
+        // `PropertyGraph::add_edge` and keeps the hot tier from storing a value
+        // the cold tier would reject. (F-ENG: hot/cold write-path parity.)
+        if !new_weight.is_finite() {
+            return Err(hirn_core::HirnError::InvalidInput(format!(
+                "graph edge weight must be finite, got {new_weight}"
+            )));
+        }
+        // Clamp identically to the cold tier so both tiers hold the same value.
+        let clamped = new_weight.clamp(0.01, 1.0);
         self.cold
             .update_edge_weight(edge_id, new_weight, co_retrieval_count)
             .await?;
         {
             let mut graph = self.hot.write();
             if let Some(edge) = graph.edge_mut(edge_id) {
-                edge.weight = new_weight;
+                edge.weight = clamped;
                 if let Some(count) = co_retrieval_count {
                     edge.co_retrieval_count = count;
                 }
@@ -1638,6 +1725,7 @@ mod tests {
             self.inner.tag(dataset, tag).await
         }
 
+        #[allow(deprecated)] // forwarding a deprecated trait method on a test mock
         async fn checkout(&self, dataset: &str, version: u64) -> Result<(), HirnDbError> {
             self.inner.checkout(dataset, version).await
         }
@@ -1886,6 +1974,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn batch_add_nodes_failure_preserves_preexisting_cold_nodes() {
+        let (cold, storage) = fault_injecting_cold().await;
+        let cached = CachedGraphStore::new(cold.clone());
+
+        let existing = MemoryId::new();
+        let fresh = MemoryId::new();
+        let namespace = Namespace::default();
+        let now = Timestamp::now();
+
+        cached
+            .add_node(existing, Layer::Episodic, 0.8, now, namespace)
+            .await
+            .unwrap();
+
+        storage
+            .fail_node_merge_insert
+            .store(true, AtomicOrdering::Release);
+
+        let result = cached
+            .add_nodes(&[
+                GraphNodeData {
+                    id: existing,
+                    layer: Layer::Episodic,
+                    importance: 0.9,
+                    created_at: now,
+                    namespace,
+                    access_count: 0,
+                },
+                GraphNodeData {
+                    id: fresh,
+                    layer: Layer::Semantic,
+                    importance: 0.6,
+                    created_at: now,
+                    namespace,
+                    access_count: 0,
+                },
+            ])
+            .await;
+
+        assert!(result.is_err());
+        // Rollback must only touch rows this call would have created — the
+        // pre-existing node survives in both tiers.
+        assert!(
+            cold.has_node(existing).await.unwrap(),
+            "batch rollback must not delete pre-existing cold nodes"
+        );
+        assert!(cached.has_node(existing).await.unwrap());
+        assert!(!cold.has_node(fresh).await.unwrap());
+        assert!(!cached.has_node(fresh).await.unwrap());
+    }
+
+    #[tokio::test]
     async fn write_through_edges_preserve_hot_edge_ids_in_cold_tier() {
         let cold = test_cold().await;
         let cached = CachedGraphStore::new(cold.clone());
@@ -1937,6 +2077,50 @@ mod tests {
 
         assert!(result.is_err());
         assert!(!cached.has_node(a).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn add_node_upsert_failure_preserves_preexisting_cold_node() {
+        let (cold, storage) = fault_injecting_cold().await;
+        let cached = CachedGraphStore::new(cold.clone());
+
+        let a = MemoryId::new();
+        let b = MemoryId::new();
+        let ns = Namespace::default();
+
+        cached
+            .add_node(a, Layer::Episodic, 0.8, Timestamp::now(), ns)
+            .await
+            .unwrap();
+        cached
+            .add_node(b, Layer::Semantic, 0.6, Timestamp::now(), ns)
+            .await
+            .unwrap();
+        cached
+            .add_edge(a, b, EdgeRelation::Causes, 0.7, Metadata::new())
+            .await
+            .unwrap();
+
+        storage
+            .fail_node_merge_insert
+            .store(true, AtomicOrdering::Release);
+        let result = cached
+            .add_node(a, Layer::Episodic, 0.9, Timestamp::now(), ns)
+            .await;
+
+        assert!(result.is_err());
+        // A failed upsert must not "roll back" the pre-existing node by
+        // deletion — that would destroy the durable row and cascade-expire
+        // its edges.
+        assert!(
+            cold.has_node(a).await.unwrap(),
+            "pre-existing cold node must survive a failed upsert"
+        );
+        assert!(
+            !cold.get_edges(a).await.unwrap().is_empty(),
+            "edges of the pre-existing node must not be cascade-expired"
+        );
+        assert!(cached.has_node(a).await.unwrap());
     }
 
     #[tokio::test]
@@ -2454,5 +2638,210 @@ mod tests {
                 assert!((h - c).abs() < 1e-5);
             }
         }
+    }
+
+    /// Cross-tier equivalence with lateral inhibition enabled (μ > 0).
+    ///
+    /// Jaccard-modulated inhibition needs embeddings, which `activate_graph`
+    /// does not thread through, so the tier entry points are exercised
+    /// directly: `hirn_graph::spread_activation` (hot, petgraph) vs
+    /// `crate::persistent_activation::spread_activation` (cold, Lance). The
+    /// fixture places two seed-like nodes at depth 3 — outside the 2-hop
+    /// protected set — one sharing the seed's single out-neighbor
+    /// (Jaccard 1 → no suppression) and one sharing none (Jaccard 0 → full μ
+    /// suppression), so inhibition provably changes scores on both tiers.
+    #[tokio::test]
+    async fn hot_and_cold_activation_paths_agree_with_inhibition() {
+        let cold = test_cold().await;
+        let cached = CachedGraphStore::new(cold);
+        let ns = Namespace::default();
+
+        let seed = MemoryId::new();
+        let mid = MemoryId::new();
+        let far = MemoryId::new();
+        let shares_neighbor = MemoryId::new();
+        let no_shared_neighbor = MemoryId::new();
+        for id in [seed, mid, far, shares_neighbor, no_shared_neighbor] {
+            cached
+                .add_node(id, Layer::Episodic, 0.5, Timestamp::now(), ns)
+                .await
+                .unwrap();
+        }
+        for (src, tgt) in [
+            (seed, mid),
+            (mid, far),
+            (far, shares_neighbor),
+            (far, no_shared_neighbor),
+            (shares_neighbor, mid), // shares the seed's out-neighborhood {mid}
+        ] {
+            cached
+                .add_edge(src, tgt, EdgeRelation::Causes, 0.9, Metadata::new())
+                .await
+                .unwrap();
+        }
+
+        // Both depth-3 nodes look semantically identical to the seed, so the
+        // similarity gate passes and only the Jaccard term differentiates them.
+        let seed_like = vec![1.0_f32, 0.0, 0.0, 0.0];
+        let embeddings: HashMap<MemoryId, Vec<f32>> = [
+            (seed, seed_like.clone()),
+            (shares_neighbor, seed_like.clone()),
+            (no_shared_neighbor, seed_like),
+        ]
+        .into_iter()
+        .collect();
+
+        let config = hirn_graph::ActivationConfig {
+            max_depth: 3,
+            epsilon: 0.001,
+            inhibition_strength: 0.5,
+            ..Default::default()
+        };
+
+        let hot = hirn_graph::spread_activation(
+            &cached.hot_graph(),
+            &[seed],
+            &config,
+            Some(&embeddings),
+            None,
+        )
+        .unwrap();
+        let cold = crate::persistent_activation::spread_activation(
+            cached.cold(),
+            &[seed],
+            &config,
+            Some(&embeddings),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Inhibition must actually fire: both depth-3 nodes have identical
+        // pre-inhibition scores by construction, so a score gap proves the
+        // Jaccard-modulated suppression ran.
+        assert!(
+            hot.activations[&no_shared_neighbor] < hot.activations[&shares_neighbor],
+            "inhibition must suppress the node with no shared neighbors"
+        );
+
+        let mut hot_entries: Vec<_> = hot.activations.into_iter().collect();
+        let mut cold_entries: Vec<_> = cold.activations.into_iter().collect();
+        hirn_graph::sort_by_score_then_id(&mut hot_entries);
+        hirn_graph::sort_by_score_then_id(&mut cold_entries);
+
+        let hot_ids: Vec<MemoryId> = hot_entries.iter().map(|(id, _)| *id).collect();
+        let cold_ids: Vec<MemoryId> = cold_entries.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            hot_ids, cold_ids,
+            "hot and cold tiers must return identical id orderings under inhibition"
+        );
+        for (i, ((_, h), (_, c))) in hot_entries.iter().zip(cold_entries.iter()).enumerate() {
+            assert!(
+                (h - c).abs() < 1e-5,
+                "inhibited score mismatch at rank {i}: hot={h}, cold={c}"
+            );
+        }
+
+        // Engine-level parity with μ > 0 for both remaining modes (PPR has no
+        // inhibition term; both tiers must still agree when μ is configured).
+        for mode in [ExecActivationMode::Spreading, ExecActivationMode::Ppr] {
+            let hot = cached
+                .activate_graph(&[seed], mode, None, 3, 0.001, 0.5, usize::MAX, None)
+                .await
+                .unwrap();
+            let cold = cached
+                .activate_graph(&[seed], mode, None, 3, 0.001, 0.5, 0, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                hot.ids, cold.ids,
+                "hot and cold orderings must match with inhibition_mu > 0 for {mode:?}"
+            );
+            for (h, c) in hot.scores.iter().zip(cold.scores.iter()) {
+                assert!((h - c).abs() < 1e-5);
+            }
+        }
+    }
+
+    /// R-18: the hot tier must reject non-finite edge weights and clamp finite
+    /// ones identically to the cold tier, so the two tiers never diverge and a
+    /// NaN never poisons activation.
+    #[tokio::test]
+    async fn update_edge_weight_rejects_nan_and_clamps_like_cold() {
+        let cold = test_cold().await;
+        let cached = CachedGraphStore::new(cold.clone());
+
+        let a = MemoryId::new();
+        let b = MemoryId::new();
+        let ns = Namespace::default();
+        cached
+            .add_node(a, Layer::Episodic, 0.8, Timestamp::now(), ns.clone())
+            .await
+            .unwrap();
+        cached
+            .add_node(b, Layer::Semantic, 0.6, Timestamp::now(), ns)
+            .await
+            .unwrap();
+        let eid = cached
+            .add_edge(a, b, EdgeRelation::Causes, 0.7, Metadata::new())
+            .await
+            .unwrap();
+
+        // Above-range weight clamps to 1.0 on both tiers.
+        cached.update_edge_weight(eid, 5.0, None).await.unwrap();
+        let hot = cached.get_edge(eid).await.unwrap().unwrap().weight;
+        let cold_w = cold.get_edges_by_ids(&[eid]).await.unwrap()[0].weight;
+        assert_eq!(hot, 1.0);
+        assert_eq!(cold_w, 1.0);
+
+        // Below-range weight clamps to 0.01 on both tiers.
+        cached.update_edge_weight(eid, -0.2, None).await.unwrap();
+        let hot = cached.get_edge(eid).await.unwrap().unwrap().weight;
+        let cold_w = cold.get_edges_by_ids(&[eid]).await.unwrap()[0].weight;
+        assert_eq!(hot, 0.01);
+        assert_eq!(cold_w, 0.01);
+
+        // NaN is rejected outright — neither tier is touched, so both retain
+        // the prior finite value and stay in agreement.
+        assert!(
+            cached
+                .update_edge_weight(eid, f32::NAN, None)
+                .await
+                .is_err(),
+            "non-finite edge weight must be rejected"
+        );
+        let hot = cached.get_edge(eid).await.unwrap().unwrap().weight;
+        let cold_w = cold.get_edges_by_ids(&[eid]).await.unwrap()[0].weight;
+        assert!(
+            hot.is_finite() && cold_w.is_finite(),
+            "neither tier may hold a non-finite weight"
+        );
+        assert_eq!(
+            hot, cold_w,
+            "hot and cold must hold the same clamped finite value"
+        );
+        assert_eq!(hot, 0.01);
+    }
+
+    /// R-66: `get_node` must return the node's real stored creation time, not
+    /// `Timestamp::now()`.
+    #[tokio::test]
+    async fn get_node_returns_stored_creation_time() {
+        let cold = test_cold().await;
+        let cached = CachedGraphStore::new(cold);
+
+        let a = MemoryId::new();
+        let ns = Namespace::default();
+        let created = Timestamp::from_millis(1_600_000_000_000);
+        cached
+            .add_node(a, Layer::Episodic, 0.8, created, ns)
+            .await
+            .unwrap();
+
+        let node = cached.get_node(a).await.unwrap().unwrap();
+        assert_eq!(
+            node.created_at, created,
+            "get_node must return the stored creation time, not now()"
+        );
     }
 }

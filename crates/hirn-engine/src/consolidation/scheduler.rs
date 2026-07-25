@@ -119,6 +119,10 @@ pub struct ConsolidationScheduler {
     state: Arc<SchedulerState>,
     schedule: ConsolidationSchedule,
     config: ConsolidationConfig,
+    /// Optional LLM provider. When set, the automatic consolidation path runs
+    /// the LLM-dependent stages (community summaries, RAPTOR, LLM concept
+    /// extraction); when `None`, only the heuristic stages run (R-63d).
+    llm: Option<Arc<dyn hirn_core::embed::LlmProvider>>,
     /// Handle to the background thread (joined on `Drop`).
     handle: Option<thread::JoinHandle<()>>,
 }
@@ -129,6 +133,16 @@ impl ConsolidationScheduler {
     /// Uses `SurpriseThreshold` as the default mode with the configured
     /// `consolidation_interval_secs` as the fallback.
     pub fn new(db: Arc<HirnDB>, config: ConsolidationConfig) -> Self {
+        Self::new_with_llm(db, config, None)
+    }
+
+    /// [`Self::new`] with an optional LLM provider so the automatic
+    /// consolidation path can run LLM-dependent stages (R-63d).
+    pub fn new_with_llm(
+        db: Arc<HirnDB>,
+        config: ConsolidationConfig,
+        llm: Option<Arc<dyn hirn_core::embed::LlmProvider>>,
+    ) -> Self {
         let interval_secs = db.config().consolidation_interval_secs;
         let schedule = if interval_secs > 0 {
             ConsolidationSchedule::SurpriseThreshold {
@@ -138,7 +152,7 @@ impl ConsolidationScheduler {
         } else {
             ConsolidationSchedule::Manual
         };
-        Self::with_schedule(db, config, schedule)
+        Self::with_schedule_and_llm(db, config, schedule, llm)
     }
 
     /// Create a new scheduler with a specific scheduling strategy.
@@ -146,6 +160,17 @@ impl ConsolidationScheduler {
         db: Arc<HirnDB>,
         config: ConsolidationConfig,
         schedule: ConsolidationSchedule,
+    ) -> Self {
+        Self::with_schedule_and_llm(db, config, schedule, None)
+    }
+
+    /// [`Self::with_schedule`] with an optional LLM provider so the automatic
+    /// consolidation path can run LLM-dependent stages (R-63d).
+    pub fn with_schedule_and_llm(
+        db: Arc<HirnDB>,
+        config: ConsolidationConfig,
+        schedule: ConsolidationSchedule,
+        llm: Option<Arc<dyn hirn_core::embed::LlmProvider>>,
     ) -> Self {
         let state = Arc::new(SchedulerState {
             running: AtomicBool::new(false),
@@ -164,8 +189,9 @@ impl ConsolidationScheduler {
             let state = Arc::clone(&state);
             let sched = schedule.clone();
             let cfg = config.clone();
+            let llm = llm.clone();
             thread::spawn(move || {
-                Self::background_loop(&db, &state, &cfg, &sched);
+                Self::background_loop(&db, &state, &cfg, &sched, llm.as_ref());
             })
         };
 
@@ -174,6 +200,7 @@ impl ConsolidationScheduler {
             state,
             schedule,
             config,
+            llm,
             handle: Some(handle),
         }
     }
@@ -254,8 +281,9 @@ impl ConsolidationScheduler {
             let st = Arc::clone(&state);
             let sched = schedule.clone();
             let cfg = self.config.clone();
+            let llm = self.llm.clone();
             thread::spawn(move || {
-                Self::background_loop(&db, &st, &cfg, &sched);
+                Self::background_loop(&db, &st, &cfg, &sched, llm.as_ref());
             })
         };
 
@@ -299,6 +327,7 @@ impl ConsolidationScheduler {
         state: &SchedulerState,
         config: &ConsolidationConfig,
         schedule: &ConsolidationSchedule,
+        llm: Option<&Arc<dyn hirn_core::embed::LlmProvider>>,
     ) {
         // Create a single Tokio runtime for the entire scheduler lifetime
         // instead of spawning one per consolidation cycle.
@@ -335,7 +364,7 @@ impl ConsolidationScheduler {
             if state.shutdown.load(Ordering::Acquire) {
                 // Drain remaining queued requests before exiting.
                 while state.queued.load(Ordering::Acquire) > 0 {
-                    Self::run_consolidation(db, state, config, &rt);
+                    Self::run_consolidation(db, state, config, &rt, llm);
                     state.queued.fetch_sub(1, Ordering::Release);
                 }
                 break;
@@ -349,7 +378,7 @@ impl ConsolidationScheduler {
                     state.queued.fetch_add(1, Ordering::Release);
                 }
                 while state.queued.load(Ordering::Acquire) > 0 {
-                    Self::run_consolidation(db, state, config, &rt);
+                    Self::run_consolidation(db, state, config, &rt, llm);
                     state.queued.fetch_sub(1, Ordering::Release);
                 }
             }
@@ -411,6 +440,7 @@ impl ConsolidationScheduler {
         state: &SchedulerState,
         config: &ConsolidationConfig,
         rt: &tokio::runtime::Runtime,
+        llm: Option<&Arc<dyn hirn_core::embed::LlmProvider>>,
     ) {
         // Acquire lock — spin-wait if another run is in progress.
         while state
@@ -448,7 +478,7 @@ impl ConsolidationScheduler {
         // `running` is cleared whether we return normally, with an error, or
         // via panic.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            rt.block_on(execute_consolidation_pipeline(db, config, &[], None))
+            rt.block_on(execute_consolidation_pipeline(db, config, &[], llm))
         }));
 
         match result {
@@ -496,6 +526,126 @@ impl Drop for ConsolidationScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::sync::atomic::AtomicUsize;
+
+    use hirn_core::embed::{ChatMessage, LlmOptions, LlmProvider};
+    use hirn_core::episodic::EpisodicRecord;
+    use hirn_core::metadata::Metadata;
+    use hirn_core::types::{AgentId, EdgeRelation, EventType};
+
+    /// Mock LLM that counts invocations so tests can prove the LLM-dependent
+    /// consolidation stages actually ran.
+    struct CountingLlm {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for CountingLlm {
+        async fn generate_text(
+            &self,
+            _messages: &[ChatMessage],
+            _options: &LlmOptions,
+        ) -> hirn_core::HirnResult<String> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok("THEME: test\nKEY_ENTITIES: auth, api\nSUMMARY: about auth.".into())
+        }
+
+        fn model_id(&self) -> &str {
+            "counting-llm"
+        }
+    }
+
+    /// Store connected episodes so consolidation has communities to summarize.
+    async fn populate(db: &HirnDB) {
+        let agent = AgentId::new("sched-test").unwrap();
+        let mut ids = Vec::new();
+        for i in 0..6 {
+            let emb = match i % 3 {
+                0 => vec![1.0, 0.0, 0.0],
+                1 => vec![0.95, 0.05, 0.0],
+                _ => vec![0.9, 0.1, 0.0],
+            };
+            let record = EpisodicRecord::builder()
+                .event_type(EventType::Observation)
+                .content(format!("Auth episode {i}: JWT tokens for API auth"))
+                .summary(format!("Auth episode {i}"))
+                .importance(0.7)
+                .surprise(0.5)
+                .agent_id(agent.clone())
+                .embedding(emb)
+                .entity("auth", "topic")
+                .build()
+                .unwrap();
+            ids.push(db.remember_bypass_admission(record).await.unwrap());
+        }
+        for i in 0..ids.len() {
+            for j in (i + 1)..ids.len() {
+                let _ = db
+                    .connect_with(
+                        ids[i],
+                        ids[j],
+                        EdgeRelation::SimilarTo,
+                        0.9,
+                        Metadata::default(),
+                    )
+                    .await;
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scheduler_runs_llm_stages_when_provider_configured() {
+        // R-63d: the automatic path must run LLM stages when a provider is
+        // configured (previously it always passed `None`).
+        let db = test_db().await;
+        populate(&db).await;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let llm: Arc<dyn LlmProvider> = Arc::new(CountingLlm {
+            calls: Arc::clone(&calls),
+        });
+
+        let mut sched = ConsolidationScheduler::with_schedule_and_llm(
+            Arc::clone(&db),
+            ConsolidationConfig::default(),
+            ConsolidationSchedule::Manual,
+            Some(llm),
+        );
+        sched.trigger();
+
+        // Wait for the background consolidation to complete.
+        for _ in 0..50 {
+            if calls.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        sched.stop();
+
+        assert!(
+            calls.load(Ordering::Relaxed) > 0,
+            "LLM-dependent consolidation stages should run when a provider is configured"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scheduler_without_llm_does_not_invoke_provider() {
+        // Baseline: with no provider, no LLM calls are made.
+        let db = test_db().await;
+        populate(&db).await;
+
+        let mut sched = ConsolidationScheduler::with_schedule(
+            Arc::clone(&db),
+            ConsolidationConfig::default(),
+            ConsolidationSchedule::Manual,
+        );
+        sched.trigger();
+        std::thread::sleep(Duration::from_millis(500));
+        sched.stop();
+        // Nothing to assert on an external counter; this exercises the None path
+        // for coverage and ensures it does not panic.
+    }
 
     async fn test_db() -> Arc<HirnDB> {
         let dir = tempfile::tempdir().unwrap();

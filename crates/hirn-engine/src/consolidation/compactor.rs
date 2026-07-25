@@ -321,32 +321,69 @@ async fn compact_all_datasets(
     })
 }
 
+/// Page size for archival rounds.
+const ARCHIVAL_PAGE_SIZE: usize = 1000;
+
 /// Archive episodic memories older than `age_secs`.
 ///
-/// Iterates in bounded batches (1000 per round) to avoid unbounded memory use.
+/// R-63c: iterates in bounded pages *until a page yields no more eligible
+/// records*, so a store with more than one page of archival-eligible episodes
+/// is fully archived (the previous implementation ran a single page and
+/// silently left the rest). `list_episodes_for_archival` returns only
+/// non-archived episodes oldest-first, so each round archives the oldest
+/// eligible records; once a page's head is newer than the cutoff (or empty) no
+/// eligible records remain and the loop terminates.
+///
 /// Fails if listing or archival fails so lifecycle compaction cannot emit a
 /// success result ahead of the archival state.
 async fn archive_old_memories(
     runtime: &(impl LifecycleArchivalRuntime + ?Sized),
     age_secs: u64,
 ) -> HirnResult<usize> {
+    archive_old_memories_paged(runtime, age_secs, ARCHIVAL_PAGE_SIZE).await
+}
+
+/// [`archive_old_memories`] with an explicit page size (see its docs). Split out
+/// so tests can exercise the multi-page loop without a full 1000-record page.
+async fn archive_old_memories_paged(
+    runtime: &(impl LifecycleArchivalRuntime + ?Sized),
+    age_secs: u64,
+    page_size: usize,
+) -> HirnResult<usize> {
+    let page_size = page_size.max(1);
     let age_secs_i64 = i64::try_from(age_secs).unwrap_or(i64::MAX);
     let cutoff = chrono::Utc::now() - chrono::Duration::seconds(age_secs_i64);
     let cutoff_ts = hirn_core::timestamp::Timestamp::from_datetime(cutoff);
 
-    let episodes = runtime.list_episodes_for_archival(1000).await?;
-
-    // Collect IDs eligible for archival, then archive.
-    let to_archive: Vec<_> = episodes
-        .iter()
-        .filter(|ep| ep.timestamp < cutoff_ts)
-        .map(|ep| ep.id)
-        .collect();
-
     let mut archived = 0;
-    for id in &to_archive {
-        runtime.archive_episode_for_compaction(*id).await?;
-        archived += 1;
+    loop {
+        let episodes = runtime.list_episodes_for_archival(page_size).await?;
+        if episodes.is_empty() {
+            break;
+        }
+
+        // Records are oldest-first; eligible ones (older than the cutoff) lead
+        // the page. If none are eligible, everything remaining is newer than the
+        // cutoff and we are done.
+        let to_archive: Vec<_> = episodes
+            .iter()
+            .filter(|ep| ep.timestamp < cutoff_ts)
+            .map(|ep| ep.id)
+            .collect();
+        if to_archive.is_empty() {
+            break;
+        }
+
+        for id in &to_archive {
+            runtime.archive_episode_for_compaction(*id).await?;
+            archived += 1;
+        }
+
+        // A short page means we have seen every non-archived record; the
+        // just-archived ones will not reappear, so there is nothing left.
+        if episodes.len() < page_size {
+            break;
+        }
     }
 
     Ok(archived)
@@ -426,6 +463,30 @@ mod tests {
         }
     }
 
+    /// Stateful runtime that models archival removing records from the
+    /// non-archived working set, so paging across rounds can be exercised.
+    struct PagingArchivalRuntime {
+        remaining: Mutex<Vec<EpisodicRecord>>,
+        archived: Mutex<Vec<MemoryId>>,
+    }
+
+    #[async_trait]
+    impl LifecycleArchivalRuntime for PagingArchivalRuntime {
+        async fn list_episodes_for_archival(
+            &self,
+            limit: usize,
+        ) -> HirnResult<Vec<EpisodicRecord>> {
+            let remaining = self.remaining.lock().unwrap();
+            Ok(remaining.iter().take(limit).cloned().collect())
+        }
+
+        async fn archive_episode_for_compaction(&self, id: MemoryId) -> HirnResult<()> {
+            self.remaining.lock().unwrap().retain(|ep| ep.id != id);
+            self.archived.lock().unwrap().push(id);
+            Ok(())
+        }
+    }
+
     fn old_episode(content: &str) -> EpisodicRecord {
         EpisodicRecord::builder()
             .content(content)
@@ -467,6 +528,51 @@ mod tests {
             .await
             .expect_err("index optimization failure should abort lifecycle compaction");
         assert!(matches!(error, HirnError::Unsupported(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn archive_old_memories_loops_across_multiple_pages() {
+        // R-63c: more eligible records than one page must all be archived.
+        let episodes: Vec<EpisodicRecord> =
+            (0..5).map(|i| old_episode(&format!("old-{i}"))).collect();
+        let runtime = PagingArchivalRuntime {
+            remaining: Mutex::new(episodes),
+            archived: Mutex::new(Vec::new()),
+        };
+
+        // Page size 2 → the old single-shot call would archive only 2/5.
+        let archived = archive_old_memories_paged(&runtime, 0, 2).await.unwrap();
+        assert_eq!(
+            archived, 5,
+            "every page of eligible records must be archived"
+        );
+        assert_eq!(runtime.archived.lock().unwrap().len(), 5);
+        assert!(runtime.remaining.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn archive_old_memories_stops_when_page_head_is_newer() {
+        // Records newer than the cutoff must terminate the loop (no spin).
+        let fresh: Vec<EpisodicRecord> = (0..3)
+            .map(|i| {
+                EpisodicRecord::builder()
+                    .content(format!("fresh-{i}"))
+                    .embedding(vec![0.1])
+                    .agent_id(AgentId::new("compactor_test").unwrap())
+                    .build()
+                    .unwrap()
+            })
+            .collect();
+        let runtime = PagingArchivalRuntime {
+            remaining: Mutex::new(fresh),
+            archived: Mutex::new(Vec::new()),
+        };
+        // Large age (100 years) → cutoff far in the past → nothing eligible.
+        let archived = archive_old_memories_paged(&runtime, 100 * 365 * 86_400, 2)
+            .await
+            .unwrap();
+        assert_eq!(archived, 0);
+        assert_eq!(runtime.remaining.lock().unwrap().len(), 3);
     }
 
     #[tokio::test(flavor = "multi_thread")]

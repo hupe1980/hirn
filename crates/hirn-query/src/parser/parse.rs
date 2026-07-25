@@ -64,6 +64,20 @@ pub struct QueryLimits {
     /// Prevents clients from escalating beyond the validated iterative-retrieval
     /// hop ceiling — enforces the same cap regardless of operator-level default.
     pub max_iterative_hops: usize,
+    /// Maximum `FOLLOW CAUSES DEPTH` / `EXPLAIN CAUSES ... DEPTH` value
+    /// (default: 16).
+    ///
+    /// Bounds backward causal-chain traversal so an attacker cannot request an
+    /// arbitrarily deep (or `usize`-overflowing) expansion (R-48).
+    pub max_causal_depth: usize,
+    /// Maximum `WITH PROVENANCE DEPTH` value (default: 16).
+    ///
+    /// Bounds DerivedFrom/PartOf provenance expansion (R-48).
+    pub max_provenance_depth: usize,
+    /// Maximum `COMMUNITY_DEPTH` value (default: 16).
+    ///
+    /// Bounds hierarchical community traversal for hybrid THINK (R-48).
+    pub max_community_depth: usize,
 }
 
 impl Default for QueryLimits {
@@ -74,6 +88,9 @@ impl Default for QueryLimits {
             max_limit: 10_000,
             max_context_budget: 1_000_000,
             max_iterative_hops: 5,
+            max_causal_depth: 16,
+            max_provenance_depth: 16,
+            max_community_depth: 16,
         }
     }
 }
@@ -130,6 +147,12 @@ fn validate_limits(stmt: &Statement, limits: &QueryLimits) -> Result<(), ParseEr
             if let Some(ref expand) = r.expand {
                 check_depth(expand.depth, limits.max_expand_depth)?;
             }
+            if let Some(depth) = r.follow_causes {
+                check_causal_depth(depth, limits.max_causal_depth)?;
+            }
+            if let Some(depth) = r.provenance_depth {
+                check_provenance_depth(depth, limits.max_provenance_depth)?;
+            }
         }
         Statement::Think(t) => {
             if let Some(limit) = t.limit {
@@ -144,6 +167,15 @@ fn validate_limits(stmt: &Statement, limits: &QueryLimits) -> Result<(), ParseEr
             if let Some(ref expand) = t.expand {
                 check_depth(expand.depth, limits.max_expand_depth)?;
             }
+            if let Some(depth) = t.follow_causes {
+                check_causal_depth(depth, limits.max_causal_depth)?;
+            }
+            if let Some(depth) = t.provenance_depth {
+                check_provenance_depth(depth, limits.max_provenance_depth)?;
+            }
+            if let Some(depth) = t.community_depth {
+                check_community_depth(depth, limits.max_community_depth)?;
+            }
         }
         Statement::RecallEvents(r) => {
             if let Some(limit) = r.limit {
@@ -157,6 +189,11 @@ fn validate_limits(stmt: &Statement, limits: &QueryLimits) -> Result<(), ParseEr
             }
         }
         Statement::Explain(e) => validate_limits(&e.inner, limits)?,
+        Statement::ExplainCauses(e) => {
+            if let Some(depth) = e.depth {
+                check_causal_depth(depth, limits.max_causal_depth)?;
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -193,6 +230,33 @@ fn check_max_hops(value: usize, max: usize) -> Result<(), ParseError> {
     if value > max {
         return Err(ParseError::simple(format!(
             "MAX_HOPS {value} exceeds maximum allowed value of {max}"
+        )));
+    }
+    Ok(())
+}
+
+fn check_causal_depth(value: usize, max: usize) -> Result<(), ParseError> {
+    if value > max {
+        return Err(ParseError::simple(format!(
+            "CAUSES DEPTH {value} exceeds maximum allowed value of {max}"
+        )));
+    }
+    Ok(())
+}
+
+fn check_provenance_depth(value: usize, max: usize) -> Result<(), ParseError> {
+    if value > max {
+        return Err(ParseError::simple(format!(
+            "PROVENANCE DEPTH {value} exceeds maximum allowed value of {max}"
+        )));
+    }
+    Ok(())
+}
+
+fn check_community_depth(value: usize, max: usize) -> Result<(), ParseError> {
+    if value > max {
+        return Err(ParseError::simple(format!(
+            "COMMUNITY_DEPTH {value} exceeds maximum allowed value of {max}"
         )));
     }
     Ok(())
@@ -304,7 +368,7 @@ fn build_statement(pair: pest::iterators::Pair<'_, Rule>) -> Result<Statement, P
 fn build_recall(pair: pest::iterators::Pair<'_, Rule>) -> Result<RecallStmt, ParseError> {
     let mut stmt = RecallStmt {
         layers: vec![],
-        about: String::new(),
+        about: StringOrParam::default(),
         involving: None,
         temporal: None,
         as_of: None,
@@ -391,7 +455,7 @@ fn build_recall(pair: pest::iterators::Pair<'_, Rule>) -> Result<RecallStmt, Par
         }
     }
 
-    if stmt.about.is_empty() {
+    if stmt.about.is_blank_literal() {
         return Err(ParseError::simple("RECALL requires ABOUT clause"));
     }
 
@@ -427,7 +491,7 @@ fn build_recall_events(
 
 fn build_think(pair: pest::iterators::Pair<'_, Rule>) -> Result<ThinkStmt, ParseError> {
     let mut stmt = ThinkStmt {
-        about: String::new(),
+        about: StringOrParam::default(),
         involving: None,
         temporal: None,
         expand: None,
@@ -729,15 +793,18 @@ fn build_layer_filter(pair: pest::iterators::Pair<'_, Rule>) -> Vec<Layer> {
         .collect()
 }
 
-fn extract_about(pair: pest::iterators::Pair<'_, Rule>) -> Result<String, ParseError> {
+fn extract_about(pair: pest::iterators::Pair<'_, Rule>) -> Result<StringOrParam, ParseError> {
     let inner = pair
         .into_inner()
         .next()
         .ok_or_else(|| ParseError::simple("empty ABOUT clause"))?;
     Ok(match inner.as_rule() {
-        Rule::parameter => inner.as_str().to_string(),
-        Rule::string_literal => extract_string_value(inner)?,
-        _ => String::new(),
+        // A bare `$name` token is a placeholder; a quoted string is a literal
+        // (even if its content happens to be `$name`) — the two must not be
+        // conflated (R-50).
+        Rule::parameter => StringOrParam::Param(inner.as_str().to_string()),
+        Rule::string_literal => StringOrParam::Literal(extract_string_value(inner)?),
+        _ => StringOrParam::default(),
     })
 }
 
@@ -998,7 +1065,7 @@ fn build_in_subquery(pair: pest::iterators::Pair<'_, Rule>) -> Result<SubqueryFi
         field,
         subquery: subquery.unwrap_or(Subquery {
             layers: vec![],
-            about: String::new(),
+            about: StringOrParam::default(),
             involving: None,
             temporal: None,
             limit: None,
@@ -1009,7 +1076,7 @@ fn build_in_subquery(pair: pest::iterators::Pair<'_, Rule>) -> Result<SubqueryFi
 /// Parse the inner subquery (RECALL layer ABOUT "..." ...).
 fn build_subquery(pair: pest::iterators::Pair<'_, Rule>) -> Result<Subquery, ParseError> {
     let mut layers = vec![];
-    let mut about = String::new();
+    let mut about = StringOrParam::default();
     let mut involving = None;
     let mut temporal = None;
     let mut limit = None;
@@ -1932,7 +1999,7 @@ mod tests {
         let stmt = parse(q).unwrap();
         match stmt {
             Statement::Think(t) => {
-                assert!(t.about.contains("HNSW"));
+                assert!(t.about.as_literal().unwrap().contains("HNSW"));
                 assert_eq!(t.budget, Some(4096));
                 assert_eq!(t.mode, RetrievalMode::Local);
                 assert_eq!(t.community_depth, None);
@@ -1947,7 +2014,7 @@ mod tests {
         let stmt = parse(q).unwrap();
         match stmt {
             Statement::Think(t) => {
-                assert!(t.about.contains("themes"));
+                assert!(t.about.as_literal().unwrap().contains("themes"));
                 assert_eq!(t.mode, RetrievalMode::Global);
                 assert_eq!(t.community_depth, None);
             }
@@ -1961,7 +2028,7 @@ mod tests {
         let stmt = parse(q).unwrap();
         match stmt {
             Statement::Think(t) => {
-                assert!(t.about.contains("cross-domain"));
+                assert!(t.about.as_literal().unwrap().contains("cross-domain"));
                 assert_eq!(t.mode, RetrievalMode::Hybrid);
                 assert_eq!(t.community_depth, Some(3));
                 assert!(!t.hybrid);
@@ -2028,7 +2095,7 @@ mod tests {
         let stmt = parse(q).unwrap();
         match stmt {
             Statement::Think(t) => {
-                assert!(t.about.contains("architecture"));
+                assert!(t.about.as_literal().unwrap().contains("architecture"));
                 assert_eq!(t.mode, RetrievalMode::Raptor);
             }
             other => panic!("expected Think, got {other:?}"),
@@ -2041,7 +2108,7 @@ mod tests {
         let stmt = parse(q).unwrap();
         match stmt {
             Statement::Think(t) => {
-                assert!(t.about.contains("deployment"));
+                assert!(t.about.as_literal().unwrap().contains("deployment"));
                 assert_eq!(t.mode, RetrievalMode::Adaptive);
             }
             other => panic!("expected Think, got {other:?}"),
@@ -2823,7 +2890,11 @@ mod tests {
     fn parse_positional_param_in_about() {
         let stmt = parse(r#"RECALL episodic ABOUT $1 LIMIT 10"#).unwrap();
         match stmt {
-            Statement::Recall(r) => assert_eq!(r.about, "$1"),
+            // A bare `$1` token is a placeholder, not a literal (R-50).
+            Statement::Recall(r) => {
+                assert_eq!(r.about, StringOrParam::Param("$1".into()));
+                assert_eq!(r.about.param_name(), Some("$1"));
+            }
             _ => panic!("expected Recall"),
         }
     }
@@ -2832,9 +2903,37 @@ mod tests {
     fn parse_named_param_in_about() {
         let stmt = parse(r#"RECALL episodic ABOUT $query LIMIT 5"#).unwrap();
         match stmt {
-            Statement::Recall(r) => assert_eq!(r.about, "$query"),
+            Statement::Recall(r) => {
+                assert_eq!(r.about, StringOrParam::Param("$query".into()));
+            }
             _ => panic!("expected Recall"),
         }
+    }
+
+    #[test]
+    fn quoted_dollar_literal_in_about_is_not_a_param() {
+        // R-50: a quoted `"$q"` is a literal search for the text `$q`, NOT a
+        // parameter placeholder — so it must not appear in `collect_parameters`
+        // and must not be re-bound.
+        let stmt = parse(r#"RECALL episodic ABOUT "$q" LIMIT 5"#).unwrap();
+        match &stmt {
+            Statement::Recall(r) => {
+                assert_eq!(r.about, StringOrParam::Literal("$q".into()));
+                assert_eq!(r.about.param_name(), None);
+            }
+            _ => panic!("expected Recall"),
+        }
+        assert!(
+            collect_parameters(&stmt).is_empty(),
+            "quoted literal must not be collected as a parameter"
+        );
+    }
+
+    #[test]
+    fn unbound_param_in_about_survives_to_analyze() {
+        // Parsing keeps the placeholder; rejection happens at analyze time.
+        let stmt = parse(r#"RECALL episodic ABOUT $q LIMIT 5"#).unwrap();
+        assert_eq!(collect_parameters(&stmt), vec!["$q".to_string()]);
     }
 
     #[test]
@@ -3629,6 +3728,84 @@ mod tests {
         assert!(result.is_err());
         let msg = result.unwrap_err().message.to_lowercase();
         assert!(msg.contains("limit") || msg.contains("exceed"));
+    }
+
+    // ── R-48: causal / provenance / community depth ceilings ───────────
+
+    #[test]
+    fn follow_causes_depth_exceeds_limit_is_rejected() {
+        let q = r#"RECALL episodic ABOUT "x" FOLLOW CAUSES DEPTH 1000000"#;
+        let err = parse(q).unwrap_err();
+        assert!(
+            err.message.contains("CAUSES DEPTH") && err.message.contains("maximum"),
+            "expected causal-depth ceiling error, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn follow_causes_wrapping_depth_is_rejected_not_truncated() {
+        // 4294967297 == u32::MAX + 2, which `as u32` would silently wrap to 1.
+        let q = r#"RECALL episodic ABOUT "x" FOLLOW CAUSES DEPTH 4294967297"#;
+        assert!(
+            parse(q).is_err(),
+            "a depth that would wrap under `as u32` must be rejected, not truncated"
+        );
+    }
+
+    #[test]
+    fn provenance_depth_exceeds_limit_is_rejected() {
+        let q = r#"RECALL episodic ABOUT "x" WITH PROVENANCE DEPTH 1000000"#;
+        let err = parse(q).unwrap_err();
+        assert!(
+            err.message.contains("PROVENANCE DEPTH"),
+            "expected provenance-depth ceiling error, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn community_depth_exceeds_limit_is_rejected() {
+        let q = r#"THINK ABOUT "x" MODE hybrid COMMUNITY_DEPTH 1000000"#;
+        let err = parse(q).unwrap_err();
+        assert!(
+            err.message.contains("COMMUNITY_DEPTH"),
+            "expected community-depth ceiling error, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn explain_causes_depth_exceeds_limit_is_rejected() {
+        let q = r#"EXPLAIN CAUSES "outage" DEPTH 1000000"#;
+        let err = parse(q).unwrap_err();
+        assert!(
+            err.message.contains("CAUSES DEPTH"),
+            "expected causal-depth ceiling error, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn causal_depth_within_limit_still_parses() {
+        let q = r#"RECALL episodic ABOUT "x" FOLLOW CAUSES DEPTH 8"#;
+        let stmt = parse(q).unwrap();
+        match stmt {
+            Statement::Recall(r) => assert_eq!(r.follow_causes, Some(8)),
+            _ => panic!("expected Recall"),
+        }
+    }
+
+    #[test]
+    fn causal_depth_ceiling_is_configurable() {
+        let limits = QueryLimits {
+            max_causal_depth: 4,
+            ..Default::default()
+        };
+        let q = r#"RECALL episodic ABOUT "x" FOLLOW CAUSES DEPTH 5"#;
+        assert!(parse_with_limits(q, &limits).is_err());
+        let q_ok = r#"RECALL episodic ABOUT "x" FOLLOW CAUSES DEPTH 4"#;
+        assert!(parse_with_limits(q_ok, &limits).is_ok());
     }
 
     #[test]

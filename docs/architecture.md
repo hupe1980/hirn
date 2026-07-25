@@ -16,7 +16,7 @@ This project is under active development. APIs, on-disk formats, and behaviour m
 > A cognitive memory engine for AI agents — the brain an LLM never had.
 > Rust 2024 edition · 13 crates · ~117 000 lines · 2 700+ tests
 
-**Storage:** All data is stored via **`hirn-storage`** — a purpose-built cognitive storage engine using **Lance 4.0** + `lance-namespace`, providing the `PhysicalStore` trait with `LancePhysicalStore` (production) and `MemoryStore` (testing) backends. DataFusion `SessionContext` is the single execution entry point. `DashMap` + epoch-based caching for lock-free Dataset access.
+**Storage:** All data is stored via **`hirn-storage`** — a purpose-built cognitive storage engine using **Lance 9.0** + `lance-namespace`, providing the `PhysicalStore` trait with `LancePhysicalStore` (production) and `MemoryStore` (testing) backends. DataFusion `SessionContext` is the single execution entry point. `DashMap` + epoch-based caching for lock-free Dataset access.
 
 If you want the shortest task-oriented route through the documentation before diving into internals, start with [Getting Started](getting-started.md).
 
@@ -40,7 +40,7 @@ Arrow `RecordBatch` streams rather than imperative async chains allocating inter
 
 Three architectural commitments follow from that idea, and they recur throughout this guide:
 
-- **Columnar, versioned storage.** Every memory tier is a Lance 4.0 dataset with an Arrow-native
+- **Columnar, versioned storage.** Every memory tier is a Lance 9.0 dataset with an Arrow-native
   schema, MVCC versioning, and pushdown-friendly indices (IVF-HNSW, FTS/BM25, BTree, Bitmap). This
   is what lets policy predicates, temporal filters, and namespace pruning execute at near-zero cost.
 - **A two-tier graph.** A hot in-memory `petgraph` serves sub-millisecond activation and shallow
@@ -68,7 +68,7 @@ flowchart TB
   core["hirn-core<br/>types · config · traits"]
   prov["hirn-provider<br/>embedders · LLMs · rerankers"]
   graph["hirn-graph<br/>property graph · activation"]
-  storage["hirn-storage<br/>Lance 4.0 · PhysicalStore"]
+  storage["hirn-storage<br/>Lance 9.0 · PhysicalStore"]
   query["hirn-query<br/>HirnQL parser · plan compiler"]
   exec["hirn-exec<br/>19 operators · 8 UDFs · 5 rules"]
   engine["hirn-engine<br/>HirnDB orchestrator · 11 views"]
@@ -105,7 +105,7 @@ The ASCII rendering of the same dependency graph, with more detail on trait re-e
           │               │            │
     ┌─────▼────────┐ ┌───▼────────┐ ┌──▼─────────────┐
     │hirn-provider │ │ hirn-graph │ │ hirn-storage   │
-    │(Embedder +   │ │ (property  │ │ (Lance 4.0,    │
+    │(Embedder +   │ │ (property  │ │ (Lance 9.0,    │
     │ LLM impls)   │ │  graph)    │ │  PhysicalStore,│
     └─────┬────────┘ └───┬────────┘ │  SessionContext)│
           │              │          └──┬──────────────┘
@@ -167,16 +167,16 @@ The ASCII rendering of the same dependency graph, with more detail on trait re-e
 | Crate | Lines | Tests | Purpose |
 |-------|------:|------:|---------|
 | **hirn-core** | ~7 300 | 208 | `MemoryId` (ULID, `Copy`), `Timestamp`, `Namespace` (interned `Copy`), `AgentId` (interned `Copy`), `Layer`, `EdgeRelation`, `EventType`, `KnowledgeType`, `HirnConfig`, `HirnError`, `Metadata`, `Provenance`, `MemoryContent` (multi-modal), `ResourceObject`, `DerivedArtifact`, `HydrationMode`, `OfflineJobId`, `CognitiveJob`, `OfflineJobTarget`, `OperatorBudget`, and `GeneratedCognitionReview`. `CircuitBreaker`, `AuditAction`/`AuditEntry`, `WelfordStats`, `StringInterner`, `text_util`. **Trait abstractions**: `Embedder`, `AsymmetricEmbedder`, `TokenCounter`, `Reranker`, `LlmProvider`, `EntityExtractor`, `Tokenizer`, `ToolExecutor`. **Record types**: `WorkingMemoryEntry`, `EpisodicRecord`, `SemanticRecord`, `ProceduralRecord`, `SvoEvent`, `ProspectiveImplication`, `PlanningAgenda`, `ReconcileProposal` |
-| **hirn-storage** | ~15 200 | 297 | Cognitive storage engine on Lance 4.0 + lance-namespace. `PhysicalStore` trait (30+ async methods: CRUD, vector/FTS/hybrid/multivector search, blob storage, indexing, compaction, versioning, namespace management, schema evolution). `LancePhysicalStore` (production backend with DashMap `EpochCache`, `LanceTableProvider` for DataFusion projection+filter pushdown), `MemoryStore` (test backend with brute-force search). 14 core datasets: `episodic`, `semantic`, `procedural`, `working`, `graph_nodes`, `graph_edges`, `svo_events`, `prospective_implications`, `topic_loom`, `mcfa_audit_log`, `offline_jobs`, `resources`, `derived_artifacts`, `_resource_blobs`. `RealmManager` for lance-namespace directory isolation. Resource governance covers retention, quota enforcement, lineage-preserving redaction/purge, and modality-specific derived artifacts. Rerankers: `RRFReranker`, `LinearCombinationReranker`, `ColBERTReranker`, `RerankerPipeline` |
+| **hirn-storage** | ~15 200 | 297 | Cognitive storage engine on Lance 9.0 + lance-namespace. `PhysicalStore` trait (30+ async methods: CRUD, vector/FTS/hybrid/multivector search, blob storage, indexing, compaction, versioning, namespace management, schema evolution). `LancePhysicalStore` (production backend with DashMap `EpochCache`, `LanceTableProvider` for DataFusion projection+filter pushdown), `MemoryStore` (test backend with brute-force search). 14 core datasets: `episodic`, `semantic`, `procedural`, `working`, `graph_nodes`, `graph_edges`, `svo_events`, `prospective_implications`, `topic_loom`, `mcfa_audit_log`, `offline_jobs`, `resources`, `derived_artifacts`, `_resource_blobs`. `RealmManager` for lance-namespace directory isolation. Resource governance covers retention, quota enforcement, lineage-preserving redaction/purge, and modality-specific derived artifacts. Rerankers: `RRFReranker`, `LinearCombinationReranker`, `ColBERTReranker`, `RerankerPipeline` |
 | **hirn-graph** | ~3 500 | 84 | In-memory `PropertyGraph` (petgraph `StableDiGraph`), spreading activation with configurable SYNAPSE lateral inhibition, Personalized PageRank (PPR), Hebbian learning with lock-free `HebbianBuffer` (crossbeam `SegQueue`), `PersistentGraph` (Lance-backed cold tier), edge relations, graph persistence. Two-tier via `CachedGraphStore` |
 | **hirn-provider** | ~7 500 | 79 | Unified provider crate for embedders, LLMs, tokenizers, and rerankers. Embedders: `PseudoEmbedder`, `OpenAIEmbedder`, `OllamaEmbedder`, `CohereEmbedder`, `VoyageEmbedder`, `OnnxEmbedder`. Wrappers: `PersistentCachedEmbedder`, `BatchingEmbedder`, `RetryingEmbedder`, `CircuitBreakerEmbedder`. LLMs: `OpenAILlmProvider`, `OllamaLlmProvider`, `AnthropicProvider`, `MockLlmProvider`. Circuit breaker, retry, batch. `RegexEntityExtractor`, `LlmReranker` |
 | **hirn-query** | ~8 400 | 274 | HirnQL: Pest PEG grammar parser, TypedAST analyzer, DataFusion `LogicalPlan` compiler. `QueryPipeline` (7-stage: parse → limits → analyze → rewrite → plan → optimize → execute; prepared statements enter after parse with a bound AST). `PlanCache` (bounded LRU keyed by normalized query text, 1024 entries — the single plan cache in the system). Physical `HirnOp` variants plus `ImperativeBoundary` for engine-owned statements such as `CONSOLIDATE`. Statements: RECALL, THINK, REMEMBER, FORGET, CONNECT, INSPECT, TRACE, CONSOLIDATE, WATCH, TRAVERSE, EXPLAIN, CREATE/DROP REALM, GRANT, REVOKE, SHOW POLICIES, EXPLAIN POLICY, RECALL EVENTS. Grammar extensions: DEPTH AUTO\|FULL\|SUMMARY, TOPIC, WITH PROSPECTIVE, WITH MCFA_DEFENSE, WITH CONFLICTS, MODE ITERATIVE MAX_HOPS, AS OF |
-| **hirn-exec** | ~12 600 | 152 | DataFusion custom execution layer. **19 physical operators** (6 core + 9 cognitive + 4 causal): `LanceHybridSearchExec`, `GraphActivationExec`, `CausalChainExec`, `ContextBudgetExec`, `HebbianBufferExec`, `PolicyFilterExec`, `RpeScoreExec`, `ProspectiveIndexingExec`, `SvoExtractionExec`, `QueryComplexityExec`, `QualityGateExec`, `IterativeRetrievalExec`, `InterferenceDetectorExec`, `TopicLoomExec`, `McfaDefenseExec`, `CausalQueryReadExec`, `CausalDiscoveryExec`, `NliContradictionExec`, `AbaReconsolidationExec`. **8 UDFs**: `composite_score`, `temporal_decay`, `token_count`, `surprise_score`, `rpe_score`, `source_reliability`, `fade_mem_decay`, `causal_relevance`. **5 optimizer rules**: `PolicyPushdownRule`, `ActivationFusionRule`, `TemporalIndexRule`, `NamespacePartitionPruneRule`, `DepthSchedulingRule`. Prospective short-circuiting is planned explicitly through `HirnOp::ProspectiveSearch` → `ProspectiveShortCircuitExec`. `HirnSessionExt` for runtime state injection. `HirnExtensionPlanner` + `HirnQueryPlanner` for LogicalPlan → PhysicalPlan bridging |
+| **hirn-exec** | ~12 600 | 152 | DataFusion custom execution layer. **18 physical operators** (6 core + 8 cognitive + 4 causal): `LanceHybridSearchExec`, `GraphActivationExec`, `CausalChainExec`, `ContextBudgetExec`, `HebbianBufferExec`, `PolicyFilterExec`, `RpeScoreExec`, `ProspectiveIndexingExec`, `SvoExtractionExec`, `QueryComplexityExec`, `QualityGateExec`, `IterativeRetrievalExec`, `InterferenceDetectorExec`, `TopicLoomExec`, `CausalQueryReadExec`, `CausalDiscoveryExec`, `NliContradictionExec`, `AbaReconsolidationExec` (MCFA detection is the shared `mcfa_defense::detect_threat`, enforced on the engine's scored read path with a live `mcfa_audit_log` sink — no longer a plan operator). Ranking uses the single canonical `hirn_core::scoring` composite formula (the former scalar scoring UDFs were deleted). **2 optimizer rules** (`PolicyPushdownRule`, `ActivationFusionRule`; the dead/redundant `TemporalIndexRule`, `NamespacePartitionPruneRule`, and `DepthSchedulingRule` were deleted). Prospective short-circuiting is planned explicitly through `HirnOp::ProspectiveSearch` → `ProspectiveShortCircuitExec`. `HirnSessionExt` for runtime state injection. `HirnExtensionPlanner` + `HirnQueryPlanner` for LogicalPlan → PhysicalPlan bridging |
 | **hirn-policy** | ~1 500 | 22 | Cedar 4.9+ integration, Cedar entity schema, policy store, audit trail, HMAC integrity verification |
 | **hirn-engine** | ~42 000 | 1 130 | `HirnDB` orchestrator: wires storage + graph + exec + policy. 11 domain views: `episodic()`, `semantic()`, `procedural()`, `working()`, `graph()`, `recall()`, `namespace()`, `causal()`, `policy()`, `admin()`, `ql()`. Sub-modules: `graph/` (CachedGraphStore, Hebbian, activation, causal BFS, topic loom), `retrieval/` (recall, think, iterative multi-hop, depth scheduler, quality gate, explanation surfaces), `consolidation/` (segmentation, narrative, causal discovery, NLI, ABA, interference), `admission/` (RPE scorer, MCFA defense), `write_path/` (RPE scoring, prospective indexing, SVO extraction, interference tracking), `observability/` (metrics, diagnostics, trace, event bus), `resource_presentation` (evidence summaries, preview packaging, hydration helpers), `offline_scheduler_runtime` (budgeted dream/reconcile/plan execution, persistence, replay), `cross_agent` (quarantine approval and rollback), and `tools/` (MemoryToolkit, MemoryAgent). HirnQL execution via `hirn_query::QueryPipeline` + imperative dispatch |
 | **hirn** | ~1 700 | 165 | Public façade: `Hirn` type alias, core re-exports, `prelude` module, plus first-class `content` and `resource` modules for multimodal memory. `HirnMemory`: zero-config high-level API with env-based provider auto-discovery, `hirn.toml` config. Fluent builders: `MemoryRecallBuilder`, `MemoryThinkBuilder` |
 | **hirnd** | ~8 500 | 320+ | Standalone daemon: axum HTTP REST, tonic gRPC, MCP server (rmcp), JWT/API-key auth, route-class sliding-window throttling keyed by authenticated actor, TLS, realm management, config validation, streaming recall via gRPC. **Distribution layer:** OpenRaft metadata consensus (`raft/` module — `HirnStateMachine`, `MemLogStore`, HTTP/JSON network transport), consolidation lease protocol, shard-per-realm affinity with write forwarding, cluster management endpoints (`/v1/cluster/{init,join,metrics}`), S3/GCS/Azure storage backend via `StorageBackendConfig`, DynamoDB metadata store (behind `serverless` feature flag) |
-| **hirn-bench** | ~8 800 | — | H1–H6 cognitive test suites, the advanced offline-cognition benchmark family (explanation quality, dream precision/recall, reconcile accuracy, planning usefulness), LoCoMo-Plus, LongMemEval, AMemGym, CLadder, ActMemEval, DMR, Mem2Act, AmaBench benchmark adapters, storage/resource latency benches, and concurrent load envelopes |
+| **hirn-bench** | ~8 800 | — | H1–H6 cognitive test suites, the advanced offline-cognition benchmark family (explanation quality, dream precision/recall, reconcile accuracy, planning usefulness), external benchmark adapters (LoCoMo, DMR, LongMemEval, BEAM) with optional LLM reader + judge (`--reader`/`--judge`: official LongMemEval judge prompts, BEAM reader-judged answers, exact reader-token accounting), blake3 dataset pinning + seeded provenance, storage/resource latency benches, and concurrent load envelopes |
 | **hirn-python** | ~1 300 | — | PyO3 thin Rust bridge (`HirnBridge`). Pure Python `Memory`/`AsyncMemory` classes with pluggable `EmbeddingFunction`. Published via maturin. `.pyi` type stubs |
 | **hirn-node** | ~800 | — | napi-rs thin Rust bridge (`HirnBridge`). Pure JS `Memory`/`AsyncMemory` classes with pluggable `EmbeddingFunction`. Auto-generated `.d.ts` TypeScript declarations |
 
@@ -394,7 +394,7 @@ Collapsed tree retrieval (Sarthi et al., 2024): queries all `RaptorSummary` reco
 
 ## Persistence Layer
 
-> **hirn-storage** — purpose-built cognitive storage engine on **Lance 4.0** columnar format with `lance-namespace` for multicloud catalog. Provides `PhysicalStore` trait with `LancePhysicalStore` (production) and `MemoryStore` (testing). Built-in FTS, hybrid search, IVF-HNSW indexing, multivector support, and DashMap + epoch-based Dataset caching. DataFusion `SessionContext` created at open time with Lance datasets registered as `LanceTableProvider` tables.
+> **hirn-storage** — purpose-built cognitive storage engine on **Lance 9.0** columnar format with `lance-namespace` for multicloud catalog. Provides `PhysicalStore` trait with `LancePhysicalStore` (production) and `MemoryStore` (testing). Built-in FTS, hybrid search, IVF-HNSW indexing, multivector support, and DashMap + epoch-based Dataset caching. DataFusion `SessionContext` created at open time with Lance datasets registered as `LanceTableProvider` tables.
 
 ### Datasets (hirn-storage)
 
@@ -1022,10 +1022,18 @@ Domain-specific query language parsed via pest grammar.
 ### Execution Pipeline
 
 ```
-HirnQL string → pest parser → AST → QueryPlanner → QueryPlan → Executor → QueryResult
+HirnQL string → pest parser → AST → typed analysis + validation → LogicalPlan → PhysicalPlan → QueryResult
 ```
 
-The **QueryPlanner** (F-45) analyzes WHERE clauses and reorders them by estimated cost: namespace filters (cheapest, pure key lookup) execute first, followed by temporal range scans, then full-text BM25 searches, and finally embedding-based similarity (most expensive). The planner produces a `QueryPlan` that the executor follows, avoiding unnecessary index lookups when earlier filters eliminate candidates. `plan_ordered_where_clauses()` assigns costs and sorts ascending.
+There is exactly **one compiler stack**: `hirn-query`'s `QueryPipeline` runs
+`typed_ast::analyze` (which also performs the semantic validation pass in
+`compiler/validate.rs` — value ranges, field whitelists, budget/depth bounds)
+and then `plan_compiler` produces a `CompiledPlan { LogicalPlan → PhysicalPlan }`.
+Prepared statements store the parsed template AST; `execute_prepared` binds
+parameter values directly into typed AST nodes and executes the bound AST —
+there is no re-serialize/re-parse round-trip, and the serializer exists only
+for `Display`/`EXPLAIN`. Compiled plans are cached in a bounded, O(1)-reorder
+LRU (`hirn_query::PlanCache`).
 
 **String escape sequences (F-50):** HirnQL string literals support `\\`, `\"`, `\'`, `\n`, `\t`, and `\r` via `unescape_string()`.
 
@@ -1045,15 +1053,6 @@ hirn-exec/src/
     causal_chain.rs        CausalChainExec (DFS on Causes edges)
     hebbian_buffer.rs      HebbianBufferExec (co-retrieval recording)
     lance_hybrid_search.rs LanceHybridSearchExec (vector+FTS+RRF)
-  udfs/                — 8 SIMD-vectorized scoring UDFs
-    composite_score.rs     Weighted multi-signal ranking
-    temporal_decay.rs      Ebbinghaus-modulated forgetting
-    token_count.rs         Text tokenization (tiktoken estimator)
-    rpe_score.rs           Reward prediction error
-    source_reliability.rs  Provenance-based trust scoring
-    surprise_score.rs      KL-divergence sigmoid transform
-    fade_mem_decay.rs      Access-frequency-modulated decay rate
-    causal_relevance.rs    strength × confidence × log(1+evidence)
   rules/               — Optimizer rules
     activation_fusion.rs   Fuse adjacent GraphActivationExec nodes
     temporal_index.rs      Push temporal predicates into Lance BTree
@@ -1080,8 +1079,8 @@ execute_recall()
   └── DataFusion LogicalPlan
         ├── LanceHybridSearchExec (vector + FTS + RRF fusion)
         ├── GraphActivationExec  (spreading activation on hot graph)
-        ├── composite_score UDF  (SIMD-vectorized ranking)
-        └── ContextBudgetExec    (token-budget enforcement with BinaryHeap)
+        └── ContextBudgetExec    (token-budget enforcement; ranks with the
+                                  canonical hirn_core::scoring composite formula)
 ```
 
 ### Imperative Consolidation Boundary

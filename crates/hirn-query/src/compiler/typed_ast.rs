@@ -340,6 +340,19 @@ impl Default for AnalyzeContext {
 /// - Invalid memory IDs (not valid ULID)
 /// - Unknown edge relation names
 pub fn analyze(stmt: &ast::Statement, ctx: &AnalyzeContext) -> HirnResult<TypedStatement> {
+    // Stage 2a: untyped semantic validation (value ranges, field whitelists,
+    // temporal formats). Single-sourced in `validate` so text compilation and
+    // bound prepared statements run the exact same checks.
+    let errors = super::validate::validate(stmt);
+    if !errors.is_empty() {
+        let message = errors
+            .iter()
+            .map(|error| error.message.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(HirnError::InvalidInput(message));
+    }
+
     match stmt {
         ast::Statement::Recall(r) => {
             analyze_recall(r, ctx).map(|recall| TypedStatement::Recall(Box::new(recall)))
@@ -416,6 +429,12 @@ pub fn analyze(stmt: &ast::Statement, ctx: &AnalyzeContext) -> HirnResult<TypedS
 // ── Statement analyzers ────────────────────────────────────────────────
 
 fn analyze_recall(r: &ast::RecallStmt, ctx: &AnalyzeContext) -> HirnResult<TypedRecall> {
+    if let Some(topic) = &r.topic {
+        reject_unbound_string_param(topic, "TOPIC")?;
+    }
+    if let Some(ns) = &r.namespace {
+        reject_unbound_string_param(ns, "NAMESPACE")?;
+    }
     let namespace = resolve_namespace(r.namespace.as_deref(), ctx)?;
     let modality = resolve_modality_filters(r.modality.as_ref())?;
     let resource_roles = resolve_evidence_roles(r.resource_roles.as_ref())?;
@@ -475,7 +494,7 @@ fn analyze_recall(r: &ast::RecallStmt, ctx: &AnalyzeContext) -> HirnResult<Typed
     Ok(TypedRecall {
         namespace,
         layers: r.layers.clone(),
-        query: r.about.clone(),
+        query: resolve_string_or_param(&r.about, "ABOUT")?,
         involving: r.involving.clone().unwrap_or_default(),
         modality,
         resource_roles,
@@ -484,7 +503,10 @@ fn analyze_recall(r: &ast::RecallStmt, ctx: &AnalyzeContext) -> HirnResult<Typed
         temporal,
         as_of,
         expand,
-        follow_causes: r.follow_causes.map(|d| d as u32),
+        follow_causes: r
+            .follow_causes
+            .map(|d| depth_to_u32(d, "FOLLOW CAUSES DEPTH"))
+            .transpose()?,
         filters,
         subquery_filters,
         depth: r.depth_mode.map(DepthMode::from).unwrap_or_default(),
@@ -500,6 +522,48 @@ fn analyze_recall(r: &ast::RecallStmt, ctx: &AnalyzeContext) -> HirnResult<Typed
         group_by: r.group_by.clone(),
         output_format: r.output_format.or(r.result_format),
         from_realms: r.from_realms.clone(),
+    })
+}
+
+/// Resolve a [`ast::StringOrParam`] in a string position to its literal text,
+/// rejecting an unbound `$param` placeholder that survived binding.
+///
+/// A quoted literal (even one whose content is `$q`) resolves to its verbatim
+/// text; a bare `$q` that was never bound is rejected fail-closed — the same
+/// rule already applied to LIMIT/BUDGET params (R-50).
+fn resolve_string_or_param(value: &ast::StringOrParam, position: &str) -> HirnResult<String> {
+    match value {
+        ast::StringOrParam::Literal(text) => Ok(text.clone()),
+        ast::StringOrParam::Param(name) => Err(HirnError::InvalidInput(format!(
+            "unbound parameter '{name}' in {position} — bind it before execution"
+        ))),
+    }
+}
+
+/// Reject any plain-`String` field that still holds an unbound `$param`
+/// placeholder (e.g. `TOPIC $x`, `NAMESPACE $ns`, `REASON $r`) after binding.
+///
+/// These positions never legitimately carry literal `$`-prefixed text, so a
+/// surviving placeholder is always an unbound parameter and is rejected
+/// fail-closed (R-50).
+fn reject_unbound_string_param(value: &str, position: &str) -> HirnResult<()> {
+    if ast::is_param(value) {
+        return Err(HirnError::InvalidInput(format!(
+            "unbound parameter '{value}' in {position} — bind it before execution"
+        )));
+    }
+    Ok(())
+}
+
+/// Convert a `usize` depth into a `u32` without silent truncation.
+///
+/// Parse-time `validate_limits` already rejects depths above the configured
+/// ceilings, so this is a defense-in-depth guard: rather than `as u32`
+/// wrapping a huge value into a small one (e.g. `4294967297` → `1`, R-48), an
+/// out-of-range depth is rejected outright.
+fn depth_to_u32(value: usize, what: &str) -> HirnResult<u32> {
+    u32::try_from(value).map_err(|_| {
+        HirnError::InvalidInput(format!("{what} {value} is too large (must fit in 32 bits)"))
     })
 }
 
@@ -568,6 +632,12 @@ fn analyze_recall_events(
     r: &ast::RecallEventsStmt,
     ctx: &AnalyzeContext,
 ) -> HirnResult<TypedRecallEvents> {
+    if let Some(entity) = &r.entity_filter {
+        reject_unbound_string_param(entity, "EVENTS FOR")?;
+    }
+    if let Some(ns) = &r.namespace {
+        reject_unbound_string_param(ns, "NAMESPACE")?;
+    }
     let namespace = r
         .namespace
         .as_deref()
@@ -585,6 +655,9 @@ fn analyze_recall_events(
 }
 
 fn analyze_think(t: &ast::ThinkStmt, ctx: &AnalyzeContext) -> HirnResult<TypedThink> {
+    if let Some(ns) = &t.namespace {
+        reject_unbound_string_param(ns, "NAMESPACE")?;
+    }
     let namespace = resolve_namespace(t.namespace.as_deref(), ctx)?;
     let temporal = resolve_temporal(t.temporal.as_ref())?;
     let expand = resolve_expand(t.expand.as_ref())?;
@@ -592,11 +665,14 @@ fn analyze_think(t: &ast::ThinkStmt, ctx: &AnalyzeContext) -> HirnResult<TypedTh
 
     Ok(TypedThink {
         namespace,
-        query: t.about.clone(),
+        query: resolve_string_or_param(&t.about, "ABOUT")?,
         involving: t.involving.clone().unwrap_or_default(),
         temporal,
         expand,
-        follow_causes: t.follow_causes.map(|d| d as u32),
+        follow_causes: t
+            .follow_causes
+            .map(|d| depth_to_u32(d, "FOLLOW CAUSES DEPTH"))
+            .transpose()?,
         filters,
         depth: t.depth_mode.map(DepthMode::from).unwrap_or_default(),
         with_prospective: t.with_prospective.unwrap_or(false),
@@ -613,6 +689,9 @@ fn analyze_think(t: &ast::ThinkStmt, ctx: &AnalyzeContext) -> HirnResult<TypedTh
 }
 
 fn analyze_correct(c: &ast::CorrectStmt, ctx: &AnalyzeContext) -> HirnResult<TypedCorrect> {
+    if let Some(reason) = &c.reason {
+        reject_unbound_string_param(reason, "REASON")?;
+    }
     let namespace = resolve_namespace(c.namespace.as_deref(), ctx)?;
     let target = parse_semantic_target_ref(&c.target)?;
     let observed_at = c
@@ -634,6 +713,9 @@ fn analyze_correct(c: &ast::CorrectStmt, ctx: &AnalyzeContext) -> HirnResult<Typ
 }
 
 fn analyze_supersede(s: &ast::SupersedeStmt, ctx: &AnalyzeContext) -> HirnResult<TypedSupersede> {
+    if let Some(reason) = &s.reason {
+        reject_unbound_string_param(reason, "REASON")?;
+    }
     let namespace = resolve_namespace(s.namespace.as_deref(), ctx)?;
     let target = parse_semantic_target_ref(&s.target)?;
     let observed_at = s
@@ -658,6 +740,9 @@ fn analyze_merge_memory(
     m: &ast::MergeMemoryStmt,
     ctx: &AnalyzeContext,
 ) -> HirnResult<TypedMergeMemory> {
+    if let Some(reason) = &m.reason {
+        reject_unbound_string_param(reason, "REASON")?;
+    }
     let namespace = resolve_namespace(m.namespace.as_deref(), ctx)?;
     let sources = m
         .sources
@@ -685,6 +770,9 @@ fn analyze_merge_memory(
 }
 
 fn analyze_retract(r: &ast::RetractStmt, ctx: &AnalyzeContext) -> HirnResult<TypedRetract> {
+    if let Some(reason) = &r.reason {
+        reject_unbound_string_param(reason, "REASON")?;
+    }
     let namespace = resolve_namespace(r.namespace.as_deref(), ctx)?;
     let target = parse_semantic_target_ref(&r.target)?;
     let observed_at = r
@@ -713,6 +801,9 @@ fn analyze_history(h: &ast::HistoryStmt, ctx: &AnalyzeContext) -> HirnResult<Typ
 }
 
 fn analyze_traverse(t: &ast::TraverseStmt, ctx: &AnalyzeContext) -> HirnResult<TypedTraverse> {
+    if let Some(ns) = &t.namespace {
+        reject_unbound_string_param(ns, "NAMESPACE")?;
+    }
     let requested_namespace = t
         .namespace
         .as_deref()
@@ -730,7 +821,7 @@ fn analyze_traverse(t: &ast::TraverseStmt, ctx: &AnalyzeContext) -> HirnResult<T
         requested_namespace,
         from,
         via,
-        depth: t.depth as u32,
+        depth: depth_to_u32(t.depth, "TRAVERSE DEPTH")?,
         filters,
         limit: t.limit,
     })
@@ -741,16 +832,19 @@ fn analyze_explain_causes(
     ctx: &AnalyzeContext,
 ) -> HirnResult<TypedExplainCauses> {
     let _ = ctx;
+    reject_unbound_string_param(&e.target, "EXPLAIN CAUSES")?;
     let namespace = resolve_optional_namespace(e.namespace.as_deref())?;
     Ok(TypedExplainCauses {
         namespace,
         target: e.target.clone(),
-        depth: e.depth.unwrap_or(3) as u32,
+        depth: depth_to_u32(e.depth.unwrap_or(3), "CAUSES DEPTH")?,
     })
 }
 
 fn analyze_what_if(w: &ast::WhatIfStmt, ctx: &AnalyzeContext) -> HirnResult<TypedWhatIf> {
     let _ = ctx;
+    reject_unbound_string_param(&w.intervention, "WHAT_IF")?;
+    reject_unbound_string_param(&w.outcome, "THEN")?;
     let namespace = resolve_optional_namespace(w.namespace.as_deref())?;
     Ok(TypedWhatIf {
         namespace,
@@ -764,6 +858,8 @@ fn analyze_counterfactual(
     ctx: &AnalyzeContext,
 ) -> HirnResult<TypedCounterfactual> {
     let _ = ctx;
+    reject_unbound_string_param(&c.antecedent, "COUNTERFACTUAL")?;
+    reject_unbound_string_param(&c.consequent, "THEN")?;
     let namespace = resolve_optional_namespace(c.namespace.as_deref())?;
     Ok(TypedCounterfactual {
         namespace,
@@ -824,7 +920,7 @@ fn resolve_expand(clause: Option<&ast::ExpandClause>) -> HirnResult<Option<Typed
     match clause {
         None => Ok(None),
         Some(e) => Ok(Some(TypedExpand {
-            depth: e.depth as u32,
+            depth: depth_to_u32(e.depth, "EXPAND GRAPH DEPTH")?,
             min_weight: e.min_weight,
             activation: e.activation.unwrap_or(ast::ActivationModeAst::Spreading),
         })),
@@ -969,6 +1065,58 @@ mod tests {
             TypedStatement::Recall(r) => {
                 assert_eq!(r.namespace, Namespace::new("custom_ns").unwrap());
             }
+            _ => panic!("expected Recall"),
+        }
+    }
+
+    #[test]
+    fn analyze_quoted_dollar_literal_searches_for_literal_text() {
+        // R-50: `ABOUT "$q"` is a literal search for the text `$q`, never a
+        // parameter — it must reach analyze as the literal query string.
+        let stmt = parse(r#"RECALL episodic ABOUT "$q" LIMIT 5"#).unwrap();
+        let typed = analyze(&stmt, &ctx()).unwrap();
+        match typed {
+            TypedStatement::Recall(r) => assert_eq!(r.query, "$q"),
+            _ => panic!("expected Recall"),
+        }
+    }
+
+    #[test]
+    fn analyze_unbound_about_param_is_rejected() {
+        // R-50: a bare, unbound `ABOUT $q` must fail closed at analyze, not
+        // reach execution as a literal search for `$q`.
+        let stmt = parse(r#"RECALL episodic ABOUT $q LIMIT 5"#).unwrap();
+        let err = analyze(&stmt, &ctx()).unwrap_err();
+        assert!(
+            err.to_string().contains("unbound parameter") && err.to_string().contains("$q"),
+            "expected unbound-parameter error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn analyze_unbound_think_about_param_is_rejected() {
+        let stmt = parse(r#"THINK ABOUT $q LIMIT 5"#).unwrap();
+        let err = analyze(&stmt, &ctx()).unwrap_err();
+        assert!(err.to_string().contains("unbound parameter"), "got: {err}");
+    }
+
+    #[test]
+    fn analyze_unbound_topic_param_is_rejected() {
+        let stmt = parse(r#"RECALL episodic ABOUT "x" TOPIC $t LIMIT 5"#).unwrap();
+        let err = analyze(&stmt, &ctx()).unwrap_err();
+        assert!(err.to_string().contains("unbound parameter"), "got: {err}");
+    }
+
+    #[test]
+    fn analyze_bound_about_param_succeeds() {
+        // Once bound, the placeholder is a Literal and analyze accepts it.
+        let mut stmt = parse(r#"RECALL episodic ABOUT $q LIMIT 5"#).unwrap();
+        let mut values = std::collections::HashMap::new();
+        values.insert("$q".to_string(), "hello".to_string());
+        assert!(crate::parser::ast::bind_parameters(&mut stmt, &values).is_empty());
+        let typed = analyze(&stmt, &ctx()).unwrap();
+        match typed {
+            TypedStatement::Recall(r) => assert_eq!(r.query, "hello"),
             _ => panic!("expected Recall"),
         }
     }

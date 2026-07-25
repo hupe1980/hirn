@@ -5,7 +5,6 @@ pub mod embed_cache_ops;
 pub mod embedding_registry;
 pub mod engine;
 pub mod error;
-pub mod fragment_cache;
 pub mod index;
 pub mod lance_store;
 pub mod memory_store;
@@ -27,7 +26,6 @@ pub use compaction::{
 pub use embedding_registry::EmbeddingRegistry;
 pub use engine::{HirnDb, HirnDbConfig};
 pub use error::HirnDbError;
-pub use fragment_cache::{FragmentCache, FragmentCacheConfig};
 pub use mutation_envelope_ops::{
     MutationEnvelopeRecord, MutationEnvelopeState, append_mutation_envelope,
     append_mutation_envelopes, get_mutation_envelope, list_mutation_envelopes,

@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, RecordBatch};
 use async_trait::async_trait;
+use datafusion::catalog::TableProvider;
 
 use crate::error::HirnDbError;
 use crate::store::{
@@ -66,11 +67,24 @@ impl<S: PhysicalStore> PolicyEnforcedStore<S> {
             .map_err(|_| HirnDbError::PolicyViolation("no principal set for current task".into()))
     }
 
-    /// Build the `namespace IN (...)` predicate fragment for the given allowed
-    /// namespaces. Returns `None` when all namespaces are permitted.
-    fn build_namespace_predicate(allowed: &[String]) -> Option<String> {
+    /// Build a `<column> IN (...)` predicate fragment scoping `column` to the
+    /// allowed namespaces.
+    ///
+    /// An **empty** allow-list means the principal may access *zero* namespaces,
+    /// which is deny-all — mirroring [`Self::enforce_append`]'s empty⇒reject
+    /// posture. It must yield a predicate that never matches any row
+    /// (`<column> IN ('')`), NOT `None`: returning `None` injects no predicate
+    /// and would be fail-OPEN, letting a zero-namespace principal read and
+    /// delete every tenant's rows. `None` is reserved for the distinct
+    /// "permit all namespaces" case, which is signalled upstream by
+    /// [`Self::resolve_allowed`] returning `None` (the builder is never called
+    /// then).
+    fn build_namespace_predicate_for(column: &str, allowed: &[String]) -> Option<String> {
         if allowed.is_empty() {
-            return None;
+            // Never-matching: the empty string is not a valid namespace, so this
+            // scopes reads/deletes/merges to nothing. Accepted by both the
+            // Lance/DataFusion filter parser and the MemoryStore scan parser.
+            return Some(format!("{column} IN ('')"));
         }
         let escaped: Vec<String> = allowed
             .iter()
@@ -79,7 +93,12 @@ impl<S: PhysicalStore> PolicyEnforcedStore<S> {
                 format!("'{safe}'")
             })
             .collect();
-        Some(format!("namespace IN ({})", escaped.join(", ")))
+        Some(format!("{column} IN ({})", escaped.join(", ")))
+    }
+
+    /// Build the `namespace IN (...)` predicate for scans/filters/deletes.
+    fn build_namespace_predicate(allowed: &[String]) -> Option<String> {
+        Self::build_namespace_predicate_for("namespace", allowed)
     }
 
     /// Inject the namespace predicate into an existing filter string.
@@ -156,6 +175,59 @@ impl<S: PhysicalStore> PolicyEnforcedStore<S> {
             return Ok(format!("({predicate}) AND {ns_pred}"));
         }
         Ok(predicate.to_string())
+    }
+
+    /// Enforce namespace policy on a `merge_insert`.
+    ///
+    /// `merge_insert` matches rows purely on the `on` keys and, with
+    /// `WhenMatched::UpdateAll`, overwrites the matched TARGET row regardless of
+    /// its namespace. A principal scoped to `ns1` could therefore submit a batch
+    /// carrying an `id` that collides with a victim row in `ns2` and clobber it.
+    /// We close this the same way `update_where`/`delete` are closed: two guards.
+    ///
+    /// 1. [`Self::enforce_append`] rejects the batch outright if any INCOMING
+    ///    row targets a forbidden namespace.
+    /// 2. A `when_matched` condition (`target.namespace IN (...)`) restricts the
+    ///    overwrite to rows already inside the principal's allowed namespaces, so
+    ///    a key collision with a foreign-tenant row is a no-op.
+    ///
+    /// When the policy permits all namespaces (`resolve_allowed` → `None`) no
+    /// target guard is needed and the caller's own condition is preserved.
+    async fn enforce_merge_insert(
+        &self,
+        dataset: &str,
+        on: &[&str],
+        batch: RecordBatch,
+        caller_condition: Option<&str>,
+    ) -> Result<(), HirnDbError> {
+        self.enforce_append(&batch).await?;
+
+        let policy_condition = if Self::should_enforce_namespace_filter(dataset) {
+            match self.resolve_allowed().await? {
+                Some(allowed) => Self::build_namespace_predicate_for("target.namespace", &allowed),
+                None => None,
+            }
+        } else {
+            None
+        };
+
+        // Combine the policy's target-namespace guard with any caller-supplied
+        // condition (both must hold for a matched row to be overwritten).
+        let condition = match (caller_condition, policy_condition.as_deref()) {
+            (Some(caller), Some(policy)) => Some(format!("({caller}) AND ({policy})")),
+            (Some(caller), None) => Some(caller.to_string()),
+            (None, Some(policy)) => Some(policy.to_string()),
+            (None, None) => None,
+        };
+
+        match condition {
+            Some(cond) => {
+                self.inner
+                    .merge_insert_where(dataset, on, batch, Some(&cond))
+                    .await
+            }
+            None => self.inner.merge_insert(dataset, on, batch).await,
+        }
     }
 
     /// Verify that an append batch only targets allowed namespaces.
@@ -274,8 +346,18 @@ impl<S: PhysicalStore> PhysicalStore for PolicyEnforcedStore<S> {
         on: &[&str],
         batch: RecordBatch,
     ) -> Result<(), HirnDbError> {
-        self.enforce_append(&batch).await?;
-        self.inner.merge_insert(dataset, on, batch).await
+        self.enforce_merge_insert(dataset, on, batch, None).await
+    }
+
+    async fn merge_insert_where(
+        &self,
+        dataset: &str,
+        on: &[&str],
+        batch: RecordBatch,
+        when_matched_condition: Option<&str>,
+    ) -> Result<(), HirnDbError> {
+        self.enforce_merge_insert(dataset, on, batch, when_matched_condition)
+            .await
     }
 
     async fn update_where(
@@ -349,41 +431,87 @@ impl<S: PhysicalStore> PhysicalStore for PolicyEnforcedStore<S> {
         self.inner.multivector_search(dataset, opts).await
     }
 
-    // ── Indexing (pass-through) ──
+    // ── Indexing (dataset-global — fail-closed without a principal) ──
+    //
+    // These operate on the whole dataset (all namespaces), so they are
+    // cross-tenant primitives. There is no per-namespace scoping possible, and
+    // the [`NamespacePolicy`] model exposes no admin/role concept, so the
+    // enforcement here is **fail-closed on a missing principal** (R-44):
+    // reject when no principal is set, consistent with the CRUD posture.
+    // Administrative authorization (who may rebuild indices, compact, evolve
+    // schema, roll back, or drop namespaces) MUST be enforced by a layer above
+    // this store — this layer only guarantees a principal is present.
 
     async fn create_index(&self, dataset: &str, config: IndexConfig) -> Result<(), HirnDbError> {
+        Self::current_principal()?;
         self.inner.create_index(dataset, config).await
     }
 
     async fn optimize_indices(&self, dataset: &str) -> Result<(), HirnDbError> {
+        Self::current_principal()?;
         self.inner.optimize_indices(dataset).await
     }
 
-    // ── Compaction (pass-through) ──
+    // ── Compaction (dataset-global — fail-closed) ──
 
     async fn compact(
         &self,
         dataset: &str,
         opts: CompactOptions,
     ) -> Result<CompactResult, HirnDbError> {
+        Self::current_principal()?;
         self.inner.compact(dataset, opts).await
     }
 
-    // ── Versioning (pass-through) ──
+    // ── Versioning ──
 
     async fn version(&self, dataset: &str) -> Result<u64, HirnDbError> {
         self.inner.version(dataset).await
     }
 
     async fn tag(&self, dataset: &str, tag: &str) -> Result<(), HirnDbError> {
+        Self::current_principal()?;
         self.inner.tag(dataset, tag).await
     }
 
+    async fn open_at_version(
+        &self,
+        dataset: &str,
+        version: u64,
+    ) -> Result<Vec<RecordBatch>, HirnDbError> {
+        // Fail-closed: require a principal, then scope the historical snapshot
+        // to the principal's namespaces so time-travel cannot leak other
+        // tenants' rows (R-12/R-44).
+        Self::current_principal()?;
+        let batches = self.inner.open_at_version(dataset, version).await?;
+        if !Self::should_enforce_namespace_filter(dataset) {
+            return Ok(batches);
+        }
+        if let Some(allowed) = self.resolve_allowed().await?
+            && let Some(ns_pred) = Self::build_namespace_predicate(&allowed)
+        {
+            return crate::scan::filter_batches(&ns_pred, &batches);
+        }
+        Ok(batches)
+    }
+
+    async fn rollback_to(&self, dataset: &str, version: u64) -> Result<(), HirnDbError> {
+        // Dataset-global, destructive (affects every tenant sharing the
+        // dataset). Fail-closed on a missing principal; admin authorization must
+        // be enforced above this layer (R-44).
+        Self::current_principal()?;
+        self.inner.rollback_to(dataset, version).await
+    }
+
+    #[allow(deprecated)]
     async fn checkout(&self, dataset: &str, version: u64) -> Result<(), HirnDbError> {
-        self.inner.checkout(dataset, version).await
+        // Deprecated destructive alias — same posture as `rollback_to`.
+        Self::current_principal()?;
+        self.inner.rollback_to(dataset, version).await
     }
 
     async fn list_tags(&self, dataset: &str) -> Result<Vec<VersionTag>, HirnDbError> {
+        Self::current_principal()?;
         self.inner.list_tags(dataset).await
     }
 
@@ -397,31 +525,37 @@ impl<S: PhysicalStore> PhysicalStore for PolicyEnforcedStore<S> {
         self.inner.exists(dataset).await
     }
 
-    // ── Namespace (pass-through) ──
+    // ── Namespace ──
 
     async fn list_namespaces(&self) -> Result<Vec<String>, HirnDbError> {
         self.inner.list_namespaces().await
     }
 
     async fn create_namespace(&self, name: &str) -> Result<(), HirnDbError> {
+        Self::current_principal()?;
         self.inner.create_namespace(name).await
     }
 
     async fn drop_namespace(&self, name: &str) -> Result<(), HirnDbError> {
+        // Global, destructive — drops a whole namespace and its tables.
+        // Fail-closed; admin authorization must live above this layer (R-44).
+        Self::current_principal()?;
         self.inner.drop_namespace(name).await
     }
 
-    // ── Schema evolution (pass-through) ──
+    // ── Schema evolution (dataset-global — fail-closed) ──
 
     async fn add_columns(
         &self,
         dataset: &str,
         transforms: Vec<ColumnTransform>,
     ) -> Result<(), HirnDbError> {
+        Self::current_principal()?;
         self.inner.add_columns(dataset, transforms).await
     }
 
     async fn drop_columns(&self, dataset: &str, columns: &[&str]) -> Result<(), HirnDbError> {
+        Self::current_principal()?;
         self.inner.drop_columns(dataset, columns).await
     }
 
@@ -429,7 +563,98 @@ impl<S: PhysicalStore> PhysicalStore for PolicyEnforcedStore<S> {
         &self,
         dataset: &str,
     ) -> Option<Arc<dyn datafusion::catalog::TableProvider>> {
-        self.inner.table_provider(dataset).await
+        // Wrap the inner provider so SQL/HirnQL table scans are scoped to the
+        // principal's namespaces (R-25). Without this, a table_provider scan
+        // bypasses `enforce_scan` entirely and reads every tenant's rows.
+        let inner = self.inner.table_provider(dataset).await?;
+
+        // Non-namespaced datasets (e.g. blob storage) are not tenant-scoped.
+        if !Self::should_enforce_namespace_filter(dataset) {
+            return Some(inner);
+        }
+
+        match self.resolve_allowed().await {
+            // Unrestricted principal — hand back the inner provider unchanged.
+            Ok(None) => Some(inner),
+            // Restricted principal — inject a `namespace IN (...)` predicate
+            // (empty allow-list ⇒ never-matching, deny-all).
+            Ok(Some(allowed)) => Some(Arc::new(NamespaceFilteredTableProvider::new(
+                inner, &allowed,
+            ))),
+            // No principal set — fail closed: return no provider so the caller
+            // falls back to an empty table rather than reading all tenants.
+            Err(_) => None,
+        }
+    }
+}
+
+// ── Namespace-filtering TableProvider (R-25) ──
+
+/// A [`TableProvider`] wrapper that injects a `namespace IN (...)` predicate
+/// into every scan before delegating to the inner (Lance) provider.
+///
+/// The predicate is pushed as an additional scan filter. Lance applies scan
+/// predicates exactly against the full table schema — independent of the output
+/// projection — so tenant isolation holds even when the query does not select
+/// the `namespace` column.
+struct NamespaceFilteredTableProvider {
+    inner: Arc<dyn TableProvider>,
+    predicate: datafusion_expr::Expr,
+}
+
+impl NamespaceFilteredTableProvider {
+    fn new(inner: Arc<dyn TableProvider>, allowed: &[String]) -> Self {
+        use datafusion_expr::{col, lit};
+        // Empty allow-list ⇒ deny-all (never matches), mirroring
+        // `build_namespace_predicate`'s fail-closed posture.
+        let predicate = if allowed.is_empty() {
+            lit(false)
+        } else {
+            col("namespace").in_list(allowed.iter().cloned().map(lit).collect(), false)
+        };
+        Self { inner, predicate }
+    }
+}
+
+impl std::fmt::Debug for NamespaceFilteredTableProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NamespaceFilteredTableProvider")
+            .field("predicate", &self.predicate)
+            .finish()
+    }
+}
+
+#[async_trait]
+impl TableProvider for NamespaceFilteredTableProvider {
+    // `as_any` is no longer a `TableProvider` method in DataFusion 54 — the
+    // trait now has an `Any` supertrait bound that provides downcasting.
+
+    fn schema(&self) -> arrow_schema::SchemaRef {
+        self.inner.schema()
+    }
+
+    fn table_type(&self) -> datafusion::logical_expr::TableType {
+        self.inner.table_type()
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&datafusion_expr::Expr],
+    ) -> datafusion::error::Result<Vec<datafusion::logical_expr::TableProviderFilterPushDown>> {
+        self.inner.supports_filters_pushdown(filters)
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn datafusion::catalog::Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[datafusion_expr::Expr],
+        limit: Option<usize>,
+    ) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        // Append the namespace predicate to the caller's filters and delegate.
+        let mut combined = filters.to_vec();
+        combined.push(self.predicate.clone());
+        self.inner.scan(state, projection, &combined, limit).await
     }
 }
 
@@ -690,9 +915,12 @@ mod tests {
     }
 
     #[test]
-    fn build_namespace_predicate_empty() {
+    fn build_namespace_predicate_empty_is_deny_all_not_none() {
+        // Regression for R-01: an empty allow-list is deny-all, so the builder
+        // must return a never-matching predicate — NOT `None`, which would
+        // inject no filter and expose every tenant's rows (fail-OPEN).
         let pred = PolicyEnforcedStore::<MemoryStore>::build_namespace_predicate(&[]);
-        assert!(pred.is_none());
+        assert_eq!(pred.as_deref(), Some("namespace IN ('')"));
     }
 
     #[test]
@@ -751,5 +979,406 @@ mod tests {
             .await;
 
         assert!(result.is_ok());
+    }
+
+    // ── R-01: empty allow-list is deny-all (fail-CLOSED) ──
+    //
+    // A principal mapped to `Some(vec![])` is authorized for ZERO namespaces.
+    // Every read/delete must resolve to EMPTY, never to "all tenants' rows".
+    // These seed rows across multiple namespaces — which the pre-fix code
+    // leaked because `build_namespace_predicate` returned `None` for an empty
+    // allow-list and no predicate was injected.
+
+    fn test_vector_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("namespace", DataType::Utf8, false),
+            Field::new(
+                "embedding",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 3),
+                false,
+            ),
+        ]))
+    }
+
+    fn test_vector_batch(ids: &[&str], namespaces: &[&str], vectors: &[[f32; 3]]) -> RecordBatch {
+        use arrow_array::{FixedSizeListArray, Float32Array};
+        let flat: Vec<f32> = vectors.iter().flatten().copied().collect();
+        let values = Float32Array::from(flat);
+        let embedding = FixedSizeListArray::try_new(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            3,
+            Arc::new(values),
+            None,
+        )
+        .unwrap();
+        RecordBatch::try_new(
+            test_vector_schema(),
+            vec![
+                Arc::new(StringArray::from(ids.to_vec())),
+                Arc::new(StringArray::from(namespaces.to_vec())),
+                Arc::new(embedding),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn empty_allow_list_scan_returns_nothing() {
+        let store = setup_store(vec![("agent_z", vec![])]);
+        store
+            .inner
+            .append(
+                "test",
+                test_batch(&["a", "b", "c"], &["ns1", "ns2", "ns3"], &[1, 2, 3]),
+            )
+            .await
+            .unwrap();
+
+        let results = CURRENT_PRINCIPAL
+            .scope("agent_z".to_string(), async {
+                store.scan("test", ScanOptions::default()).await
+            })
+            .await
+            .unwrap();
+
+        let total: usize = results.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 0, "zero-namespace principal must see no rows");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn empty_allow_list_count_returns_zero() {
+        let store = setup_store(vec![("agent_z", vec![])]);
+        store
+            .inner
+            .append(
+                "test",
+                test_batch(&["a", "b", "c"], &["ns1", "ns2", "ns3"], &[1, 2, 3]),
+            )
+            .await
+            .unwrap();
+
+        let count = CURRENT_PRINCIPAL
+            .scope("agent_z".to_string(), async {
+                store.count("test", None).await
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(count, 0, "zero-namespace principal must count no rows");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn empty_allow_list_delete_removes_nothing() {
+        let store = setup_store(vec![("agent_z", vec![])]);
+        store
+            .inner
+            .append(
+                "test",
+                test_batch(&["a", "b", "c"], &["ns1", "ns2", "ns3"], &[1, 2, 3]),
+            )
+            .await
+            .unwrap();
+
+        let deleted = CURRENT_PRINCIPAL
+            .scope("agent_z".to_string(), async {
+                store.delete("test", "value >= 0").await
+            })
+            .await
+            .unwrap();
+        assert_eq!(deleted, 0, "zero-namespace principal must delete no rows");
+
+        // All three rows survive untouched.
+        let remaining = store
+            .inner
+            .scan("test", ScanOptions::default())
+            .await
+            .unwrap();
+        let total: usize = remaining.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn empty_allow_list_vector_search_returns_nothing() {
+        let store = setup_store(vec![("agent_z", vec![])]);
+        store
+            .inner
+            .append(
+                "vecs",
+                test_vector_batch(
+                    &["a", "b", "c"],
+                    &["ns1", "ns2", "ns3"],
+                    &[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                ),
+            )
+            .await
+            .unwrap();
+
+        let results = CURRENT_PRINCIPAL
+            .scope("agent_z".to_string(), async {
+                store
+                    .vector_search(
+                        "vecs",
+                        VectorSearchOptions {
+                            column: "embedding".to_string(),
+                            query: vec![1.0, 0.0, 0.0],
+                            limit: 10,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            })
+            .await
+            .unwrap();
+
+        let total: usize = results.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 0, "zero-namespace principal must match no vectors");
+    }
+
+    // ── R-09: merge_insert cannot overwrite a foreign-namespace row ──
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn merge_insert_cannot_overwrite_foreign_namespace_row() {
+        let store = setup_store(vec![("agent_a", vec!["ns1"])]);
+
+        // A victim row owned by ns2.
+        store
+            .inner
+            .append("test", test_batch(&["victim"], &["ns2"], &[100]))
+            .await
+            .unwrap();
+
+        // agent_a (scoped to ns1) submits a batch whose id collides with the
+        // ns2 victim but claims namespace ns1 — the classic cross-tenant
+        // overwrite. The incoming namespace is allowed, so enforce_append lets
+        // it through; the target-row guard must still protect the ns2 row.
+        let result = CURRENT_PRINCIPAL
+            .scope("agent_a".to_string(), async {
+                store
+                    .merge_insert("test", &["id"], test_batch(&["victim"], &["ns1"], &[999]))
+                    .await
+            })
+            .await;
+        assert!(result.is_ok(), "operation itself should not error");
+
+        // The ns2 victim row must be unchanged (still value 100, still ns2), and
+        // no ns1 row must have been created for `victim`.
+        let rows = store
+            .inner
+            .scan("test", ScanOptions::default())
+            .await
+            .unwrap();
+        let total: usize = rows.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 1, "no new row should be inserted");
+
+        let batch = &rows[0];
+        let namespaces = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let values = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(namespaces.value(0), "ns2", "victim namespace preserved");
+        assert_eq!(values.value(0), 100, "victim value must NOT be overwritten");
+    }
+
+    // ── R-44: dataset-global ops fail closed without a principal ──
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn global_ops_without_principal_are_rejected() {
+        let store = setup_store(vec![("agent_a", vec!["ns1"])]);
+        store
+            .inner
+            .append("test", test_batch(&["a"], &["ns1"], &[1]))
+            .await
+            .unwrap();
+
+        // No CURRENT_PRINCIPAL set — every dataset-global op must be rejected.
+        assert!(matches!(
+            store
+                .create_index("test", crate::store::IndexConfig::bitmap("namespace"))
+                .await,
+            Err(HirnDbError::PolicyViolation(_))
+        ));
+        assert!(matches!(
+            store.compact("test", CompactOptions::default()).await,
+            Err(HirnDbError::PolicyViolation(_))
+        ));
+        assert!(matches!(
+            store.rollback_to("test", 0).await,
+            Err(HirnDbError::PolicyViolation(_))
+        ));
+        assert!(matches!(
+            store.drop_namespace("ns1").await,
+            Err(HirnDbError::PolicyViolation(_))
+        ));
+        assert!(matches!(
+            store.drop_columns("test", &["value"]).await,
+            Err(HirnDbError::PolicyViolation(_))
+        ));
+        assert!(matches!(
+            store.tag("test", "v1").await,
+            Err(HirnDbError::PolicyViolation(_))
+        ));
+    }
+
+    // ── R-25: table_provider is namespace-scoped ──
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn table_provider_scopes_scan_to_namespace() {
+        use datafusion::prelude::SessionContext;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_str().unwrap().to_string();
+        let ns = crate::namespace::NamespaceConfig::local(&root)
+            .connect()
+            .await
+            .unwrap();
+        let lance = crate::lance_store::LancePhysicalStore::new(root, ns);
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("namespace", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+                Arc::new(StringArray::from(vec!["ns1", "ns2", "ns1"])),
+            ],
+        )
+        .unwrap();
+        lance.append("t", batch).await.unwrap();
+
+        let store = PolicyEnforcedStore::new(
+            lance,
+            Arc::new(TestPolicy::new(vec![("agent_a", vec!["ns1"])])),
+        );
+
+        // Build the provider under the principal — the namespace predicate is
+        // baked into it at construction, so the later scan is scoped even though
+        // DataFusion executes it outside the task-local scope.
+        let provider = CURRENT_PRINCIPAL
+            .scope("agent_a".to_string(), async {
+                store.table_provider("t").await
+            })
+            .await
+            .expect("provider for restricted principal");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("t", provider).unwrap();
+        let batches = ctx
+            .sql("SELECT id, namespace FROM t")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 2, "table_provider scan must return only ns1 rows");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn table_provider_no_principal_fails_closed() {
+        // With a real (Lance) inner provider available, a missing principal must
+        // still yield NO provider — never the unfiltered inner one (R-25/R-44).
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_str().unwrap().to_string();
+        let ns = crate::namespace::NamespaceConfig::local(&root)
+            .connect()
+            .await
+            .unwrap();
+        let lance = crate::lance_store::LancePhysicalStore::new(root, ns);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("namespace", DataType::Utf8, false),
+        ]));
+        lance
+            .append(
+                "t",
+                RecordBatch::try_new(
+                    schema,
+                    vec![
+                        Arc::new(StringArray::from(vec!["a"])),
+                        Arc::new(StringArray::from(vec!["ns1"])),
+                    ],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let store = PolicyEnforcedStore::new(
+            lance,
+            Arc::new(TestPolicy::new(vec![("agent_a", vec!["ns1"])])),
+        );
+
+        // No CURRENT_PRINCIPAL set → fail closed (no provider).
+        assert!(store.table_provider("t").await.is_none());
+    }
+
+    // ── R-12: open_at_version is namespace-scoped and fails closed ──
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn open_at_version_scoped_to_namespace() {
+        let store = setup_store(vec![("agent_a", vec!["ns1"])]);
+        store
+            .inner
+            .append("test", test_batch(&["a", "b"], &["ns1", "ns2"], &[1, 2]))
+            .await
+            .unwrap();
+        let version = store.inner.version("test").await.unwrap();
+
+        // No principal → fail closed.
+        assert!(matches!(
+            store.open_at_version("test", version).await,
+            Err(HirnDbError::PolicyViolation(_))
+        ));
+
+        // agent_a sees only its ns1 row in the historical snapshot.
+        let batches = CURRENT_PRINCIPAL
+            .scope("agent_a".to_string(), async {
+                store.open_at_version("test", version).await
+            })
+            .await
+            .unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 1, "historical read is scoped to allowed namespaces");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn merge_insert_updates_own_namespace_row() {
+        let store = setup_store(vec![("agent_a", vec!["ns1"])]);
+
+        store
+            .inner
+            .append("test", test_batch(&["own"], &["ns1"], &[100]))
+            .await
+            .unwrap();
+
+        CURRENT_PRINCIPAL
+            .scope("agent_a".to_string(), async {
+                store
+                    .merge_insert("test", &["id"], test_batch(&["own"], &["ns1"], &[777]))
+                    .await
+            })
+            .await
+            .unwrap();
+
+        let rows = store
+            .inner
+            .scan("test", ScanOptions::default())
+            .await
+            .unwrap();
+        let values = rows[0]
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(values.value(0), 777, "own-namespace row is updated");
     }
 }

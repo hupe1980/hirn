@@ -74,10 +74,14 @@ impl WelfordStats {
         self.count = combined_count;
     }
 
-    /// Sample variance (Bessel's correction). Returns 1.0 if fewer than 2 samples.
+    /// Sample variance (Bessel's correction).
+    ///
+    /// Returns `0.0` when fewer than 2 samples have been recorded (no spread
+    /// can be estimated yet). This mirrors [`z_score`](Self::z_score), which
+    /// also special-cases `count < 2` to `0.0`, so the two are consistent.
     pub fn variance(&self) -> f64 {
         if self.count < 2 {
-            return 1.0;
+            return 0.0;
         }
         self.m2 / (self.count - 1) as f64
     }
@@ -164,6 +168,16 @@ mod tests {
         // All identical → zero variance → z_score returns 0.0
         assert!((stats.z_score(5.0)).abs() < f64::EPSILON);
         assert!((stats.z_score(10.0)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn variance_is_zero_below_two_samples() {
+        // Consistency with z_score, which also returns 0.0 for count < 2.
+        let mut stats = WelfordStats::new();
+        assert!((stats.variance() - 0.0).abs() < f64::EPSILON);
+        assert!((stats.stddev() - 0.0).abs() < f64::EPSILON);
+        stats.update(5.0);
+        assert!((stats.variance() - 0.0).abs() < f64::EPSILON);
     }
 
     #[test]

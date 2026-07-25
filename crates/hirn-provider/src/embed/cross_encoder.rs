@@ -105,9 +105,10 @@ impl CrossEncoderReranker {
             EmbedError::local("cross-encoder", format!("ONNX model load failed: {e}"))
         })?;
 
-        let tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path).map_err(|e| {
+        let mut tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path).map_err(|e| {
             EmbedError::local("cross-encoder", format!("Tokenizer load failed: {e}"))
         })?;
+        apply_pair_truncation(&mut tokenizer, DEFAULT_MAX_LENGTH)?;
 
         Ok(Self {
             session: Arc::new(Mutex::new(session)),
@@ -117,10 +118,12 @@ impl CrossEncoderReranker {
     }
 
     /// Override the maximum sequence length.
-    #[must_use]
-    pub fn with_max_length(mut self, max_length: usize) -> Self {
+    ///
+    /// Reconfigures the tokenizer's pair-aware truncation to the new budget.
+    pub fn with_max_length(mut self, max_length: usize) -> HirnResult<Self> {
         self.max_length = max_length;
-        self
+        apply_pair_truncation(Arc::make_mut(&mut self.tokenizer), max_length)?;
+        Ok(self)
     }
 
     /// Score a batch of (query, document) pairs in a single ONNX forward pass.
@@ -178,8 +181,34 @@ impl CrossEncoderReranker {
             .into());
         }
 
-        Ok(logits.iter().copied().collect())
+        Ok(logits.to_vec())
     }
+}
+
+/// Configure pair-aware truncation on the tokenizer.
+///
+/// Uses `LongestFirst` (the standard cross-encoder default): the token budget
+/// is shared between query and document, trimming whichever segment is longer
+/// first. Truncation runs *before* the post-processor adds special tokens, so
+/// `[CLS]`/`[SEP]` always survive and a long query can no longer starve the
+/// document out of the sequence entirely.
+fn apply_pair_truncation(
+    tokenizer: &mut tokenizers::Tokenizer,
+    max_length: usize,
+) -> HirnResult<()> {
+    tokenizer
+        .with_truncation(Some(tokenizers::TruncationParams {
+            max_length,
+            strategy: tokenizers::TruncationStrategy::LongestFirst,
+            ..Default::default()
+        }))
+        .map_err(|e| {
+            EmbedError::local(
+                "cross-encoder",
+                format!("Truncation configuration failed: {e}"),
+            )
+        })?;
+    Ok(())
 }
 
 /// Tokenize query/document pairs and build padded `[batch_size, max_len]` tensors.
@@ -187,6 +216,10 @@ impl CrossEncoderReranker {
 /// Returns `(input_ids, attention_mask, token_type_ids)` as `Array2<i64>`.
 /// This is extracted from [`CrossEncoderReranker::score_batch`] so the
 /// tokenization + padding logic can be unit-tested without an ONNX session.
+///
+/// The real (pair-aware) truncation is done by the tokenizer itself — see
+/// [`apply_pair_truncation`]. The `.min(max_length)` below is only a defensive
+/// cap in case the tokenizer was constructed without truncation configured.
 fn tokenize_and_pad(
     tokenizer: &tokenizers::Tokenizer,
     query: &str,
@@ -310,7 +343,8 @@ mod tests {
 
     /// Build a minimal BERT-style tokenizer in-memory for unit tests.
     /// Uses the `tokenizers` crate directly — no model files needed.
-    fn test_tokenizer() -> tokenizers::Tokenizer {
+    /// Truncation is configured exactly like production ([`apply_pair_truncation`]).
+    fn test_tokenizer(max_length: usize) -> tokenizers::Tokenizer {
         use tokenizers::models::wordpiece::WordPiece;
         use tokenizers::normalizers::BertNormalizer;
         use tokenizers::pre_tokenizers::bert::BertPreTokenizer;
@@ -355,13 +389,13 @@ mod tests {
                 .unwrap(),
         ));
         tokenizer.with_padding(None);
-        tokenizer.with_truncation(None).unwrap();
+        apply_pair_truncation(&mut tokenizer, max_length).unwrap();
         tokenizer
     }
 
     #[test]
     fn tokenize_and_pad_shapes() {
-        let tok = test_tokenizer();
+        let tok = test_tokenizer(512);
         let docs = vec!["the capital of france".into(), "hello world".into()];
 
         let (ids, mask, types) = tokenize_and_pad(&tok, "paris", &docs, 512).unwrap();
@@ -377,7 +411,7 @@ mod tests {
 
     #[test]
     fn tokenize_and_pad_attention_mask_correctness() {
-        let tok = test_tokenizer();
+        let tok = test_tokenizer(512);
         let docs = vec!["the capital".into(), "hello world rust language".into()];
 
         let (ids, mask, _types) = tokenize_and_pad(&tok, "paris", &docs, 512).unwrap();
@@ -406,7 +440,8 @@ mod tests {
 
     #[test]
     fn tokenize_and_pad_max_length_truncation() {
-        let tok = test_tokenizer();
+        // Truncation is configured on the tokenizer itself (as in production).
+        let tok = test_tokenizer(6);
         let docs = vec!["the capital of france is paris hello world rust language".into()];
 
         // Severely limit max_length to force truncation.
@@ -416,8 +451,83 @@ mod tests {
     }
 
     #[test]
+    fn truncation_is_pair_aware_long_query_keeps_document() {
+        // A pathologically long query must not starve the document:
+        // LongestFirst trims the query first, so the (short) document
+        // survives truncation intact.
+        let max_length = 12;
+        let tok = test_tokenizer(max_length);
+        let long_query = "the ".repeat(50); // 50 tokens, way over budget
+        let docs = vec!["hello world".into()];
+
+        let (ids, _mask, types) =
+            tokenize_and_pad(&tok, long_query.trim(), &docs, max_length).unwrap();
+
+        let row: Vec<i64> = ids.row(0).to_vec();
+        // Document tokens ("hello"=10, "world"=11) must survive.
+        assert!(
+            row.contains(&10),
+            "doc token 'hello' truncated away: {row:?}"
+        );
+        assert!(
+            row.contains(&11),
+            "doc token 'world' truncated away: {row:?}"
+        );
+        // And the document segment (type_id 1) must be present.
+        let type_row: Vec<i64> = types.row(0).to_vec();
+        assert!(
+            type_row.contains(&1),
+            "document segment missing after truncation: {type_row:?}"
+        );
+    }
+
+    #[test]
+    fn truncation_preserves_trailing_special_token() {
+        // Truncation runs before the post-processor adds [CLS]/[SEP], so the
+        // sequence must still end with [SEP] (id 3) after truncation.
+        let max_length = 8;
+        let tok = test_tokenizer(max_length);
+        let long_query = "capital ".repeat(30);
+        let docs = vec!["hello world rust language".into()];
+
+        let (ids, mask, _types) =
+            tokenize_and_pad(&tok, long_query.trim(), &docs, max_length).unwrap();
+
+        let row: Vec<i64> = ids.row(0).to_vec();
+        let mask_row: Vec<i64> = mask.row(0).to_vec();
+        let last_real = mask_row
+            .iter()
+            .rposition(|&m| m == 1)
+            .expect("row should have at least one real token");
+        assert_eq!(row[0], 2, "sequence should start with [CLS]: {row:?}");
+        assert_eq!(
+            row[last_real], 3,
+            "sequence should end with [SEP] after truncation: {row:?}"
+        );
+    }
+
+    #[test]
+    fn truncation_respects_max_length_budget() {
+        let max_length = 10;
+        let tok = test_tokenizer(max_length);
+        let docs = vec![
+            "the capital of france is paris hello world rust language".into(),
+            "hello world hello world hello world hello world".into(),
+        ];
+
+        let (ids, _mask, _types) =
+            tokenize_and_pad(&tok, "the capital of france is paris", &docs, max_length).unwrap();
+
+        assert!(
+            ids.shape()[1] <= max_length,
+            "padded width {} exceeds max_length {max_length}",
+            ids.shape()[1]
+        );
+    }
+
+    #[test]
     fn tokenize_and_pad_token_type_ids() {
-        let tok = test_tokenizer();
+        let tok = test_tokenizer(512);
         let docs = vec!["the capital of france".into()];
 
         let (_ids, _mask, types) = tokenize_and_pad(&tok, "paris", &docs, 512).unwrap();
@@ -435,7 +545,7 @@ mod tests {
 
     #[test]
     fn tokenize_and_pad_single_doc() {
-        let tok = test_tokenizer();
+        let tok = test_tokenizer(512);
         let docs = vec!["hello".into()];
 
         let (ids, mask, types) = tokenize_and_pad(&tok, "world", &docs, 512).unwrap();

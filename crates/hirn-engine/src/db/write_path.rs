@@ -180,6 +180,7 @@ pub async fn compute_rpe(
     search_limit: usize,
     stats: &mut RunningRpeStats,
     circuit_breaker: &RpeCircuitBreaker,
+    namespace: &Namespace,
 ) -> RpeResult {
     // ── Circuit-breaker check ─────────────────────────────────────────────
     if circuit_breaker.is_open() {
@@ -195,6 +196,12 @@ pub async fn compute_rpe(
     let mut max_sim: f32 = 0.0;
     let mut any_search_error = false;
 
+    // Scope the novelty search to the writing namespace so a foreign tenant's
+    // records can neither contaminate the RPE baseline nor act as a similarity
+    // timing oracle. This mirrors the per-(realm × namespace × model × layer)
+    // `RpePartitionKey` that keys the running statistics.
+    let namespace_filter = crate::admission::controllers::namespace_eq_filter(namespace);
+
     for dataset in &datasets {
         let exists = matches!(storage.exists(dataset).await, Ok(true));
         if !exists {
@@ -205,6 +212,7 @@ pub async fn compute_rpe(
             query: embedding.to_vec(),
             column: "embedding".into(),
             limit: search_limit,
+            filter: Some(namespace_filter.clone()),
             ..Default::default()
         };
 
@@ -287,15 +295,28 @@ pub struct BatchSearchResult {
 pub async fn batch_vector_search_max_sim(
     storage: &dyn PhysicalStore,
     embeddings: &[Vec<f32>],
+    namespaces: &[Namespace],
     search_limit: usize,
 ) -> Option<BatchSearchResult> {
     if embeddings.is_empty() {
         return None;
     }
+    debug_assert_eq!(
+        embeddings.len(),
+        namespaces.len(),
+        "batch_vector_search_max_sim: namespaces must be index-aligned with embeddings"
+    );
 
     let n = embeddings.len();
     let mut max_sims = vec![0.0_f32; n];
     let mut had_storage_error = false;
+
+    // Per-embedding namespace filter: each query is scoped to its own writing
+    // namespace so RPE similarity never crosses tenant boundaries (R-03).
+    let namespace_filters: Vec<String> = namespaces
+        .iter()
+        .map(crate::admission::controllers::namespace_eq_filter)
+        .collect();
 
     let datasets = ["episodic", "semantic", "procedural"];
 
@@ -306,10 +327,12 @@ pub async fn batch_vector_search_max_sim(
 
         let queries: Vec<VectorSearchOptions> = embeddings
             .iter()
-            .map(|emb| VectorSearchOptions {
+            .zip(namespace_filters.iter())
+            .map(|(emb, ns_filter)| VectorSearchOptions {
                 query: emb.clone(),
                 column: "embedding".into(),
                 limit: search_limit,
+                filter: Some(ns_filter.clone()),
                 ..Default::default()
             })
             .collect();
@@ -873,6 +896,86 @@ impl ShardedInterferenceTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── R-03 cross-namespace RPE scoping ────────────────────────────────
+
+    async fn temp_storage() -> (std::sync::Arc<dyn PhysicalStore>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let lance_path = dir.path().join("lance");
+        let config = hirn_storage::HirnDbConfig::local(lance_path.to_str().unwrap());
+        let backend = hirn_storage::HirnDb::open(config).await.unwrap();
+        (backend.store_arc(), dir)
+    }
+
+    async fn insert_episodic_ns(
+        storage: &std::sync::Arc<dyn PhysicalStore>,
+        emb: Vec<f32>,
+        namespace: Namespace,
+    ) {
+        let rec = hirn_core::episodic::EpisodicRecord::builder()
+            .content("existing memory")
+            .embedding(emb)
+            .agent_id(hirn_core::types::AgentId::new("test").unwrap())
+            .namespace(namespace)
+            .build()
+            .unwrap();
+        let batch =
+            hirn_storage::datasets::episodic::to_batch(std::slice::from_ref(&rec), 32).unwrap();
+        storage.append("episodic", batch).await.unwrap();
+    }
+
+    /// An identical record in a foreign namespace must not depress novelty
+    /// (raise similarity) for the writing namespace — the RPE search is scoped.
+    #[tokio::test]
+    async fn compute_rpe_is_scoped_to_writing_namespace() {
+        let (storage, _dir) = temp_storage().await;
+        let emb: Vec<f32> = (0..32).map(|i| (i as f32 * 0.1).sin()).collect();
+
+        let foreign_ns =
+            Namespace::private_for(&hirn_core::types::AgentId::new("agent-b").unwrap());
+        insert_episodic_ns(&storage, emb.clone(), foreign_ns).await;
+
+        // Writing into a DIFFERENT namespace: the foreign near-identical record
+        // is invisible, so max_similarity stays ~0 (fully novel).
+        let own_ns = Namespace::private_for(&hirn_core::types::AgentId::new("agent-a").unwrap());
+        let mut stats = RunningRpeStats::default();
+        let breaker = RpeCircuitBreaker::new();
+        let scoped = compute_rpe(
+            storage.as_ref(),
+            &emb,
+            0.3,
+            10,
+            &mut stats,
+            &breaker,
+            &own_ns,
+        )
+        .await;
+        assert!(
+            scoped.max_similarity < 0.5,
+            "foreign-namespace record must not raise similarity for writer, got {}",
+            scoped.max_similarity
+        );
+
+        // Sanity: writing into the SAME namespace as the record finds the match.
+        let mut stats2 = RunningRpeStats::default();
+        let breaker2 = RpeCircuitBreaker::new();
+        let same = compute_rpe(
+            storage.as_ref(),
+            &emb,
+            0.3,
+            10,
+            &mut stats2,
+            &breaker2,
+            &foreign_ns,
+        )
+        .await;
+        assert!(
+            same.max_similarity > scoped.max_similarity,
+            "same-namespace search should see the near-identical record ({} vs {})",
+            same.max_similarity,
+            scoped.max_similarity
+        );
+    }
 
     #[test]
     fn interference_score_low_similarity() {

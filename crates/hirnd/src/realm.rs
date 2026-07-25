@@ -153,12 +153,7 @@ impl RealmManager {
             for (k, v) in &backend.properties {
                 ns_cfg = ns_cfg.with_property(k, v);
             }
-            let mut db_cfg = HirnDbConfig::new(ns_cfg);
-            if let Some(ref cache_dir) = backend.fragment_cache_dir {
-                let realm_cache = std::path::Path::new(cache_dir).join(realm_id);
-                db_cfg = db_cfg.with_fragment_cache(realm_cache, backend.fragment_cache_max_bytes);
-            }
-            db_cfg
+            HirnDbConfig::new(ns_cfg)
         } else {
             // Local filesystem
             HirnDbConfig::local(lance_path.to_string_lossy())

@@ -175,12 +175,6 @@ pub async fn run_forgetting(
     // Grace period for purging: 7 days of being archived.
     let grace_period_hours = 168.0; // 7 days
 
-    let filter = crate::db::EpisodicFilter {
-        include_archived: true,
-        ..Default::default()
-    };
-    let episodes = db.list_episodes(&filter).await?;
-
     let mut records_decayed = 0;
     let mut records_archived = 0;
     let mut records_purged = 0;
@@ -188,56 +182,94 @@ pub async fn run_forgetting(
     let now = Timestamp::now();
     let now_dt = now.as_datetime();
 
-    for ep in &episodes {
-        let hours_since_access = now_dt
-            .signed_duration_since(ep.last_accessed.as_datetime())
-            .num_hours() as f64;
+    // R-63b: page the episodic scan in bounded batches instead of loading every
+    // record (including archived) at once. Decisions are collected during the
+    // read-only scan and the mutations are applied afterward, so at most one
+    // page of full records is resident at a time and paging is not disturbed by
+    // concurrent archival within the same pass.
+    let page_size = config.consolidation_batch_size.max(1);
+    let mut offset = 0usize;
+    let mut to_purge: Vec<MemoryId> = Vec::new();
+    let mut to_archive: Vec<MemoryId> = Vec::new();
 
-        // Skip very recently created records (grace period: 1 hour).
-        let hours_since_creation = now_dt
-            .signed_duration_since(ep.timestamp.as_datetime())
-            .num_hours() as f64;
-        if hours_since_creation < 1.0 {
-            continue;
+    loop {
+        let filter = crate::db::EpisodicFilter {
+            include_archived: true,
+            limit: Some(page_size),
+            offset: Some(offset),
+            ..Default::default()
+        };
+        let page = db.list_episodes(&filter).await?;
+        if page.is_empty() {
+            break;
         }
+        let page_len = page.len();
 
-        // Ebbinghaus retention score: R = e^(-t/S)
-        let retention = retention_score_with_alpha(
-            hours_since_access,
-            ep.stability,
-            ep.access_count,
-            config.spaced_repetition_alpha,
-        );
-        let effective_importance = ep.importance * retention;
-
-        // Check for purging (already archived + effective importance below the
-        // purge threshold for the whole grace period). Grace is measured from
-        // the archival revision (`updated_at`, stamped when `archived` was
-        // set) AND from the last access — measuring from last access alone
-        // let a record archived this very pass be hard-deleted immediately if
-        // it simply hadn't been read for a week, i.e. no post-archival grace
-        // at all.
-        if ep.archived && effective_importance < purge_threshold {
-            let hours_since_archival = now_dt
-                .signed_duration_since(ep.updated_at.as_datetime())
+        for ep in &page {
+            let hours_since_access = now_dt
+                .signed_duration_since(ep.last_accessed.as_datetime())
                 .num_hours() as f64;
-            if hours_since_access > grace_period_hours && hours_since_archival > grace_period_hours
-            {
-                db.delete_episode(ep.id).await?;
-                records_purged += 1;
+
+            // Skip very recently created records (grace period: 1 hour).
+            let hours_since_creation = now_dt
+                .signed_duration_since(ep.timestamp.as_datetime())
+                .num_hours() as f64;
+            if hours_since_creation < 1.0 {
                 continue;
+            }
+
+            // Ebbinghaus retention score: R = e^(-t/S)
+            let retention = retention_score_with_alpha(
+                hours_since_access,
+                ep.stability,
+                ep.access_count,
+                config.spaced_repetition_alpha,
+            );
+            let effective_importance = ep.importance * retention;
+
+            // Check for purging (already archived + effective importance below
+            // the purge threshold for the whole grace period). Grace is
+            // measured from the archival revision (`updated_at`, stamped when
+            // `archived` was set) AND from the last access — measuring from
+            // last access alone let a record archived this very pass be
+            // hard-deleted immediately if it simply hadn't been read for a
+            // week, i.e. no post-archival grace at all.
+            if ep.archived && effective_importance < purge_threshold {
+                let hours_since_archival = now_dt
+                    .signed_duration_since(ep.updated_at.as_datetime())
+                    .num_hours() as f64;
+                if hours_since_access > grace_period_hours
+                    && hours_since_archival > grace_period_hours
+                {
+                    to_purge.push(ep.id);
+                    records_purged += 1;
+                    continue;
+                }
+            }
+
+            // Check for archiving.
+            if !ep.archived && effective_importance < archive_threshold {
+                to_archive.push(ep.id);
+                records_archived += 1;
+                records_decayed += 1;
+            } else if effective_importance < ep.importance * 0.999 {
+                // Track as decayed if retention caused meaningful drop.
+                records_decayed += 1;
             }
         }
 
-        // Check for archiving.
-        if !ep.archived && effective_importance < archive_threshold {
-            db.archive_episode(ep.id).await?;
-            records_archived += 1;
-            records_decayed += 1;
-        } else if effective_importance < ep.importance * 0.999 {
-            // Track as decayed if retention caused meaningful drop.
-            records_decayed += 1;
+        if page_len < page_size {
+            break;
         }
+        offset += page_size;
+    }
+
+    // Apply the collected mutations after the scan completes.
+    for id in &to_purge {
+        db.delete_episode(*id).await?;
+    }
+    for id in &to_archive {
+        db.archive_episode(*id).await?;
     }
 
     // Decay Hebbian edge weights and prune those below threshold in a single
@@ -426,6 +458,39 @@ mod tests {
         assert!(
             (r - expected_r).abs() < 1e-5,
             "got {r}, expected {expected_r}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_forgetting_pages_beyond_a_single_batch() {
+        // R-63b: with more archivable records than one page, paging must scan
+        // every page and archive them all (the old code loaded everything at
+        // once; this asserts the paged scan still reaches the tail).
+        let (db, _dir) = temp_db().await;
+        let old = Timestamp::from_datetime(chrono::Utc::now() - chrono::Duration::days(30));
+        for i in 0..5 {
+            let rec = EpisodicRecord::builder()
+                .event_type(EventType::Observation)
+                .content(format!("stale event {i}"))
+                .summary(format!("stale event {i}"))
+                .embedding(vec![0.1, 0.2, 0.3, 0.4])
+                .importance(0.01) // effective importance well below archive_threshold (0.1)
+                .agent_id(AgentId::new("forgetting-page").unwrap())
+                .timestamp(old)
+                .build()
+                .unwrap();
+            db.remember_bypass_admission(rec).await.unwrap();
+        }
+
+        // Page size 2 → three pages for five records.
+        let config = ConsolidationConfig {
+            consolidation_batch_size: 2,
+            ..Default::default()
+        };
+        let result = run_forgetting(&db, &config).await.unwrap();
+        assert_eq!(
+            result.records_archived, 5,
+            "every page must be scanned and all stale records archived"
         );
     }
 

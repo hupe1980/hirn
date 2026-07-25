@@ -1,3 +1,14 @@
+//! HTTP realm write-owner forwarding scaffolding.
+//!
+//! **Dormant by design (R-13).** Multi-node write correctness is provided by
+//! Lance manifest compare-and-swap (optimistic concurrency + retry), not by a
+//! single-writer realm owner — see `crate::raft::coordinator` and
+//! `docs/deployment.md`. No `AssignRealm` command is ever proposed, so
+//! [`CoordinationRuntime::realm_write_owner`] always resolves to `None` and
+//! writes execute locally. This module is retained as the seam for a possible
+//! future, metrics-gated realm-affinity *throughput* optimisation; it must
+//! never gate the write path for correctness.
+
 use axum::Json;
 use axum::http::{HeaderMap, StatusCode};
 use metrics::counter;

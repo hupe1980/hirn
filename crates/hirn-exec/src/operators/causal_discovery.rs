@@ -4,7 +4,6 @@
 //! causal relationships. Uses a simplified Granger approach: if event A
 //! consistently precedes event B within a time window, infer A → B.
 
-use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
@@ -51,7 +50,7 @@ impl Default for CausalDiscoveryConfig {
 pub struct CausalDiscoveryExec {
     input: Arc<dyn ExecutionPlan>,
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     config: CausalDiscoveryConfig,
     namespace: String,
 }
@@ -63,12 +62,12 @@ impl CausalDiscoveryExec {
         namespace: String,
     ) -> Self {
         let schema = Self::output_schema();
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             datafusion_physical_expr::EquivalenceProperties::new(schema.clone()),
             datafusion_physical_plan::Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
         Self {
             input,
             schema,
@@ -105,15 +104,11 @@ impl ExecutionPlan for CausalDiscoveryExec {
         "CausalDiscoveryExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -146,64 +141,75 @@ impl ExecutionPlan for CausalDiscoveryExec {
             use futures::StreamExt;
             use std::collections::HashMap;
 
-            // Collect temporal patterns: (content_a, content_b) → co-occurrence count.
-            let mut pair_counts: HashMap<(String, String), Vec<(String, String)>> = HashMap::new();
+            // Co-occurrence window in milliseconds (timestamps are `created_at_ms`).
+            let window_ms = config.max_time_gap_secs.saturating_mul(1000) as i64;
+
+            // Deduplicate on the ordered pair of record IDs so evidence counts are
+            // deterministic and free of the content-prefix collisions the old
+            // 50-char key suffered. Key: (cause_id, effect_id) → co-occurrence count.
+            let mut pair_counts: HashMap<(String, String), u32> = HashMap::new();
 
             let mut stream = input;
-            let mut prev_records: Vec<(String, String, u64)> = Vec::new(); // (id, content, timestamp)
+            let mut prev_records: Vec<(String, i64)> = Vec::new(); // (id, timestamp_ms)
 
             while let Some(batch) = stream.next().await {
                 let batch = batch?;
 
                 let id_col = batch.column_by_name("id");
                 let content_col = batch.column_by_name("content");
-                let ts_col = batch.column_by_name("created_at");
+                // Temporal ordering column is `created_at_ms` (Int64), matching the
+                // convention used by the sibling recall/graph operators.
+                let ts_col = batch.column_by_name("created_at_ms");
 
                 if let (Some(ids), Some(contents)) = (id_col, content_col) {
                     if let (Some(id_arr), Some(content_arr)) = (
                         ids.as_any().downcast_ref::<StringArray>(),
                         contents.as_any().downcast_ref::<StringArray>(),
                     ) {
-                        let timestamps: Vec<u64> = ts_col
+                        let timestamps: Vec<i64> = ts_col
                             .and_then(|c| {
                                 c.as_any()
-                                    .downcast_ref::<arrow_array::UInt64Array>()
+                                    .downcast_ref::<arrow_array::Int64Array>()
                                     .map(|a| (0..a.len()).map(|i| a.value(i)).collect())
                             })
-                            .unwrap_or_else(|| vec![0u64; id_arr.len()]);
+                            .unwrap_or_else(|| vec![0i64; id_arr.len()]);
 
                         for i in 0..id_arr.len() {
                             if id_arr.is_null(i) || content_arr.is_null(i) {
                                 continue;
                             }
                             let id = id_arr.value(i).to_string();
-                            let content = content_arr.value(i).to_string();
                             let ts = timestamps.get(i).copied().unwrap_or(0);
 
+                            // Time-window pruning: drop previous records that are
+                            // older than the co-occurrence window. This bounds
+                            // `prev_records` to the window instead of growing O(n).
+                            prev_records
+                                .retain(|(_, prev_ts)| ts.saturating_sub(*prev_ts) <= window_ms);
+
                             // Check temporal co-occurrence with previous records.
-                            for (prev_id, prev_content, prev_ts) in &prev_records {
-                                if ts > *prev_ts
-                                    && (ts - prev_ts) <= config.max_time_gap_secs * 1000
-                                {
-                                    // Normalize: use first ~50 chars as content key.
-                                    let key_a = truncate_key(prev_content);
-                                    let key_b = truncate_key(&content);
-                                    if key_a != key_b {
-                                        pair_counts
-                                            .entry((key_a, key_b))
-                                            .or_default()
-                                            .push((prev_id.clone(), id.clone()));
-                                    }
+                            for (prev_id, prev_ts) in &prev_records {
+                                if ts > *prev_ts && (ts - prev_ts) <= window_ms && *prev_id != id {
+                                    *pair_counts
+                                        .entry((prev_id.clone(), id.clone()))
+                                        .or_insert(0) += 1;
                                 }
                             }
 
-                            prev_records.push((id, content, ts));
+                            prev_records.push((id, ts));
                         }
                     }
                 }
             }
 
-            // Filter by minimum evidence and compute strength.
+            // Filter by minimum evidence/confidence, then emit in a deterministic
+            // order (sorted by cause_id, then effect_id) so runs are reproducible.
+            let mut edges: Vec<((String, String), u32)> = pair_counts
+                .into_iter()
+                .filter(|(_, count)| *count >= config.min_evidence)
+                .collect();
+            edges.sort_by(|a, b| a.0.cmp(&b.0));
+
             let mut cause_ids = Vec::new();
             let mut effect_ids = Vec::new();
             let mut strengths = Vec::new();
@@ -211,11 +217,7 @@ impl ExecutionPlan for CausalDiscoveryExec {
             let mut evidence_counts = Vec::new();
             let mut mechanisms: Vec<Option<String>> = Vec::new();
 
-            for ((_key_a, _key_b), pairs) in &pair_counts {
-                let count = pairs.len() as u32;
-                if count < config.min_evidence {
-                    continue;
-                }
+            for ((cause, effect), count) in edges {
                 // Strength proportional to evidence count (capped).
                 let strength = (count as f32 / 10.0).min(1.0);
                 // Confidence increases with evidence, logarithmically.
@@ -225,15 +227,12 @@ impl ExecutionPlan for CausalDiscoveryExec {
                     continue;
                 }
 
-                // Use the last observed pair as representative.
-                if let Some((cause, effect)) = pairs.last() {
-                    cause_ids.push(cause.clone());
-                    effect_ids.push(effect.clone());
-                    strengths.push(strength);
-                    confidences.push(confidence);
-                    evidence_counts.push(count);
-                    mechanisms.push(Some("temporal_granger".to_string()));
-                }
+                cause_ids.push(cause);
+                effect_ids.push(effect);
+                strengths.push(strength);
+                confidences.push(confidence);
+                evidence_counts.push(count);
+                mechanisms.push(Some("temporal_granger".to_string()));
             }
 
             let batch = RecordBatch::try_new(
@@ -259,7 +258,109 @@ impl ExecutionPlan for CausalDiscoveryExec {
     }
 }
 
-fn truncate_key(s: &str) -> String {
-    let chars: Vec<char> = s.chars().take(50).collect();
-    chars.into_iter().collect::<String>().to_lowercase()
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::MemoryBatchExec;
+    use arrow_array::Int64Array;
+    use futures::StreamExt;
+
+    fn input_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("content", DataType::Utf8, false),
+            Field::new("created_at_ms", DataType::Int64, false),
+        ]))
+    }
+
+    /// Build a batch of time-ordered records where cause ids `A` consistently
+    /// precede effect ids `B` (reusing the same ids so evidence accumulates).
+    fn related_batch() -> RecordBatch {
+        let ids = vec!["A", "B", "A", "B", "A", "B", "A", "B"];
+        let contents = vec![
+            "cause event",
+            "effect event",
+            "cause event",
+            "effect event",
+            "cause event",
+            "effect event",
+            "cause event",
+            "effect event",
+        ];
+        // Strictly increasing timestamps (ms), each 1s apart.
+        let ts: Vec<i64> = (0..8).map(|i| i as i64 * 1000).collect();
+        RecordBatch::try_new(
+            input_schema(),
+            vec![
+                Arc::new(StringArray::from(ids)),
+                Arc::new(StringArray::from(contents)),
+                Arc::new(Int64Array::from(ts)),
+            ],
+        )
+        .unwrap()
+    }
+
+    async fn run_once() -> RecordBatch {
+        let mem = MemoryBatchExec::new(input_schema(), vec![related_batch()]);
+        let exec = CausalDiscoveryExec::new(
+            Arc::new(mem),
+            CausalDiscoveryConfig::default(),
+            "test".to_string(),
+        );
+        let ctx = Arc::new(TaskContext::default());
+        let mut stream = exec.execute(0, ctx).unwrap();
+        stream.next().await.unwrap().unwrap()
+    }
+
+    #[tokio::test]
+    async fn causal_discovery_emits_pairs_for_time_ordered_records() {
+        // R-53b: with `created_at_ms` (Int64) read correctly, time-ordered
+        // related records must actually produce causal edges (previously a
+        // no-op because timestamps read as 0 from the wrong column).
+        let batch = run_once().await;
+        assert!(
+            batch.num_rows() > 0,
+            "causal discovery should emit pairs for time-ordered related records"
+        );
+
+        // Output must be deterministic across runs (sorted by cause/effect id).
+        let batch2 = run_once().await;
+        assert_eq!(batch.num_rows(), batch2.num_rows());
+
+        let causes = |b: &RecordBatch| -> Vec<String> {
+            b.column_by_name("cause_id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .iter()
+                .map(|v| v.unwrap().to_string())
+                .collect()
+        };
+        let effects = |b: &RecordBatch| -> Vec<String> {
+            b.column_by_name("effect_id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .iter()
+                .map(|v| v.unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(
+            causes(&batch),
+            causes(&batch2),
+            "cause order must be deterministic"
+        );
+        assert_eq!(
+            effects(&batch),
+            effects(&batch2),
+            "effect order must be deterministic"
+        );
+
+        // Sorted-by-cause invariant holds.
+        let mut sorted = causes(&batch);
+        sorted.sort();
+        assert_eq!(causes(&batch), sorted, "cause_ids should be emitted sorted");
+    }
 }

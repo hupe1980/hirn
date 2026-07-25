@@ -2790,6 +2790,7 @@ impl HirnDB {
             self,
             stmt,
             records,
+            scope.actor_id,
             allowed_query_namespaces.as_deref(),
         )
         .await?;
@@ -2822,6 +2823,13 @@ impl HirnDB {
             .await
             .map_err(map_datafusion_error)?;
         let execute_plan_ms = duration_ms(execute_plan_start.elapsed());
+
+        // R-19: apply recall-path Hebbian co-retrieval learning recorded by
+        // `HebbianBufferExec` during plan execution. The queue is empty for
+        // plans that do not contain the operator, so this is a no-op there.
+        if let Err(e) = self.drain_co_retrieval_hebbian().await {
+            tracing::warn!(error = %e, "co-retrieval hebbian drain after compiled plan failed");
+        }
 
         Ok(CompiledPlanExecution {
             batches,
@@ -2925,15 +2933,7 @@ impl HirnDB {
 }
 
 fn recall_scoring_weights(db: &HirnDB) -> ScoringWeights {
-    ScoringWeights {
-        similarity: db.config().scoring_similarity_weight,
-        importance: db.config().scoring_importance_weight,
-        recency: db.config().scoring_recency_weight,
-        activation: db.config().scoring_activation_weight,
-        causal_relevance: db.config().scoring_causal_relevance_weight,
-        surprise: db.config().scoring_surprise_weight,
-        source_reliability: db.config().scoring_source_reliability_weight,
-    }
+    ScoringWeights::from_config(db.config())
 }
 
 fn think_context_config(
@@ -3198,7 +3198,7 @@ fn is_storage_backed_recall_filter(filter: &hirn_query::TypedFilter) -> bool {
 
 /// Strip the terminal `ContextAssembly` extension node from a THINK logical plan.
 ///
-/// Returns the inner plan (output of `ContextBudgetExec` / `McfaDefenseExec`) so
+/// Returns the inner plan (output of `ContextBudgetExec`) so
 /// that `execute_compiled_plan_batches` can run the decode phase without trying
 /// to call the assembly runtime (which isn't registered yet at that point).
 ///
@@ -3803,7 +3803,7 @@ mod tests {
     fn sample_recall_stmt(hybrid: bool) -> RecallStmt {
         RecallStmt {
             layers: Vec::new(),
-            about: "release readiness".to_string(),
+            about: hirn_query::StringOrParam::Literal("release readiness".to_string()),
             involving: None,
             temporal: None,
             as_of: None,
@@ -3836,7 +3836,7 @@ mod tests {
 
     fn sample_think_stmt(hybrid: bool) -> ThinkStmt {
         ThinkStmt {
-            about: "release readiness".to_string(),
+            about: hirn_query::StringOrParam::Literal("release readiness".to_string()),
             involving: None,
             temporal: None,
             expand: None,
@@ -3862,13 +3862,19 @@ mod tests {
     fn compiled_preview_rerank_query_text_uses_non_empty_query_regardless_of_hybrid() {
         let stmt = sample_recall_stmt(false);
         assert_eq!(
-            compiled_preview_rerank_query_text(stmt.hybrid, &stmt.about),
+            compiled_preview_rerank_query_text(
+                stmt.hybrid,
+                stmt.about.as_literal().unwrap_or_default()
+            ),
             Some("release readiness")
         );
 
         let stmt = sample_recall_stmt(true);
         assert_eq!(
-            compiled_preview_rerank_query_text(stmt.hybrid, &stmt.about),
+            compiled_preview_rerank_query_text(
+                stmt.hybrid,
+                stmt.about.as_literal().unwrap_or_default()
+            ),
             Some("release readiness")
         );
     }
@@ -3878,14 +3884,20 @@ mod tests {
         let stmt = sample_think_stmt(false);
         let recall_stmt = crate::ql::read_support::recall_stmt_from_think(&stmt);
         assert_eq!(
-            compiled_preview_rerank_query_text(recall_stmt.hybrid, &stmt.about),
+            compiled_preview_rerank_query_text(
+                recall_stmt.hybrid,
+                stmt.about.as_literal().unwrap_or_default()
+            ),
             Some("release readiness")
         );
 
         let stmt = sample_think_stmt(true);
         let recall_stmt = crate::ql::read_support::recall_stmt_from_think(&stmt);
         assert_eq!(
-            compiled_preview_rerank_query_text(recall_stmt.hybrid, &stmt.about),
+            compiled_preview_rerank_query_text(
+                recall_stmt.hybrid,
+                stmt.about.as_literal().unwrap_or_default()
+            ),
             Some("release readiness")
         );
     }
@@ -4049,6 +4061,7 @@ mod tests {
             self.inner.tag(dataset, tag).await
         }
 
+        #[allow(deprecated)] // forwarding a deprecated trait method on a test mock
         async fn checkout(&self, dataset: &str, version: u64) -> Result<(), HirnDbError> {
             self.inner.checkout(dataset, version).await
         }

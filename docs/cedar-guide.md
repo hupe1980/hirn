@@ -3,7 +3,7 @@ title: Cedar Guide
 parent: Security
 nav_order: 1
 description: >-
-  Write authorization policies for hirn with Cedar: the entity model, 18 actions,
+  Write authorization policies for hirn with Cedar: the entity model, 20 actions,
   RBAC and ABAC, realm isolation, and runtime policy management via HirnQL.
 ---
 
@@ -86,6 +86,7 @@ always wins over `permit` in Cedar, which is what makes fail-closed narrowing sa
 |--------|-------------|-------------|
 | `remember` | Store new memories | Write access |
 | `correct` | Append a corrected semantic revision | Semantic edit |
+| `reflect` | Revise a belief's credence from new evidence (distinct from `correct`) | Belief revision |
 | `supersede` | Advance the authoritative semantic head | Semantic edit |
 | `merge` | Merge semantic logical memories into one active chain | Semantic edit |
 | `retract` | Tombstone a semantic memory while preserving history | Semantic edit |
@@ -97,6 +98,7 @@ always wins over `permit` in Cedar, which is what makes fail-closed narrowing sa
 | `watch` | Stream real-time events | Read access |
 | `connect` | Create graph edges | Write access |
 | `execute` | Execute HirnQL queries | Combined |
+| `review` | Approve/reject/rollback quarantined memories | Admin |
 | `admin` | Administrative operations | Admin |
 | `recall_raw_text` | Recall with raw text content | Privileged read |
 | `read` | Coarse-grained read permission for tools and layers | Generic read |

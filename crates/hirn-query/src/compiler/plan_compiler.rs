@@ -110,8 +110,6 @@ pub enum HirnOp {
     IterativeRetrieval { max_hops: u32 },
     /// Interference detection.
     InterferenceDetector,
-    /// MCFA defense — memory control-flow attack detection.
-    McfaDefense,
     /// Prospective search — check pre-indexed questions for recall short-circuit.
     ProspectiveSearch { query: String, namespace: String },
     /// SVO event scan — structured scan of the svo_events dataset.
@@ -284,7 +282,6 @@ impl UserDefinedLogicalNodeCore for HirnPlanNode {
             HirnOp::QualityGate { .. } => "HirnQualityGate",
             HirnOp::IterativeRetrieval { .. } => "HirnIterativeRetrieval",
             HirnOp::InterferenceDetector => "HirnInterferenceDetector",
-            HirnOp::McfaDefense => "HirnMcfaDefense",
             HirnOp::ProspectiveSearch { .. } => "HirnProspectiveSearch",
             HirnOp::SvoEventScan { .. } => "HirnSvoEventScan",
             HirnOp::SemanticHistoryScan { .. } => "HirnSemanticHistoryScan",
@@ -421,6 +418,66 @@ fn dfschema(schema: SchemaRef) -> DFSchemaRef {
     Arc::new(datafusion_common::DFSchema::try_from(schema).expect("valid schema"))
 }
 
+/// Physical column layout carried through the recall/think operator chain.
+///
+/// Several physical operators append tail columns to the base recall schema
+/// (`GraphActivationExec`: `activation_score`+`depth`, `CausalChainExec`:
+/// `causal_score`+`causal_depth`, `IterativeRetrievalExec`:
+/// `retrieval_round`, `QualityGateExec`: `quality_score`+`quality_action`).
+/// The compiler tracks these so the `ContextBudget` node can declare a
+/// logical schema identical to the physical operator's output.
+#[derive(Debug, Clone)]
+struct CarriedRecallFields(Vec<Field>);
+
+impl CarriedRecallFields {
+    fn new() -> Self {
+        Self(
+            recall_schema()
+                .fields()
+                .iter()
+                .map(|field| field.as_ref().clone())
+                .collect(),
+        )
+    }
+
+    fn push(&mut self, name: &str, data_type: DataType, nullable: bool) {
+        self.0.push(Field::new(name, data_type, nullable));
+    }
+
+    fn after_graph_activation(&mut self, activation: ActivationRepr) {
+        // `ActivationRepr::None` lowers to a physical pass-through — no
+        // columns are appended in that case.
+        if activation != ActivationRepr::None {
+            self.push("activation_score", DataType::Float32, false);
+            self.push("depth", DataType::UInt32, false);
+        }
+    }
+
+    fn after_causal_chain(&mut self) {
+        self.push("causal_score", DataType::Float32, false);
+        self.push("causal_depth", DataType::UInt32, false);
+    }
+
+    fn after_iterative_retrieval(&mut self) {
+        self.push("retrieval_round", DataType::UInt32, false);
+    }
+
+    fn after_quality_gate(&mut self) {
+        self.push("quality_score", DataType::Float32, false);
+        self.push("quality_action", DataType::Utf8, false);
+    }
+
+    /// Schema of a `ContextBudget` node: the carried input layout plus the
+    /// two columns the physical `ContextBudgetExec` appends
+    /// (`assembly_mode`, `token_count`).
+    fn context_budget_dfschema(&self) -> DFSchemaRef {
+        let mut fields = self.0.clone();
+        fields.push(Field::new("assembly_mode", DataType::Utf8, false));
+        fields.push(Field::new("token_count", DataType::UInt32, false));
+        dfschema(Arc::new(Schema::new(fields)))
+    }
+}
+
 // ── Compiler ───────────────────────────────────────────────────────────
 
 /// Compile a `TypedStatement` into a DataFusion `LogicalPlan`.
@@ -478,10 +535,16 @@ pub fn compile(stmt: &TypedStatement) -> HirnResult<LogicalPlan> {
     }
 }
 
-/// Compile RECALL: [QueryComplexity] → HybridSearch → [GraphActivation] → [CausalChain] → HebbianBuffer → [ContextBudget] → [McfaDefense]
+/// Compile RECALL: [QueryComplexity] → HybridSearch → [GraphActivation] → [CausalChain] → HebbianBuffer → [ContextBudget]
+///
+/// MCFA defense (`WITH MCFA_DEFENSE ON`) is enforced by the engine's scored
+/// post-processing path (`read_support::apply_mcfa_filter_to_scored`), which
+/// also writes flagged rows to the `mcfa_audit_log` dataset — it is therefore
+/// not part of the compiled plan.
 fn compile_recall(r: &TypedRecall) -> HirnResult<LogicalPlan> {
     let result_schema = dfschema(recall_schema());
     let ns = r.namespace.as_str().to_string();
+    let mut carried = CarriedRecallFields::new();
 
     // Stage 0: Query complexity classification (only for DEPTH AUTO).
     // For DEPTH FULL/SUMMARY the engine uses a fixed pipeline depth.
@@ -534,12 +597,14 @@ fn compile_recall(r: &TypedRecall) -> HirnResult<LogicalPlan> {
     // Stage 2: Graph activation (skip for DEPTH SUMMARY or if no EXPAND GRAPH).
     let after_graph = if r.depth != DepthMode::Summary {
         if let Some(ref expand) = r.expand {
+            let activation: ActivationRepr = expand.activation.into();
+            carried.after_graph_activation(activation);
             hirn_extension(
                 HirnOp::GraphActivation {
                     seed_limit: r.limit,
                     depth: expand.depth,
                     min_weight: expand.min_weight.map(|w| (w * 1000.0) as u32),
-                    activation: expand.activation.into(),
+                    activation,
                 },
                 result_schema.clone(),
                 vec![after_seed_predicates],
@@ -553,6 +618,7 @@ fn compile_recall(r: &TypedRecall) -> HirnResult<LogicalPlan> {
 
     // Stage 3: Causal chain (optional — only if FOLLOW CAUSES).
     let after_causal = if let Some(depth) = r.follow_causes {
+        carried.after_causal_chain();
         hirn_extension(
             HirnOp::CausalChain { depth },
             result_schema.clone(),
@@ -569,22 +635,17 @@ fn compile_recall(r: &TypedRecall) -> HirnResult<LogicalPlan> {
         vec![after_causal],
     );
 
-    // Stage 5: Context budget (optional).
-    let after_budget = if let Some(budget) = r.budget {
+    // Stage 5: Context budget (optional). The node declares the exact
+    // physical output layout (carried input columns + the two appended
+    // columns), so logical == physical schema.
+    let final_plan = if let Some(budget) = r.budget {
         hirn_extension(
             HirnOp::ContextBudget { budget },
-            result_schema.clone(),
+            carried.context_budget_dfschema(),
             vec![after_hebbian],
         )
     } else {
         after_hebbian
-    };
-
-    // Stage 6: MCFA defense (optional — only if WITH MCFA_DEFENSE ON).
-    let final_plan = if r.with_mcfa {
-        hirn_extension(HirnOp::McfaDefense, result_schema, vec![after_budget])
-    } else {
-        after_budget
     };
 
     Ok(final_plan)
@@ -879,10 +940,14 @@ fn think_source_plan(
     }
 }
 
-/// Compile THINK: [QueryComplexity] → HybridSearch → [GraphActivation] → [IterativeRetrieval] → QualityGate → HebbianBuffer → ContextBudget → [McfaDefense]
+/// Compile THINK: [QueryComplexity] → HybridSearch → [GraphActivation] → [IterativeRetrieval] → QualityGate → HebbianBuffer → ContextBudget → ContextAssembly
+///
+/// MCFA defense (`WITH MCFA_DEFENSE ON`) is enforced by the engine's scored
+/// post-processing path (see `compile_recall`), not by the compiled plan.
 fn compile_think(t: &TypedThink) -> HirnResult<LogicalPlan> {
     let result_schema = dfschema(recall_schema());
     let effective_mode = resolve_think_mode(t);
+    let mut carried = CarriedRecallFields::new();
 
     // Stage 0: Query complexity classification (only for DEPTH AUTO).
     let complexity = if t.depth == DepthMode::Auto {
@@ -903,12 +968,14 @@ fn compile_think(t: &TypedThink) -> HirnResult<LogicalPlan> {
     // Stage 2: Graph activation (skip for DEPTH SUMMARY).
     let after_graph = if t.depth != DepthMode::Summary {
         if let Some(ref expand) = t.expand {
+            let activation: ActivationRepr = expand.activation.into();
+            carried.after_graph_activation(activation);
             hirn_extension(
                 HirnOp::GraphActivation {
                     seed_limit: t.limit,
                     depth: expand.depth,
                     min_weight: expand.min_weight.map(|w| (w * 1000.0) as u32),
-                    activation: expand.activation.into(),
+                    activation,
                 },
                 result_schema.clone(),
                 vec![search],
@@ -922,6 +989,7 @@ fn compile_think(t: &TypedThink) -> HirnResult<LogicalPlan> {
 
     // Stage 3: Causal chain (optional — only if FOLLOW CAUSES).
     let after_causal = if let Some(depth) = t.follow_causes {
+        carried.after_causal_chain();
         hirn_extension(
             HirnOp::CausalChain { depth },
             result_schema.clone(),
@@ -933,6 +1001,7 @@ fn compile_think(t: &TypedThink) -> HirnResult<LogicalPlan> {
 
     // Stage 4: Iterative multi-hop (only if MODE ITERATIVE).
     let after_iterative = if effective_mode == ResolvedThinkMode::Iterative {
+        carried.after_iterative_retrieval();
         hirn_extension(
             HirnOp::IterativeRetrieval {
                 max_hops: t.max_hops.unwrap_or(3) as u32,
@@ -945,6 +1014,7 @@ fn compile_think(t: &TypedThink) -> HirnResult<LogicalPlan> {
     };
 
     // Stage 5: Quality gate.
+    carried.after_quality_gate();
     let after_gate = hirn_extension(
         HirnOp::QualityGate {
             threshold: 500, // 0.5 default
@@ -960,27 +1030,22 @@ fn compile_think(t: &TypedThink) -> HirnResult<LogicalPlan> {
         vec![after_gate],
     );
 
-    // Stage 7: Context budget.
+    // Stage 7: Context budget. The node declares the exact physical output
+    // layout (carried input columns + the two appended columns), so
+    // logical == physical schema.
     let after_budget = hirn_extension(
         HirnOp::ContextBudget { budget: t.budget },
-        result_schema.clone(),
+        carried.context_budget_dfschema(),
         vec![after_hebbian],
     );
 
-    // Stage 8: MCFA defense (optional — only if WITH MCFA_DEFENSE ON).
-    let after_mcfa = if t.with_mcfa {
-        hirn_extension(HirnOp::McfaDefense, result_schema, vec![after_budget])
-    } else {
-        after_budget
-    };
-
-    // Stage 9: Context assembly — Arrow-native terminal operator that assembles
+    // Stage 8: Context assembly — Arrow-native terminal operator that assembles
     // working memory, graph/causal sections, contradiction detection, and
     // resource previews into a single opaque JSON row for the engine to decode.
     let final_plan = hirn_extension(
         HirnOp::ContextAssembly,
         dfschema(context_assembly_schema()),
-        vec![after_mcfa],
+        vec![after_budget],
     );
 
     Ok(final_plan)
@@ -1371,16 +1436,73 @@ pub fn query_hash(query: &str) -> u64 {
 ///
 /// Use this in the query pipeline so the normalized source can be stored in
 /// the plan cache for collision detection (N-M19).
+///
+/// Normalization is keyword case-insensitive and whitespace-collapsing **only
+/// outside string literals**. Literal contents (the bytes between matching `"`
+/// or `'` quotes, honoring `\` escapes) are preserved verbatim — including
+/// their case and interior whitespace — so that `ABOUT "Apple"` and
+/// `ABOUT "apple"`, or `ABOUT "a  b"` and `ABOUT "a b"`, produce distinct
+/// normalized strings and hashes. Collapsing them would let the plan cache
+/// serve one query the compiled plan of another whose only difference is a
+/// literal value that feeds the embedding vector and FTS term (R-47).
 pub fn query_normalize_and_hash(query: &str) -> (String, u64) {
-    let normalized = query
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_uppercase();
+    let normalized = normalize_outside_literals(query);
     let mut hasher = DefaultHasher::new();
     normalized.hash(&mut hasher);
     let hash = hasher.finish();
     (normalized, hash)
+}
+
+/// Uppercase + whitespace-collapse the query text, but preserve the byte-exact
+/// contents of every string literal (single- or double-quoted, `\`-escaped).
+fn normalize_outside_literals(query: &str) -> String {
+    let mut out = String::with_capacity(query.len());
+    // Quote char of the literal we are currently inside, if any.
+    let mut in_string: Option<char> = None;
+    // Whether the previous byte inside a string was an unescaped backslash.
+    let mut escaped = false;
+    // A whitespace run outside a literal is deferred as a single space and only
+    // emitted when a subsequent non-whitespace char arrives (trims both ends).
+    let mut pending_space = false;
+
+    for c in query.chars() {
+        match in_string {
+            Some(quote) => {
+                // Inside a literal: copy verbatim, tracking escapes so an
+                // escaped quote does not close the literal.
+                out.push(c);
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == quote {
+                    in_string = None;
+                }
+            }
+            None => {
+                if c.is_whitespace() {
+                    if !out.is_empty() {
+                        pending_space = true;
+                    }
+                } else {
+                    if pending_space {
+                        out.push(' ');
+                        pending_space = false;
+                    }
+                    if c == '"' || c == '\'' {
+                        in_string = Some(c);
+                        out.push(c);
+                    } else {
+                        // uppercase (may expand to multiple chars, e.g. ß)
+                        for up in c.to_uppercase() {
+                            out.push(up);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
@@ -1709,10 +1831,67 @@ mod tests {
 
     #[test]
     fn query_hash_normalizes() {
+        // Case-insensitive keywords and collapsed whitespace *outside* the
+        // literal produce the same key when the literal content is identical.
         let h1 = query_hash(r#"RECALL  episodic  ABOUT  "test""#);
         let h2 = query_hash(r#"recall episodic about "test""#);
-        // Both normalize to uppercase with single spaces.
         assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn query_hash_distinguishes_case_variant_literals() {
+        // R-47: the literal feeds the embedding vector and FTS term, so a
+        // case-variant literal MUST yield a different cache key/plan — even
+        // though the keywords are byte-identical.
+        let h1 = query_hash(r#"RECALL episodic ABOUT "Apple""#);
+        let h2 = query_hash(r#"RECALL episodic ABOUT "apple""#);
+        assert_ne!(h1, h2);
+
+        // The normalized source (used by the collision guard) must differ too.
+        let (n1, _) = query_normalize_and_hash(r#"RECALL episodic ABOUT "Apple""#);
+        let (n2, _) = query_normalize_and_hash(r#"RECALL episodic ABOUT "apple""#);
+        assert_ne!(n1, n2);
+        assert!(n1.contains("Apple"), "literal case preserved: {n1}");
+        assert!(n2.contains("apple"), "literal case preserved: {n2}");
+        // Keywords are still upper-cased outside the literal.
+        assert!(n1.starts_with("RECALL EPISODIC ABOUT "));
+    }
+
+    #[test]
+    fn query_hash_preserves_whitespace_inside_literals() {
+        // R-47: interior whitespace of a literal is meaningful (distinct FTS
+        // term / embedding), so it must NOT be collapsed.
+        let h1 = query_hash(r#"RECALL episodic ABOUT "a  b""#);
+        let h2 = query_hash(r#"RECALL episodic ABOUT "a b""#);
+        assert_ne!(h1, h2);
+
+        let (n1, _) = query_normalize_and_hash(r#"RECALL episodic ABOUT "a  b""#);
+        assert!(n1.contains("a  b"), "interior whitespace preserved: {n1}");
+    }
+
+    #[test]
+    fn query_hash_case_variant_keywords_share_key() {
+        // Keyword case folding still collapses variants that differ only in
+        // keyword casing (and outside-literal whitespace).
+        let h1 = query_hash(r#"recall   episodic ABOUT "x""#);
+        let h2 = query_hash(r#"RECALL episodic about "x""#);
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn query_hash_ignores_escaped_quote_inside_literal() {
+        // An escaped quote must not prematurely close the literal, so the
+        // trailing keyword after it is still upper-cased and the literal
+        // content is preserved verbatim.
+        let (n1, _) = query_normalize_and_hash(r#"RECALL episodic ABOUT "a\"B" limit 5"#);
+        assert!(
+            n1.contains(r#"a\"B"#),
+            "escaped-quote literal preserved: {n1}"
+        );
+        assert!(
+            n1.ends_with("LIMIT 5"),
+            "keyword after literal upper-cased: {n1}"
+        );
     }
 
     #[test]
@@ -1870,51 +2049,68 @@ mod tests {
     }
 
     #[test]
-    fn compile_recall_with_mcfa_defense_on() {
-        let plan =
-            compile_ql(r#"RECALL episodic ABOUT "test" WITH MCFA_DEFENSE ON LIMIT 5"#).unwrap();
-        let display = format!("{plan}");
-        assert!(
-            display.contains("McfaDefense"),
-            "WITH MCFA_DEFENSE ON should emit McfaDefense: {display}"
+    fn compile_recall_with_mcfa_defense_never_emits_plan_node() {
+        // MCFA defense is enforced (and audited) by the engine's scored
+        // post-processing path, not by a plan operator — even with the
+        // clause ON, the compiled plan carries no McfaDefense node.
+        for query in [
+            r#"RECALL episodic ABOUT "test" WITH MCFA_DEFENSE ON LIMIT 5"#,
+            r#"RECALL episodic ABOUT "test" WITH MCFA_DEFENSE OFF LIMIT 5"#,
+            r#"THINK ABOUT "question" WITH MCFA_DEFENSE ON BUDGET 4096"#,
+            r#"THINK ABOUT "question" WITH MCFA_DEFENSE OFF BUDGET 4096"#,
+        ] {
+            let plan = compile_ql(query).unwrap();
+            let display = format!("{plan}");
+            assert!(
+                !display.contains("McfaDefense"),
+                "MCFA defense must not appear in the compiled plan for {query}: {display}"
+            );
+        }
+    }
+
+    #[test]
+    fn context_budget_schema_declares_appended_columns() {
+        // The logical ContextBudget node must declare the exact output schema
+        // of the physical ContextBudgetExec: input columns + assembly_mode +
+        // token_count.
+        let plan = compile_ql(r#"RECALL episodic ABOUT "test" BUDGET 2048 LIMIT 5"#).unwrap();
+
+        let LogicalPlan::Extension(ext) = &plan else {
+            panic!("expected ContextBudget extension at plan root, got {plan}");
+        };
+        let node = ext
+            .node
+            .as_any()
+            .downcast_ref::<HirnPlanNode>()
+            .expect("hirn node");
+        assert!(matches!(node.op, HirnOp::ContextBudget { budget: 2048 }));
+
+        let input_schema = node.inputs[0].schema();
+        let budget_schema = node.schema.clone();
+        assert_eq!(
+            budget_schema.fields().len(),
+            input_schema.fields().len() + 2,
+            "ContextBudget must append exactly two columns"
+        );
+        let names: Vec<&str> = budget_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(names[names.len() - 2], "assembly_mode");
+        assert_eq!(names[names.len() - 1], "token_count");
+        assert_eq!(
+            budget_schema.fields()[names.len() - 2].data_type(),
+            &DataType::Utf8
+        );
+        assert_eq!(
+            budget_schema.fields()[names.len() - 1].data_type(),
+            &DataType::UInt32
         );
     }
 
     #[test]
-    fn compile_recall_with_mcfa_defense_off() {
-        let plan =
-            compile_ql(r#"RECALL episodic ABOUT "test" WITH MCFA_DEFENSE OFF LIMIT 5"#).unwrap();
-        let display = format!("{plan}");
-        assert!(
-            !display.contains("McfaDefense"),
-            "WITH MCFA_DEFENSE OFF should not emit McfaDefense: {display}"
-        );
-    }
-
-    #[test]
-    fn compile_think_with_mcfa_defense_on() {
-        let plan =
-            compile_ql(r#"THINK ABOUT "question" WITH MCFA_DEFENSE ON BUDGET 4096"#).unwrap();
-        let display = format!("{plan}");
-        assert!(
-            display.contains("McfaDefense"),
-            "WITH MCFA_DEFENSE ON should emit McfaDefense: {display}"
-        );
-    }
-
-    #[test]
-    fn compile_think_with_mcfa_defense_off() {
-        let plan =
-            compile_ql(r#"THINK ABOUT "question" WITH MCFA_DEFENSE OFF BUDGET 4096"#).unwrap();
-        let display = format!("{plan}");
-        assert!(
-            !display.contains("McfaDefense"),
-            "WITH MCFA_DEFENSE OFF should not emit McfaDefense: {display}"
-        );
-    }
-
-    #[test]
-    fn compile_remember_always_includes_mcfa_defense() {
+    fn compile_remember_is_rejected() {
         let error = compile_ql(r#"REMEMBER episode CONTENT "test event""#).unwrap_err();
         assert!(
             error.to_string().contains("REMEMBER is not supported"),

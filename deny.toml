@@ -8,7 +8,6 @@ ignore = [
     { id = "RUSTSEC-2025-0141", reason = "rustls-pemfile unmaintained — transitive dep, no replacement available" },
     { id = "RUSTSEC-2026-0194", reason = "quick-xml quadratic parse DoS — reachable only via reqsign→opendal cloud-signing XML from configured (trusted) cloud endpoints; fix needs quick-xml 0.41, blocked by lance =4.0.0's reqsign pin; revisit on the next lance upgrade" },
     { id = "RUSTSEC-2026-0195", reason = "quick-xml namespace-alloc DoS — same reqsign→opendal path and same lance-pinned blocker as RUSTSEC-2026-0194; revisit on the next lance upgrade" },
-    { id = "RUSTSEC-2026-0189", reason = "rmcp <1.4 DNS-rebinding (no Host validation). Real exposure is limited to hosts running the MCP listener while a local browser visits a hostile page; MCP is off unless configured, binds loopback by default, and docs mandate a validating reverse proxy for anything beyond local dev. Proper fix is the rmcp 0.1→2.x migration of hirnd::mcp — tracked as the next dependency task" },
 ]
 
 [licenses]

@@ -55,7 +55,7 @@ pub struct ServerConfig {
     #[serde(default)]
     pub engine: EngineConfig,
 
-    /// MCP (Model Context Protocol) SSE server settings
+    /// MCP (Model Context Protocol) Streamable HTTP server settings
     #[serde(default)]
     pub mcp: McpConfig,
 
@@ -70,6 +70,13 @@ pub struct ServerConfig {
     /// Raft cluster configuration (optional; enables multi-node mode)
     #[serde(default)]
     pub raft: Option<RaftConfig>,
+
+    /// DynamoDB coordination for serverless deployments (optional). When set
+    /// and Raft is not configured, the sleep-time consolidation pass is gated
+    /// on a DynamoDB conditional-write lease instead of the Raft lease.
+    #[cfg(feature = "serverless")]
+    #[serde(default)]
+    pub dynamo: Option<crate::dynamo::DynamoConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -283,33 +290,39 @@ pub struct WatchConfig {
     pub buffer_size: usize,
 }
 
-/// MCP (Model Context Protocol) SSE server configuration.
+/// MCP (Model Context Protocol) Streamable HTTP server configuration.
+///
+/// The MCP surface authenticates **per request**: every call must carry an
+/// `Authorization: Bearer` credential (API key or JWT) resolved against the
+/// same `[auth]` / `[token]` machinery as the HTTP API, and the credential's
+/// realm selects the tenant database. There is no listener-level credential.
+/// The transport validates the `Host` header natively (loopback-only by
+/// default) to block DNS-rebinding attacks (RUSTSEC-2026-0189), and serves
+/// TLS when the daemon-wide `[tls]` section is configured.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpConfig {
-    /// Enable the MCP SSE server (default: true).
+    /// Enable the MCP Streamable HTTP server (default: true).
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Bind address for the MCP SSE server.
+    /// Bind address for the MCP server.
     /// Defaults to `127.0.0.1` (localhost only) for security.
-    /// Set to `0.0.0.0` to expose on all interfaces (use a reverse proxy with auth in production).
+    /// Set to `0.0.0.0` to expose on all interfaces — this additionally
+    /// requires `allowed_hosts` so `Host`-header validation keeps working.
     #[serde(default = "default_mcp_bind")]
     pub bind: String,
-    /// Bearer credential (API key or JWT) that authenticates the MCP surface.
-    ///
-    /// The rmcp SSE transport cannot surface per-request HTTP headers to the
-    /// tool handlers, so the listener authenticates once at startup: this
-    /// credential is validated against the same `[auth]` / `[token]`
-    /// machinery as the HTTP API, and the identity it resolves to (realm,
-    /// agent, operation/namespace scopes) applies to every MCP call.
-    ///
-    /// Required whenever the daemon runs with auth enabled (i.e. unless
-    /// `insecure_dev_mode = true`). Supports `$ENV_VAR` and `file://` refs.
-    #[serde(
-        default,
-        deserialize_with = "resolve_optional_secret",
-        serialize_with = "serialize_optional_secret_redacted"
-    )]
-    pub auth_token: Option<zeroize::Zeroizing<String>>,
+    /// `Host` authorities accepted by the transport (DNS-rebinding
+    /// protection). Empty (the default) accepts loopback hosts only
+    /// (`localhost`, `127.0.0.1`, `::1`). Public deployments must list the
+    /// hostnames clients connect to, e.g. `["mcp.example.com"]`; entries
+    /// without a port match any port.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+    /// Browser origins accepted by the transport, matched per RFC 6454
+    /// `(scheme, host, port)`, e.g. `["https://app.example.com"]`. Empty
+    /// (the default) disables `Origin` validation — non-browser MCP clients
+    /// don't send one; requests without an `Origin` header always pass.
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
 }
 
 impl Default for McpConfig {
@@ -317,7 +330,8 @@ impl Default for McpConfig {
         Self {
             enabled: true,
             bind: default_mcp_bind(),
-            auth_token: None,
+            allowed_hosts: Vec::new(),
+            allowed_origins: Vec::new(),
         }
     }
 }
@@ -426,16 +440,6 @@ pub struct StorageBackendConfig {
     /// Examples: `{ "storage.region" = "us-east-1", "storage.endpoint" = "http://minio:9000" }`
     #[serde(default)]
     pub properties: std::collections::HashMap<String, String>,
-    /// Optional local fragment cache for accelerating remote reads.
-    /// Path to the cache directory on local NVMe/SSD.
-    pub fragment_cache_dir: Option<String>,
-    /// Maximum size of the fragment cache in bytes (default: 1 GiB).
-    #[serde(default = "default_fragment_cache_size")]
-    pub fragment_cache_max_bytes: u64,
-}
-
-const fn default_fragment_cache_size() -> u64 {
-    1024 * 1024 * 1024 // 1 GiB
 }
 
 impl ServerConfig {
@@ -499,16 +503,26 @@ impl ServerConfig {
         self.throttle.validate()?;
         self.sleep.validate()?;
 
-        // The MCP listener has no per-request auth (transport limitation), so
-        // outside explicit dev mode it must authenticate via a startup
-        // credential resolved against [auth]/[token].
-        if self.mcp.enabled && !self.insecure_dev_mode && self.mcp.auth_token.is_none() {
-            return Err(
-                "mcp.auth_token must be configured (an API key or JWT accepted by [auth]/[token]) \
-                 when the MCP server is enabled; set mcp.enabled = false to disable it, or \
-                 insecure_dev_mode = true for local development"
-                    .to_string(),
-            );
+        // MCP authenticates per request against [auth]/[token] (covered by
+        // the global auth requirement above). The transport's Host-header
+        // allowlist defaults to loopback only, so a non-loopback bind without
+        // an explicit allowlist would reject every request — catch the
+        // misconfiguration at startup.
+        if self.mcp.enabled && self.mcp.allowed_hosts.is_empty() {
+            let is_loopback = self
+                .mcp
+                .bind
+                .parse::<std::net::IpAddr>()
+                .map(|ip| ip.is_loopback())
+                .unwrap_or(false);
+            if !is_loopback {
+                return Err(format!(
+                    "mcp.bind = \"{}\" is not a loopback address; set mcp.allowed_hosts to the \
+                     hostnames MCP clients will use (Host-header validation defaults to loopback \
+                     only to prevent DNS rebinding), or bind to 127.0.0.1",
+                    self.mcp.bind
+                ));
+            }
         }
 
         // Raft configuration validation.
@@ -578,6 +592,8 @@ impl Default for ServerConfig {
             sleep: SleepConfig::default(),
             storage: None,
             raft: None,
+            #[cfg(feature = "serverless")]
+            dynamo: None,
         }
     }
 }
@@ -879,9 +895,6 @@ impl StorageBackendConfig {
                 self.uri
             ));
         }
-        if self.fragment_cache_max_bytes == 0 {
-            return Err("storage.fragment_cache_max_bytes must be > 0".to_string());
-        }
         Ok(())
     }
 }
@@ -948,9 +961,6 @@ mod tests {
     fn production_raft_rejects_dev_local_profile() {
         let mut config = ServerConfig::default();
         config.auth = Some(auth_config());
-        // These fixtures exercise the raft transport validations; disable MCP
-        // so its own production requirement (mcp.auth_token) doesn't fire first.
-        config.mcp.enabled = false;
         let mut raft = base_raft_config();
         raft.transport_secret = Some(zeroize::Zeroizing::new(
             "0123456789abcdef0123456789abcdef".to_owned(),
@@ -968,9 +978,6 @@ mod tests {
     fn production_raft_tls_profile_requires_https() {
         let mut config = ServerConfig::default();
         config.auth = Some(auth_config());
-        // These fixtures exercise the raft transport validations; disable MCP
-        // so its own production requirement (mcp.auth_token) doesn't fire first.
-        config.mcp.enabled = false;
         let mut raft = base_raft_config();
         raft.transport_profile = ClusterTransportProfile::ProdTls;
         raft.transport_secret = Some(zeroize::Zeroizing::new(
@@ -986,9 +993,6 @@ mod tests {
     fn production_raft_mtls_requires_client_ca() {
         let mut config = ServerConfig::default();
         config.auth = Some(auth_config());
-        // These fixtures exercise the raft transport validations; disable MCP
-        // so its own production requirement (mcp.auth_token) doesn't fire first.
-        config.mcp.enabled = false;
         let mut raft = base_raft_config();
         raft.transport_profile = ClusterTransportProfile::ProdMtls;
         raft.advertise_addr = "https://node-1.example:3000".to_owned();
@@ -1063,9 +1067,6 @@ mod tests {
     fn server_validation_covers_sleep_section() {
         let mut config = ServerConfig::default();
         config.auth = Some(auth_config());
-        // Mirror neighboring production fixtures: disable MCP so its own
-        // auth_token requirement doesn't fire before the sleep check.
-        config.mcp.enabled = false;
         config.sleep.idle_after_secs = 0;
 
         let err = config.validate().unwrap_err();
@@ -1073,6 +1074,34 @@ mod tests {
             err.contains("sleep.idle_after_secs"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn mcp_non_loopback_bind_requires_allowed_hosts() {
+        let mut config = ServerConfig::default();
+        config.auth = Some(auth_config());
+        config.mcp.bind = "0.0.0.0".to_owned();
+
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("mcp.allowed_hosts"), "unexpected error: {err}");
+
+        // An explicit Host allowlist makes the non-loopback bind valid.
+        config.mcp.allowed_hosts = vec!["mcp.example.com".to_owned()];
+        config.validate().unwrap();
+
+        // Disabling MCP also clears the requirement.
+        config.mcp.allowed_hosts.clear();
+        config.mcp.enabled = false;
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn mcp_loopback_bind_needs_no_allowed_hosts() {
+        let mut config = ServerConfig::default();
+        config.auth = Some(auth_config());
+        assert_eq!(config.mcp.bind, "127.0.0.1");
+        assert!(config.mcp.allowed_hosts.is_empty());
+        config.validate().unwrap();
     }
 
     #[test]

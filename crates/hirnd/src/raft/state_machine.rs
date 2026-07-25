@@ -33,6 +33,12 @@ pub struct StateMachineData {
     pub nodes: BTreeMap<NodeId, String>,
     /// Active consolidation leases keyed by realm.
     pub leases: BTreeMap<String, ConsolidationLease>,
+    /// Monotonic counter issuing fencing tokens for lease acquisitions. Every
+    /// successful `AcquireLease` bumps it, so each acquisition observes a
+    /// strictly greater fence than any prior one (cluster-wide). Serialized
+    /// with the snapshot so fences never regress across restarts / snapshots.
+    #[serde(default)]
+    pub lease_fence_counter: u64,
 }
 
 #[derive(Debug)]
@@ -147,13 +153,18 @@ impl HirnStateMachine {
                         };
                     }
                 }
+                // Issue a fresh, strictly-increasing fencing token for this
+                // acquisition. Re-acquisition by the same holder also bumps it.
+                data.lease_fence_counter = data.lease_fence_counter.saturating_add(1);
+                let fence = data.lease_fence_counter;
                 let lease = ConsolidationLease::new(
                     realm.clone(),
                     *holder,
                     *duration_secs,
                     *proposed_at_epoch_secs,
+                    fence,
                 );
-                info!(realm = %realm, holder = holder, duration = duration_secs, "lease acquired");
+                info!(realm = %realm, holder = holder, duration = duration_secs, fence, "lease acquired");
                 data.leases.insert(realm.clone(), lease);
                 RaftResponse::Ok
             }

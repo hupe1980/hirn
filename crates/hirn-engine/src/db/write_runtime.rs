@@ -324,26 +324,41 @@ impl WriteRuntime {
         let stats_path = db_path.join("rpe_stats.json");
         let tmp_path = db_path.join("rpe_stats.json.tmp");
 
-        match serde_json::to_string(&snapshot) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(&tmp_path, &json) {
-                    tracing::warn!(path = %tmp_path.display(), error = %e, "failed to write rpe_stats tmp file");
-                    return;
-                }
-                #[cfg(windows)]
-                let _ = std::fs::remove_file(&stats_path);
-                if let Err(e) = std::fs::rename(&tmp_path, &stats_path) {
-                    tracing::warn!(
-                        src = %tmp_path.display(),
-                        dst = %stats_path.display(),
-                        error = %e,
-                        "failed to rename rpe_stats tmp file"
-                    );
-                }
-            }
+        let json = match serde_json::to_string(&snapshot) {
+            Ok(json) => json,
             Err(e) => {
                 tracing::warn!(error = %e, "failed to serialize rpe_stats");
+                return;
             }
+        };
+
+        // R-73: the atomic write (`fs::write` + `rename`) is blocking IO. This
+        // runs inside the async remember path, so offload it to a blocking
+        // thread instead of stalling a tokio worker. Best-effort and
+        // fire-and-forget; falls back to inline IO when no runtime is present
+        // (e.g. a synchronous close/drop path).
+        let write_and_rename = move || {
+            if let Err(e) = std::fs::write(&tmp_path, &json) {
+                tracing::warn!(path = %tmp_path.display(), error = %e, "failed to write rpe_stats tmp file");
+                return;
+            }
+            #[cfg(windows)]
+            let _ = std::fs::remove_file(&stats_path);
+            if let Err(e) = std::fs::rename(&tmp_path, &stats_path) {
+                tracing::warn!(
+                    src = %tmp_path.display(),
+                    dst = %stats_path.display(),
+                    error = %e,
+                    "failed to rename rpe_stats tmp file"
+                );
+            }
+        };
+
+        match tokio::runtime::Handle::try_current() {
+            Ok(_) => {
+                tokio::task::spawn_blocking(write_and_rename);
+            }
+            Err(_) => write_and_rename(),
         }
     }
 

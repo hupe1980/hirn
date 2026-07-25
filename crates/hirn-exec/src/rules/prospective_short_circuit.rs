@@ -28,7 +28,6 @@ pub const DEFAULT_PROSPECTIVE_THRESHOLD: f32 = 0.92;
 // and attempts to short-circuit at execution time.
 // ---------------------------------------------------------------------------
 
-use std::any::Any;
 use std::fmt;
 
 use arrow_array::{Array, RecordBatch, StringArray};
@@ -55,7 +54,7 @@ pub struct ProspectiveShortCircuitExec {
     /// Output schema (same as input).
     schema: SchemaRef,
     /// Execution properties.
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl ProspectiveShortCircuitExec {
@@ -65,12 +64,12 @@ impl ProspectiveShortCircuitExec {
         threshold: f32,
     ) -> Self {
         let schema = input.schema();
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             datafusion_physical_expr::EquivalenceProperties::new(schema.clone()),
             datafusion_physical_plan::Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
 
         Self {
             input,
@@ -83,7 +82,6 @@ impl ProspectiveShortCircuitExec {
 
     pub fn new(input: Arc<dyn ExecutionPlan>, threshold: f32) -> Result<Self> {
         let search_params = input
-            .as_any()
             .downcast_ref::<LanceHybridSearchExec>()
             .map(|search| search.params().clone())
             .ok_or_else(|| {
@@ -101,7 +99,7 @@ impl ProspectiveShortCircuitExec {
 }
 
 fn search_params_from_plan(plan: &Arc<dyn ExecutionPlan>) -> Option<HybridSearchParams> {
-    if let Some(search) = plan.as_any().downcast_ref::<LanceHybridSearchExec>() {
+    if let Some(search) = plan.downcast_ref::<LanceHybridSearchExec>() {
         return Some(search.params().clone());
     }
 
@@ -125,15 +123,11 @@ impl ExecutionPlan for ProspectiveShortCircuitExec {
         "ProspectiveShortCircuitExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -464,7 +458,6 @@ mod tests {
             .with_new_children(vec![fresh_search])
             .expect("child replacement should succeed");
         let rebuilt = rebuilt
-            .as_any()
             .downcast_ref::<ProspectiveShortCircuitExec>()
             .expect("rebuilt node should stay prospective");
 
@@ -502,7 +495,6 @@ mod tests {
             .with_new_children(vec![wrapped_child])
             .expect("child replacement should succeed");
         let rebuilt = rebuilt
-            .as_any()
             .downcast_ref::<ProspectiveShortCircuitExec>()
             .expect("rebuilt node should stay prospective");
 
@@ -521,18 +513,18 @@ mod tests {
     struct TestWrapperExec {
         child: Arc<dyn ExecutionPlan>,
         schema: SchemaRef,
-        properties: PlanProperties,
+        properties: Arc<PlanProperties>,
     }
 
     impl TestWrapperExec {
         fn new(child: Arc<dyn ExecutionPlan>) -> Self {
             let schema = child.schema();
-            let properties = PlanProperties::new(
+            let properties = Arc::new(PlanProperties::new(
                 datafusion_physical_expr::EquivalenceProperties::new(schema.clone()),
                 datafusion_physical_plan::Partitioning::UnknownPartitioning(1),
                 EmissionType::Final,
                 Boundedness::Bounded,
-            );
+            ));
 
             Self {
                 child,
@@ -553,15 +545,11 @@ mod tests {
             "TestWrapperExec"
         }
 
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
         fn schema(&self) -> SchemaRef {
             self.schema.clone()
         }
 
-        fn properties(&self) -> &PlanProperties {
+        fn properties(&self) -> &Arc<PlanProperties> {
             &self.properties
         }
 
@@ -611,7 +599,6 @@ mod tests {
             .with_new_children(vec![wrapped_child])
             .expect("child replacement should succeed");
         let rebuilt = rebuilt
-            .as_any()
             .downcast_ref::<ProspectiveShortCircuitExec>()
             .expect("rebuilt node should stay prospective");
 

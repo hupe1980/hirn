@@ -708,7 +708,10 @@ async fn e2e_operator_count_matches_target() {
     // We verify by counting the operator module re-exports from hirn-exec.
     // This test catches accidental operator deletions during refactoring.
 
-    // 19 operators (6 core + 9 cognitive + 4 causal)
+    // 18 operators (6 core + 8 cognitive + 4 causal). MCFA detection is no
+    // longer a plan operator: `mcfa_defense` exports the shared `detect_threat`
+    // detector, enforced (with a live `mcfa_audit_log` sink) on the engine's
+    // scored read path.
     let operator_names = [
         "LanceHybridSearchExec",
         "GraphActivationExec",
@@ -724,7 +727,6 @@ async fn e2e_operator_count_matches_target() {
         "IterativeRetrievalExec",
         "InterferenceDetectorExec",
         "TopicLoomExec",
-        "McfaDefenseExec",
         "CausalQueryReadExec",
         "CausalDiscoveryExec",
         "NliContradictionExec",
@@ -732,32 +734,18 @@ async fn e2e_operator_count_matches_target() {
     ];
     assert_eq!(
         operator_names.len(),
-        19,
-        "Current physical operator inventory: 19 operators"
+        18,
+        "Current physical operator inventory: 18 operators"
     );
 
-    // 8 UDFs
-    let udf_names = [
-        "composite_score",
-        "temporal_decay",
-        "token_count",
-        "surprise_score",
-        "rpe_score",
-        "source_reliability",
-        "fade_mem_decay",
-        "causal_relevance",
-    ];
-    assert_eq!(udf_names.len(), 8, "GREENFIELD target: 8 scoring UDFs");
+    // Scoring UDFs were deleted: ranking runs through the single canonical
+    // `hirn_core::scoring::composite_score` formula used by both the physical
+    // operators and the engine paths (no DataFusion scalar UDFs remain).
 
-    // 5 optimizer rules
-    let rule_names = [
-        "PolicyPushdownRule",
-        "ActivationFusionRule",
-        "TemporalIndexRule",
-        "NamespacePartitionPruneRule",
-        "DepthSchedulingRule",
-    ];
-    assert_eq!(rule_names.len(), 5, "GREENFIELD target: 5 optimizer rules");
+    // 2 registered optimizer rules (see `hirn_exec::rules::all_rules`); the
+    // remaining rule types exist but are intentionally not registered.
+    let rule_names = ["PolicyPushdownRule", "ActivationFusionRule"];
+    assert_eq!(rule_names.len(), 2, "registered optimizer rules");
 
     // 10 datasets
     let dataset_names = [

@@ -525,9 +525,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn max_tokens_exceeded_returns_token_limit_error() {
-        let provider =
-            OpenAILlmProvider::new("key", "gpt-4o").expect("openai client should initialize");
+    async fn max_tokens_exceeded_is_advisory_and_surfaces_provider_rejection() {
+        // The local max-tokens table is advisory only (the provider API is the
+        // authority): an over-limit request is still sent, and the API's own
+        // rejection is surfaced as a permanent provider error.
+        let (url, handle) = mock_server_error(
+            400,
+            r#"{"error":{"message":"max_tokens is too large: 1000000","type":"invalid_request_error"}}"#,
+        )
+        .await;
+
+        let provider = OpenAILlmProvider::new("key", "gpt-4o")
+            .expect("openai client should initialize")
+            .with_base_url(&url)
+            .expect("mock base url should be accepted");
 
         let err = provider
             .generate(
@@ -545,8 +556,9 @@ mod tests {
 
         let msg = err.to_string();
         assert!(
-            msg.contains("token limit exceeded") || msg.contains("1000000"),
-            "expected token limit error: {msg}"
+            msg.contains("max_tokens is too large") || msg.contains("1000000"),
+            "expected the provider's own rejection to be surfaced: {msg}"
         );
+        handle.abort();
     }
 }

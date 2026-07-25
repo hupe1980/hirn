@@ -1,6 +1,5 @@
 //! `CausalQueryReadExec` — query-scoped terminal reads for causal HirnQL statements.
 
-use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
@@ -24,7 +23,7 @@ pub enum CausalReadKind {
 #[derive(Debug, Clone)]
 pub struct CausalQueryReadExec {
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     kind: CausalReadKind,
     primary: String,
     secondary: Option<String>,
@@ -41,12 +40,12 @@ impl CausalQueryReadExec {
         depth: u32,
         namespace: Option<String>,
     ) -> Self {
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             datafusion_physical_expr::EquivalenceProperties::new(schema.clone()),
             datafusion_physical_plan::Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
 
         Self {
             schema,
@@ -80,15 +79,11 @@ impl ExecutionPlan for CausalQueryReadExec {
         }
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

@@ -166,6 +166,42 @@ impl Default for EmbedderPersistentCacheRuntimeConfig {
     }
 }
 
+/// Action the poisoning admission controller takes when an ingest-time
+/// content scan detects prompt-injection patterns in a memory candidate.
+///
+/// Stored content is NEVER rewritten (recall fidelity matters); the
+/// controller only flags, audits, or rejects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AdmissionPoisoningAction {
+    /// Do not scan candidate content at ingest time (default).
+    #[default]
+    Off,
+    /// Admit the candidate, but stamp its metadata with the findings, emit a
+    /// metric, and record the flags in the admission audit event.
+    Audit,
+    /// Reject the candidate with a machine-readable `poisoning_detected:` reason.
+    Reject,
+}
+
+/// Action the duplicate admission controller takes when an incoming candidate
+/// is a near-duplicate (cosine similarity above `admission_duplicate_threshold`)
+/// of an existing record.
+///
+/// R-34: this was previously a free `String` where the engine mapped
+/// `"merge"` → merge and *everything else* (including typos like `"Merge"` or
+/// `"reject "`) silently → reject. Modeling it as an enum makes invalid values
+/// a hard deserialization error and gives the builder a type-safe surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AdmissionDuplicateAction {
+    /// Reject the duplicate candidate (default).
+    #[default]
+    Reject,
+    /// Merge the duplicate into the existing record.
+    Merge,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ConflictResolutionPolicy {
@@ -418,14 +454,30 @@ hirn_config_fields! {
     /// Duplicate detector similarity threshold. Default: 0.95.
     pub admission_duplicate_threshold: f32,
 
-    /// Duplicate detector action: "reject" or "merge". Default: "reject".
-    pub admission_duplicate_action: String,
+    /// Duplicate detector action: `reject` or `merge`. Default: `reject`.
+    pub admission_duplicate_action: AdmissionDuplicateAction,
 
     /// Per-agent token budget for the token budget gate. Default: `500_000`.
     pub admission_token_budget_limit: u64,
 
     /// Rate limiter: max writes per minute per agent. Default: 100.
     pub admission_rate_limit: u32,
+
+    /// Minimum effective trust score (provenance-derived, blended with the
+    /// authoring agent's Bayesian reputation) required to admit a candidate.
+    /// 0.0 disables the trust gate entirely. Default: 0.0.
+    pub admission_min_trust: f32,
+
+    /// Optional stricter trust tier: candidates whose effective trust is at
+    /// or above `admission_min_trust` but below this threshold are rejected
+    /// with a machine-readable `trust_quarantine_recommended:` reason so the
+    /// caller can route them to quarantine review instead of storage.
+    /// `None` disables the tier. Default: `None`.
+    pub admission_trust_quarantine_below: Option<f32>,
+
+    /// Ingest-time poisoning scan action: `off` (default), `audit`
+    /// (admit + flag + audit event), or `reject`. Content is never rewritten.
+    pub admission_poisoning_action: AdmissionPoisoningAction,
 
     // ── RPE-Gated Admission ─────────────────────────────────────────────
 
@@ -756,6 +808,9 @@ impl Default for HirnConfig {
             admission_duplicate_action: default_duplicate_action(),
             admission_token_budget_limit: default_token_budget_limit(),
             admission_rate_limit: default_rate_limit(),
+            admission_min_trust: 0.0,
+            admission_trust_quarantine_below: None,
+            admission_poisoning_action: AdmissionPoisoningAction::Off,
             rpe_enabled: false,
             rpe_fast_path_threshold: 0.3,
             rpe_similarity_search_limit: 5,
@@ -827,24 +882,33 @@ impl HirnConfig {
             }
         }
 
+        // R-31: one-sided float guards below explicitly reject non-finite
+        // values first. A comparison like `x <= 0.0` or `x < 0.0` is *false*
+        // for both NaN and +∞, so without an `is_finite()` gate a NaN/+∞ set
+        // via the builder or deserialized from TOML/JSON would slip through.
+        if !self.archive_threshold.is_finite() || !self.purge_threshold.is_finite() {
+            return Err(HirnError::InvalidInput(
+                "archive_threshold and purge_threshold must be finite".into(),
+            ));
+        }
         if self.archive_threshold <= self.purge_threshold {
             return Err(HirnError::InvalidInput(
                 "archive_threshold must be strictly greater than purge_threshold".into(),
             ));
         }
-        if self.decay_lambda <= 0.0 {
+        if !self.decay_lambda.is_finite() || self.decay_lambda <= 0.0 {
             return Err(HirnError::InvalidInput(
-                "decay_lambda must be > 0.0 (zero means no recency scoring)".into(),
+                "decay_lambda must be a finite value > 0.0 (zero means no recency scoring)".into(),
             ));
         }
-        if self.hebbian_learning_rate < 0.0 {
+        if !self.hebbian_learning_rate.is_finite() || self.hebbian_learning_rate < 0.0 {
             return Err(HirnError::InvalidInput(
-                "hebbian_learning_rate must be non-negative".into(),
+                "hebbian_learning_rate must be a finite, non-negative value".into(),
             ));
         }
-        if self.hebbian_decay_rate < 0.0 {
+        if !self.hebbian_decay_rate.is_finite() || self.hebbian_decay_rate < 0.0 {
             return Err(HirnError::InvalidInput(
-                "hebbian_decay_rate must be non-negative".into(),
+                "hebbian_decay_rate must be a finite, non-negative value".into(),
             ));
         }
         if !(0.0..=1.0).contains(&self.working_memory_reserve) {
@@ -854,6 +918,45 @@ impl HirnConfig {
         }
         if self.token_budget == 0 {
             return Err(HirnError::InvalidInput("token_budget must be > 0".into()));
+        }
+        if !(0.0..=1.0).contains(&self.admission_min_trust) {
+            return Err(invalid_config(
+                "admission_min_trust",
+                self.admission_min_trust,
+                "must be in [0.0, 1.0]",
+            ));
+        }
+        if let Some(quarantine_below) = self.admission_trust_quarantine_below {
+            if !(0.0..=1.0).contains(&quarantine_below) {
+                return Err(invalid_config(
+                    "admission_trust_quarantine_below",
+                    quarantine_below,
+                    "must be in [0.0, 1.0]",
+                ));
+            }
+            if quarantine_below < self.admission_min_trust {
+                return Err(invalid_config(
+                    "admission_trust_quarantine_below",
+                    quarantine_below,
+                    "must be >= admission_min_trust (candidates below the minimum are hard-rejected first)",
+                ));
+            }
+        }
+        // R-34: admission surprise/duplicate thresholds are cosine values and
+        // must lie in [0.0, 1.0]. `RangeInclusive::contains` rejects NaN too.
+        if !(0.0..=1.0).contains(&self.admission_surprise_threshold) {
+            return Err(invalid_config(
+                "admission_surprise_threshold",
+                self.admission_surprise_threshold,
+                "must be a cosine value in [0.0, 1.0]",
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.admission_duplicate_threshold) {
+            return Err(invalid_config(
+                "admission_duplicate_threshold",
+                self.admission_duplicate_threshold,
+                "must be a cosine value in [0.0, 1.0]",
+            ));
         }
         // embedding_dimensions is validated by the EmbeddingDimension type itself.
         self.resource_retention_policy.validate()?;
@@ -981,16 +1084,19 @@ impl HirnConfig {
                 "memory_half_life_hours must be > 0".into(),
             ));
         }
-        if self.memory_min_importance < 0.0 {
+        if !self.memory_min_importance.is_finite() || self.memory_min_importance < 0.0 {
             return Err(HirnError::InvalidInput(
-                "memory_min_importance must be >= 0.0".into(),
+                "memory_min_importance must be a finite value >= 0.0".into(),
             ));
         }
 
         // Write-path threshold validation.
-        if self.rpe_fast_path_threshold < 0.0 || self.rpe_fast_path_threshold > 2.0 {
+        if !self.rpe_fast_path_threshold.is_finite()
+            || self.rpe_fast_path_threshold < 0.0
+            || self.rpe_fast_path_threshold > 2.0
+        {
             return Err(HirnError::InvalidInput(
-                "rpe_fast_path_threshold must be in [0.0, 2.0]".into(),
+                "rpe_fast_path_threshold must be a finite value in [0.0, 2.0]".into(),
             ));
         }
         if !(0.0..=1.0).contains(&self.svo_confidence_threshold) {
@@ -1012,9 +1118,11 @@ impl HirnConfig {
                 ));
             }
         }
-        if self.interference_consolidation_threshold < 0.0 {
+        if !self.interference_consolidation_threshold.is_finite()
+            || self.interference_consolidation_threshold < 0.0
+        {
             return Err(HirnError::InvalidInput(
-                "interference_consolidation_threshold must be >= 0.0".into(),
+                "interference_consolidation_threshold must be a finite value >= 0.0".into(),
             ));
         }
         if !(0.0..=1.0).contains(&self.quality_gate_threshold) {
@@ -1105,19 +1213,25 @@ impl HirnConfig {
         // Callers can check `config.warnings()` for advisory messages.
 
         // N-M07: Missing range validation for graph + scoring numeric params.
-        if !(0.0..=1.0).contains(&self.activation_decay_factor) {
+        // Low residual: the error message documents the half-open interval
+        // (0.0, 1.0], so we reject 0.0 explicitly (a 0.0 depth-decay factor
+        // means activation never propagates). `RangeInclusive::contains`
+        // already rejects NaN; the extra `> 0.0` gate excludes 0.0.
+        if !(self.activation_decay_factor > 0.0 && self.activation_decay_factor <= 1.0) {
             return Err(HirnError::InvalidInput(
                 "activation_decay_factor must be in (0.0, 1.0]".into(),
             ));
         }
-        if self.activation_convergence_threshold <= 0.0 {
+        if !self.activation_convergence_threshold.is_finite()
+            || self.activation_convergence_threshold <= 0.0
+        {
             return Err(HirnError::InvalidInput(
-                "activation_convergence_threshold must be > 0.0".into(),
+                "activation_convergence_threshold must be a finite value > 0.0".into(),
             ));
         }
-        if self.inhibition_strength < 0.0 {
+        if !self.inhibition_strength.is_finite() || self.inhibition_strength < 0.0 {
             return Err(HirnError::InvalidInput(
-                "inhibition_strength must be >= 0.0".into(),
+                "inhibition_strength must be a finite value >= 0.0".into(),
             ));
         }
         if !(0.0..=1.0).contains(&self.similarity_edge_threshold) {
@@ -1152,26 +1266,54 @@ impl HirnConfig {
             }
         }
 
-        // F-122: db_path writability check — fail early with an actionable message
-        // rather than surfacing a cryptic storage error later during open().
-        {
-            let path = &self.db_path;
-            if path.exists() {
-                if !path.is_dir() {
-                    return Err(invalid_config(
-                        "db_path",
-                        path.display(),
-                        "path exists but is not a directory; provide a directory path",
-                    ));
-                }
-            } else if let Some(parent) = path.parent() {
-                if !parent.as_os_str().is_empty() && parent.exists() && !parent.is_dir() {
-                    return Err(invalid_config(
-                        "db_path",
-                        path.display(),
-                        "parent path exists but is not a directory; check db_path",
-                    ));
-                }
+        // R-32: the `db_path` writability check used to live here, but
+        // `validate()` runs on every deserialize (via the `#[serde(try_from)]`
+        // `TryFrom`), so stat-ing the disk on every TOML/JSON/proto decode was
+        // environment-dependent and TOCTOU-prone. The filesystem check now
+        // lives in [`validate_for_open`], which the engine calls from
+        // `HirnDb::open` / `open_with_config` before touching storage.
+        Ok(())
+    }
+
+    /// Full validation for the database-open path.
+    ///
+    /// Runs [`validate`](Self::validate) and then performs environment-dependent
+    /// filesystem checks against `db_path` (existence / directory kind). Kept
+    /// **separate** from `validate()` so that plain deserialization
+    /// (`#[serde(try_from)]`) never touches the disk (R-32).
+    ///
+    /// The engine must call this — rather than bare `validate()` — from its
+    /// `HirnDb::open` / `open_with_config` entry points so that a bad `db_path`
+    /// is reported with an actionable message before storage is initialized.
+    pub fn validate_for_open(&self) -> Result<(), HirnError> {
+        fn invalid_config(field: &str, value: impl std::fmt::Display, reason: &str) -> HirnError {
+            HirnError::InvalidConfig {
+                field: field.to_string(),
+                value: value.to_string(),
+                reason: reason.to_string(),
+            }
+        }
+
+        self.validate()?;
+
+        // F-122: db_path writability check — fail early with an actionable
+        // message rather than surfacing a cryptic storage error later.
+        let path = &self.db_path;
+        if path.exists() {
+            if !path.is_dir() {
+                return Err(invalid_config(
+                    "db_path",
+                    path.display(),
+                    "path exists but is not a directory; provide a directory path",
+                ));
+            }
+        } else if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() && parent.exists() && !parent.is_dir() {
+                return Err(invalid_config(
+                    "db_path",
+                    path.display(),
+                    "parent path exists but is not a directory; check db_path",
+                ));
             }
         }
 
@@ -1217,8 +1359,8 @@ const fn default_surprise_threshold() -> f32 {
 const fn default_duplicate_threshold() -> f32 {
     0.95
 }
-fn default_duplicate_action() -> String {
-    "reject".into()
+const fn default_duplicate_action() -> AdmissionDuplicateAction {
+    AdmissionDuplicateAction::Reject
 }
 const fn default_token_budget_limit() -> u64 {
     500_000
@@ -1389,6 +1531,35 @@ impl HirnConfigBuilder {
     #[must_use]
     pub const fn token_budget(mut self, budget: u32) -> Self {
         self.0.token_budget = budget;
+        self
+    }
+
+    /// Enable or disable the admission control pipeline.
+    #[must_use]
+    pub const fn admission_enabled(mut self, enabled: bool) -> Self {
+        self.0.admission_enabled = enabled;
+        self
+    }
+
+    /// Minimum effective trust required to admit a candidate (0.0 disables).
+    #[must_use]
+    pub const fn admission_min_trust(mut self, min_trust: f32) -> Self {
+        self.0.admission_min_trust = min_trust;
+        self
+    }
+
+    /// Trust tier below which candidates are rejected with a
+    /// quarantine-recommended reason (`None` disables the tier).
+    #[must_use]
+    pub const fn admission_trust_quarantine_below(mut self, threshold: Option<f32>) -> Self {
+        self.0.admission_trust_quarantine_below = threshold;
+        self
+    }
+
+    /// Ingest-time poisoning scan action (off / audit / reject).
+    #[must_use]
+    pub const fn admission_poisoning_action(mut self, action: AdmissionPoisoningAction) -> Self {
+        self.0.admission_poisoning_action = action;
         self
     }
 
@@ -2194,5 +2365,132 @@ embedding_dimensions = 64
             }
             other => panic!("expected InvalidConfig, got {other}"),
         }
+    }
+
+    // ── R-31: non-finite one-sided guards ───────────────────────────────
+
+    #[test]
+    fn nonfinite_one_sided_floats_rejected() {
+        // NaN / +∞ make `x <= 0.0` and `x < 0.0` guards false, so without an
+        // explicit `is_finite()` gate they would slip through.
+        assert!(
+            HirnConfig::builder()
+                .decay_lambda(f64::NAN)
+                .build()
+                .is_err()
+        );
+        assert!(
+            HirnConfig::builder()
+                .decay_lambda(f64::INFINITY)
+                .build()
+                .is_err()
+        );
+        assert!(
+            HirnConfig::builder()
+                .hebbian_learning_rate(f64::NAN)
+                .build()
+                .is_err()
+        );
+        assert!(
+            HirnConfig::builder()
+                .hebbian_decay_rate(f64::INFINITY)
+                .build()
+                .is_err()
+        );
+        assert!(
+            HirnConfig::builder()
+                .rpe_fast_path_threshold(f32::NAN)
+                .build()
+                .is_err()
+        );
+        assert!(
+            HirnConfig::builder()
+                .memory_min_importance(f32::INFINITY)
+                .build()
+                .is_err()
+        );
+        assert!(
+            HirnConfig::builder()
+                .interference_consolidation_threshold(f32::NAN)
+                .build()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn activation_decay_factor_rejects_zero() {
+        // 0.0 means activation never propagates → half-open interval (0.0, 1.0].
+        let mut config = HirnConfig::default();
+        config.activation_decay_factor = 0.0;
+        assert!(config.validate().is_err());
+        config.activation_decay_factor = 1.0;
+        assert!(config.validate().is_ok());
+    }
+
+    // ── R-32: validate() no longer stats the disk ───────────────────────
+
+    #[test]
+    fn validate_does_not_touch_filesystem_for_missing_db_path() {
+        // A nonexistent db_path must deserialize/validate cleanly — the FS
+        // check moved to validate_for_open().
+        let mut config = HirnConfig::default();
+        config.db_path = PathBuf::from("/this/path/definitely/does/not/exist/brain");
+        config.validate().expect("validate must not stat the disk");
+    }
+
+    #[test]
+    fn validate_for_open_surfaces_bad_db_path() {
+        // db_path pointing at an existing *file* (not a directory) is caught by
+        // validate_for_open(), but not by plain validate().
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut config = HirnConfig::default();
+        config.db_path = file.path().to_path_buf();
+        config
+            .validate()
+            .expect("plain validate ignores the filesystem");
+        let err = config.validate_for_open().unwrap_err();
+        match err {
+            HirnError::InvalidConfig { field, .. } => assert_eq!(field, "db_path"),
+            other => panic!("expected InvalidConfig for db_path, got {other}"),
+        }
+    }
+
+    // ── R-34: admission enum + threshold ranges ─────────────────────────
+
+    #[test]
+    fn admission_thresholds_out_of_range_rejected() {
+        let mut config = HirnConfig::default();
+        config.admission_surprise_threshold = 1.5;
+        assert!(config.validate().is_err());
+
+        let mut config = HirnConfig::default();
+        config.admission_duplicate_threshold = -0.1;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn admission_duplicate_action_enum_round_trips() {
+        let mut config = HirnConfig::default();
+        config.admission_duplicate_action = AdmissionDuplicateAction::Merge;
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        // Serializes as its snake_case identifier, not a free string typo.
+        assert!(toml_str.contains("admission_duplicate_action = \"merge\""));
+        let back: HirnConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(
+            back.admission_duplicate_action,
+            AdmissionDuplicateAction::Merge
+        );
+    }
+
+    #[test]
+    fn admission_duplicate_action_rejects_invalid_string() {
+        // A typo like "Merge" is now a hard deserialization error rather than a
+        // silent fall-through to Reject.
+        let mut toml_str = toml::to_string_pretty(&HirnConfig::default()).unwrap();
+        toml_str = toml_str.replace(
+            "admission_duplicate_action = \"reject\"",
+            "admission_duplicate_action = \"Merge\"",
+        );
+        assert!(toml::from_str::<HirnConfig>(&toml_str).is_err());
     }
 }

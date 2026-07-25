@@ -4,7 +4,6 @@
 //! sufficiency) and emits an "escalate" flag when quality falls below threshold.
 //! Target: ≤20% of queries escalate to deliberation.
 
-use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
@@ -70,7 +69,7 @@ pub struct QualityGateExec {
     /// Token budget for sufficiency calculation.
     token_budget: usize,
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl QualityGateExec {
@@ -92,12 +91,12 @@ impl QualityGateExec {
         )));
         let schema = Arc::new(Schema::new(fields));
 
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             datafusion_physical_expr::EquivalenceProperties::new(schema.clone()),
             datafusion_physical_plan::Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
 
         Self {
             input,
@@ -227,15 +226,11 @@ impl ExecutionPlan for QualityGateExec {
         "QualityGateExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

@@ -1,0 +1,552 @@
+{
+  "run_id": "01KYAC9PMGHPX5QD93APW2M07E",
+  "metadata": {
+    "generated_at_rfc3339": "2026-07-24T15:42:07.381511+00:00",
+    "dataset_source": "external:longmemeval",
+    "corpus_embedding_source": "cache:embeddings/longmemeval_oracle_embeddings.json",
+    "embedding_model_label": "text-embedding-3-small",
+    "query_embedding_source": "cache",
+    "query_embedding_model_label": "text-embedding-3-small",
+    "embedding_dims": 1536,
+    "token_budget": 4096,
+    "k": 10,
+    "retrieval_profile": "minimal",
+    "execution_surface": "compiled-hirnql",
+    "query_text_hybrid": false,
+    "active_retrieval_surfaces": {
+      "query_text_hybrid": false,
+      "graph_routing": true,
+      "multivector": false,
+      "reranker": false,
+      "tokenizer": false,
+      "compiled_hirnql": true,
+      "quality_gate": false,
+      "iterative_retrieval": false,
+      "notes": [
+        "compiled_hirnql=true via plain THINK/RECALL execution with diagnostics; quality_gate=false for benchmark minimal-profile parity, while iterative retrieval remains off because benchmark queries use local THINK mode",
+        "cache-backed benchmark embedder installed for query-time parity with ingest",
+        "minimal profile keeps provider-backed retrieval extras disabled"
+      ]
+    },
+    "runs": 1,
+    "baseline_strategies": [
+      "full-context",
+      "iterative-retrieval"
+    ],
+    "seed": 0,
+    "dataset_files": [
+      {
+        "path": "longmemeval_oracle",
+        "blake3": "c7b0a5dc8cbb1170629c43e06f0c7029375324acb7c5bd7d73a7959be386d37a"
+      }
+    ],
+    "dataset_hash_blake3": "ff7ed687a502556b330b41fee915854b7b944c950fb54c6715a7cb28a1fa9034",
+    "reader_model": "gpt-4o",
+    "judge_model": "gpt-4o",
+    "environment": {
+      "os": "macos",
+      "arch": "aarch64",
+      "logical_cpus": 14,
+      "git_commit_sha": "e2218090719dff118a0e367519052604d3aa3c55",
+      "cargo_lock_blake3": "62e23a51f0f626200c2e9470a8424171e52fa2310315a057c8588e8a6be83d68"
+    }
+  },
+  "results": [
+    {
+      "benchmark": "LongMemEval (/private/tmp/claude-501/-Users-hupe-Workspaces-hupe1980-hirn/16e76fa0-5dd5-4b00-b31a-48a92f03b6ac/scratchpad/lme-oracle)",
+      "strategy": "hirn",
+      "run_id": "01KYAC9PMGHPX5QD93APW2M07E",
+      "categories": [
+        {
+          "name": "knowledge-update",
+          "containment": 0.9134199134199134,
+          "token_f1": 0.002568193076120156,
+          "recall_accuracy": 0.6410256410256411,
+          "mrr": 0.3782000407000406,
+          "ndcg": 0.4254406307046827,
+          "semantic_similarity": 0.0129980141916176,
+          "false_positive_rate": 0.0,
+          "total": 78
+        },
+        {
+          "name": "multi-session",
+          "containment": 0.6825099483844315,
+          "token_f1": 0.0029885084571766667,
+          "recall_accuracy": 0.39849624060150374,
+          "mrr": 0.21228070175438596,
+          "ndcg": 0.26657806359900454,
+          "semantic_similarity": 0.0074239271192363815,
+          "false_positive_rate": 0.0,
+          "total": 133
+        },
+        {
+          "name": "single-session-assistant",
+          "containment": 0.8862204316151684,
+          "token_f1": 0.0040099822230772126,
+          "recall_accuracy": 0.5535714285714286,
+          "mrr": 0.3959821428571429,
+          "ndcg": 0.4322685548081972,
+          "semantic_similarity": 0.01511486334273304,
+          "false_positive_rate": 0.0,
+          "total": 56
+        },
+        {
+          "name": "single-session-preference",
+          "containment": 0.7336081681304384,
+          "token_f1": 0.035894255877241064,
+          "recall_accuracy": 0.0,
+          "mrr": 0.0,
+          "ndcg": 0.0,
+          "semantic_similarity": 0.004784757072296911,
+          "false_positive_rate": 0.0,
+          "total": 30
+        },
+        {
+          "name": "single-session-user",
+          "containment": 0.9663838166845685,
+          "token_f1": 0.002562199364584898,
+          "recall_accuracy": 0.7571428571428571,
+          "mrr": 0.5721428571428571,
+          "ndcg": 0.5923135334677793,
+          "semantic_similarity": 0.016483728835956588,
+          "false_positive_rate": 0.0,
+          "total": 70
+        },
+        {
+          "name": "temporal-reasoning",
+          "containment": 0.8171007731072851,
+          "token_f1": 0.004808238258174223,
+          "recall_accuracy": 0.22556390977443608,
+          "mrr": 0.1562328440147989,
+          "ndcg": 0.1677686305053856,
+          "semantic_similarity": 0.008401563131341303,
+          "false_positive_rate": 0.0,
+          "total": 133
+        }
+      ],
+      "overall_containment": 0.8199568711748682,
+      "overall_token_f1": 0.005436054018819081,
+      "overall_recall_accuracy": 0.434,
+      "overall_mrr": 0.2814738095238095,
+      "overall_ndcg": 0.31324293184570523,
+      "overall_semantic_similarity": 0.010524942776303834,
+      "false_positive_rate": 0.0,
+      "execution_latency": {
+        "p50": 47048.167,
+        "p95": 91176.25,
+        "p99": 95925.292,
+        "min": 41696.166,
+        "max": 97462.542,
+        "mean": 51538.212
+      },
+      "evaluation_latency": {
+        "p50": 108.333,
+        "p95": 218.958,
+        "p99": 265.459,
+        "min": 76.917,
+        "max": 578.25,
+        "mean": 126.592
+      },
+      "end_to_end_latency": {
+        "p50": 47200.623999999996,
+        "p95": 91291.5,
+        "p99": 96082.958,
+        "min": 41773.083000000006,
+        "max": 97632.25,
+        "mean": 51664.804000000004
+      },
+      "token_cost": {
+        "context_tokens": 1621447,
+        "prompt_tokens": 1630452,
+        "completion_tokens": 0,
+        "total_tokens": 1630452,
+        "avg_context_tokens_per_query": 3242.894,
+        "avg_prompt_tokens_per_query": 3260.904,
+        "avg_total_tokens_per_query": 3260.904
+      },
+      "tokens_per_query_mean": 5310.328,
+      "tokens_per_query_p50": 5292,
+      "tokens_per_query_p95": 6622,
+      "token_estimator": "tiktoken-rs/cl100k_base",
+      "context_tokens_per_query_mean": 3242.894,
+      "context_tokens_per_query_p50": 3261,
+      "context_tokens_per_query_p95": 3491,
+      "reader": {
+        "reader_model": "gpt-4o",
+        "judge_model": "gpt-4o",
+        "judge_protocol": "longmemeval-official",
+        "reader_temperature": 0.0,
+        "official_reader_accuracy": 0.474,
+        "answered_queries": 500,
+        "judged_queries": 500,
+        "abstention_queries": 30,
+        "abstention_correct": 30,
+        "category_accuracy": [
+          {
+            "name": "knowledge-update",
+            "accuracy": 0.6410256410256411,
+            "total": 78
+          },
+          {
+            "name": "multi-session",
+            "accuracy": 0.39097744360902253,
+            "total": 133
+          },
+          {
+            "name": "single-session-assistant",
+            "accuracy": 0.7678571428571429,
+            "total": 56
+          },
+          {
+            "name": "single-session-preference",
+            "accuracy": 0.1,
+            "total": 30
+          },
+          {
+            "name": "single-session-user",
+            "accuracy": 0.7428571428571429,
+            "total": 70
+          },
+          {
+            "name": "temporal-reasoning",
+            "accuracy": 0.2781954887218045,
+            "total": 133
+          }
+        ],
+        "reader_prompt_tokens_total": 1622721,
+        "reader_completion_tokens_total": 6013,
+        "reader_prompt_tokens_per_query_mean": 3245.442,
+        "reader_prompt_tokens_per_query_p50": 3267,
+        "reader_prompt_tokens_per_query_p95": 3497,
+        "reader_completion_tokens_per_query_mean": 12.026,
+        "reader_completion_tokens_per_query_p50": 4,
+        "reader_completion_tokens_per_query_p95": 40,
+        "judge_prompt_tokens_total": 88489,
+        "judge_completion_tokens_total": 870
+      },
+      "oracle_assisted": false,
+      "total_queries": 500,
+      "ingest_time_secs": 51.52921275,
+      "query_time_secs": 25.863249833,
+      "total_time_secs": 78.101155542,
+      "compiled_phase_timings": {
+        "optimize": {
+          "p50": 101.58399999999999,
+          "p95": 119.416,
+          "p99": 130.542,
+          "min": 71.167,
+          "max": 500.75,
+          "mean": 102.835
+        },
+        "physical_plan": {
+          "p50": 171.375,
+          "p95": 195.5,
+          "p99": 203.708,
+          "min": 127.74999999999999,
+          "max": 731.6669999999999,
+          "mean": 172.52700000000002
+        },
+        "execute_plan": {
+          "p50": 27409.25,
+          "p95": 71334.125,
+          "p99": 75787.25,
+          "min": 21883.083000000002,
+          "max": 77767.083,
+          "mean": 31721.009000000002
+        },
+        "embed": {
+          "p50": 3.667,
+          "p95": 5.208,
+          "p99": 6.792000000000001,
+          "min": 1.417,
+          "max": 19.0,
+          "mean": 3.7689999999999997
+        },
+        "decode": {
+          "p50": 3991.2919999999995,
+          "p95": 4439.75,
+          "p99": 4774.584,
+          "min": 2963.917,
+          "max": 6615.5,
+          "mean": 3999.568
+        },
+        "assemble": {
+          "p50": 13351.125,
+          "p95": 16927.875,
+          "p99": 19201.208000000002,
+          "min": 10909.125,
+          "max": 21954.541,
+          "mean": 13585.508
+        },
+        "total": {
+          "p50": 45095.251000000004,
+          "p95": 89261.041,
+          "p99": 94103.541,
+          "min": 40336.792,
+          "max": 95549.0,
+          "mean": 49669.619
+        }
+      },
+      "baselines": [
+        {
+          "benchmark": "LongMemEval (/private/tmp/claude-501/-Users-hupe-Workspaces-hupe1980-hirn/16e76fa0-5dd5-4b00-b31a-48a92f03b6ac/scratchpad/lme-oracle)",
+          "strategy": "full-context",
+          "run_id": "01KYAC9PMGHPX5QD93APW2M07E",
+          "categories": [
+            {
+              "name": "knowledge-update",
+              "containment": 0.4304057054057054,
+              "token_f1": 0.0010678876078289961,
+              "recall_accuracy": 0.20512820512820512,
+              "mrr": 0.09547466422466422,
+              "ndcg": 0.09968002667296808,
+              "semantic_similarity": 0.0129980141916176,
+              "false_positive_rate": 0.0,
+              "total": 78
+            },
+            {
+              "name": "multi-session",
+              "containment": 0.4600773453389352,
+              "token_f1": 0.0015373437063708113,
+              "recall_accuracy": 0.2857142857142857,
+              "mrr": 0.18695548394796518,
+              "ndcg": 0.2066703571333404,
+              "semantic_similarity": 0.0074239271192363815,
+              "false_positive_rate": 0.0,
+              "total": 133
+            },
+            {
+              "name": "single-session-assistant",
+              "containment": 0.22404003682199172,
+              "token_f1": 0.001354429027085076,
+              "recall_accuracy": 0.017857142857142856,
+              "mrr": 0.017857142857142856,
+              "ndcg": 0.017857142857142856,
+              "semantic_similarity": 0.01511486334273304,
+              "false_positive_rate": 0.0,
+              "total": 56
+            },
+            {
+              "name": "single-session-preference",
+              "containment": 0.5548612121444003,
+              "token_f1": 0.02023212042159846,
+              "recall_accuracy": 0.0,
+              "mrr": 0.0,
+              "ndcg": 0.0,
+              "semantic_similarity": 0.004784757072296911,
+              "false_positive_rate": 0.0,
+              "total": 30
+            },
+            {
+              "name": "single-session-user",
+              "containment": 0.3203604248717031,
+              "token_f1": 0.0009230503707940271,
+              "recall_accuracy": 0.08571428571428572,
+              "mrr": 0.007227891156462584,
+              "ndcg": 0.00967542657641921,
+              "semantic_similarity": 0.016483728835956588,
+              "false_positive_rate": 0.0,
+              "total": 70
+            },
+            {
+              "name": "temporal-reasoning",
+              "containment": 0.47559930349142143,
+              "token_f1": 0.0024325279856179448,
+              "recall_accuracy": 0.09022556390977443,
+              "mrr": 0.0719656283566058,
+              "ndcg": 0.07543638296895724,
+              "semantic_similarity": 0.008401563131341303,
+              "false_positive_rate": 0.0,
+              "total": 133
+            }
+          ],
+          "overall_containment": 0.4192678949669305,
+          "overall_token_f1": 0.0027174266651309315,
+          "overall_recall_accuracy": 0.146,
+          "overall_mrr": 0.0867789682539683,
+          "overall_ndcg": 0.09394503674889293,
+          "overall_semantic_similarity": 0.010524942776303834,
+          "false_positive_rate": 0.0,
+          "execution_latency": {
+            "p50": 1209.208,
+            "p95": 1235.5,
+            "p99": 1261.75,
+            "min": 1081.292,
+            "max": 2274.0,
+            "mean": 1208.248
+          },
+          "evaluation_latency": {
+            "p50": 78.167,
+            "p95": 216.0,
+            "p99": 279.625,
+            "min": 64.334,
+            "max": 347.66700000000003,
+            "mean": 102.401
+          },
+          "end_to_end_latency": {
+            "p50": 1291.375,
+            "p95": 1438.9170000000001,
+            "p99": 1504.917,
+            "min": 1150.75,
+            "max": 2447.583,
+            "mean": 1310.65
+          },
+          "token_cost": {
+            "context_tokens": 2020336,
+            "prompt_tokens": 2029341,
+            "completion_tokens": 0,
+            "total_tokens": 2029341,
+            "avg_context_tokens_per_query": 4040.672,
+            "avg_prompt_tokens_per_query": 4058.682,
+            "avg_total_tokens_per_query": 4058.682
+          },
+          "tokens_per_query_mean": 8081.344,
+          "tokens_per_query_p50": 8116,
+          "tokens_per_query_p95": 8116,
+          "token_estimator": "tiktoken-rs/cl100k_base",
+          "context_tokens_per_query_mean": 4040.672,
+          "context_tokens_per_query_p50": 4058,
+          "context_tokens_per_query_p95": 4058,
+          "oracle_assisted": false,
+          "total_queries": 500,
+          "ingest_time_secs": 0.0,
+          "query_time_secs": 0.659460334,
+          "total_time_secs": 1.7256029160000002,
+          "embedding_cache_miss_count": 1000
+        },
+        {
+          "benchmark": "LongMemEval (/private/tmp/claude-501/-Users-hupe-Workspaces-hupe1980-hirn/16e76fa0-5dd5-4b00-b31a-48a92f03b6ac/scratchpad/lme-oracle)",
+          "strategy": "iterative-retrieval",
+          "run_id": "01KYAC9PMGHPX5QD93APW2M07E",
+          "categories": [
+            {
+              "name": "knowledge-update",
+              "containment": 0.5511474636474636,
+              "token_f1": 0.011994543816110002,
+              "recall_accuracy": 0.48717948717948717,
+              "mrr": 0.27788461538461534,
+              "ndcg": 0.328439398166665,
+              "semantic_similarity": 0.0129980141916176,
+              "false_positive_rate": 0.0,
+              "total": 78
+            },
+            {
+              "name": "multi-session",
+              "containment": 0.48798316729870594,
+              "token_f1": 0.00415379962635915,
+              "recall_accuracy": 0.3684210526315789,
+              "mrr": 0.26078589330469026,
+              "ndcg": 0.29142632677964225,
+              "semantic_similarity": 0.0074239271192363815,
+              "false_positive_rate": 0.0,
+              "total": 133
+            },
+            {
+              "name": "single-session-assistant",
+              "containment": 0.6608964291765044,
+              "token_f1": 0.008750116586737414,
+              "recall_accuracy": 0.3392857142857143,
+              "mrr": 0.27083333333333337,
+              "ndcg": 0.28811792771601435,
+              "semantic_similarity": 0.01511486334273304,
+              "false_positive_rate": 0.0,
+              "total": 56
+            },
+            {
+              "name": "single-session-preference",
+              "containment": 0.48581977715225105,
+              "token_f1": 0.0662634476378729,
+              "recall_accuracy": 0.0,
+              "mrr": 0.0,
+              "ndcg": 0.0,
+              "semantic_similarity": 0.004784757072296911,
+              "false_positive_rate": 0.0,
+              "total": 30
+            },
+            {
+              "name": "single-session-user",
+              "containment": 0.533674662847595,
+              "token_f1": 0.004218738635107003,
+              "recall_accuracy": 0.4,
+              "mrr": 0.2353968253968254,
+              "ndcg": 0.2746478805235259,
+              "semantic_similarity": 0.016483728835956588,
+              "false_positive_rate": 0.0,
+              "total": 70
+            },
+            {
+              "name": "temporal-reasoning",
+              "containment": 0.5453853046361603,
+              "token_f1": 0.008810410387674042,
+              "recall_accuracy": 0.15789473684210525,
+              "mrr": 0.11637426900584795,
+              "ndcg": 0.13026505322211468,
+              "semantic_similarity": 0.008401563131341303,
+              "false_positive_rate": 0.0,
+              "total": 133
+            }
+          ],
+          "overall_containment": 0.5387390573592454,
+          "overall_token_f1": 0.010866072023947926,
+          "overall_recall_accuracy": 0.31,
+          "overall_mrr": 0.206963492063492,
+          "overall_ndcg": 0.2341263643719542,
+          "overall_semantic_similarity": 0.010524942776303834,
+          "false_positive_rate": 0.0,
+          "execution_latency": {
+            "p50": 23267.666999999998,
+            "p95": 30965.0,
+            "p99": 32922.75,
+            "min": 16636.875,
+            "max": 34607.25,
+            "mean": 23804.236999999997
+          },
+          "evaluation_latency": {
+            "p50": 63.959,
+            "p95": 171.125,
+            "p99": 246.375,
+            "min": 17.959,
+            "max": 269.708,
+            "mean": 77.107
+          },
+          "end_to_end_latency": {
+            "p50": 23353.915999999997,
+            "p95": 31036.209,
+            "p99": 32979.875,
+            "min": 16711.375,
+            "max": 34665.583,
+            "mean": 23881.344999999998
+          },
+          "token_cost": {
+            "context_tokens": 664437,
+            "prompt_tokens": 673442,
+            "completion_tokens": 0,
+            "total_tokens": 673442,
+            "avg_context_tokens_per_query": 1328.874,
+            "avg_prompt_tokens_per_query": 1346.884,
+            "avg_total_tokens_per_query": 1346.884
+          },
+          "tokens_per_query_mean": 6199.604,
+          "tokens_per_query_p50": 6370,
+          "tokens_per_query_p95": 8081,
+          "token_estimator": "tiktoken-rs/cl100k_base",
+          "context_tokens_per_query_mean": 1328.874,
+          "context_tokens_per_query_p50": 1411,
+          "context_tokens_per_query_p95": 1926,
+          "oracle_assisted": false,
+          "total_queries": 500,
+          "ingest_time_secs": 0.0,
+          "query_time_secs": 11.945057125,
+          "total_time_secs": 12.991763333,
+          "embedding_cache_miss_count": 1500
+        }
+      ],
+      "embedding_cache_miss_count": 500
+    }
+  ],
+  "total_time_secs": 78.101155542,
+  "final_score": 0.8199568711748682,
+  "geometric_mean": 0.8199568711748682,
+  "min_suite_score": 0.8199568711748682,
+  "all_competitive": true
+}

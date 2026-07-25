@@ -433,6 +433,46 @@ pub mod store {
         }
     }
 
+    /// Serverless consolidation lease: the DynamoDB equivalent of the Raft
+    /// [`ConsolidationLease`](crate::raft::ConsolidationLease).
+    ///
+    /// Wraps a [`DynamoMetadataStore`] and the local node identity so the
+    /// sleep-time scheduler ([`crate::sleep::ConsolidationCoordinator::Dynamo`])
+    /// can gate the consolidation pass on a fenced, TTL-backed lease — exactly
+    /// one node per realm consolidates, matching the cluster (Raft) behaviour.
+    /// The returned fence is DynamoDB's monotonic `ADD fence :one` counter.
+    pub struct DynamoConsolidationLease {
+        store: std::sync::Arc<DynamoMetadataStore>,
+        node_id: String,
+    }
+
+    impl DynamoConsolidationLease {
+        /// Build a lease coordinator for `node_id` backed by `store`.
+        pub fn new(store: std::sync::Arc<DynamoMetadataStore>, node_id: impl Into<String>) -> Self {
+            Self {
+                store,
+                node_id: node_id.into(),
+            }
+        }
+
+        /// Acquire (or renew) the lease for `realm`. Returns `Ok(Some(fence))`
+        /// when this node holds it, `Ok(None)` when another live holder does.
+        pub async fn acquire(
+            &self,
+            realm: &str,
+            duration_secs: u64,
+        ) -> Result<Option<u64>, String> {
+            self.store
+                .acquire_lease(realm, &self.node_id, duration_secs)
+                .await
+        }
+
+        /// Release the lease for `realm` (idempotent).
+        pub async fn release(&self, realm: &str) -> Result<(), String> {
+            self.store.release_lease(realm, &self.node_id).await
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -450,4 +490,4 @@ pub mod store {
 
 // Re-export when feature is enabled.
 #[cfg(feature = "serverless")]
-pub use store::{DynamoConfig, DynamoMetadataStore};
+pub use store::{DynamoConfig, DynamoConsolidationLease, DynamoMetadataStore};

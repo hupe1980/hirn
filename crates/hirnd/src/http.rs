@@ -24,14 +24,15 @@ use subtle::ConstantTimeEq;
 use tokio::sync::{Notify, broadcast};
 
 use crate::auth::{
-    AuthState, Operation, auth_middleware, token_allows_namespace, token_allows_operation,
+    AuthState, ISSUER_KID_HEADER, Operation, auth_middleware, credential_kid,
+    token_allows_namespace, token_allows_operation,
 };
 use crate::config::ClusterTransportProfile;
 use crate::convert;
 use crate::coordination::CoordinationRuntime;
 use crate::realm::RealmManager;
 use crate::throttle::RateLimitClass;
-use crate::watch::{WatchEvent, WatchNamespaceScope};
+use crate::watch::{WatchEvent, WatchEventKind, WatchNamespaceScope};
 
 pub use crate::throttle::RateLimiter;
 
@@ -418,6 +419,7 @@ pub fn router(state: Arc<HttpState>, auth_state: Arc<AuthState>) -> Router {
         .route("/v1/consolidate", post(consolidate))
         .route("/v1/watch", get(watch_sse))
         .route("/v1/auth/token", post(issue_token))
+        .route("/v1/auth/revoke", post(revoke_token))
         .route("/debug/brain-stats", get(brain_stats))
         // Inner to auth: only authenticated API traffic resets the sleep
         // scheduler's idle clock (health probes must not keep hirnd awake).
@@ -443,25 +445,72 @@ pub fn router(state: Arc<HttpState>, auth_state: Arc<AuthState>) -> Router {
         .route("/raft/append", post(raft_append))
         .route("/raft/snapshot", post(raft_snapshot))
         .route("/raft/vote", post(raft_vote))
+        .route("/raft/propose", post(raft_propose))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             raft_transport_auth_middleware,
         ))
         .with_state(Arc::clone(&state));
 
-    // Public routes (no auth required)
-    Router::new()
+    // Public probe routes (no auth). These have no authenticated actor to key
+    // the per-agent throttle on, so they get a per-source-IP rate limit — the
+    // only rate limit that applies to unauthenticated scans of `/health`,
+    // `/readyz`, `/metrics` (R-72). Raft transport is deliberately excluded:
+    // it is authenticated by the shared transport secret and runs at heartbeat
+    // frequency, so per-IP throttling it would risk breaking consensus.
+    let public_probe_routes = Router::new()
         .route("/health", get(health))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics_endpoint))
-        .with_state(state)
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            public_ip_throttle,
+        ))
+        .with_state(Arc::clone(&state));
+
+    Router::new()
+        .merge(public_probe_routes)
         .merge(raft_transport_routes)
         .merge(control_plane_routes)
         .merge(api_routes)
         .layer(middleware::from_fn(trace_id_middleware))
         // F-E3: Limit request body size to 16 MiB to prevent OOM from oversized payloads.
         .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024))
+}
+
+/// Per-source-IP rate limit for unauthenticated public routes.
+///
+/// Keyed on the peer IP (from [`axum::extract::ConnectInfo`]) so an
+/// unauthenticated client cannot flood `/health`/`/metrics`. When the peer
+/// address is unavailable (e.g. a server started without connection info, as
+/// in some tests) the throttle is skipped rather than failing the request.
+async fn public_ip_throttle(
+    State(state): State<Arc<HttpState>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    // Peer address is injected into request extensions by the connect-info
+    // make-service (plaintext) or the TLS accept loop. When absent (e.g. a
+    // server started without connection info, as in some tests) the throttle
+    // is skipped rather than failing the request.
+    let peer_ip = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|info| info.0.ip());
+    if let Some(ip) = peer_ip {
+        if !state.rate_limiter.check_ip(RateLimitClass::Read, ip) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(ErrorResponse::with_retryable(
+                    "per-IP rate limit exceeded — try again later",
+                    true,
+                )),
+            )
+                .into_response();
+        }
+    }
+    next.run(request).await
 }
 
 // ─── Helpers ─────────────────────────────────────────────────
@@ -1346,6 +1395,34 @@ struct TokenResponse {
     expires_at: u64,
 }
 
+#[derive(Deserialize)]
+struct RevokeRequest {
+    /// Full JWT to revoke (preferred: the server extracts jti + exp itself,
+    /// and accepts the token even if it has just expired).
+    #[serde(default)]
+    token: Option<String>,
+    /// Revoke by bare jti when the token itself is not at hand.
+    #[serde(default)]
+    jti: Option<String>,
+    /// Expiry of the token identified by `jti` (bounds how long the
+    /// revocation entry is retained). Defaults to now + configured TTL.
+    #[serde(default)]
+    exp: Option<u64>,
+    /// Revoke every token issued by this credential fingerprint.
+    #[serde(default)]
+    iss_kid: Option<String>,
+    /// Revoke every token issued by this API key (the server derives the
+    /// fingerprint; use when rotating a key out of the config).
+    #[serde(default)]
+    api_key: Option<String>,
+}
+
+#[derive(Default, Serialize)]
+struct RevokeResponse {
+    revoked_jtis: Vec<String>,
+    revoked_issuers: Vec<String>,
+}
+
 // ─── Handlers ────────────────────────────────────────────────
 
 /// Issue a scoped JWT token. Requires valid API key auth.
@@ -1392,7 +1469,12 @@ async fn issue_token(
         // would be a widening, so inherit the caller's own scope instead.
         if operations.is_empty() {
             operations.clone_from(&caller_ops);
-        } else if let Some(op) = operations.iter().find(|op| !caller_ops.contains(op)) {
+        } else if let Some(op) = operations
+            .iter()
+            .find(|op| !token_allows_operation(&caller_ops, op))
+        {
+            // Hierarchy-aware subset check: an [Admin] caller may mint Read /
+            // Write tokens, but a [Read] caller cannot mint a [Write] token.
             return Err((
                 StatusCode::FORBIDDEN,
                 Json(ErrorResponse::new(format!(
@@ -1414,9 +1496,17 @@ async fn issue_token(
         }
     }
 
+    // Bind the minted token to the credential that authenticated this
+    // request (daemon-authored header injected by `auth_middleware`), so
+    // revoking that credential also revokes this token.
+    let iss_kid = headers
+        .get(ISSUER_KID_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+
     let token = state
         .auth_state
-        .issue_token(&identity, namespaces, operations, body.ttl_secs)
+        .issue_token(&identity, namespaces, operations, body.ttl_secs, iss_kid)
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1442,6 +1532,101 @@ async fn issue_token(
             expires_at: claims.exp,
         }),
     ))
+}
+
+/// Revoke issued JWTs before their natural expiry.
+///
+/// Accepts any combination of: a full `token` (preferred — the server
+/// extracts jti/exp and enforces realm scoping), a bare `jti`, an issuer
+/// credential fingerprint `iss_kid`, or a raw `api_key` whose entire
+/// issuance tree should die (key rotation/removal).
+///
+/// Requires an unrestricted principal (API key / mTLS) or a token that
+/// carries the `admin` operation. The revocation list is node-local; in a
+/// cluster this endpoint must be called on each node (see
+/// [`crate::auth::RevocationList`]).
+async fn revoke_token(
+    State(state): State<Arc<HttpState>>,
+    headers: HeaderMap,
+    Json(body): Json<RevokeRequest>,
+) -> Result<(StatusCode, Json<RevokeResponse>), (StatusCode, Json<ErrorResponse>)> {
+    enforce_rate_limit(&state, &headers, RateLimitClass::Auth)?;
+
+    if !state.auth_state.tokens_enabled() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new("token sessions not configured")),
+        ));
+    }
+
+    // Restricted (token-authenticated) callers need the admin operation;
+    // unrestricted principals (API key / mTLS) may always revoke.
+    if let Some(caller_ops) = parse_token_operations(&headers)? {
+        if !caller_ops.is_empty() && !caller_ops.contains(&Operation::Admin) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(ErrorResponse::new(
+                    "token revocation requires the admin operation",
+                )),
+            ));
+        }
+    }
+
+    let realm = extract_realm_id(&headers)?;
+    let revocations = state.auth_state.revocations();
+    let mut response = RevokeResponse::default();
+
+    if let Some(ref token) = body.token {
+        let claims = state.auth_state.decode_for_revocation(token).map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new("not a token issued by this server")),
+            )
+        })?;
+        // A caller may only revoke tokens of its own realm.
+        if claims.realm != realm {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(ErrorResponse::new(
+                    "cannot revoke a token belonging to another realm",
+                )),
+            ));
+        }
+        revocations.revoke_jti(claims.jti.clone(), claims.exp);
+        response.revoked_jtis.push(claims.jti);
+    }
+
+    if let Some(jti) = body.jti {
+        // Without the token we cannot know its exp; retain the entry for the
+        // caller-supplied exp, defaulting to now + the configured TTL.
+        let exp = body.exp.unwrap_or_else(|| {
+            jsonwebtoken::get_current_timestamp() + state.auth_state.token_ttl_secs()
+        });
+        revocations.revoke_jti(jti.clone(), exp);
+        response.revoked_jtis.push(jti);
+    }
+
+    if let Some(kid) = body.iss_kid {
+        revocations.revoke_issuer(kid.clone());
+        response.revoked_issuers.push(kid);
+    }
+
+    if let Some(ref api_key) = body.api_key {
+        let kid = credential_kid("key", api_key);
+        state.auth_state.revoke_api_key(api_key);
+        response.revoked_issuers.push(kid);
+    }
+
+    if response.revoked_jtis.is_empty() && response.revoked_issuers.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "nothing to revoke: provide token, jti, iss_kid, or api_key",
+            )),
+        ));
+    }
+
+    Ok((StatusCode::OK, Json(response)))
 }
 
 async fn health(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
@@ -1718,12 +1903,15 @@ async fn remember(
                 let ctx = agent_context(&db, &agent).await?;
                 ctx.remember(record).await.map_err(map_err)?
             };
-            let _ = state.watch_tx.send(WatchEvent::Created {
-                id: id.clone(),
-                layer: Layer::Episodic,
-                entities: w_entities,
-                importance: w_importance,
-                namespace: w_namespace,
+            let _ = state.watch_tx.send(WatchEvent {
+                realm: extract_realm_id(&headers)?.to_owned(),
+                kind: WatchEventKind::Created {
+                    id: id.clone(),
+                    layer: Layer::Episodic,
+                    entities: w_entities,
+                    importance: w_importance,
+                    namespace: w_namespace,
+                },
             });
             (id.to_string(), "episodic")
         }
@@ -1770,12 +1958,15 @@ async fn remember(
                 let ctx = agent_context(&db, &agent).await?;
                 ctx.store_semantic(record).await.map_err(map_err)?
             };
-            let _ = state.watch_tx.send(WatchEvent::Created {
-                id: id.clone(),
-                layer: Layer::Semantic,
-                entities: vec![],
-                importance: w_importance,
-                namespace: w_namespace,
+            let _ = state.watch_tx.send(WatchEvent {
+                realm: extract_realm_id(&headers)?.to_owned(),
+                kind: WatchEventKind::Created {
+                    id: id.clone(),
+                    layer: Layer::Semantic,
+                    entities: vec![],
+                    importance: w_importance,
+                    namespace: w_namespace,
+                },
             });
             (id.to_string(), "semantic")
         }
@@ -2337,8 +2528,11 @@ async fn consolidate(
 
     let result = builder.execute().await.map_err(map_err)?;
 
-    let _ = state.watch_tx.send(WatchEvent::Consolidated {
-        records_processed: result.records_processed,
+    let _ = state.watch_tx.send(WatchEvent {
+        realm: extract_realm_id(&headers)?.to_owned(),
+        kind: WatchEventKind::Consolidated {
+            records_processed: result.records_processed,
+        },
     });
 
     counter!("hirnd_requests_total", "endpoint" => "consolidate").increment(1);
@@ -2381,6 +2575,8 @@ async fn watch_sse(
         check_namespace(&headers, &agent, Some(namespace))?;
     }
     let namespace_scope = watch_namespace_scope(&headers, &agent, query.namespace.clone())?;
+    // Subscribers only see events from their own authenticated realm.
+    let subscriber_realm = extract_realm_id(&headers)?.to_owned();
     let mut rx = state.watch_tx.subscribe();
 
     let layer_filter: Option<Layer> =
@@ -2404,6 +2600,7 @@ async fn watch_sse(
             match rx.recv().await {
                 Ok(event) => {
                     if let Some(proto_event) = event.to_proto(
+                        &subscriber_realm,
                         &layer_filter,
                         &entities,
                         min_importance,
@@ -2704,6 +2901,38 @@ async fn raft_vote(
     }
 }
 
+/// Raft internal: leader proposal forwarding.
+///
+/// A follower's `ClusterCoordinator::propose` re-issues mutating cluster
+/// commands (node registry updates, consolidation-lease acquire/renew/release)
+/// here after `client_write` returned `ForwardToLeader`. Authenticated by the
+/// shared transport secret via [`raft_transport_auth_middleware`]. On success
+/// the applied [`RaftResponse`](crate::raft::RaftResponse) is returned as JSON;
+/// if this node is not (or is no longer) the leader the request fails and the
+/// caller retries.
+async fn raft_propose(
+    State(state): State<Arc<HttpState>>,
+    Json(req): Json<crate::raft::RaftRequest>,
+) -> impl IntoResponse {
+    let Some(ref raft) = state.raft else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "raft not enabled"})),
+        )
+            .into_response();
+    };
+    match raft.client_write(req).await {
+        Ok(resp) => (StatusCode::OK, Json(resp.data)).into_response(),
+        Err(e) => (
+            // Not the leader (or a transient consensus error): the caller
+            // retries on its next tick.
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": format!("{e}"), "retryable": true})),
+        )
+            .into_response(),
+    }
+}
+
 // ─── Cluster Management Endpoints ────────────────────────────
 
 #[derive(Deserialize)]
@@ -2915,7 +3144,7 @@ pub async fn serve_http_tls(
             accepted = listener.accept() => accepted,
             _ = shutdown.changed() => break,
         };
-        let (stream, _addr) = accepted?;
+        let (stream, peer_addr) = accepted?;
         let acceptor = acceptor.clone();
         let app = app.clone();
 
@@ -2947,6 +3176,11 @@ pub async fn serve_http_tls(
                                         req.headers_mut().insert("x-client-cert-cn", val);
                                     }
                                 }
+                                // Expose the peer address for the per-IP throttle
+                                // on unauthenticated public routes (R-72), matching
+                                // the plaintext connect-info make-service.
+                                req.extensions_mut()
+                                    .insert(axum::extract::ConnectInfo(peer_addr));
                                 app.oneshot(req).await
                             }
                         },

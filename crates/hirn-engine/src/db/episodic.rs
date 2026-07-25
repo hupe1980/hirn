@@ -83,9 +83,38 @@ fn apply_admission_decision(
     match decision {
         crate::admission::AdmissionDecision::Accept {
             importance_override,
+            flags,
         } => {
             if let Some(override_val) = importance_override {
                 record.importance = override_val;
+            }
+            // Controller flags (e.g. poisoning audit findings) are stamped
+            // into metadata so the stored record carries the machine-readable
+            // trail — the content itself is never rewritten.
+            if !flags.is_empty() {
+                use hirn_core::metadata::MetadataValue;
+                let list = MetadataValue::List(
+                    flags
+                        .iter()
+                        .map(|flag| {
+                            let mut entry = std::collections::BTreeMap::new();
+                            entry.insert(
+                                "controller".to_string(),
+                                MetadataValue::String(flag.controller.clone()),
+                            );
+                            entry.insert(
+                                "code".to_string(),
+                                MetadataValue::String(flag.code.clone()),
+                            );
+                            entry.insert(
+                                "detail".to_string(),
+                                MetadataValue::String(flag.detail.clone()),
+                            );
+                            MetadataValue::Map(entry)
+                        })
+                        .collect(),
+                );
+                record.metadata.insert("admission_flags".to_string(), list);
             }
             Ok(())
         }
@@ -1011,9 +1040,16 @@ impl HirnDB {
                     .iter()
                     .map(|(_, _, e)| e.clone())
                     .collect();
+                // Namespaces are index-aligned with `embeddings` so each RPE
+                // similarity query is scoped to the record's writing namespace.
+                let namespaces: Vec<hirn_core::types::Namespace> = indexed_embeddings
+                    .iter()
+                    .map(|(ai, _, _)| admitted[*ai].1.namespace)
+                    .collect();
                 match super::write_path::batch_vector_search_max_sim(
                     self.storage_backend(),
                     &embeddings,
+                    &namespaces,
                     self.config.rpe_similarity_search_limit,
                 )
                 .await
@@ -1912,6 +1948,7 @@ impl HirnDB {
                     self.config.rpe_similarity_search_limit,
                     &mut stats_snapshot,
                     &self.write_runtime().rpe_circuit_breaker_for(&key),
+                    &record.namespace,
                 )
                 .await;
                 self.write_runtime()
@@ -2066,23 +2103,34 @@ impl HirnDB {
 
         {
             let dims = self.config.embedding_dimensions.as_usize();
-            let batch =
-                hirn_storage::datasets::episodic::to_batch(std::slice::from_ref(&record), dims)
-                    .map_err(|e| HirnError::storage(e))
-                    .map_err(|error| {
-                        explanation.status = crate::RememberStatus::Failed;
-                        explanation.error = Some(error.to_string());
-                        crate::RememberFailure::new(error, explanation.clone())
-                    })?;
-            self.storage_runtime
-                .append(hirn_storage::datasets::episodic::DATASET_NAME, batch)
-                .await
-                .map_err(|e| HirnError::storage(e))
-                .map_err(|error| {
+            // R-58: the graph node was added above. The episodic to_batch /
+            // append failure paths must remove it before returning, mirroring
+            // the edge-failure path and the batch write path — otherwise a
+            // failed episodic append leaves an orphaned graph node.
+            let batch = match hirn_storage::datasets::episodic::to_batch(
+                std::slice::from_ref(&record),
+                dims,
+            ) {
+                Ok(batch) => batch,
+                Err(e) => {
+                    let _ = self.cached_graph().remove_node(id).await;
+                    let error = HirnError::storage(e);
                     explanation.status = crate::RememberStatus::Failed;
                     explanation.error = Some(error.to_string());
-                    crate::RememberFailure::new(error, explanation.clone())
-                })?;
+                    return Err(crate::RememberFailure::new(error, explanation));
+                }
+            };
+            if let Err(e) = self
+                .storage_runtime
+                .append(hirn_storage::datasets::episodic::DATASET_NAME, batch)
+                .await
+            {
+                let _ = self.cached_graph().remove_node(id).await;
+                let error = HirnError::storage(e);
+                explanation.status = crate::RememberStatus::Failed;
+                explanation.error = Some(error.to_string());
+                return Err(crate::RememberFailure::new(error, explanation));
+            }
         }
 
         let arrival = self.write_runtime().record_arrival(namespace, id);

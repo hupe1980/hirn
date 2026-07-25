@@ -66,6 +66,18 @@ pub async fn evolve_on_new_memory(
             _ => continue,
         };
 
+        // Cross-namespace isolation: the Synchronous evolution path searches all
+        // namespaces (`vector_search_all`), so a candidate may belong to a
+        // foreign tenant. Only evolve/link records in the new memory's own
+        // namespace (or the shared namespace). Without this a Synchronous write
+        // in namespace A could `correct_semantic` a belief in namespace B and
+        // create a cross-namespace `DerivedFrom` edge.
+        let same_namespace = record.namespace == new_record.namespace;
+        let shared = record.namespace == hirn_core::types::Namespace::shared();
+        if !same_namespace && !shared {
+            continue;
+        }
+
         // Skip if similarity is below threshold.
         if sim < config.evolution_similarity_threshold {
             continue;
@@ -152,5 +164,115 @@ impl Default for EvolutionConfig {
             evolution_top_k: 5,
             evolution_similarity_threshold: 0.75,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hirn_core::types::Namespace;
+    use std::sync::Arc;
+
+    async fn test_db() -> HirnDB {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test");
+        let lance_path = dir.path().join("lance");
+        let mut config = hirn_core::HirnConfig::default();
+        config.db_path = db_path;
+        config.embedding_dimensions = hirn_core::EmbeddingDimension::new_const(3);
+        let storage: Arc<dyn hirn_storage::PhysicalStore> = hirn_storage::HirnDb::open(
+            hirn_storage::HirnDbConfig::local(lance_path.to_str().unwrap()),
+        )
+        .await
+        .unwrap()
+        .store_arc();
+        let db = HirnDB::open_with_config(config, storage).await.unwrap();
+        std::mem::forget(dir);
+        db
+    }
+
+    async fn store_semantic_ns(db: &HirnDB, emb: Vec<f32>, namespace: Namespace) -> MemoryId {
+        let record = SemanticRecord::builder()
+            .concept("shared-concept")
+            .description("the sky is blue")
+            .embedding(emb)
+            .confidence(0.6)
+            .agent_id(AgentId::new("owner").unwrap())
+            .namespace(namespace)
+            .build()
+            .unwrap();
+        db.store_semantic(record).await.unwrap()
+    }
+
+    fn episodic_ns(emb: Vec<f32>, namespace: Namespace) -> EpisodicRecord {
+        EpisodicRecord::builder()
+            .content("the sky is blue")
+            .embedding(emb)
+            .agent_id(AgentId::new("writer").unwrap())
+            .namespace(namespace)
+            .build()
+            .unwrap()
+    }
+
+    /// R-04 regression: a Synchronous-mode write in namespace A must not evolve
+    /// or link to a semantic belief living in namespace B.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn synchronous_evolution_does_not_cross_namespaces() {
+        let db = test_db().await;
+        let emb = vec![0.2_f32, 0.4, 0.6];
+
+        // Belief lives in a foreign tenant's namespace.
+        let ns_b = Namespace::private_for(&AgentId::new("agent-b").unwrap());
+        let belief_id = store_semantic_ns(&db, emb.clone(), ns_b).await;
+
+        // New episode is written into a different namespace with an identical
+        // embedding (would be a top similarity hit without scoping).
+        let ns_a = Namespace::private_for(&AgentId::new("agent-a").unwrap());
+        let new_record = episodic_ns(emb.clone(), ns_a);
+
+        let config = EvolutionConfig::default();
+        let result = evolve_on_new_memory(&db, &new_record, &config)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.records_evolved, 0,
+            "must not evolve a belief in a foreign namespace"
+        );
+        assert_eq!(
+            result.links_created, 0,
+            "must not create a cross-namespace DerivedFrom edge"
+        );
+
+        // The foreign belief's evidence_count must be untouched.
+        let belief = match db.get_memory(belief_id).await.unwrap() {
+            hirn_core::record::MemoryRecord::Semantic(s) => s,
+            other => panic!("expected semantic record, got {other:?}"),
+        };
+        assert_eq!(
+            belief.evidence_count, 0,
+            "foreign belief evidence_count must be unchanged"
+        );
+    }
+
+    /// Positive control: a belief in the *same* namespace is still evolved.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn synchronous_evolution_evolves_same_namespace() {
+        let db = test_db().await;
+        let emb = vec![0.2_f32, 0.4, 0.6];
+
+        let ns_a = Namespace::private_for(&AgentId::new("agent-a").unwrap());
+        store_semantic_ns(&db, emb.clone(), ns_a).await;
+
+        let new_record = episodic_ns(emb.clone(), ns_a);
+        let config = EvolutionConfig::default();
+        let result = evolve_on_new_memory(&db, &new_record, &config)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.records_evolved, 1,
+            "a same-namespace belief should be evolved"
+        );
     }
 }

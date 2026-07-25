@@ -62,6 +62,13 @@ impl BfsResult {
     }
 }
 
+/// Upper bound on total DFS stack pops in [`PersistentGraph::deep_causal_bfs`]
+/// (R-69). Independent of the emitted-chain cap, this bounds the frontier state
+/// (and the per-frame Vec/HashSet clones) so a wide/low-depth DAG cannot balloon
+/// CPU/memory even when it emits few full chains. Sized generously above the
+/// chain cap so ordinary deep queries are never truncated by it.
+pub const MAX_CAUSAL_EXPLORED_POPS: usize = 65_536;
+
 /// A single row from [`PersistentGraph::deep_causal_bfs`].
 ///
 /// Each row represents one edge in a causal chain, tagged with chain_id,
@@ -853,6 +860,14 @@ impl PersistentGraph {
         new_weight: f32,
         co_retrieval_count: Option<u64>,
     ) -> HirnResult<()> {
+        // Reject non-finite weights: `clamp` passes NaN through unchanged, which
+        // would poison downstream activation. Mirrors the hot tier and
+        // `PropertyGraph::add_edge`.
+        if !new_weight.is_finite() {
+            return Err(hirn_core::HirnError::InvalidInput(format!(
+                "graph edge weight must be finite, got {new_weight}"
+            )));
+        }
         if let Some(mut edge) = self.get_edges_by_ids(&[edge_id]).await?.into_iter().next() {
             edge.weight = new_weight.clamp(0.01, 1.0);
             edge.updated_at = Timestamp::now();
@@ -1165,6 +1180,78 @@ impl PersistentGraph {
             .await
     }
 
+    /// Fetch the namespaces of many nodes with one `id IN (...)` projection
+    /// scan per chunk instead of one `get_node` scan per id.
+    ///
+    /// Returns a map from node id to namespace; ids without a stored node are
+    /// simply absent from the map.
+    pub async fn node_namespaces(
+        &self,
+        ids: &[MemoryId],
+    ) -> HirnResult<HashMap<MemoryId, Namespace>> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        if !self.storage.exists(DATASET_NODES_NAME).await? {
+            return Ok(HashMap::new());
+        }
+
+        let unique_ids: Vec<MemoryId> = ids
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+
+        let mut namespaces = HashMap::with_capacity(unique_ids.len());
+        // Process in chunks of 500 to keep the SQL expression manageable
+        // (same chunking as `flush_access_counts`).
+        for chunk in unique_ids.chunks(500) {
+            let predicate = format!("id IN ({})", Self::quoted_in_values(chunk).join(", "));
+            let mut stream = self
+                .storage
+                .scan_stream(
+                    DATASET_NODES_NAME,
+                    ScanOptions {
+                        columns: Some(vec!["id".into(), "namespace".into()]),
+                        filter: Some(predicate),
+                        exact_filter: None,
+                        order_by: None,
+                        limit: None,
+                        offset: None,
+                    },
+                )
+                .await?;
+
+            while let Some(batch) = stream.try_next().await? {
+                let id_col = batch
+                    .column_by_name("id")
+                    .and_then(|c| c.as_any().downcast_ref::<arrow_array::StringArray>());
+                let ns_col = batch
+                    .column_by_name("namespace")
+                    .and_then(|c| c.as_any().downcast_ref::<arrow_array::StringArray>());
+                if let (Some(id_arr), Some(ns_arr)) = (id_col, ns_col) {
+                    for i in 0..batch.num_rows() {
+                        if let (Ok(id), Ok(namespace)) = (
+                            MemoryId::parse(id_arr.value(i)),
+                            Namespace::new(ns_arr.value(i)),
+                        ) {
+                            namespaces.insert(id, namespace);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(namespaces)
+    }
+
+    /// Return which of the given ids currently exist as nodes, using the same
+    /// batched projection scan as [`node_namespaces`](Self::node_namespaces).
+    pub async fn existing_node_ids(&self, ids: &[MemoryId]) -> HirnResult<HashSet<MemoryId>> {
+        Ok(self.node_namespaces(ids).await?.into_keys().collect())
+    }
+
     async fn filter_edges_by_target_namespace(
         &self,
         edges: Vec<GraphEdge>,
@@ -1177,24 +1264,19 @@ impl PersistentGraph {
             return Ok(vec![]);
         }
 
-        let mut namespace_cache = HashMap::new();
-        let mut visible_edges = Vec::with_capacity(edges.len());
-        for edge in edges {
-            if let std::collections::hash_map::Entry::Vacant(entry) =
-                namespace_cache.entry(edge.target)
-            {
-                let is_visible = self
-                    .node_namespace(edge.target)
-                    .await?
-                    .is_some_and(|namespace| allowed_namespaces.contains(&namespace));
-                entry.insert(is_visible);
-            }
-            if namespace_cache.get(&edge.target).copied().unwrap_or(false) {
-                visible_edges.push(edge);
-            }
-        }
+        // One batched projection scan for all distinct targets instead of one
+        // `node_namespace` lookup per distinct target.
+        let targets: Vec<MemoryId> = edges.iter().map(|edge| edge.target).collect();
+        let namespaces = self.node_namespaces(&targets).await?;
 
-        Ok(visible_edges)
+        Ok(edges
+            .into_iter()
+            .filter(|edge| {
+                namespaces
+                    .get(&edge.target)
+                    .is_some_and(|namespace| allowed_namespaces.contains(namespace))
+            })
+            .collect())
     }
 
     async fn filter_node_ids_by_namespace(
@@ -1209,18 +1291,16 @@ impl PersistentGraph {
             return Ok(vec![]);
         }
 
-        let mut visible = Vec::with_capacity(ids.len());
-        for &id in ids {
-            if self
-                .node_namespace(id)
-                .await?
-                .is_some_and(|namespace| allowed_namespaces.contains(&namespace))
-            {
-                visible.push(id);
-            }
-        }
-
-        Ok(visible)
+        let namespaces = self.node_namespaces(ids).await?;
+        Ok(ids
+            .iter()
+            .copied()
+            .filter(|id| {
+                namespaces
+                    .get(id)
+                    .is_some_and(|namespace| allowed_namespaces.contains(namespace))
+            })
+            .collect())
     }
 
     /// Batch BFS using batch adjacency reads.
@@ -1315,6 +1395,14 @@ impl PersistentGraph {
     /// depth, and the chain's composite score.
     ///
     /// Complexity: one Lance scan per depth level (not per node).
+    ///
+    /// Returns `(rows, truncated)` where `truncated` is `true` if enumeration
+    /// stopped early — either because the emitted-chain cap
+    /// ([`MAX_CAUSAL_CHAINS`](crate::graph::causal::MAX_CAUSAL_CHAINS)) or the
+    /// explored-state cap ([`MAX_CAUSAL_EXPLORED_POPS`]) was hit (R-69). The
+    /// explored-state cap bounds the DFS frontier itself (total stack pops),
+    /// independent of how many chains are emitted, so a wide/low-depth DAG
+    /// cannot balloon the frontier + per-frame clones into an OOM/CPU hazard.
     pub async fn deep_causal_bfs(
         &self,
         start_ids: &[MemoryId],
@@ -1322,7 +1410,7 @@ impl PersistentGraph {
         confidence_threshold: f32,
         relation: EdgeRelation,
         allowed_namespaces: Option<&[Namespace]>,
-    ) -> HirnResult<Vec<CausalBfsRow>> {
+    ) -> HirnResult<(Vec<CausalBfsRow>, bool)> {
         use std::collections::{HashMap, HashSet};
 
         let bfs = self
@@ -1343,6 +1431,11 @@ impl PersistentGraph {
         // deep, high-fan-out graphs (this is the delegated deep-query path).
         let mut rows = Vec::new();
         let mut chain_counter = 0_u32;
+        let mut truncated = false;
+        // R-69: bound the EXPLORED state (total stack pops), not just emitted
+        // chains. High-fan-out/low-depth DAGs emit few full-length chains but
+        // can still explode the frontier and the per-frame Vec/HashSet clones.
+        let mut total_pops = 0_usize;
 
         'seeds: for &seed in start_ids {
             // Stack: (current_node, depth, chain_edges_so_far, visited)
@@ -1353,7 +1446,21 @@ impl PersistentGraph {
             }];
 
             while let Some((node, depth, chain_edges, visited)) = stack.pop() {
+                total_pops += 1;
+                if total_pops > MAX_CAUSAL_EXPLORED_POPS {
+                    truncated = true;
+                    tracing::warn!(
+                        max_pops = MAX_CAUSAL_EXPLORED_POPS,
+                        "deep causal BFS truncated: explored-state cap reached"
+                    );
+                    // Emit the partial chain we were on before bailing out.
+                    if !chain_edges.is_empty() {
+                        emit_causal_rows(&chain_edges, &mut rows, &mut chain_counter);
+                    }
+                    break 'seeds;
+                }
                 if chain_counter as usize >= crate::graph::causal::MAX_CAUSAL_CHAINS {
+                    truncated = true;
                     tracing::warn!(
                         max_chains = crate::graph::causal::MAX_CAUSAL_CHAINS,
                         "deep causal BFS truncated: chain cap reached"
@@ -1405,7 +1512,7 @@ impl PersistentGraph {
             }
         }
 
-        Ok(rows)
+        Ok((rows, truncated))
     }
 
     /// BFS neighbor traversal.
@@ -1916,6 +2023,40 @@ mod tests {
         assert!(err.to_string().contains("edge metadata exceeds"));
     }
 
+    #[tokio::test]
+    async fn add_edge_rejects_non_finite_weight_and_clamps_to_unit_range() {
+        let pg = PersistentGraph::new(dummy_storage());
+        let ns = Namespace::default_ns();
+        let now = Timestamp::now();
+        let a = MemoryId::new();
+        let b = MemoryId::new();
+        pg.add_node(a, Layer::Episodic, 0.5, now, ns.clone())
+            .await
+            .unwrap();
+        pg.add_node(b, Layer::Episodic, 0.5, now, ns).await.unwrap();
+
+        // Non-finite weights are rejected — clamp(NaN) is NaN and would
+        // poison every downstream activation in the connected component.
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let err = pg
+                .add_edge(a, b, EdgeRelation::Causes, bad, Metadata::new())
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("finite"),
+                "expected finite-weight rejection, got: {err}"
+            );
+        }
+
+        // Below-range weights clamp to 0.0, matching the hot tier's [0, 1].
+        let id = pg
+            .add_edge(a, b, EdgeRelation::Causes, -0.5, Metadata::new())
+            .await
+            .unwrap();
+        let edge = pg.get_edge(id).await.unwrap().unwrap();
+        assert_eq!(edge.weight, 0.0);
+    }
+
     // ── Helper to build a populated graph ──
 
     /// Create a graph with `node_count` nodes and directed edges forming
@@ -2220,12 +2361,75 @@ mod tests {
             .await
             .unwrap();
 
-        let rows = pg
+        let (rows, truncated) = pg
             .deep_causal_bfs(&[a], 3, 0.0, EdgeRelation::Causes, Some(&[visible_ns]))
             .await
             .unwrap();
 
         assert!(rows.is_empty());
+        assert!(!truncated, "a tiny scoped query must not be truncated");
+    }
+
+    /// R-69: a DAG with exponentially many paths must be bounded and must
+    /// surface `truncated = true`. A layered fully-connected DAG keeps the node
+    /// count tiny (fast to build) while the number of root→leaf paths — and thus
+    /// the DFS explored state — grows as `width^depth`, tripping a cap.
+    #[tokio::test]
+    async fn deep_causal_bfs_wide_dag_is_bounded_and_reports_truncation() {
+        let pg = PersistentGraph::new(dummy_storage());
+        let ns = Namespace::shared();
+        let now = Timestamp::now();
+
+        // root → L1(width) fully-connected to L2(width) fully-connected to ...
+        // Paths = width^layers, but only width*layers + 1 distinct nodes.
+        let width = 8usize;
+        let layers = 7usize; // 8^7 ≈ 2M paths → far past both caps.
+
+        let root = MemoryId::new();
+        pg.add_node(root, Layer::Episodic, 0.5, now, ns.clone())
+            .await
+            .unwrap();
+
+        let mut prev_layer = vec![root];
+        for _ in 0..layers {
+            // Build this layer's nodes.
+            let mut layer = Vec::with_capacity(width);
+            for _ in 0..width {
+                let id = MemoryId::new();
+                pg.add_node(id, Layer::Episodic, 0.5, now, ns.clone())
+                    .await
+                    .unwrap();
+                layer.push(id);
+            }
+            // Fully connect the previous layer to this one.
+            for &src in &prev_layer {
+                for &dst in &layer {
+                    pg.add_edge(src, dst, EdgeRelation::Causes, 0.9, Metadata::default())
+                        .await
+                        .unwrap();
+                }
+            }
+            prev_layer = layer;
+        }
+
+        let (rows, truncated) = pg
+            .deep_causal_bfs(&[root], layers + 1, 0.0, EdgeRelation::Causes, None)
+            .await
+            .unwrap();
+
+        assert!(
+            truncated,
+            "an exponential-path DAG must trip a truncation cap and report it"
+        );
+        // Emitted chains stay within the chain cap (bounded output).
+        assert!(
+            rows.iter()
+                .map(|r| &r.chain_id)
+                .collect::<HashSet<_>>()
+                .len()
+                <= crate::graph::causal::MAX_CAUSAL_CHAINS,
+            "emitted chains must respect the chain cap"
+        );
     }
 
     #[tokio::test]

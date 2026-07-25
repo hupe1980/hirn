@@ -22,6 +22,9 @@ pub const CONSOLIDATION_TOTAL: &str = "hirn_consolidation_total";
 /// Total admission rejections (labels: realm).
 pub const ADMISSION_REJECTED_TOTAL: &str = "hirn_admission_rejected_total";
 
+/// Total candidates flagged by the ingest-time poisoning scan (labels: action=audit|reject).
+pub const ADMISSION_POISONING_FLAGGED_TOTAL: &str = "hirn_admission_poisoning_flagged_total";
+
 /// Total authorization decisions (labels: decision=allow|deny).
 pub const AUTHZ_DECISIONS_TOTAL: &str = "hirn_authz_decisions_total";
 

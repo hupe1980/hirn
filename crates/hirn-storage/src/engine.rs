@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
@@ -6,7 +5,6 @@ use arrow_schema::{DataType, Field, SchemaRef};
 
 use crate::embedding_registry::EmbeddingRegistry;
 use crate::error::HirnDbError;
-use crate::fragment_cache::{FragmentCache, FragmentCacheConfig};
 use crate::lance_store::LancePhysicalStore;
 use crate::memory_store::MemoryStore;
 use crate::namespace::NamespaceConfig;
@@ -21,8 +19,6 @@ const DEFAULT_MAX_CONCURRENT_EMBEDDING_TASKS: usize = 8;
 pub struct HirnDbConfig {
     /// Namespace configuration (root path + properties).
     pub namespace: NamespaceConfig,
-    /// Optional fragment cache for local NVMe/SSD acceleration of remote object stores.
-    pub fragment_cache: Option<FragmentCacheConfig>,
     /// Maximum number of concurrent embedding tasks used when auto-enriching batches.
     pub max_concurrent_embedding_tasks: usize,
     /// Optional namespace-level policy enforcer.
@@ -37,7 +33,6 @@ impl std::fmt::Debug for HirnDbConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HirnDbConfig")
             .field("namespace", &self.namespace)
-            .field("fragment_cache", &self.fragment_cache)
             .field(
                 "max_concurrent_embedding_tasks",
                 &self.max_concurrent_embedding_tasks,
@@ -55,7 +50,6 @@ impl HirnDbConfig {
     pub fn local(path: impl Into<String>) -> Self {
         Self {
             namespace: NamespaceConfig::local(path),
-            fragment_cache: None,
             max_concurrent_embedding_tasks: DEFAULT_MAX_CONCURRENT_EMBEDDING_TASKS,
             namespace_policy: None,
         }
@@ -65,20 +59,9 @@ impl HirnDbConfig {
     pub fn new(namespace: NamespaceConfig) -> Self {
         Self {
             namespace,
-            fragment_cache: None,
             max_concurrent_embedding_tasks: DEFAULT_MAX_CONCURRENT_EMBEDDING_TASKS,
             namespace_policy: None,
         }
-    }
-
-    /// Enable fragment caching at the given directory.
-    #[must_use]
-    pub fn with_fragment_cache(mut self, root: impl Into<PathBuf>, max_size_bytes: u64) -> Self {
-        self.fragment_cache = Some(FragmentCacheConfig {
-            root: root.into(),
-            max_size_bytes,
-        });
-        self
     }
 
     /// Limit concurrent embedding tasks used for auto-enriched batch appends.
@@ -105,7 +88,6 @@ impl HirnDbConfig {
 /// API for opening databases backed by either Lance or in-memory storage.
 pub struct HirnDb {
     store: Arc<dyn PhysicalStore>,
-    fragment_cache: Option<Arc<FragmentCache>>,
     max_concurrent_embedding_tasks: usize,
     registry: EmbeddingRegistry,
 }
@@ -121,14 +103,8 @@ impl HirnDb {
             None => Arc::new(lance),
         };
 
-        let fragment_cache = match config.fragment_cache {
-            Some(fc_config) => Some(Arc::new(FragmentCache::open(fc_config).await?)),
-            None => None,
-        };
-
         Ok(Self {
             store,
-            fragment_cache,
             max_concurrent_embedding_tasks: config.max_concurrent_embedding_tasks.max(1),
             registry: EmbeddingRegistry::new(),
         })
@@ -138,7 +114,6 @@ impl HirnDb {
     pub fn open_memory() -> Self {
         Self {
             store: Arc::new(MemoryStore::new()),
-            fragment_cache: None,
             max_concurrent_embedding_tasks: DEFAULT_MAX_CONCURRENT_EMBEDDING_TASKS,
             registry: EmbeddingRegistry::new(),
         }
@@ -148,7 +123,6 @@ impl HirnDb {
     pub fn from_store(store: Arc<dyn PhysicalStore>) -> Self {
         Self {
             store,
-            fragment_cache: None,
             max_concurrent_embedding_tasks: DEFAULT_MAX_CONCURRENT_EMBEDDING_TASKS,
             registry: EmbeddingRegistry::new(),
         }
@@ -162,11 +136,6 @@ impl HirnDb {
     /// Get a shared reference to the store.
     pub fn store_arc(&self) -> Arc<dyn PhysicalStore> {
         Arc::clone(&self.store)
-    }
-
-    /// Get the fragment cache, if configured.
-    pub fn fragment_cache(&self) -> Option<&Arc<FragmentCache>> {
-        self.fragment_cache.as_ref()
     }
 
     /// Access the embedding registry for registering/looking up embedding providers.
@@ -591,6 +560,27 @@ impl HirnDb {
             .await?;
         }
 
+        // Scalar lookup indices for the auxiliary caches/stores (R-24): without
+        // these, `content_hash =` / `resource_id =` lookups and merge-inserts do
+        // an O(n) full scan of the whole dataset every call.
+        if self
+            .store
+            .exists(crate::datasets::embed_cache::DATASET_NAME)
+            .await
+            .unwrap_or(false)
+        {
+            crate::datasets::embed_cache::create_content_hash_index(self.store.as_ref()).await?;
+        }
+
+        if self
+            .store
+            .exists(crate::datasets::resource_blob::DATASET_NAME)
+            .await
+            .unwrap_or(false)
+        {
+            crate::datasets::resource_blob::create_resource_id_index(self.store.as_ref()).await?;
+        }
+
         Ok(())
     }
 
@@ -735,7 +725,7 @@ mod tests {
         DerivedArtifactIndexPolicy, DerivedArtifactIndexRule, DerivedArtifactKind, ModalityProfile,
         ResourceIndexPolicy, ResourceIndexRule, SecondaryIndexType,
     };
-    use lance_index::DatasetIndexExt;
+    use lance::index::DatasetIndexExt;
 
     #[test]
     fn standard_datasets_contains_all_expected() {
@@ -1017,6 +1007,37 @@ mod tests {
                     config.columns == vec!["kind".to_string(), "modality".to_string()]
                         && config.index_type == IndexType::Bitmap
                 })
+        );
+    }
+
+    /// R-24: bootstrap must create scalar lookup indices on the auxiliary
+    /// caches/stores so `content_hash =` / `resource_id =` lookups and
+    /// merge-inserts don't full-scan.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ensure_datasets_creates_auxiliary_lookup_indices() {
+        let store = Arc::new(MemoryStore::new());
+        let db = HirnDb::from_store(store.clone());
+        db.ensure_datasets(128).await.unwrap();
+
+        assert!(
+            store
+                .index_configs(crate::datasets::embed_cache::DATASET_NAME)
+                .iter()
+                .any(|config| {
+                    config.columns == vec!["content_hash".to_string()]
+                        && config.index_type == IndexType::BTree
+                }),
+            "_embed_cache.content_hash must have a BTree index"
+        );
+        assert!(
+            store
+                .index_configs(crate::datasets::resource_blob::DATASET_NAME)
+                .iter()
+                .any(|config| {
+                    config.columns == vec!["resource_id".to_string()]
+                        && config.index_type == IndexType::BTree
+                }),
+            "_resource_blobs.resource_id must have a BTree index"
         );
     }
 

@@ -5,6 +5,28 @@
 //! backends — the in-memory `MemoryStore` (fast, used everywhere in unit tests)
 //! and the real `LancePhysicalStore` (the production backend) — so the two can
 //! never silently diverge on the paths recall depends on.
+//!
+//! ## Known backend differences (R-43)
+//!
+//! A few behaviours intentionally differ between `MemoryStore` and
+//! `LancePhysicalStore`; conformance tests avoid asserting on them. Fixed ones
+//! are noted for context:
+//!
+//! - **`update_where` row order**: `MemoryStore` reassembles updated rows first
+//!   then the untouched remainder, so it may reorder rows; Lance preserves
+//!   physical order. Neither backend guarantees scan order without `order_by`,
+//!   so callers must not depend on it.
+//! - **`_distance` scale for cosine/dot**: the flat (brute-force) path and the
+//!   Lance ANN index can report distances on slightly different scales for
+//!   cosine/dot (e.g. `1 - cos` vs a normalized variant). Only the *ranking* is
+//!   contractual, not the absolute distance value.
+//! - **Numeric-vs-string comparison** *(fixed)*: `MemoryStore` no longer coerces
+//!   a `Utf8` column value to `f64` when comparing to a numeric literal, matching
+//!   Lance's typed comparison (see `scan::cmp_values`).
+//! - **Tag `created_at`** *(fixed)*: Lance now reports the tagged version's real
+//!   commit timestamp (millis) rather than `0`; `MemoryStore` reports seconds.
+//!   The unit differs, so tests assert only that it is populated, never the exact
+//!   value.
 
 use std::sync::Arc;
 

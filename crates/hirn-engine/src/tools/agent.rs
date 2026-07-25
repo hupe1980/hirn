@@ -21,6 +21,10 @@ pub struct MemoryAgent {
     agent_id: AgentId,
     interval: std::time::Duration,
     cancel: tokio::sync::watch::Receiver<bool>,
+    /// Optional LLM provider. When set, the maintenance cycle runs the
+    /// LLM-dependent consolidation stages (community summaries, RAPTOR, LLM
+    /// concept extraction); when `None`, only the heuristic stages run (R-63d).
+    llm: Option<Arc<dyn hirn_core::embed::LlmProvider>>,
 }
 
 /// Metrics emitted after each agent loop iteration.
@@ -46,11 +50,24 @@ impl MemoryAgent {
         interval: std::time::Duration,
         cancel: tokio::sync::watch::Receiver<bool>,
     ) -> Self {
+        Self::new_with_llm(db, agent_id, interval, cancel, None)
+    }
+
+    /// [`Self::new`] with an optional LLM provider so the maintenance cycle can
+    /// run LLM-dependent consolidation stages (R-63d).
+    pub fn new_with_llm(
+        db: Arc<HirnDB>,
+        agent_id: AgentId,
+        interval: std::time::Duration,
+        cancel: tokio::sync::watch::Receiver<bool>,
+        llm: Option<Arc<dyn hirn_core::embed::LlmProvider>>,
+    ) -> Self {
         Self {
             toolkit: MemoryToolkit::new(db),
             agent_id,
             interval,
             cancel,
+            llm,
         }
     }
 
@@ -116,8 +133,13 @@ impl MemoryAgent {
             return metrics;
         }
 
-        // Phase 1: Consolidation.
-        match db.consolidate().execute().await {
+        // Phase 1: Consolidation. Thread the LLM through when configured so the
+        // automatic path can produce community/RAPTOR/LLM summaries (R-63d).
+        let mut consolidate = db.consolidate();
+        if let Some(ref llm) = self.llm {
+            consolidate = consolidate.llm(Arc::clone(llm));
+        }
+        match consolidate.execute().await {
             Ok(result) => {
                 metrics.memories_consolidated = result.concepts_extracted;
                 metrics.causal_edges_discovered = result.causal_edges_discovered;

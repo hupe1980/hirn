@@ -29,9 +29,50 @@ use crate::{HirnError, HirnResult};
 
 /// Default maximum number of distinct strings that may be interned per interner.
 ///
-/// 65,535 (u16::MAX) is sufficient for any realistic number of namespaces or
-/// agent identifiers while bounding leaked memory to < 4 MiB per interner.
-pub const DEFAULT_INTERNER_MAX_ENTRIES: usize = 65_535;
+/// Interned ids are `u32` handles everywhere (nothing packs them into `u16`,
+/// and `Namespace`/`AgentId` serialize as strings, so the id never touches
+/// disk) — the previous 65,535 cap was an arbitrary availability ceiling: once
+/// hit, new agent ids / namespaces were permanently wedged for the process
+/// lifetime because the interner is append-only.
+///
+/// The cap exists only to bound leaked memory (`Box::leak`) against
+/// untrusted-input DoS, so it is set generously and can be raised further via
+/// the `HIRN_INTERNER_MAX_ENTRIES` environment variable (read once, at first
+/// use of the global interners).
+///
+/// Worst-case memory bound per interner at the default cap: each entry costs
+/// roughly `2 × len` bytes (one leaked copy + one `String` key in the forward
+/// map) plus ~100 B of map/vec bookkeeping. At 1,048,576 entries of typical
+/// ≤ 32-byte identifiers that is ≈ 170 MB — only reachable if an operator
+/// actually creates a million distinct namespaces/agents, in which case that
+/// working set is expected; hostile input still hits the clean
+/// [`StringInterner::try_intern`] error instead of unbounded growth.
+pub const DEFAULT_INTERNER_MAX_ENTRIES: usize = 1_048_576;
+
+/// Environment variable overriding the entry cap of the **global** namespace
+/// and agent-id interners. Values are clamped to `[1, u32::MAX]`; unparsable
+/// values fall back to [`DEFAULT_INTERNER_MAX_ENTRIES`].
+pub const INTERNER_MAX_ENTRIES_ENV: &str = "HIRN_INTERNER_MAX_ENTRIES";
+
+/// Resolve the cap for the global interners from the environment, falling
+/// back to [`DEFAULT_INTERNER_MAX_ENTRIES`].
+fn global_max_entries() -> usize {
+    parse_max_entries(std::env::var(INTERNER_MAX_ENTRIES_ENV).ok().as_deref())
+}
+
+/// Parse an optional `HIRN_INTERNER_MAX_ENTRIES` value. Split out from
+/// [`global_max_entries`] so the policy is testable without mutating global
+/// process environment.
+fn parse_max_entries(raw: Option<&str>) -> usize {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => match s.parse::<u64>() {
+            // Ids are u32, so more than u32::MAX entries can never be handed out.
+            Ok(n) if n >= 1 => usize::try_from(n.min(u32::MAX as u64)).unwrap_or(usize::MAX),
+            _ => DEFAULT_INTERNER_MAX_ENTRIES,
+        },
+        None => DEFAULT_INTERNER_MAX_ENTRIES,
+    }
+}
 
 /// A generic, thread-safe, append-only string interner.
 pub struct StringInterner {
@@ -44,16 +85,19 @@ pub struct StringInterner {
 
 impl StringInterner {
     /// Create a new empty interner with the default cap (`DEFAULT_INTERNER_MAX_ENTRIES`).
+    #[cfg(test)]
     fn new() -> Self {
         Self::with_max(DEFAULT_INTERNER_MAX_ENTRIES)
     }
 
     /// Create a new empty interner with a custom entry cap.
+    ///
+    /// The cap is clamped to `u32::MAX` because handles are `u32`.
     pub fn with_max(max_entries: usize) -> Self {
         Self {
             forward: DashMap::new(),
             reverse: RwLock::new(Vec::new()),
-            max_entries,
+            max_entries: max_entries.min(u32::MAX as usize),
         }
     }
 
@@ -142,10 +186,12 @@ static AGENT_ID_INTERNER: OnceLock<StringInterner> = OnceLock::new();
 
 /// Returns the global namespace interner (lazily initialized).
 ///
-/// Pre-interns `"default"` and `"shared"` on first access.
+/// Pre-interns `"default"` and `"shared"` on first access. The entry cap is
+/// [`DEFAULT_INTERNER_MAX_ENTRIES`] unless overridden via
+/// [`INTERNER_MAX_ENTRIES_ENV`].
 pub fn namespace_interner() -> &'static StringInterner {
     NAMESPACE_INTERNER.get_or_init(|| {
-        let interner = StringInterner::new();
+        let interner = StringInterner::with_max(global_max_entries());
         interner.intern("default");
         interner.intern("shared");
         interner
@@ -154,10 +200,12 @@ pub fn namespace_interner() -> &'static StringInterner {
 
 /// Returns the global agent-id interner (lazily initialized).
 ///
-/// Pre-interns `"system"` on first access.
+/// Pre-interns `"system"` on first access. The entry cap is
+/// [`DEFAULT_INTERNER_MAX_ENTRIES`] unless overridden via
+/// [`INTERNER_MAX_ENTRIES_ENV`].
 pub fn agent_id_interner() -> &'static StringInterner {
     AGENT_ID_INTERNER.get_or_init(|| {
-        let interner = StringInterner::new();
+        let interner = StringInterner::with_max(global_max_entries());
         interner.intern("system");
         interner
     })
@@ -237,5 +285,38 @@ mod tests {
     fn agent_id_interner_pre_interns_system() {
         let interner = agent_id_interner();
         assert_eq!(interner.resolve(0), "system");
+    }
+
+    #[test]
+    fn try_intern_errors_cleanly_at_the_cap() {
+        let interner = StringInterner::with_max(2);
+        interner.try_intern("a").unwrap();
+        interner.try_intern("b").unwrap();
+        // Existing entries stay resolvable...
+        assert_eq!(interner.try_intern("a").unwrap(), 0);
+        // ...but new ones hit a clean error, not a panic or a leak.
+        let err = interner.try_intern("c").unwrap_err();
+        assert!(matches!(err, HirnError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn parse_max_entries_policy() {
+        assert_eq!(parse_max_entries(None), DEFAULT_INTERNER_MAX_ENTRIES);
+        assert_eq!(parse_max_entries(Some("")), DEFAULT_INTERNER_MAX_ENTRIES);
+        assert_eq!(parse_max_entries(Some("  ")), DEFAULT_INTERNER_MAX_ENTRIES);
+        assert_eq!(
+            parse_max_entries(Some("not-a-number")),
+            DEFAULT_INTERNER_MAX_ENTRIES
+        );
+        assert_eq!(parse_max_entries(Some("0")), DEFAULT_INTERNER_MAX_ENTRIES);
+        assert_eq!(parse_max_entries(Some("1024")), 1024);
+        // Clamped to the u32 handle space.
+        assert_eq!(parse_max_entries(Some("99999999999999")), u32::MAX as usize);
+    }
+
+    #[test]
+    fn with_max_clamps_to_u32_handle_space() {
+        let interner = StringInterner::with_max(usize::MAX);
+        assert_eq!(interner.max_entries, u32::MAX as usize);
     }
 }

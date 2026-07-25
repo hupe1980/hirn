@@ -71,6 +71,7 @@ impl LlmError {
     #[cfg(any(feature = "openai", feature = "ollama", feature = "anthropic"))]
     pub(crate) fn from_reqwest(provider: impl Into<String>, e: reqwest::Error) -> Self {
         let provider = provider.into();
+        // Genuine connectivity failures are transient and worth retrying.
         if e.is_timeout() {
             return Self::Timeout { provider };
         }
@@ -80,6 +81,26 @@ impl LlmError {
                 source: Box::new(e),
             };
         }
+        // A response arrived carrying an error status: let the status decide
+        // whether a retry could help (5xx/429 transient, 4xx permanent).
+        if e.is_status() {
+            if let Some(status) = e.status() {
+                return Self::from_status(provider, status.as_u16(), e.to_string(), None);
+            }
+        }
+        // The response body was malformed, truncated, or undecodable. Retrying
+        // an undecodable response only wastes retries and latency, so classify
+        // these as a permanent InvalidResponse rather than a transient
+        // ConnectionFailed.
+        if e.is_body() || e.is_decode() {
+            return Self::InvalidResponse {
+                provider,
+                details: e.to_string(),
+            };
+        }
+        // Anything left (e.g. an error mid-request that is neither a clean
+        // connect nor a timeout) is treated as a transient connection failure,
+        // preserving the previous retry behavior for genuine network hiccups.
         Self::ConnectionFailed {
             provider,
             source: Box::new(e),
@@ -342,5 +363,49 @@ mod tests {
     #[test]
     fn max_tokens_unknown() {
         assert_eq!(max_tokens_for_model("my-custom-model"), None);
+    }
+
+    // A malformed/undecodable provider response must classify as a permanent
+    // InvalidResponse, not a transient ConnectionFailed — otherwise the retry
+    // wrapper burns retries and latency re-fetching the same bad body.
+    #[cfg(any(feature = "openai", feature = "ollama", feature = "anthropic"))]
+    #[tokio::test]
+    async fn from_reqwest_decode_error_is_non_transient() {
+        let http_resp = http::Response::builder()
+            .status(200)
+            .body("this is not json")
+            .unwrap();
+        let resp = reqwest::Response::from(http_resp);
+        let err = resp.json::<serde_json::Value>().await.unwrap_err();
+        assert!(err.is_decode(), "expected a decode-kind reqwest error");
+
+        let classified = LlmError::from_reqwest("openai", err);
+        assert!(
+            matches!(classified, LlmError::InvalidResponse { .. }),
+            "decode error should map to InvalidResponse, got {classified:?}"
+        );
+        assert!(
+            !classified.is_transient(),
+            "a decode error must not be retried"
+        );
+    }
+
+    // Genuine connectivity failures stay transient (retryable) — the retry
+    // contract for real network hiccups must survive the decode/body split.
+    #[test]
+    fn connect_and_timeout_variants_stay_transient() {
+        assert!(
+            LlmError::Timeout {
+                provider: "openai".into(),
+            }
+            .is_transient()
+        );
+        assert!(
+            LlmError::ConnectionFailed {
+                provider: "openai".into(),
+                source: "connection refused".into(),
+            }
+            .is_transient()
+        );
     }
 }

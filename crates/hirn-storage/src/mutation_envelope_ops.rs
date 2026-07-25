@@ -397,6 +397,19 @@ mod tests {
             self.inner.tag(dataset, tag).await
         }
 
+        async fn open_at_version(
+            &self,
+            dataset: &str,
+            version: u64,
+        ) -> Result<Vec<RecordBatch>, HirnDbError> {
+            self.inner.open_at_version(dataset, version).await
+        }
+
+        async fn rollback_to(&self, dataset: &str, version: u64) -> Result<(), HirnDbError> {
+            self.inner.rollback_to(dataset, version).await
+        }
+
+        #[allow(deprecated)]
         async fn checkout(&self, dataset: &str, version: u64) -> Result<(), HirnDbError> {
             self.inner.checkout(dataset, version).await
         }

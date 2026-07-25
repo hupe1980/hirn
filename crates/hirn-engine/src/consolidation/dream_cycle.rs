@@ -4,6 +4,7 @@
 //! knowledge, REM sleep generates novel hypotheses by connecting distant
 //! memories, and a validation phase scores hypotheses against evidence.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -13,7 +14,7 @@ use hirn_core::id::MemoryId;
 use hirn_core::metadata::Metadata;
 use hirn_core::semantic::SemanticRecord;
 use hirn_core::timestamp::Timestamp;
-use hirn_core::types::{AgentId, EdgeRelation, KnowledgeType, Origin};
+use hirn_core::types::{AgentId, EdgeRelation, KnowledgeType, Namespace, Origin};
 
 use super::ConsolidationConfig;
 use crate::HirnDB;
@@ -127,6 +128,9 @@ pub struct DreamHypothesis {
     pub source_a: MemoryId,
     /// Source memory B.
     pub source_b: MemoryId,
+    /// Namespace both sources belong to and the hypothesis was stamped with.
+    /// Hypotheses never cross namespaces (R-05), so this is well-defined.
+    pub namespace: Namespace,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -135,7 +139,12 @@ pub struct DreamHypothesis {
 
 /// Execute the full three-phase dream cycle: REPLAY → DREAM → VALIDATE.
 ///
-/// The cycle is atomic: if VALIDATE fails, hypotheses from DREAM are not promoted.
+/// DREAM hypotheses are persisted (at low confidence) as they are generated so
+/// VALIDATE can score them against durable episodic evidence. Atomicity is
+/// best-effort: VALIDATE promotes hypotheses that clear the confidence
+/// threshold and purges the rest, and if VALIDATE itself errors mid-pass the
+/// remaining unpromoted hypotheses are purged before the error propagates, so a
+/// failed cycle leaves no half-validated records behind.
 pub async fn execute_dream_cycle(
     db: &HirnDB,
     llm: Arc<dyn LlmProvider>,
@@ -188,7 +197,17 @@ pub async fn execute_dream_cycle(
         let phase_start = Instant::now();
 
         let (promoted, discarded) =
-            execute_validate_phase(db, &hypotheses, config, &batch_id).await?;
+            match execute_validate_phase(db, &hypotheses, config, &batch_id).await {
+                Ok(counts) => counts,
+                Err(e) => {
+                    // Best-effort purge so a failed VALIDATE leaves no
+                    // half-validated DREAM hypotheses persisted (atomicity).
+                    for hyp in &hypotheses {
+                        let _ = db.purge_semantic(hyp.id).await;
+                    }
+                    return Err(e);
+                }
+            };
         hypotheses_promoted = promoted;
         hypotheses_discarded = discarded;
 
@@ -216,6 +235,13 @@ pub async fn execute_dream_cycle(
 
 /// Select pairs of semantically distant memories that share entities,
 /// then ask an LLM to hypothesize connections between them.
+///
+/// R-05: records are grouped by namespace and pairs are only ever drawn from
+/// *within* a single namespace, so a hypothesis (and its `source_episode` /
+/// `DerivedFrom` provenance) never links records belonging to different tenants.
+/// Each hypothesis is stamped with its source namespace rather than landing in
+/// `default`. `dream_batch_size` is a per-cycle budget spanning all namespaces,
+/// consumed in deterministic (sorted) namespace order.
 async fn execute_dream_phase(
     db: &HirnDB,
     llm: &Arc<dyn LlmProvider>,
@@ -224,93 +250,115 @@ async fn execute_dream_phase(
 ) -> HirnResult<Vec<DreamHypothesis>> {
     let agent = AgentId::new("dream_replay").unwrap();
 
-    // Load all semantic records with embeddings.
+    // Load all semantic records with embeddings, then partition by namespace.
     let filter = SemanticFilter::default();
     let semantics = db.list_semantics(&filter).await?;
 
-    // Find distant pairs with shared entities or co-activation.
-    let pairs = find_distant_pairs(&semantics, config);
+    let mut by_namespace: HashMap<Namespace, Vec<SemanticRecord>> = HashMap::new();
+    for rec in semantics {
+        by_namespace
+            .entry(rec.namespace.clone())
+            .or_default()
+            .push(rec);
+    }
+    // Deterministic namespace ordering so the per-cycle budget is spent
+    // predictably across tenants.
+    let mut namespaces: Vec<Namespace> = by_namespace.keys().cloned().collect();
+    namespaces.sort_by(|a, b| a.as_str().cmp(b.as_str()));
 
     let mut hypotheses = Vec::new();
 
-    for (a, b) in pairs.into_iter().take(config.dream_batch_size) {
-        // Ask LLM: "What connects these seemingly unrelated observations?"
-        let prompt = build_dream_prompt(&a, &b);
-        let llm_options = LlmOptions {
-            temperature: 0.7,
-            max_tokens: 300,
-            ..Default::default()
-        };
+    'outer: for namespace in &namespaces {
+        let records = &by_namespace[namespace];
+        // Find distant pairs WITHIN this namespace only.
+        let pairs = find_distant_pairs(records, config);
 
-        let response = super::generate_text_with_timeout(
-            llm.as_ref(),
-            &prompt,
-            &llm_options,
-            config.consolidation_config.llm_timeout,
-        )
-        .await?;
-        let connection = response.trim().to_string();
+        for (a, b) in pairs {
+            if hypotheses.len() >= config.dream_batch_size {
+                break 'outer;
+            }
 
-        // Skip if LLM says "no clear connection"
-        if connection.to_lowercase().contains("no clear connection")
-            || connection.to_lowercase().contains("no obvious connection")
-            || connection.is_empty()
-        {
-            continue;
-        }
+            // Ask LLM: "What connects these seemingly unrelated observations?"
+            let prompt = build_dream_prompt(&a, &b);
+            let llm_options = LlmOptions {
+                temperature: 0.7,
+                max_tokens: 300,
+                ..Default::default()
+            };
 
-        // Create a candidate semantic record tagged as a hypothesis.
-        let concept_name = format!(
-            "hypothesis: {} ↔ {}",
-            truncate(&a.concept, 30),
-            truncate(&b.concept, 30),
-        );
-
-        let mut builder = SemanticRecord::builder()
-            .concept(&concept_name)
-            .knowledge_type(KnowledgeType::Inferred)
-            .description(&connection)
-            .confidence(0.3) // low initial confidence — needs validation
-            .agent_id(agent.clone())
-            .origin(Origin::DreamReplay)
-            .source_episode(a.id)
-            .source_episode(b.id);
-
-        // Generate embedding for the hypothesis.
-        if let Ok(emb) = db.embed_text(&connection).await {
-            builder = builder.embedding(emb);
-        }
-
-        let record = builder.build()?;
-        let hyp_id = record.id;
-        db.store_semantic(record).await?;
-
-        // Create derived_from edges.
-        let _ = db
-            .connect_with(
-                hyp_id,
-                a.id,
-                EdgeRelation::DerivedFrom,
-                0.5,
-                Metadata::default(),
+            let response = super::generate_text_with_timeout(
+                llm.as_ref(),
+                &prompt,
+                &llm_options,
+                config.consolidation_config.llm_timeout,
             )
-            .await;
-        let _ = db
-            .connect_with(
-                hyp_id,
-                b.id,
-                EdgeRelation::DerivedFrom,
-                0.5,
-                Metadata::default(),
-            )
-            .await;
+            .await?;
+            let connection = response.trim().to_string();
 
-        hypotheses.push(DreamHypothesis {
-            id: hyp_id,
-            connection,
-            source_a: a.id,
-            source_b: b.id,
-        });
+            // Skip if LLM says "no clear connection"
+            if connection.to_lowercase().contains("no clear connection")
+                || connection.to_lowercase().contains("no obvious connection")
+                || connection.is_empty()
+            {
+                continue;
+            }
+
+            // Create a candidate semantic record tagged as a hypothesis,
+            // stamped with the shared source namespace.
+            let concept_name = format!(
+                "hypothesis: {} ↔ {}",
+                truncate(&a.concept, 30),
+                truncate(&b.concept, 30),
+            );
+
+            let mut builder = SemanticRecord::builder()
+                .concept(&concept_name)
+                .knowledge_type(KnowledgeType::Inferred)
+                .description(&connection)
+                .confidence(0.3) // low initial confidence — needs validation
+                .agent_id(agent.clone())
+                .namespace(namespace.clone())
+                .origin(Origin::DreamReplay)
+                .source_episode(a.id)
+                .source_episode(b.id);
+
+            // Generate embedding for the hypothesis.
+            if let Ok(emb) = db.embed_text(&connection).await {
+                builder = builder.embedding(emb);
+            }
+
+            let record = builder.build()?;
+            let hyp_id = record.id;
+            db.store_semantic(record).await?;
+
+            // Create derived_from edges.
+            let _ = db
+                .connect_with(
+                    hyp_id,
+                    a.id,
+                    EdgeRelation::DerivedFrom,
+                    0.5,
+                    Metadata::default(),
+                )
+                .await;
+            let _ = db
+                .connect_with(
+                    hyp_id,
+                    b.id,
+                    EdgeRelation::DerivedFrom,
+                    0.5,
+                    Metadata::default(),
+                )
+                .await;
+
+            hypotheses.push(DreamHypothesis {
+                id: hyp_id,
+                connection,
+                source_a: a.id,
+                source_b: b.id,
+                namespace: namespace.clone(),
+            });
+        }
     }
 
     Ok(hypotheses)
@@ -420,16 +468,27 @@ async fn execute_validate_phase(
     let mut promoted = 0;
     let mut discarded = 0;
 
-    let filter = crate::db::EpisodicFilter {
-        include_archived: false,
-        limit: Some(config.validation_evidence_limit * 10), // load a larger pool
-        ..Default::default()
-    };
-    let episodes = db.list_episodes(&filter).await?;
+    // R-05: score each hypothesis only against episodic evidence from its own
+    // namespace. Episode pools are loaded (and cached) per namespace so a
+    // hypothesis is never boosted by another tenant's episodes.
+    let mut episodes_by_ns: HashMap<Namespace, Vec<hirn_core::episodic::EpisodicRecord>> =
+        HashMap::new();
 
     for hyp in hypotheses {
+        if !episodes_by_ns.contains_key(&hyp.namespace) {
+            let filter = crate::db::EpisodicFilter {
+                include_archived: false,
+                namespace: Some(hyp.namespace.clone()),
+                limit: Some(config.validation_evidence_limit * 10), // load a larger pool
+                ..Default::default()
+            };
+            let episodes = db.list_episodes(&filter).await?;
+            episodes_by_ns.insert(hyp.namespace.clone(), episodes);
+        }
+        let episodes = &episodes_by_ns[&hyp.namespace];
+
         // Search for supporting episodes by embedding similarity.
-        let evidence_count = count_supporting_evidence(db, hyp, &episodes, config).await;
+        let evidence_count = count_supporting_evidence(db, hyp, episodes, config).await;
 
         // Compute evidence-weighted confidence.
         // Formula: conf = base + (evidence / (evidence + 3)) * 0.5
@@ -913,6 +972,87 @@ mod tests {
             .filter(|s| s.knowledge_type == KnowledgeType::Inferred)
             .count();
         assert_eq!(inferred, 0, "discarded hypotheses should be deleted");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_dream_never_crosses_namespaces() {
+        // R-05: two tenants each with a distant pair. A dream pass must only
+        // synthesize hypotheses WITHIN a namespace, stamp each with its source
+        // namespace (never `default`), and never link records across tenants.
+        let db = test_db().await;
+
+        let ns_a = Namespace::private_for(&AgentId::new("tenant_a").unwrap());
+        let ns_b = Namespace::private_for(&AgentId::new("tenant_b").unwrap());
+
+        // Records → namespace, so we can assert provenance stays intra-tenant.
+        let mut ns_of: std::collections::HashMap<MemoryId, Namespace> =
+            std::collections::HashMap::new();
+
+        let mk = |concept: &str, emb: Vec<f32>, ns: &Namespace| -> SemanticRecord {
+            SemanticRecord::builder()
+                .concept(concept)
+                .knowledge_type(KnowledgeType::Propositional)
+                .description(concept)
+                .embedding(emb)
+                .confidence(0.8)
+                .agent_id(agent())
+                .namespace(ns.clone())
+                .origin(Origin::Consolidation)
+                .build()
+                .unwrap()
+        };
+
+        for (concept, emb, ns) in [
+            ("tenant A alpha", vec![1.0, 0.0, 0.0], &ns_a),
+            ("tenant A omega", vec![0.0, 0.0, 1.0], &ns_a),
+            ("tenant B alpha", vec![1.0, 0.0, 0.0], &ns_b),
+            ("tenant B omega", vec![0.0, 0.0, 1.0], &ns_b),
+        ] {
+            let rec = mk(concept, emb, ns);
+            ns_of.insert(rec.id, ns.clone());
+            db.store_semantic(rec).await.unwrap();
+        }
+
+        let llm: Arc<dyn LlmProvider> = Arc::new(MockDreamLlm::constant(
+            "These two observations share an underlying lifecycle pattern.",
+        ));
+
+        let config = DreamCycleConfig {
+            replay_enabled: false,
+            validate_enabled: false, // keep hypotheses persisted for inspection
+            dream_batch_size: 10,
+            dream_min_distance: 0.5,
+            ..Default::default()
+        };
+
+        let result = execute_dream_cycle(&db, llm, &config).await.unwrap();
+        // One intra-namespace distant pair per tenant.
+        assert_eq!(result.hypotheses_generated, 2);
+
+        // Inspect every persisted hypothesis.
+        let semantics = db.list_semantics(&SemanticFilter::default()).await.unwrap();
+        let hyps: Vec<_> = semantics
+            .iter()
+            .filter(|s| s.knowledge_type == KnowledgeType::Inferred)
+            .collect();
+        assert_eq!(hyps.len(), 2, "expected one hypothesis per tenant");
+
+        for hyp in hyps {
+            // The hypothesis carries a real tenant namespace, not `default`.
+            assert_ne!(hyp.namespace, Namespace::default());
+            assert!(hyp.namespace == ns_a || hyp.namespace == ns_b);
+
+            // Both source episodes belong to the SAME namespace as the
+            // hypothesis — provenance never crosses tenants.
+            assert_eq!(hyp.source_episodes.len(), 2);
+            for src in &hyp.source_episodes {
+                assert_eq!(
+                    ns_of.get(src),
+                    Some(&hyp.namespace),
+                    "hypothesis source {src} must be intra-namespace"
+                );
+            }
+        }
     }
 
     // ── Unit tests for internal functions ────────────────────────────

@@ -1045,10 +1045,21 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[tokio::test]
-    async fn max_tokens_exceeded_returns_token_limit_error() {
+    async fn max_tokens_exceeded_is_advisory_and_surfaces_provider_rejection() {
+        // The local max-tokens table is advisory only (the provider API is the
+        // authority): an over-limit request is still sent, and the API's own
+        // rejection is surfaced as a permanent provider error.
+        let (url, handle) = mock_server_error(
+            400,
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens: 1000000 > model maximum"}}"#,
+        )
+        .await;
+
         let provider = AnthropicProvider::new("sk-test")
             .expect("anthropic client should initialize")
-            .with_model("claude-3-5-sonnet-20241022");
+            .with_model("claude-3-5-sonnet-20241022")
+            .with_base_url(&url)
+            .expect("mock base url should be accepted");
 
         let err = provider
             .generate(
@@ -1066,9 +1077,10 @@ data: {\"type\":\"message_stop\"}\n\n";
 
         let msg = err.to_string();
         assert!(
-            msg.contains("token limit exceeded") || msg.contains("1000000"),
-            "expected token limit error: {msg}"
+            msg.contains("model maximum") || msg.contains("1000000"),
+            "expected the provider's own rejection to be surfaced: {msg}"
         );
+        handle.abort();
     }
 
     #[tokio::test]

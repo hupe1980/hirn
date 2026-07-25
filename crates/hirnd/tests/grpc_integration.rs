@@ -12,7 +12,7 @@ use hirnd::proto::hirn_service_server::HirnServiceServer;
 use hirnd::proto::{self, remember_request};
 use hirnd::realm::RealmManager;
 use hirnd::throttle::RateLimiter;
-use hirnd::watch::WatchEvent;
+use hirnd::watch::{WatchEvent, WatchEventKind};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
@@ -179,6 +179,7 @@ fn issue_test_token(
             },
             namespaces,
             operations,
+            None,
             None,
         )
         .unwrap()
@@ -1579,20 +1580,26 @@ async fn test_grpc_watch_backpressure_high_event_rate() {
     // Flood the broadcast channel with 100 events (no subscriber can keep up
     // with a buffer of only 4).
     for i in 0..100 {
-        let _ = watch_tx.send(WatchEvent::Created {
-            id: MemoryId::new(),
-            layer: Layer::Episodic,
-            entities: vec![format!("entity-{i}")],
-            importance: 0.5,
-            namespace: Namespace::default(),
+        let _ = watch_tx.send(WatchEvent {
+            realm: "default".to_owned(),
+            kind: WatchEventKind::Created {
+                id: MemoryId::new(),
+                layer: Layer::Episodic,
+                entities: vec![format!("entity-{i}")],
+                importance: 0.5,
+                namespace: Namespace::default(),
+            },
         });
     }
 
     // Send a final event after a small pause so the subscriber has a chance
     // to recover from lagged state and receive it.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    let _ = watch_tx.send(WatchEvent::Consolidated {
-        records_processed: 42,
+    let _ = watch_tx.send(WatchEvent {
+        realm: "default".to_owned(),
+        kind: WatchEventKind::Consolidated {
+            records_processed: 42,
+        },
     });
 
     // Collect events with a timeout. We expect at least one event to arrive
@@ -1923,4 +1930,54 @@ async fn test_grpc_recall_stream_returns_multiple_results() {
     for r in &results {
         assert!(r.record.is_some(), "result should have a record");
     }
+}
+
+/// R-70: a gRPC caller must not be able to act as another agent by supplying a
+/// body-level `agent_id`. `share_memory` used to trust `ShareMemoryRequest.agent_id`;
+/// it now always uses the interceptor-authenticated identity, so an attacker
+/// cannot share a *victim's* private memory by spoofing the field.
+#[tokio::test]
+async fn share_memory_ignores_body_supplied_agent_id() {
+    let (mut client, _tmp) = start_grpc_server().await;
+
+    let victim = "victim-agent";
+    let attacker = "attacker-agent";
+    let victim_ns = Namespace::private_for(&AgentId::new(victim).unwrap())
+        .as_str()
+        .to_string();
+
+    // Victim stores a memory in its own private namespace.
+    let remember = proto::RememberRequest {
+        record: Some(remember_request::Record::Episodic(proto::EpisodicRecord {
+            content: "victim secret".to_string(),
+            namespace: victim_ns.clone(),
+            ..Default::default()
+        })),
+    };
+    let mut req = tonic::Request::new(remember);
+    req.metadata_mut()
+        .insert("x-realm-id", MetadataValue::from_static("default"));
+    req.metadata_mut()
+        .insert("x-agent-id", victim.parse().unwrap());
+    let victim_id = client.remember(req).await.unwrap().into_inner().id.unwrap();
+
+    // Attacker attempts to share the victim's private memory, spoofing the body
+    // agent_id as the victim. With the fix the actor is the attacker, whose
+    // access check against the victim's private namespace fails.
+    let share = proto::ShareMemoryRequest {
+        id: Some(victim_id),
+        agent_id: victim.to_string(), // spoofed — must be ignored
+        target_namespace: "shared".to_string(),
+    };
+    let mut req = tonic::Request::new(share);
+    req.metadata_mut()
+        .insert("x-realm-id", MetadataValue::from_static("default"));
+    req.metadata_mut()
+        .insert("x-agent-id", attacker.parse().unwrap());
+
+    let result = client.share_memory(req).await;
+    assert!(
+        result.is_err(),
+        "attacker must not share a victim's private memory by spoofing agent_id"
+    );
 }

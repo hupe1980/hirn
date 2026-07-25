@@ -19,7 +19,6 @@ use crate::db::HirnDB;
 
 use super::ast::*;
 use super::direct_support;
-use super::planner;
 use super::results::QueryResult;
 
 use super::context::ContextConfig;
@@ -248,7 +247,7 @@ impl<'a> QueryBuilder<'a> {
             } else {
                 self.layers.clone()
             },
-            about: self.about.clone().unwrap_or_default(),
+            about: self.about.clone().unwrap_or_default().into(),
             involving: self.involving.clone(),
             temporal: self.temporal.clone(),
             expand: self.expand.clone(),
@@ -282,7 +281,7 @@ impl<'a> QueryBuilder<'a> {
     /// Build the AST `Statement` as a THINK.
     pub fn build_think_stmt(&self) -> Statement {
         Statement::Think(Box::new(ThinkStmt {
-            about: self.about.clone().unwrap_or_default(),
+            about: self.about.clone().unwrap_or_default().into(),
             involving: self.involving.clone(),
             temporal: self.temporal.clone(),
             expand: self.expand.clone(),
@@ -304,10 +303,12 @@ impl<'a> QueryBuilder<'a> {
         }))
     }
 
-    /// Get the query plan that would be executed (like EXPLAIN).
-    pub fn plan(&self) -> planner::QueryPlan {
+    /// Return the compiled logical plan for this query as a formatted plan
+    /// tree (like EXPLAIN). The plan comes from the same `hirn_query`
+    /// pipeline that executes the query.
+    pub fn explain(&self) -> HirnResult<String> {
         let stmt = self.build_recall_stmt();
-        planner::plan(&stmt, None)
+        self.db.explain_plan(&stmt.to_string())
     }
 
     /// Execute as a RECALL query.
@@ -406,7 +407,8 @@ mod tests {
 
     #[test]
     fn builder_plan_matches_ql_plan() {
-        // Verify that a builder-produced statement plan matches the QL-produced plan.
+        // Verify that a builder-produced statement compiles to the same
+        // logical plan as the equivalent HirnQL text (single compiler stack).
         let builder_stmt = Statement::Recall(Box::new(RecallStmt {
             layers: vec![Layer::Episodic],
             about: "test query".into(),
@@ -442,9 +444,13 @@ mod tests {
         let ql_stmt =
             crate::ql::parser::parse(r#"RECALL episodic ABOUT "test query" LIMIT 10"#).unwrap();
 
-        let plan1 = planner::plan(&builder_stmt, None);
-        let plan2 = planner::plan(&ql_stmt, None);
+        let pipeline = hirn_query::QueryPipeline::new(hirn_query::AnalyzeContext::default());
+        let compiled_builder = pipeline.compile_statement(builder_stmt).unwrap();
+        let compiled_ql = pipeline.compile_statement(ql_stmt).unwrap();
 
-        assert_eq!(plan1, plan2);
+        assert_eq!(
+            hirn_query::compiler::pipeline::format_plan_tree(&compiled_builder.plan),
+            hirn_query::compiler::pipeline::format_plan_tree(&compiled_ql.plan),
+        );
     }
 }

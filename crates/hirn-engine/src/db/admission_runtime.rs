@@ -50,16 +50,36 @@ impl AdmissionRuntime {
 
         use crate::admission::controllers::{
             duplicate::{DuplicateAction, DuplicateDetector},
+            poisoning::PoisoningGate,
             rate_limiter::RateLimiter,
             surprise::SurpriseGate,
             token_budget::TokenBudgetGate,
+            trust::TrustGate,
+        };
+        use hirn_core::config::{AdmissionDuplicateAction, AdmissionPoisoningAction};
+
+        let action = match config.admission_duplicate_action {
+            AdmissionDuplicateAction::Merge => DuplicateAction::Merge,
+            AdmissionDuplicateAction::Reject => DuplicateAction::Reject,
         };
 
-        let action = match config.admission_duplicate_action.as_str() {
-            "merge" => DuplicateAction::Merge,
-            _ => DuplicateAction::Reject,
-        };
-        let pipeline = AdmissionPipeline::new()
+        let mut pipeline = AdmissionPipeline::new();
+
+        // Cheap checks first: trust (in-process scoring + tiny agent-table
+        // scan) and the pure-CPU poisoning scan run before the
+        // embedding/vector-search controllers.
+        if config.admission_min_trust > 0.0 || config.admission_trust_quarantine_below.is_some() {
+            pipeline.add(TrustGate::new(
+                storage.clone(),
+                config.admission_min_trust,
+                config.admission_trust_quarantine_below,
+            ));
+        }
+        if config.admission_poisoning_action != AdmissionPoisoningAction::Off {
+            pipeline.add(PoisoningGate::new(config.admission_poisoning_action));
+        }
+
+        let pipeline = pipeline
             .with(SurpriseGate::new(
                 storage.clone(),
                 "episodic",
@@ -71,10 +91,9 @@ impl AdmissionRuntime {
                 1.0 - config.admission_duplicate_threshold,
                 action,
             ))
-            .with(TokenBudgetGate::new(
+            .with(TokenBudgetGate::new_cognitive(
                 storage,
                 tokenizer,
-                "episodic",
                 config.admission_token_budget_limit as usize,
             ))
             .with(RateLimiter::new(config.admission_rate_limit as u64, 60));
@@ -151,9 +170,50 @@ mod tests {
             Arc::new(EstimatingTokenizer),
         );
 
+        // Trust and poisoning gates stay uninstalled with default config
+        // (admission_min_trust = 0.0, poisoning action = off).
         assert_eq!(
             runtime.admission_pipeline().map(|pipeline| pipeline.len()),
             Some(4)
+        );
+    }
+
+    #[test]
+    fn setup_default_pipeline_installs_trust_and_poisoning_gates_when_configured() {
+        let mut runtime = AdmissionRuntime::new();
+        let mut config = HirnConfig::default();
+        config.admission_enabled = true;
+        config.admission_min_trust = 0.4;
+        config.admission_poisoning_action = hirn_core::config::AdmissionPoisoningAction::Audit;
+
+        runtime.setup_default_pipeline(
+            &config,
+            Arc::new(MemoryStore::new()),
+            Arc::new(EstimatingTokenizer),
+        );
+
+        assert_eq!(
+            runtime.admission_pipeline().map(|pipeline| pipeline.len()),
+            Some(6)
+        );
+    }
+
+    #[test]
+    fn quarantine_tier_alone_installs_trust_gate() {
+        let mut runtime = AdmissionRuntime::new();
+        let mut config = HirnConfig::default();
+        config.admission_enabled = true;
+        config.admission_trust_quarantine_below = Some(0.5);
+
+        runtime.setup_default_pipeline(
+            &config,
+            Arc::new(MemoryStore::new()),
+            Arc::new(EstimatingTokenizer),
+        );
+
+        assert_eq!(
+            runtime.admission_pipeline().map(|pipeline| pipeline.len()),
+            Some(5)
         );
     }
 

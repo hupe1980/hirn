@@ -2,6 +2,7 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::task::{Context, Poll};
 
 use arrow_array::builder::Float32Builder;
@@ -19,8 +20,8 @@ use lance::dataset::write::merge_insert::{MergeInsertBuilder, WhenMatched, WhenN
 use lance::dataset::write::update::{UpdateBuilder, UpdateResult};
 use lance::dataset::write::{WriteMode, WriteParams};
 use lance::dataset::{ColumnAlteration, NewColumnTransform};
+use lance::index::DatasetIndexExt;
 use lance::index::vector::VectorIndexParams;
-use lance_index::DatasetIndexExt;
 use lance_index::scalar::ScalarIndexParams;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_index::vector::ivf::IvfBuildParams;
@@ -35,6 +36,15 @@ use crate::error::HirnDbError;
 use crate::store::*;
 
 const FLAT_VECTOR_CACHE_MAX_ROWS: usize = 50_000;
+/// Maximum number of distinct flat-vector snapshots (per filter/version) kept
+/// resident. Bounds the otherwise-unbounded snapshot cache (R-39); the
+/// lowest-sequence (oldest-inserted) entry is evicted when the cap is reached.
+const FLAT_VECTOR_SNAPSHOT_CACHE_MAX_ENTRIES: usize = 256;
+/// Retention window (days) for old dataset versions reclaimed after compaction.
+/// Lance 7+ disabled default auto-cleanup, so hirn reclaims stale manifests/data
+/// files itself; the window keeps recent versions available for
+/// `open_at_version` time-travel and crash recovery.
+const OLD_VERSION_RETENTION_DAYS: i64 = 7;
 /// Start building the ANN vector index when the dataset crosses 80% of the flat-scan
 /// threshold (F-106 fix). This avoids the full-scan gap that would otherwise occur
 /// between hitting FLAT_VECTOR_CACHE_MAX_ROWS and the index becoming ready.
@@ -66,6 +76,14 @@ struct FlatVectorQueryBatchKey {
     filter: Option<String>,
 }
 
+/// A flat-vector snapshot plus its insertion sequence, used to evict the
+/// oldest-inserted entry when the snapshot cache is at capacity (R-39).
+#[derive(Clone)]
+struct CachedFlatSnapshot {
+    seq: u64,
+    batches: Arc<Vec<RecordBatch>>,
+}
+
 /// Lance 4.0 implementation of `PhysicalStore`.
 ///
 /// Combines a `LanceNamespace` handle (for catalog ops) with direct
@@ -87,7 +105,17 @@ pub struct LancePhysicalStore {
     /// A new attempt is made only when the dataset has at least doubled in size,
     /// limiting load_indices() I/O to O(log N) calls instead of O(N).
     index_check_row_watermark: DashMap<VectorIndexCacheKey, usize>,
-    flat_vector_snapshot_cache: DashMap<FlatVectorSnapshotKey, Arc<Vec<RecordBatch>>>,
+    flat_vector_snapshot_cache: DashMap<FlatVectorSnapshotKey, CachedFlatSnapshot>,
+    /// Monotonic sequence stamped on each snapshot insert for oldest-first
+    /// eviction (R-39).
+    flat_snapshot_seq: AtomicU64,
+    /// Distance metric used to partition auto-built and explicitly-created
+    /// vector (ANN) indexes. It must match the metric queries use, otherwise
+    /// the index mis-partitions and recall degrades once the dataset is large
+    /// enough to bypass the flat-scan path. Defaults to the system metric
+    /// (`DistanceMetric::default()` = cosine), the same default the search path
+    /// resolves to.
+    vector_index_metric: DistanceMetric,
 }
 
 impl LancePhysicalStore {
@@ -101,7 +129,58 @@ impl LancePhysicalStore {
             vector_index_cache: DashMap::new(),
             index_check_row_watermark: DashMap::new(),
             flat_vector_snapshot_cache: DashMap::new(),
+            flat_snapshot_seq: AtomicU64::new(0),
+            vector_index_metric: DistanceMetric::default(),
         }
+    }
+
+    /// Override the distance metric used when building vector (ANN) indexes.
+    ///
+    /// Set this to the metric queries against this store's vector datasets use
+    /// so the auto-built index partitions the space with the same metric.
+    #[must_use]
+    pub fn with_vector_index_metric(mut self, metric: DistanceMetric) -> Self {
+        self.vector_index_metric = metric;
+        self
+    }
+
+    /// Test-support: report whether an ANN vector index exists on `column`.
+    ///
+    /// Integration tests (the ANN-vs-flat parity suite) need to confirm which
+    /// search path is active — the exact flat scan or the IVF/ANN index — but
+    /// `open_dataset`/`has_vector_index` are crate-private. This thin wrapper
+    /// exposes just that read-only check.
+    #[doc(hidden)]
+    pub async fn vector_index_exists(
+        &self,
+        dataset: &str,
+        column: &str,
+    ) -> Result<bool, HirnDbError> {
+        let ds = self.open_dataset(dataset).await?;
+        self.has_vector_index(dataset, ds.as_ref(), column).await
+    }
+
+    /// Insert a flat-vector snapshot, evicting the oldest-inserted entry when
+    /// the cache is at capacity so it stays bounded (R-39).
+    fn insert_flat_snapshot(&self, key: FlatVectorSnapshotKey, batches: Arc<Vec<RecordBatch>>) {
+        if !self.flat_vector_snapshot_cache.contains_key(&key) {
+            while self.flat_vector_snapshot_cache.len() >= FLAT_VECTOR_SNAPSHOT_CACHE_MAX_ENTRIES {
+                let oldest = self
+                    .flat_vector_snapshot_cache
+                    .iter()
+                    .min_by_key(|entry| entry.value().seq)
+                    .map(|entry| entry.key().clone());
+                match oldest {
+                    Some(oldest_key) => {
+                        self.flat_vector_snapshot_cache.remove(&oldest_key);
+                    }
+                    None => break,
+                }
+            }
+        }
+        let seq = self.flat_snapshot_seq.fetch_add(1, AtomicOrdering::Relaxed);
+        self.flat_vector_snapshot_cache
+            .insert(key, CachedFlatSnapshot { seq, batches });
     }
 
     fn invalidate_dataset_caches(&self, dataset: &str) {
@@ -252,7 +331,7 @@ impl LancePhysicalStore {
 
         let config = IndexConfig::vector("embedding").with_replace(false);
         let lance_type = Self::to_lance_index_type(config.index_type);
-        let params = Self::build_lance_index_params(&config, lance_type)?;
+        let params = Self::build_lance_index_params(&config, lance_type, self.vector_index_metric)?;
 
         if let Err(error) = dataset
             .create_index(
@@ -288,6 +367,41 @@ impl LancePhysicalStore {
             .entry(dataset.to_string())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
+    }
+
+    /// Back off before retrying a commit that lost a concurrent-write race, and
+    /// drop the cached (now-stale) handle so the next open re-reads the latest
+    /// manifest. Returns `false` once retries are exhausted (R-23/R-41).
+    async fn backoff_or_giveup(&self, dataset: &str, attempt: &mut u32) -> bool {
+        if *attempt >= MAX_COMMIT_RETRIES {
+            return false;
+        }
+        let delay = std::time::Duration::from_millis(COMMIT_RETRY_BASE_BACKOFF_MS << *attempt);
+        *attempt += 1;
+        tracing::debug!(
+            dataset,
+            attempt = *attempt,
+            "retrying after retryable commit conflict"
+        );
+        tokio::time::sleep(delay).await;
+        // Force the next open_dataset to re-read the latest manifest from disk.
+        self.datasets.invalidate(&dataset.to_string());
+        true
+    }
+
+    /// Drop the cached dataset handle so the next read re-opens the latest
+    /// manifest from storage (R-42).
+    ///
+    /// `LancePhysicalStore` caches an `Arc<Dataset>` per dataset and does **not**
+    /// poll for new versions on every read — a single-writer-per-dataset process
+    /// is assumed for the fast path. When another process (or another
+    /// `LancePhysicalStore` handle to the same path) commits a write, cached
+    /// readers keep serving the older snapshot until the entry is invalidated.
+    /// A daemon coordinating multiple writers should call this after learning of
+    /// an external commit so subsequent reads observe it.
+    pub fn refresh_dataset(&self, dataset: &str) {
+        self.datasets.invalidate(&dataset.to_string());
+        self.invalidate_dataset_caches(dataset);
     }
 
     /// Get a dataset handle for DataFusion `LanceTableProvider` registration.
@@ -444,30 +558,22 @@ impl LancePhysicalStore {
         dataset: &Dataset,
         column: &str,
     ) -> Result<bool, HirnDbError> {
-        // ANN indexes (IVF/HNSW) are only beneficial for large datasets.
-        // For datasets ≤ FLAT_VECTOR_CACHE_MAX_ROWS the caller falls back to
-        // flat (brute-force) scan, which is both faster and exact at this scale.
-        // Returning false here avoids a load_indices() I/O call (~10-50 ms) on
-        // every search and every append for small datasets.
-        let estimated_rows: usize = dataset
-            .fragments()
-            .iter()
-            .filter_map(|f| f.physical_rows)
-            .sum();
-        if estimated_rows <= FLAT_VECTOR_CACHE_MAX_ROWS {
-            return Ok(false);
-        }
-
         let key = VectorIndexCacheKey {
             dataset: dataset_name.to_string(),
             column: column.to_string(),
         };
-        // Positive-only persistent cache: once an index is confirmed it survives
-        // all subsequent appends (Lance never removes an index during an append).
-        if self.vector_index_cache.get(&key).is_some_and(|v| *v) {
-            return Ok(true);
+        // Consult the cache first. It caches both outcomes:
+        //   * `true`  — survives appends (Lance never drops an index on append).
+        //   * `false` — cleared by `create_index`/auto-create when an index is
+        //     built, so an explicitly-created index is picked up.
+        if let Some(cached) = self.vector_index_cache.get(&key) {
+            return Ok(*cached);
         }
 
+        // Consult the authoritative index list FIRST, before any row-count
+        // heuristic (R-38): an index built via `create_index` must be honored
+        // regardless of dataset size. Flat (brute-force) scan is only the
+        // fallback used when NO ANN index exists on the column.
         let column_id = dataset
             .schema()
             .field_id(column)
@@ -476,10 +582,38 @@ impl LancePhysicalStore {
         let has_index = indices
             .iter()
             .any(|index| index.fields.contains(&column_id));
-        if has_index {
-            self.vector_index_cache.insert(key, true);
-        }
+        // Cache the result (positive or negative) so repeated searches on a
+        // small, index-less dataset don't re-run load_indices() every call.
+        self.vector_index_cache.insert(key, has_index);
         Ok(has_index)
+    }
+
+    /// Split a vector-search filter into the cacheable null-only filter
+    /// (`{col} IS NOT NULL`) and the residual predicate (namespace / caller
+    /// filter) applied in-memory. This lets one shared flat snapshot serve both
+    /// unfiltered and namespaced searches (R-37): previously the snapshot was
+    /// keyed by the full filter, so a `(namespace IN (...)) AND (col IS NOT NULL)`
+    /// query never hit the proactively-built `col IS NOT NULL` snapshot.
+    async fn flat_snapshot_and_residual(
+        &self,
+        dataset_name: &str,
+        dataset: Arc<Dataset>,
+        column: &str,
+        filter: Option<&str>,
+    ) -> Result<(Arc<Vec<RecordBatch>>, Option<String>), HirnDbError> {
+        let null_filter = format!("{column} IS NOT NULL");
+        let residual = match filter {
+            Some(f) if f != null_filter => Some(f.to_string()),
+            _ => None,
+        };
+        let snapshot = self
+            .flat_vector_snapshot(dataset_name, dataset, Some(&null_filter))
+            .await?;
+        let batches = match residual {
+            Some(ref f) => Arc::new(crate::scan::filter_batches(f, snapshot.as_slice())?),
+            None => snapshot,
+        };
+        Ok((batches, residual))
     }
 
     async fn flat_vector_search_dataset(
@@ -488,8 +622,8 @@ impl LancePhysicalStore {
         dataset: Arc<Dataset>,
         opts: VectorSearchOptions,
     ) -> Result<Vec<RecordBatch>, HirnDbError> {
-        let batches = self
-            .flat_vector_snapshot(dataset_name, dataset, opts.filter.as_deref())
+        let (batches, _residual) = self
+            .flat_snapshot_and_residual(dataset_name, dataset, &opts.column, opts.filter.as_deref())
             .await?;
 
         Self::flat_vector_search_batches(batches.as_slice(), &opts)
@@ -523,8 +657,13 @@ impl LancePhysicalStore {
             ));
         }
 
-        let batches = self
-            .flat_vector_snapshot(dataset_name, dataset, first_query.filter.as_deref())
+        let (batches, _residual) = self
+            .flat_snapshot_and_residual(
+                dataset_name,
+                dataset,
+                &first_query.column,
+                first_query.filter.as_deref(),
+            )
             .await?;
 
         Self::flat_vector_search_batches_many(batches.as_slice(), queries)
@@ -542,7 +681,7 @@ impl LancePhysicalStore {
             version: dataset.version().version,
         };
         if let Some(cached) = self.flat_vector_snapshot_cache.get(&snapshot_key) {
-            return Ok(Arc::clone(cached.value()));
+            return Ok(Arc::clone(&cached.value().batches));
         }
 
         let mut scanner = dataset.scan();
@@ -559,8 +698,7 @@ impl LancePhysicalStore {
         let row_count = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
         let batches = Arc::new(batches);
         if row_count <= FLAT_VECTOR_CACHE_MAX_ROWS {
-            self.flat_vector_snapshot_cache
-                .insert(snapshot_key, Arc::clone(&batches));
+            self.insert_flat_snapshot(snapshot_key, Arc::clone(&batches));
         }
 
         Ok(batches)
@@ -725,6 +863,119 @@ impl LancePhysicalStore {
         Ok(vec![result])
     }
 
+    /// Brute-force MaxSim search without a dense first stage, streaming the
+    /// dataset and keeping only a `limit`-sized top-k heap (R-40). Peak memory
+    /// is bounded to the result size plus one in-flight batch instead of
+    /// materializing the whole multivector column.
+    async fn multivector_bruteforce_streaming(
+        &self,
+        dataset: &str,
+        opts: &MultivectorSearchOptions,
+        query_vecs: &[Vec<f32>],
+    ) -> Result<Vec<RecordBatch>, HirnDbError> {
+        use crate::multivector::{extract_multivectors as extract_mv, maxsim_score};
+        use arrow_schema::{DataType, Field, Schema};
+
+        if opts.limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut stream = self
+            .scan_stream(
+                dataset,
+                ScanOptions {
+                    filter: opts.filter.clone(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        // Min-at-top heap keeping the best `limit` rows by MaxSim score.
+        let mut heap: BinaryHeap<MvScoredRow> = BinaryHeap::with_capacity(opts.limit + 1);
+        let mut schema: Option<arrow_schema::SchemaRef> = None;
+
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            if schema.is_none() {
+                schema = Some(batch.schema());
+            }
+            let col = batch.column_by_name(&opts.column).ok_or_else(|| {
+                HirnDbError::InvalidArgument(format!("column `{}` not found", opts.column))
+            })?;
+            for row_idx in 0..batch.num_rows() {
+                let doc_vecs = extract_mv(col, row_idx)?;
+                let score = maxsim_score(query_vecs, &doc_vecs);
+                let candidate = MvScoredRow {
+                    score,
+                    row: batch.slice(row_idx, 1),
+                };
+                if heap.len() < opts.limit {
+                    heap.push(candidate);
+                } else if heap.peek().is_some_and(|top| score > top.score) {
+                    heap.pop();
+                    heap.push(candidate);
+                }
+            }
+        }
+
+        let Some(schema) = schema else {
+            return Ok(Vec::new());
+        };
+        if heap.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Sort descending by score (best first).
+        let mut scored: Vec<MvScoredRow> = heap.into_vec();
+        scored.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // Build the result: original columns (minus any existing _distance/_score)
+        // plus the MaxSim _score column.
+        let mut result_fields: Vec<Field> =
+            schema.fields().iter().map(|f| f.as_ref().clone()).collect();
+        result_fields.retain(|f| f.name() != "_distance" && f.name() != "_score");
+        result_fields.push(Field::new("_score", DataType::Float32, false));
+        let result_schema = Arc::new(Schema::new(result_fields));
+
+        let orig_names: Vec<String> = result_schema
+            .fields()
+            .iter()
+            .filter(|f| f.name() != "_score")
+            .map(|f| f.name().clone())
+            .collect();
+
+        let mut column_slices: Vec<Vec<ArrayRef>> = vec![Vec::new(); orig_names.len()];
+        let mut scores = Float32Builder::new();
+        for scored_row in &scored {
+            for (ci, name) in orig_names.iter().enumerate() {
+                let src = scored_row.row.column_by_name(name).ok_or_else(|| {
+                    HirnDbError::InvalidArgument(format!("column `{name}` missing"))
+                })?;
+                column_slices[ci].push(Arc::clone(src));
+            }
+            scores.append_value(scored_row.score);
+        }
+
+        let mut final_arrays: Vec<ArrayRef> = Vec::with_capacity(orig_names.len() + 1);
+        for slices in column_slices {
+            let refs: Vec<&dyn Array> = slices.iter().map(|a| a.as_ref()).collect();
+            final_arrays
+                .push(arrow_select::concat::concat(&refs).map_err(HirnDbError::ArrowError)?);
+        }
+        final_arrays.push(Arc::new(scores.finish()));
+
+        let result =
+            RecordBatch::try_new(result_schema, final_arrays).map_err(HirnDbError::ArrowError)?;
+        Ok(vec![result])
+    }
+
     fn to_metric_type(metric: DistanceMetric) -> MetricType {
         match metric {
             DistanceMetric::L2 => MetricType::L2,
@@ -749,19 +1000,25 @@ impl LancePhysicalStore {
     fn build_lance_index_params(
         config: &IndexConfig,
         lance_type: lance_index::IndexType,
+        metric: DistanceMetric,
     ) -> Result<Box<dyn lance_index::IndexParams>, HirnDbError> {
         if matches!(
             config.index_type,
             IndexType::IvfHnswSq | IndexType::IvfHnswPq | IndexType::IvfPq | IndexType::IvfRq
         ) {
-            return Ok(Box::new(Self::build_vector_index_params(config)));
+            return Ok(Box::new(Self::build_vector_index_params(config, metric)));
         }
 
         // The inverted (BM25 full-text) index needs a tokenizer configuration;
         // the generic `ScalarIndexParams::for_builtin(Inverted)` omits the
         // `base_tokenizer`, so index construction fails with a missing-field
-        // error. Build dedicated `InvertedIndexParams` (default = "simple"
-        // tokenizer, English stemming) instead.
+        // error. Build dedicated `InvertedIndexParams` instead.
+        //
+        // On Lance 9 the default gives us the modern native FTS stack for free:
+        // the v2 posting format (now the default), WAND / block-max impact-skip
+        // top-k pruning, the ICU default tokenizer, and the accumulated BM25
+        // scoring-correctness fixes. hirn does not hand-roll any BM25/posting
+        // logic — this native index is the whole FTS engine.
         if matches!(config.index_type, IndexType::Bm25) {
             return Ok(Box::new(
                 lance_index::scalar::inverted::tokenizer::InvertedIndexParams::default(),
@@ -778,8 +1035,14 @@ impl LancePhysicalStore {
         Ok(Box::new(ScalarIndexParams::for_builtin(builtin_index_type)))
     }
 
-    fn build_vector_index_params(config: &IndexConfig) -> VectorIndexParams {
-        let metric_type = MetricType::L2;
+    fn build_vector_index_params(
+        config: &IndexConfig,
+        metric: DistanceMetric,
+    ) -> VectorIndexParams {
+        // Use the dataset's search metric rather than a hardcoded L2. An index
+        // partitioned under L2 mis-buckets cosine/dot queries, degrading ANN
+        // recall once the dataset is large enough to auto-build the index.
+        let metric_type = Self::to_metric_type(metric);
         let ivf_params = Self::build_ivf_params(&config.params);
 
         match config.index_type {
@@ -880,7 +1143,7 @@ impl LancePhysicalStore {
         };
         self.flat_vector_snapshot_cache
             .get(&old_key)
-            .map(|e| Arc::clone(e.value()))
+            .map(|e| Arc::clone(&e.value().batches))
     }
 }
 
@@ -947,6 +1210,22 @@ fn is_create_race_error(err: &lance::Error) -> bool {
     )
 }
 
+/// Maximum number of commit-conflict retries before surfacing the error.
+const MAX_COMMIT_RETRIES: u32 = 5;
+/// Base backoff (doubled each attempt) between commit-conflict retries.
+const COMMIT_RETRY_BASE_BACKOFF_MS: u64 = 10;
+
+/// A commit failed because another writer advanced the dataset concurrently and
+/// the operation can safely be retried against the latest version.
+fn is_retryable_commit_conflict(err: &lance::Error) -> bool {
+    matches!(
+        err,
+        lance::Error::CommitConflict { .. }
+            | lance::Error::RetryableCommitConflict { .. }
+            | lance::Error::TooMuchWriteContention { .. }
+    )
+}
+
 fn is_missing_dataset_error(err: &HirnDbError) -> bool {
     matches!(err, HirnDbError::DatasetNotFound(_))
 }
@@ -978,37 +1257,55 @@ impl PhysicalStore for LancePhysicalStore {
             let _guard = lock.lock().await;
 
             match self.open_dataset(dataset).await {
-                Ok(ds) => {
-                    // Capture the version before the write so we can locate the existing
-                    // snapshot cache entry for the incremental proactive update below.
-                    let old_version = ds.version().version;
-                    // Whether the dataset was empty *before* this append. If it had
-                    // rows and we don't hold the prior snapshot, the new batches are
-                    // only a partial view and must not become the cached snapshot
-                    // (that would make flat vector search return the new rows only).
-                    let dataset_was_empty = ds.count_rows(None).await.unwrap_or(usize::MAX) == 0;
-                    let reader = Self::record_batch_reader(&batches);
+                Ok(_) => {
+                    // Commit-conflict retry (R-41): a concurrent writer (another
+                    // process/handle, or a maintenance op) can advance the
+                    // dataset between our open and commit. Re-open the latest and
+                    // retry the append rather than surfacing a retryable error.
+                    let mut attempt = 0u32;
+                    loop {
+                        let ds = self.open_dataset(dataset).await?;
+                        // Capture the version before the write so we can locate the existing
+                        // snapshot cache entry for the incremental proactive update below.
+                        let old_version = ds.version().version;
+                        // Whether the dataset was empty *before* this append. If it had
+                        // rows and we don't hold the prior snapshot, the new batches are
+                        // only a partial view and must not become the cached snapshot
+                        // (that would make flat vector search return the new rows only).
+                        let dataset_was_empty =
+                            ds.count_rows(None).await.unwrap_or(usize::MAX) == 0;
+                        let reader = Self::record_batch_reader(&batches);
 
-                    // Clone the cached dataset (cheap: all Arc fields) instead of reopening from disk.
-                    let mut ds_mut = (*ds).clone();
-                    ds_mut
-                        .append(reader, None)
-                        .await
-                        .map_err(HirnDbError::from)?;
-                    let new_version = ds_mut.version().version;
-                    self.ensure_default_vector_index_if_needed(dataset, &mut ds_mut, &batches)
-                        .await?;
+                        // Clone the cached dataset (cheap: all Arc fields) instead of reopening from disk.
+                        let mut ds_mut = (*ds).clone();
+                        match ds_mut.append(reader, None).await {
+                            Ok(_) => {
+                                let new_version = ds_mut.version().version;
+                                self.ensure_default_vector_index_if_needed(
+                                    dataset,
+                                    &mut ds_mut,
+                                    &batches,
+                                )
+                                .await?;
 
-                    // Extract the existing snapshot (cheap Arc clone, O(1)) BEFORE
-                    // invalidation wipes the entry.
-                    let existing = self.extract_existing_snapshot(dataset, &batches, old_version);
+                                // Extract the existing snapshot (cheap Arc clone, O(1)) BEFORE
+                                // invalidation wipes the entry.
+                                let existing =
+                                    self.extract_existing_snapshot(dataset, &batches, old_version);
 
-                    // Update cache with the mutated dataset; wipe stale snapshot entries.
-                    self.datasets.put(dataset.to_string(), Arc::new(ds_mut));
-                    self.invalidate_dataset_caches(dataset);
+                                // Update cache with the mutated dataset; wipe stale snapshot entries.
+                                self.datasets.put(dataset.to_string(), Arc::new(ds_mut));
+                                self.invalidate_dataset_caches(dataset);
 
-                    // _guard dropped here — write lock released.
-                    Ok((new_version, existing, dataset_was_empty))
+                                // _guard dropped after the block — write lock released.
+                                break Ok((new_version, existing, dataset_was_empty));
+                            }
+                            Err(err)
+                                if is_retryable_commit_conflict(&err)
+                                    && self.backoff_or_giveup(dataset, &mut attempt).await => {}
+                            Err(err) => break Err(HirnDbError::from(err)),
+                        }
+                    }
                 }
                 Err(error) if is_missing_dataset_error(&error) => {
                     let dataset_handle = self.open_or_create_batches(dataset, &batches).await?;
@@ -1038,7 +1335,7 @@ impl PhysicalStore for LancePhysicalStore {
             && let Some((key, snapshot)) =
                 self.build_proactive_snapshot(dataset, new_version, existing_snapshot, &batches)
         {
-            self.flat_vector_snapshot_cache.insert(key, snapshot);
+            self.insert_flat_snapshot(key, snapshot);
         }
 
         Ok(())
@@ -1136,9 +1433,12 @@ impl PhysicalStore for LancePhysicalStore {
                 .map_err(HirnDbError::from)?;
         }
 
-        let apply_limit_in_hirn =
-            opts.filter.is_some() && (opts.limit.is_some() || opts.offset.is_some());
-        if !apply_limit_in_hirn {
+        // Push `limit`/`offset` into the Lance scanner for the filtered case too
+        // (R-36). Lance applies the limit AFTER the predicate, so pushing it is
+        // correct and lets Lance stop scanning early instead of decoding every
+        // matching batch through an in-memory limiter with an eager background
+        // drain that pulled all matches.
+        if opts.limit.is_some() || opts.offset.is_some() {
             let limit = opts.limit.map(|l| l as i64);
             let offset = opts.offset.map(|o| o as i64);
             scanner.limit(limit, offset).map_err(HirnDbError::from)?;
@@ -1146,15 +1446,7 @@ impl PhysicalStore for LancePhysicalStore {
 
         let stream = scanner.try_into_stream().await.map_err(HirnDbError::from)?;
         let stream: RecordBatchStream = Box::pin(stream.map_err(HirnDbError::from));
-        if apply_limit_in_hirn {
-            Ok(limit_offset_and_drain_on_drop(
-                stream,
-                opts.offset,
-                opts.limit,
-            ))
-        } else {
-            Ok(drain_on_drop(stream))
-        }
+        Ok(drain_on_drop(stream))
     }
 
     async fn delete(&self, dataset: &str, predicate: &str) -> Result<u64, HirnDbError> {
@@ -1163,12 +1455,24 @@ impl PhysicalStore for LancePhysicalStore {
 
         let count_before = self.count(dataset, None).await?;
 
-        let ds = self.open_dataset(dataset).await?;
-        let mut ds_mut = (*ds).clone();
-        ds_mut.delete(predicate).await.map_err(HirnDbError::from)?;
-
-        self.datasets.put(dataset.to_string(), Arc::new(ds_mut));
-        self.invalidate_dataset_caches(dataset);
+        // Commit-conflict retry (R-41): re-open latest and retry on a retryable
+        // conflict from a concurrent writer.
+        let mut attempt = 0u32;
+        loop {
+            let ds = self.open_dataset(dataset).await?;
+            let mut ds_mut = (*ds).clone();
+            match ds_mut.delete(predicate).await {
+                Ok(_) => {
+                    self.datasets.put(dataset.to_string(), Arc::new(ds_mut));
+                    self.invalidate_dataset_caches(dataset);
+                    break;
+                }
+                Err(err)
+                    if is_retryable_commit_conflict(&err)
+                        && self.backoff_or_giveup(dataset, &mut attempt).await => {}
+                Err(err) => return Err(HirnDbError::from(err)),
+            }
+        }
         let count_after = self.count(dataset, None).await?;
 
         Ok(count_before.saturating_sub(count_after))
@@ -1180,33 +1484,67 @@ impl PhysicalStore for LancePhysicalStore {
         on: &[&str],
         batch: RecordBatch,
     ) -> Result<(), HirnDbError> {
+        self.merge_insert_where(dataset, on, batch, None).await
+    }
+
+    async fn merge_insert_where(
+        &self,
+        dataset: &str,
+        on: &[&str],
+        batch: RecordBatch,
+        when_matched_condition: Option<&str>,
+    ) -> Result<(), HirnDbError> {
         let lock = self.write_lock(dataset);
         let _guard = lock.lock().await;
 
-        // If dataset doesn't exist, just create it
+        // If dataset doesn't exist, just create it. A create only inserts the
+        // incoming batch — there are no existing (target) rows to guard.
         if !self.exists(dataset).await? {
             self.open_or_create(dataset, &batch).await?;
             return Ok(());
         }
 
-        let ds = self.open_dataset(dataset).await?;
         let keys: Vec<String> = on.iter().map(|s| s.to_string()).collect();
 
-        let schema = batch.schema();
-        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        // Commit-conflict retry (R-41): rebuild the merge job against the latest
+        // version on a retryable conflict.
+        let mut attempt = 0u32;
+        loop {
+            let ds = self.open_dataset(dataset).await?;
 
-        let mut builder = MergeInsertBuilder::try_new(ds, keys).map_err(HirnDbError::from)?;
-        builder
-            .when_matched(WhenMatched::UpdateAll)
-            .when_not_matched(WhenNotMatched::InsertAll);
-        let job = builder.try_build().map_err(HirnDbError::from)?;
+            // `WhenMatched::UpdateIf(expr)` gates the overwrite on a predicate over
+            // the matched TARGET row (e.g. `target.namespace IN (...)`), so a
+            // key-collision alone is not enough to clobber another tenant's row.
+            let when_matched = match when_matched_condition {
+                Some(condition) => {
+                    WhenMatched::update_if(ds.as_ref(), condition).map_err(HirnDbError::from)?
+                }
+                None => WhenMatched::UpdateAll,
+            };
 
-        job.execute_reader(reader)
-            .await
-            .map_err(HirnDbError::from)?;
-        self.datasets.invalidate(&dataset.to_string());
-        self.invalidate_dataset_caches(dataset);
-        Ok(())
+            let batch_for_attempt = batch.clone();
+            let schema = batch_for_attempt.schema();
+            let reader = RecordBatchIterator::new(vec![Ok(batch_for_attempt)], schema);
+
+            let mut builder =
+                MergeInsertBuilder::try_new(ds, keys.clone()).map_err(HirnDbError::from)?;
+            builder
+                .when_matched(when_matched)
+                .when_not_matched(WhenNotMatched::InsertAll);
+            let job = builder.try_build().map_err(HirnDbError::from)?;
+
+            match job.execute_reader(reader).await {
+                Ok(_) => {
+                    self.datasets.invalidate(&dataset.to_string());
+                    self.invalidate_dataset_caches(dataset);
+                    return Ok(());
+                }
+                Err(err)
+                    if is_retryable_commit_conflict(&err)
+                        && self.backoff_or_giveup(dataset, &mut attempt).await => {}
+                Err(err) => return Err(HirnDbError::from(err)),
+            }
+        }
     }
 
     async fn update_where(
@@ -1225,22 +1563,33 @@ impl PhysicalStore for LancePhysicalStore {
         // snapshot cache entry under the pre-append version key.
         let lock = self.write_lock(dataset);
         let _guard = lock.lock().await;
-        let ds = self.open_dataset(dataset).await?;
-        // Capture the version before the update so we can re-key any cached
-        // flat-vector snapshots to the new version afterwards.  Embedding
-        // columns are untouched by importance-boost updates, so the snapshot
-        // data is still valid — only the version key changes.
-        let old_version = ds.version().version;
-        let mut builder = UpdateBuilder::new(ds);
-        builder = builder.update_where(filter).map_err(HirnDbError::from)?;
-        for &(col, expr) in updates {
-            builder = builder.set(col, expr).map_err(HirnDbError::from)?;
-        }
-        let job = builder.build().map_err(HirnDbError::from)?;
-        let UpdateResult {
-            new_dataset,
-            rows_updated,
-        } = job.execute().await.map_err(HirnDbError::from)?;
+        // Commit-conflict retry (R-41): rebuild the update against the latest
+        // version on a retryable conflict. Capture the version before the update
+        // so we can re-key any cached flat-vector snapshots to the new version
+        // afterwards.  Embedding columns are untouched by importance-boost
+        // updates, so the snapshot data is still valid — only the version key
+        // changes.
+        let mut attempt = 0u32;
+        let (new_dataset, rows_updated, old_version) = loop {
+            let ds = self.open_dataset(dataset).await?;
+            let old_version = ds.version().version;
+            let mut builder = UpdateBuilder::new(ds);
+            builder = builder.update_where(filter).map_err(HirnDbError::from)?;
+            for &(col, expr) in updates {
+                builder = builder.set(col, expr).map_err(HirnDbError::from)?;
+            }
+            let job = builder.build().map_err(HirnDbError::from)?;
+            match job.execute().await {
+                Ok(UpdateResult {
+                    new_dataset,
+                    rows_updated,
+                }) => break (new_dataset, rows_updated, old_version),
+                Err(err)
+                    if is_retryable_commit_conflict(&err)
+                        && self.backoff_or_giveup(dataset, &mut attempt).await => {}
+                Err(err) => return Err(HirnDbError::from(err)),
+            }
+        };
         let new_version = new_dataset.version().version;
 
         // Preserve flat-vector snapshots by re-keying to the new version.
@@ -1249,7 +1598,7 @@ impl PhysicalStore for LancePhysicalStore {
             .flat_vector_snapshot_cache
             .iter()
             .filter(|e| e.key().dataset == dataset && e.key().version == old_version)
-            .map(|e| (e.key().clone(), Arc::clone(e.value())))
+            .map(|e| (e.key().clone(), Arc::clone(&e.value().batches)))
             .collect();
 
         // Use put() so the EpochCache stays warm (no cold manifest re-read).
@@ -1259,7 +1608,7 @@ impl PhysicalStore for LancePhysicalStore {
         // Re-insert snapshots under the new version key.
         for (mut key, snapshot) in preserved {
             key.version = new_version;
-            self.flat_vector_snapshot_cache.insert(key, snapshot);
+            self.insert_flat_snapshot(key, snapshot);
         }
 
         Ok(rows_updated)
@@ -1386,6 +1735,16 @@ impl PhysicalStore for LancePhysicalStore {
 
         if let Some(ref filter) = opts.filter {
             scanner.filter(filter).map_err(HirnDbError::from)?;
+            // Apply the filter BEFORE BM25 top-k selection, mirroring the vector
+            // path (~:433). Lance defaults to post-filter: it takes the global
+            // top-`limit` rows by score and only then drops the ones the
+            // predicate excludes. A caller whose namespace predicate matches a
+            // small share of rows (multi-tenant isolation via
+            // PolicyEnforcedStore) would therefore get far fewer than `limit`
+            // FTS/hybrid results, often zero, despite many in-namespace matches
+            // existing. Prefiltering restricts the BM25 candidate set to
+            // matching rows first.
+            scanner.prefilter(true);
         }
 
         let stream = scanner.try_into_stream().await.map_err(HirnDbError::from)?;
@@ -1459,27 +1818,38 @@ impl PhysicalStore for LancePhysicalStore {
             return Ok(Vec::new());
         }
 
+        // ── No dense column: stream + bounded top-k heap (R-40) ───────────
+        // A brute-force MaxSim scan without a dense first stage previously
+        // materialized the ENTIRE multivector column in memory. Stream the
+        // dataset instead and keep only a `limit`-sized top-k heap of scored
+        // rows, bounding peak memory to the result size + one batch.
+        let Some(dense_col) = opts.dense_column.clone() else {
+            return self
+                .multivector_bruteforce_streaming(dataset, &opts, &query_vecs)
+                .await;
+        };
+
         let first_stage_limit = opts.first_stage_limit.unwrap_or(opts.limit * 10);
 
-        // ── Stage 1: Retrieve candidates ─────────────────────────────────
-        let candidates = if let Some(ref dense_col) = opts.dense_column {
-            // Compute centroid of query vectors for ANN pre-filtering.
-            let dim = query_vecs[0].len();
-            let mut centroid = vec![0.0_f32; dim];
-            for v in &query_vecs {
-                for (c, val) in centroid.iter_mut().zip(v.iter()) {
-                    *c += val;
-                }
+        // ── Stage 1: Retrieve candidates via the dense ANN column ─────────
+        // Compute centroid of query vectors for ANN pre-filtering.
+        let dim = query_vecs[0].len();
+        let mut centroid = vec![0.0_f32; dim];
+        for v in &query_vecs {
+            for (c, val) in centroid.iter_mut().zip(v.iter()) {
+                *c += val;
             }
-            let n = query_vecs.len() as f32;
-            for c in &mut centroid {
-                *c /= n;
-            }
+        }
+        let n = query_vecs.len() as f32;
+        for c in &mut centroid {
+            *c /= n;
+        }
 
-            self.vector_search(
+        let candidates = self
+            .vector_search(
                 dataset,
                 VectorSearchOptions {
-                    column: dense_col.clone(),
+                    column: dense_col,
                     query: centroid,
                     metric: opts.metric,
                     limit: first_stage_limit,
@@ -1488,22 +1858,7 @@ impl PhysicalStore for LancePhysicalStore {
                     refine_factor: None,
                 },
             )
-            .await?
-        } else {
-            // No dense column — full scan.
-            self.scan(
-                dataset,
-                ScanOptions {
-                    filter: opts.filter.clone(),
-                    exact_filter: None,
-                    order_by: None,
-                    limit: None,
-                    offset: None,
-                    columns: None,
-                },
-            )
-            .await?
-        };
+            .await?;
 
         if candidates.is_empty() {
             return Ok(Vec::new());
@@ -1592,36 +1947,66 @@ impl PhysicalStore for LancePhysicalStore {
     // ── Indexing ──
 
     async fn create_index(&self, dataset: &str, config: IndexConfig) -> Result<(), HirnDbError> {
-        let ds = self.open_dataset(dataset).await?;
-        let mut ds = (*ds).clone();
         let col_refs: Vec<&str> = config.columns.iter().map(|s| s.as_str()).collect();
         let lance_type = Self::to_lance_index_type(config.index_type);
-        let params = Self::build_lance_index_params(&config, lance_type)?;
-        match ds
-            .create_index(&col_refs, lance_type, None, params.as_ref(), config.replace)
-            .await
-        {
-            Ok(_) => {
-                self.datasets.put(dataset.to_string(), Arc::new(ds));
-                self.invalidate_dataset_caches(dataset);
-            }
-            Err(err) if !config.replace && is_index_already_exists_error(&err) => {}
-            Err(err) => return Err(HirnDbError::from(err)),
-        }
+        let params = Self::build_lance_index_params(&config, lance_type, self.vector_index_metric)?;
 
-        Ok(())
+        // Serialize against concurrent appends and retry on commit conflicts
+        // (R-23): clone→mutate→put previously raced a parallel `append`.
+        let lock = self.write_lock(dataset);
+        let _guard = lock.lock().await;
+        let mut attempt = 0u32;
+        loop {
+            let ds = self.open_dataset(dataset).await?;
+            let mut ds = (*ds).clone();
+            match ds
+                .create_index(&col_refs, lance_type, None, params.as_ref(), config.replace)
+                .await
+            {
+                Ok(_) => {
+                    self.datasets.put(dataset.to_string(), Arc::new(ds));
+                    self.invalidate_dataset_caches(dataset);
+                    // Drop any cached negative index probe (R-38) so the next
+                    // search re-checks load_indices and picks up this new index.
+                    for column in &config.columns {
+                        self.vector_index_cache.remove(&VectorIndexCacheKey {
+                            dataset: dataset.to_string(),
+                            column: column.clone(),
+                        });
+                    }
+                    return Ok(());
+                }
+                Err(err) if !config.replace && is_index_already_exists_error(&err) => {
+                    return Ok(());
+                }
+                Err(err)
+                    if is_retryable_commit_conflict(&err)
+                        && self.backoff_or_giveup(dataset, &mut attempt).await => {}
+                Err(err) => return Err(HirnDbError::from(err)),
+            }
+        }
     }
 
     async fn optimize_indices(&self, dataset: &str) -> Result<(), HirnDbError> {
-        let ds = self.open_dataset(dataset).await?;
-        let mut ds = (*ds).clone();
         let opts = lance_index::optimize::OptimizeOptions::default();
-        ds.optimize_indices(&opts)
-            .await
-            .map_err(HirnDbError::from)?;
-        self.datasets.put(dataset.to_string(), Arc::new(ds));
-        self.invalidate_dataset_caches(dataset);
-        Ok(())
+        let lock = self.write_lock(dataset);
+        let _guard = lock.lock().await;
+        let mut attempt = 0u32;
+        loop {
+            let ds = self.open_dataset(dataset).await?;
+            let mut ds = (*ds).clone();
+            match ds.optimize_indices(&opts).await {
+                Ok(_) => {
+                    self.datasets.put(dataset.to_string(), Arc::new(ds));
+                    self.invalidate_dataset_caches(dataset);
+                    return Ok(());
+                }
+                Err(err)
+                    if is_retryable_commit_conflict(&err)
+                        && self.backoff_or_giveup(dataset, &mut attempt).await => {}
+                Err(err) => return Err(HirnDbError::from(err)),
+            }
+        }
     }
 
     // ── Compaction ──
@@ -1631,21 +2016,60 @@ impl PhysicalStore for LancePhysicalStore {
         dataset: &str,
         opts: CompactOptions,
     ) -> Result<CompactResult, HirnDbError> {
-        let ds = self.open_dataset(dataset).await?;
-        let mut ds = (*ds).clone();
-
-        let lance_opts = lance::dataset::optimize::CompactionOptions {
-            target_rows_per_fragment: opts.target_rows_per_fragment.unwrap_or(1_048_576),
-            max_rows_per_group: opts.max_rows_per_group.unwrap_or(1024),
-            ..Default::default()
+        // Serialize against concurrent appends and retry on commit conflicts (R-23).
+        let lock = self.write_lock(dataset);
+        let _guard = lock.lock().await;
+        let mut attempt = 0u32;
+        let metrics = loop {
+            let lance_opts = lance::dataset::optimize::CompactionOptions {
+                target_rows_per_fragment: opts.target_rows_per_fragment.unwrap_or(1_048_576),
+                max_rows_per_group: opts.max_rows_per_group.unwrap_or(1024),
+                ..Default::default()
+            };
+            let ds = self.open_dataset(dataset).await?;
+            let mut ds = (*ds).clone();
+            match lance::dataset::optimize::compact_files(&mut ds, lance_opts, None).await {
+                Ok(metrics) => {
+                    self.datasets.put(dataset.to_string(), Arc::new(ds));
+                    self.invalidate_dataset_caches(dataset);
+                    break metrics;
+                }
+                Err(err)
+                    if is_retryable_commit_conflict(&err)
+                        && self.backoff_or_giveup(dataset, &mut attempt).await => {}
+                Err(err) => return Err(HirnDbError::from(err)),
+            }
         };
 
-        let metrics = lance::dataset::optimize::compact_files(&mut ds, lance_opts, None)
-            .await
-            .map_err(HirnDbError::from)?;
-
-        self.datasets.put(dataset.to_string(), Arc::new(ds));
-        self.invalidate_dataset_caches(dataset);
+        // Lance 7+ no longer auto-cleans old versions (Lance ≤6 did so by
+        // default); every write/compaction accrues manifests + data files that
+        // would otherwise grow unbounded. Reclaim versions older than the
+        // retention window after a successful compaction. The window preserves
+        // recent versions so `open_at_version` time-travel still works.
+        // Best-effort: a cleanup failure must never fail the compaction.
+        {
+            let ds = self.open_dataset(dataset).await?;
+            match ds
+                .cleanup_old_versions(
+                    chrono::Duration::days(OLD_VERSION_RETENTION_DAYS),
+                    Some(false),
+                    Some(false),
+                )
+                .await
+            {
+                Ok(stats) => tracing::debug!(
+                    dataset,
+                    old_versions = stats.old_versions,
+                    bytes_removed = stats.bytes_removed,
+                    "reclaimed old dataset versions after compaction"
+                ),
+                Err(err) => tracing::warn!(
+                    dataset,
+                    error = %err,
+                    "old-version cleanup after compaction failed (non-fatal)"
+                ),
+            }
+        }
 
         Ok(CompactResult {
             fragments_removed: metrics.fragments_removed as u64,
@@ -1673,33 +2097,81 @@ impl PhysicalStore for LancePhysicalStore {
         Ok(())
     }
 
-    async fn checkout(&self, dataset: &str, version: u64) -> Result<(), HirnDbError> {
+    async fn open_at_version(
+        &self,
+        dataset: &str,
+        version: u64,
+    ) -> Result<Vec<RecordBatch>, HirnDbError> {
         let ds = self.open_dataset(dataset).await?;
-        // `checkout_version` returns a new Dataset handle at the target version
-        // without persisting any change on disk.  `restore()` writes a new
-        // transaction that makes the checked-out version the current dataset
-        // state, so that subsequent opens see the rolled-back data.
-        let mut at_version = ds
+        // `checkout_version` returns a *new* Dataset handle pinned to the target
+        // version. It does NOT restore/commit — the live dataset and its cached
+        // handle are left completely untouched, so this is genuinely read-only.
+        let at_version = ds
             .checkout_version(version)
             .await
             .map_err(HirnDbError::from)?;
-        at_version.restore().await.map_err(HirnDbError::from)?;
-        self.datasets.invalidate(&dataset.to_string());
-        self.invalidate_dataset_caches(dataset);
-        Ok(())
+        let scanner = at_version.scan();
+        let stream = scanner.try_into_stream().await.map_err(HirnDbError::from)?;
+        let stream: RecordBatchStream = Box::pin(stream.map_err(HirnDbError::from));
+        drain_on_drop(stream).try_collect().await
+    }
+
+    async fn rollback_to(&self, dataset: &str, version: u64) -> Result<(), HirnDbError> {
+        // Destructive: `restore()` writes a new transaction that makes the
+        // checked-out version the current dataset state, so subsequent opens
+        // (for every tenant sharing the dataset) see the rolled-back data.
+        //
+        // Serialize under the per-dataset write lock and retry on a retryable
+        // commit conflict, re-reading the latest version each attempt (R-23).
+        let lock = self.write_lock(dataset);
+        let _guard = lock.lock().await;
+        let mut attempt = 0u32;
+        loop {
+            let ds = self.open_dataset(dataset).await?;
+            let mut at_version = ds
+                .checkout_version(version)
+                .await
+                .map_err(HirnDbError::from)?;
+            match at_version.restore().await {
+                Ok(_) => {
+                    self.datasets.invalidate(&dataset.to_string());
+                    self.invalidate_dataset_caches(dataset);
+                    return Ok(());
+                }
+                Err(err)
+                    if is_retryable_commit_conflict(&err)
+                        && self.backoff_or_giveup(dataset, &mut attempt).await => {}
+                Err(err) => return Err(HirnDbError::from(err)),
+            }
+        }
+    }
+
+    #[allow(deprecated)]
+    async fn checkout(&self, dataset: &str, version: u64) -> Result<(), HirnDbError> {
+        // Deprecated alias retained for external implementors; the historical
+        // behaviour was the destructive rollback now named `rollback_to`.
+        self.rollback_to(dataset, version).await
     }
 
     async fn list_tags(&self, dataset: &str) -> Result<Vec<VersionTag>, HirnDbError> {
         let ds = self.open_dataset(dataset).await?;
         let tags = ds.tags().list().await.map_err(HirnDbError::from)?;
-        Ok(tags
-            .into_iter()
-            .map(|(name, tag_contents)| VersionTag {
+        let mut result = Vec::with_capacity(tags.len());
+        for (name, tag_contents) in tags {
+            // Real creation time (R-43): use the commit timestamp of the tagged
+            // version rather than a hardcoded 0. `checkout_version` is a cheap
+            // manifest read and `list_tags` is a rare operation.
+            let created_at = match ds.checkout_version(tag_contents.version).await {
+                Ok(at) => at.version().timestamp.timestamp_millis(),
+                Err(_) => 0,
+            };
+            result.push(VersionTag {
                 name,
                 version: tag_contents.version,
-                created_at: 0,
-            })
-            .collect())
+                created_at,
+            });
+        }
+        Ok(result)
     }
 
     // ── Dataset management ──
@@ -1785,46 +2257,81 @@ impl PhysicalStore for LancePhysicalStore {
         dataset: &str,
         transforms: Vec<ColumnTransform>,
     ) -> Result<(), HirnDbError> {
-        let ds = self.open_dataset(dataset).await?;
-        let mut ds = (*ds).clone();
-
-        for transform in transforms {
-            match transform {
-                ColumnTransform::AddColumn {
-                    name,
-                    data_type,
-                    nullable,
-                    default_value: _,
-                } => {
-                    let field = arrow_schema::Field::new(&name, data_type, nullable);
-                    let arrow_schema = arrow_schema::Schema::new(vec![field]);
-                    ds.add_columns(
-                        NewColumnTransform::AllNulls(Arc::new(arrow_schema)),
-                        None,
-                        None,
-                    )
-                    .await
-                    .map_err(HirnDbError::from)?;
-                }
-                ColumnTransform::RenameColumn { old_name, new_name } => {
-                    let alteration = ColumnAlteration::new(old_name).rename(new_name);
-                    ds.alter_columns(&[alteration])
+        // Schema evolution mutates and commits — serialize against concurrent
+        // appends and retry on commit conflicts (R-23).
+        let lock = self.write_lock(dataset);
+        let _guard = lock.lock().await;
+        let mut attempt = 0u32;
+        loop {
+            let ds = self.open_dataset(dataset).await?;
+            let mut ds = (*ds).clone();
+            let mut retryable_err: Option<lance::Error> = None;
+            let mut result: Result<(), HirnDbError> = Ok(());
+            for transform in &transforms {
+                let step = match transform {
+                    ColumnTransform::AddColumn {
+                        name,
+                        data_type,
+                        nullable,
+                        default_value: _,
+                    } => {
+                        let field = arrow_schema::Field::new(name, data_type.clone(), *nullable);
+                        let arrow_schema = arrow_schema::Schema::new(vec![field]);
+                        ds.add_columns(
+                            NewColumnTransform::AllNulls(Arc::new(arrow_schema)),
+                            None,
+                            None,
+                        )
                         .await
-                        .map_err(HirnDbError::from)?;
+                    }
+                    ColumnTransform::RenameColumn { old_name, new_name } => {
+                        let alteration =
+                            ColumnAlteration::new(old_name.clone()).rename(new_name.clone());
+                        ds.alter_columns(&[alteration]).await.map(|_| ())
+                    }
+                };
+                if let Err(err) = step {
+                    if is_retryable_commit_conflict(&err) {
+                        retryable_err = Some(err);
+                    } else {
+                        result = Err(HirnDbError::from(err));
+                    }
+                    break;
+                }
+            }
+            match (retryable_err, result) {
+                (Some(_), _) if self.backoff_or_giveup(dataset, &mut attempt).await => continue,
+                (Some(err), _) => return Err(HirnDbError::from(err)),
+                (None, Err(e)) => return Err(e),
+                (None, Ok(())) => {
+                    self.datasets.put(dataset.to_string(), Arc::new(ds));
+                    self.invalidate_dataset_caches(dataset);
+                    return Ok(());
                 }
             }
         }
-
-        self.datasets.put(dataset.to_string(), Arc::new(ds));
-        Ok(())
     }
 
     async fn drop_columns(&self, dataset: &str, columns: &[&str]) -> Result<(), HirnDbError> {
-        let ds = self.open_dataset(dataset).await?;
-        let mut ds = (*ds).clone();
-        ds.drop_columns(columns).await.map_err(HirnDbError::from)?;
-        self.datasets.put(dataset.to_string(), Arc::new(ds));
-        Ok(())
+        // Serialize against concurrent appends and retry on commit conflicts (R-23).
+        let lock = self.write_lock(dataset);
+        let _guard = lock.lock().await;
+        let mut attempt = 0u32;
+        loop {
+            let ds = self.open_dataset(dataset).await?;
+            let mut ds = (*ds).clone();
+            match ds.drop_columns(columns).await {
+                Ok(_) => {
+                    self.datasets.put(dataset.to_string(), Arc::new(ds));
+                    self.invalidate_dataset_caches(dataset);
+                    return Ok(());
+                }
+                Err(err)
+                    if is_retryable_commit_conflict(&err)
+                        && self.backoff_or_giveup(dataset, &mut attempt).await => {}
+                Err(err) => return Err(HirnDbError::from(err)),
+            }
+        }
     }
 
     async fn table_provider(
@@ -1855,19 +2362,6 @@ fn drain_on_drop(stream: RecordBatchStream) -> RecordBatchStream {
     })
 }
 
-fn limit_offset_and_drain_on_drop(
-    stream: RecordBatchStream,
-    offset: Option<usize>,
-    limit: Option<usize>,
-) -> RecordBatchStream {
-    Box::pin(LimitOffsetDrainStream {
-        inner: Some(stream),
-        offset_remaining: offset.unwrap_or(0),
-        limit_remaining: limit,
-        done: false,
-    })
-}
-
 struct DrainOnDropStream {
     inner: Option<RecordBatchStream>,
 }
@@ -1890,97 +2384,6 @@ impl Stream for DrainOnDropStream {
 }
 
 impl Drop for DrainOnDropStream {
-    fn drop(&mut self) {
-        drain_remaining(self.inner.take());
-    }
-}
-
-struct LimitOffsetDrainStream {
-    inner: Option<RecordBatchStream>,
-    offset_remaining: usize,
-    limit_remaining: Option<usize>,
-    done: bool,
-}
-
-impl LimitOffsetDrainStream {
-    fn finish_and_drain(&mut self) {
-        self.done = true;
-        drain_remaining(self.inner.take());
-    }
-}
-
-impl Stream for LimitOffsetDrainStream {
-    type Item = Result<RecordBatch, HirnDbError>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if self.done {
-            return Poll::Ready(None);
-        }
-
-        if matches!(self.limit_remaining, Some(0)) {
-            self.finish_and_drain();
-            return Poll::Ready(None);
-        }
-
-        loop {
-            let poll = match self.inner.as_mut() {
-                Some(stream) => stream.as_mut().poll_next(cx),
-                None => return Poll::Ready(None),
-            };
-
-            let batch = match poll {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(None) => {
-                    self.inner.take();
-                    self.done = true;
-                    return Poll::Ready(None);
-                }
-                Poll::Ready(Some(Err(err))) => return Poll::Ready(Some(Err(err))),
-                Poll::Ready(Some(Ok(batch))) => batch,
-            };
-
-            let batch_rows = batch.num_rows();
-            if batch_rows == 0 {
-                continue;
-            }
-
-            if self.offset_remaining >= batch_rows {
-                self.offset_remaining -= batch_rows;
-                continue;
-            }
-
-            let skip = self.offset_remaining;
-            self.offset_remaining = 0;
-            let available = batch_rows - skip;
-            let take = self
-                .limit_remaining
-                .map_or(available, |remaining| remaining.min(available));
-
-            if take == 0 {
-                self.finish_and_drain();
-                return Poll::Ready(None);
-            }
-
-            if let Some(remaining) = self.limit_remaining.as_mut() {
-                *remaining -= take;
-            }
-
-            let output = if skip == 0 && take == batch_rows {
-                batch
-            } else {
-                batch.slice(skip, take)
-            };
-
-            if matches!(self.limit_remaining, Some(0)) {
-                self.finish_and_drain();
-            }
-
-            return Poll::Ready(Some(Ok(output)));
-        }
-    }
-}
-
-impl Drop for LimitOffsetDrainStream {
     fn drop(&mut self) {
         drain_remaining(self.inner.take());
     }
@@ -2061,6 +2464,41 @@ impl Ord for ScoredRow {
             .unwrap_or(Ordering::Equal)
             .then_with(|| self.batch_idx.cmp(&other.batch_idx))
             .then_with(|| self.row_idx.cmp(&other.row_idx))
+    }
+}
+
+/// A scored multivector row for the streaming brute-force top-k heap (R-40).
+///
+/// The `Ord` impl is **reversed** on `score` so that `BinaryHeap` (a max-heap)
+/// keeps the *smallest*-scoring retained row at the top — the one to evict when
+/// a higher-scoring candidate arrives.
+struct MvScoredRow {
+    score: f32,
+    row: RecordBatch,
+}
+
+impl PartialEq for MvScoredRow {
+    fn eq(&self, other: &Self) -> bool {
+        self.score.to_bits() == other.score.to_bits()
+    }
+}
+
+impl Eq for MvScoredRow {}
+
+impl PartialOrd for MvScoredRow {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for MvScoredRow {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Reversed: a smaller score compares as "greater" so it sits at the
+        // heap top and is evicted first.
+        other
+            .score
+            .partial_cmp(&self.score)
+            .unwrap_or(Ordering::Equal)
     }
 }
 
@@ -2153,6 +2591,8 @@ mod tests {
         vector_search_filter,
     };
     use crate::store::ExactMatchFilter;
+    #[allow(unused_imports)]
+    use crate::store::PhysicalStore;
 
     #[test]
     fn vector_search_filter_requires_non_null_embeddings() {
@@ -2232,6 +2672,31 @@ mod tests {
         assert!(!is_create_race_error(&lance::Error::io(
             "simulated I/O error"
         )));
+    }
+
+    /// Regression for R-22: the vector index must be partitioned with the
+    /// dataset's search metric, not a hardcoded L2. A cosine-searched dataset
+    /// with an L2-partitioned ANN index mis-buckets queries and loses recall
+    /// once it is large enough to auto-build the index.
+    #[test]
+    fn vector_index_params_use_requested_metric() {
+        use crate::store::IndexConfig;
+        use lance_linalg::distance::MetricType;
+
+        let config = IndexConfig::vector("embedding");
+
+        let cosine =
+            super::LancePhysicalStore::build_vector_index_params(&config, DistanceMetric::Cosine);
+        assert_eq!(cosine.metric_type, MetricType::Cosine);
+
+        let l2 = super::LancePhysicalStore::build_vector_index_params(&config, DistanceMetric::L2);
+        assert_eq!(l2.metric_type, MetricType::L2);
+
+        let dot = super::LancePhysicalStore::build_vector_index_params(
+            &config,
+            DistanceMetric::DotProduct,
+        );
+        assert_eq!(dot.metric_type, MetricType::Dot);
     }
 
     #[test]
@@ -2363,5 +2828,270 @@ mod tests {
             combined.err()
         );
         assert_eq!(combined.unwrap().num_rows(), 2);
+    }
+
+    async fn lance_test_store() -> (tempfile::TempDir, super::LancePhysicalStore) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_str().unwrap().to_string();
+        let ns = crate::namespace::NamespaceConfig::local(&root)
+            .connect()
+            .await
+            .unwrap();
+        (tmp, super::LancePhysicalStore::new(root, ns))
+    }
+
+    fn embedding_batch(rows: usize, dim: usize) -> arrow_array::RecordBatch {
+        use std::sync::Arc;
+
+        use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        let ids: Vec<String> = (0..rows).map(|i| format!("id{i}")).collect();
+        let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let mut values = Vec::with_capacity(rows * dim);
+        for i in 0..rows {
+            for d in 0..dim {
+                // Deterministic but varied values so index quantizers can train.
+                let x = ((i * 31 + d * 7) % 97) as f32 / 97.0;
+                values.push(x);
+            }
+        }
+        let fsl = FixedSizeListArray::try_new(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            dim as i32,
+            Arc::new(Float32Array::from(values)),
+            None,
+        )
+        .unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new(
+                "embedding",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    dim as i32,
+                ),
+                false,
+            ),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(id_refs)), Arc::new(fsl)],
+        )
+        .unwrap()
+    }
+
+    /// R-38: an index built via `create_index` on a SMALL dataset (below the
+    /// flat-scan row threshold) must be honored — `has_vector_index` used to
+    /// short-circuit to `false` on small datasets before consulting
+    /// `load_indices`, silently ignoring an explicitly-created index.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn small_dataset_explicit_index_is_honored() {
+        use crate::store::IndexConfig;
+
+        let (_tmp, store) = lance_test_store().await;
+        // 1024 rows is well below FLAT_VECTOR_CACHE_MAX_ROWS (50k).
+        store
+            .append("vecs", embedding_batch(1024, 32))
+            .await
+            .unwrap();
+
+        let ds = store.open_dataset("vecs").await.unwrap();
+        assert!(
+            !store
+                .has_vector_index("vecs", ds.as_ref(), "embedding")
+                .await
+                .unwrap(),
+            "no index yet → flat scan"
+        );
+
+        store
+            .create_index("vecs", IndexConfig::vector("embedding"))
+            .await
+            .unwrap();
+
+        let ds = store.open_dataset("vecs").await.unwrap();
+        assert!(
+            store
+                .has_vector_index("vecs", ds.as_ref(), "embedding")
+                .await
+                .unwrap(),
+            "explicit index on a small dataset must be used, not ignored"
+        );
+    }
+
+    fn namespaced_embedding_batch(
+        ids: &[&str],
+        namespaces: &[&str],
+        vectors: &[[f32; 4]],
+    ) -> arrow_array::RecordBatch {
+        use std::sync::Arc;
+
+        use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        let flat: Vec<f32> = vectors.iter().flatten().copied().collect();
+        let fsl = FixedSizeListArray::try_new(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            4,
+            Arc::new(Float32Array::from(flat)),
+            None,
+        )
+        .unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("namespace", DataType::Utf8, false),
+            Field::new(
+                "embedding",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4),
+                false,
+            ),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(ids.to_vec())),
+                Arc::new(StringArray::from(namespaces.to_vec())),
+                Arc::new(fsl),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// R-37: a namespaced flat vector search must reuse the single null-only
+    /// snapshot (keyed `embedding IS NOT NULL`) and apply the namespace
+    /// predicate in-memory — it must NOT build a second, per-namespace snapshot,
+    /// and it must return only in-namespace rows.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn namespaced_flat_search_reuses_null_only_snapshot() {
+        use crate::store::{DistanceMetric, VectorSearchOptions};
+
+        let (_tmp, store) = lance_test_store().await;
+        store
+            .append(
+                "v",
+                namespaced_embedding_batch(
+                    &["a", "b", "c"],
+                    &["ns1", "ns2", "ns1"],
+                    &[
+                        [1.0, 0.0, 0.0, 0.0],
+                        [0.0, 1.0, 0.0, 0.0],
+                        [0.9, 0.1, 0.0, 0.0],
+                    ],
+                ),
+            )
+            .await
+            .unwrap();
+
+        // Unfiltered search builds/uses the null-only snapshot.
+        let _ = store
+            .vector_search(
+                "v",
+                VectorSearchOptions {
+                    column: "embedding".to_string(),
+                    query: vec![1.0, 0.0, 0.0, 0.0],
+                    metric: DistanceMetric::Cosine,
+                    limit: 10,
+                    filter: None,
+                    nprobes: None,
+                    refine_factor: None,
+                },
+            )
+            .await
+            .unwrap();
+        let snapshots_after_unfiltered = store.flat_vector_snapshot_cache.len();
+
+        // Namespaced search: must reuse the same snapshot (no new entry) and
+        // return only ns1 rows.
+        let res = store
+            .vector_search(
+                "v",
+                VectorSearchOptions {
+                    column: "embedding".to_string(),
+                    query: vec![1.0, 0.0, 0.0, 0.0],
+                    metric: DistanceMetric::Cosine,
+                    limit: 10,
+                    filter: Some("namespace = 'ns1'".to_string()),
+                    nprobes: None,
+                    refine_factor: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.flat_vector_snapshot_cache.len(),
+            snapshots_after_unfiltered,
+            "namespaced search must reuse the null-only snapshot, not add a per-namespace one"
+        );
+
+        let total: usize = res.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 2, "only the two ns1 rows match");
+        for batch in &res {
+            let ns = batch
+                .column_by_name("namespace")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                assert_eq!(ns.value(i), "ns1");
+            }
+        }
+    }
+
+    /// R-40: `multivector_search` without a `dense_column` streams the dataset
+    /// and returns a bounded top-k (does not error, returns exactly `limit`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn multivector_search_without_dense_streams_topk() {
+        use crate::store::{DistanceMetric, MultivectorQuery, MultivectorSearchOptions};
+
+        let (_tmp, store) = lance_test_store().await;
+        store.append("mv", embedding_batch(200, 8)).await.unwrap();
+
+        let res = store
+            .multivector_search(
+                "mv",
+                MultivectorSearchOptions {
+                    column: "embedding".to_string(),
+                    query: MultivectorQuery::Single(vec![0.5; 8]),
+                    metric: DistanceMetric::Cosine,
+                    limit: 5,
+                    filter: None,
+                    dense_column: None,
+                    first_stage_limit: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let total: usize = res.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 5, "streaming top-k returns exactly `limit` rows");
+        assert!(
+            res[0].column_by_name("_score").is_some(),
+            "result carries the MaxSim _score column"
+        );
+    }
+
+    /// R-39: the flat-vector snapshot cache must stay bounded even under many
+    /// distinct filter/version keys.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn flat_snapshot_cache_is_bounded() {
+        use std::sync::Arc;
+
+        let (_tmp, store) = lance_test_store().await;
+        for i in 0..(super::FLAT_VECTOR_SNAPSHOT_CACHE_MAX_ENTRIES + 100) {
+            let key = super::FlatVectorSnapshotKey {
+                dataset: "d".to_string(),
+                filter: Some(format!("f{i}")),
+                version: i as u64,
+            };
+            store.insert_flat_snapshot(key, Arc::new(Vec::new()));
+        }
+        assert!(
+            store.flat_vector_snapshot_cache.len() <= super::FLAT_VECTOR_SNAPSHOT_CACHE_MAX_ENTRIES,
+            "snapshot cache must be bounded, got {}",
+            store.flat_vector_snapshot_cache.len()
+        );
     }
 }

@@ -1,75 +1,164 @@
 //! MCP (Model Context Protocol) surface.
 //!
-//! The rmcp SSE transport cannot deliver per-request HTTP headers to the tool
-//! handlers, so the MCP listener authenticates once at startup: `main`
-//! resolves `mcp.auth_token` through the same credential machinery as the
-//! HTTP API and hands the resulting [`BearerIdentity`] to this service. Every
-//! tool call then runs as that identity — realm, agent, operation scope, and
-//! namespace scope all come from the validated credential, never from
-//! caller-supplied parameters — and is throttled by the shared rate limiter
-//! with the same route classes as the HTTP layer.
+//! Served over the MCP **Streamable HTTP** transport (rmcp ≥ 2.x), which
+//! validates the `Host` header natively against an allowlist (loopback-only
+//! by default) — the DNS-rebinding fix from RUSTSEC-2026-0189 — and can
+//! additionally validate browser `Origin` headers.
+//!
+//! Unlike the retired SSE transport, Streamable HTTP delivers the HTTP
+//! request parts of every call to the handlers, so the MCP surface
+//! authenticates **per request**: each tool/resource call carries an
+//! `Authorization: Bearer` credential (API key or JWT) that is resolved
+//! through the same [`AuthState`] machinery as the HTTP API. The identity it
+//! yields — realm, agent, operation scope, namespace scope — governs that
+//! single call; tool parameters can never override it, and different MCP
+//! clients (or the same client with rotated credentials) get exactly the
+//! authority of the credential they present. Realm routing is also
+//! per-request: the credential's realm selects the tenant database through
+//! the [`RealmManager`].
+//!
+//! Every call is throttled by the shared rate limiter with the same route
+//! classes as the HTTP layer and enforced by the Cedar policy engine.
+//! [`http_router`] additionally installs a transport-level middleware that
+//! rejects unauthenticated requests with `401` + `WWW-Authenticate: Bearer`
+//! before they reach the protocol handler (defense in depth; the per-call
+//! resolution above is the authority).
 
 use std::sync::Arc;
 
+use axum::extract::State;
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
 use hirn::prelude::*;
 use hirn_engine::HirnDB;
 use hirn_engine::policy::Action;
 use hirn_engine::tools::{LinkRequest, MemoryToolkit, RecallOptions, StoreRequest, UpdateRequest};
+use rmcp::ErrorData as McpError;
+use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    Annotated, CallToolResult, Content, ListResourcesResult, PaginatedRequestParam, RawResource,
-    ReadResourceRequestParam, ReadResourceResult, ResourceContents, ServerCapabilities, ServerInfo,
+    CallToolResult, ContentBlock, Implementation, ListResourcesResult, PaginatedRequestParams,
+    ReadResourceRequestParams, ReadResourceResult, Resource, ResourceContents, ServerCapabilities,
+    ServerInfo,
 };
-use rmcp::schemars::JsonSchema;
 use rmcp::service::RequestContext;
-use rmcp::{Error as McpError, RoleServer, ServerHandler, tool};
+use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
+use rmcp::{RoleServer, ServerHandler, tool, tool_handler, tool_router};
+use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 
-use crate::auth::{BearerIdentity, Operation, token_allows_namespace, token_allows_operation};
+use crate::auth::{
+    AuthState, BearerIdentity, Operation, token_allows_namespace, token_allows_operation,
+};
+use crate::realm::RealmManager;
 use crate::throttle::{RateLimitClass, RateLimiter};
-use crate::watch::{WatchEvent, WatchNamespaceScope};
+use crate::watch::{WatchEvent, WatchEventKind, WatchNamespaceScope};
+
+/// MCP endpoint path on the MCP listener.
+pub const MCP_PATH: &str = "/mcp";
 
 /// MCP server handler wrapping the hirn engine.
+///
+/// Holds no caller identity: every tool/resource call resolves its own
+/// [`BearerIdentity`] from the request's `Authorization` header (see the
+/// module docs).
 #[derive(Clone)]
 pub struct HirnMcpService {
-    db: Arc<HirnDB>,
-    toolkit: MemoryToolkit,
+    realms: Arc<RealmManager>,
     watch_tx: broadcast::Sender<WatchEvent>,
     rate_limiter: Arc<RateLimiter>,
+    auth: Arc<AuthState>,
+}
+
+/// Identity and tenant database resolved for a single MCP call.
+struct Caller {
     identity: BearerIdentity,
     agent_id: AgentId,
+    db: Arc<HirnDB>,
 }
 
 impl HirnMcpService {
-    /// Create a new MCP service acting as the given authenticated identity.
-    ///
-    /// The identity must come from a validated credential (see the module
-    /// docs); tool parameters can never override it.
+    /// Create a new MCP service resolving credentials against `auth` and
+    /// realms against `realms`.
     pub fn new(
-        db: Arc<HirnDB>,
+        realms: Arc<RealmManager>,
         watch_tx: broadcast::Sender<WatchEvent>,
         rate_limiter: Arc<RateLimiter>,
-        identity: BearerIdentity,
-    ) -> Result<Self, String> {
-        let agent_id = AgentId::new(&identity.agent_id)
-            .map_err(|e| format!("MCP credential resolves to an invalid agent id: {e}"))?;
-        let toolkit = MemoryToolkit::new(Arc::clone(&db));
-        Ok(Self {
-            db,
-            toolkit,
+        auth: Arc<AuthState>,
+    ) -> Self {
+        Self {
+            realms,
             watch_tx,
             rate_limiter,
+            auth,
+        }
+    }
+
+    /// Resolve the caller of the current request: extract the bearer
+    /// credential from the HTTP request parts the transport injected,
+    /// validate it, and open the credential's realm database.
+    ///
+    /// Without a credential the call is rejected unless the daemon runs in
+    /// explicit `insecure_dev_mode`, in which case it falls back to the
+    /// unrestricted `system` agent in the `default` realm (mirroring the
+    /// HTTP layer's dev posture).
+    async fn caller(&self, ctx: &RequestContext<RoleServer>) -> Result<Caller, McpError> {
+        crate::sleep::ActivityTracker::global().touch();
+
+        let bearer = ctx
+            .extensions
+            .get::<http::request::Parts>()
+            .and_then(|parts| parts.headers.get(http::header::AUTHORIZATION))
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "));
+
+        let identity = match bearer {
+            Some(credential) => self.auth.resolve_bearer(credential).map_err(|e| {
+                McpError::invalid_request(format!("authentication failed: {e}"), None)
+            })?,
+            None if self.auth.allows_unauthenticated() => BearerIdentity {
+                realm: "default".to_owned(),
+                agent_id: "system".to_owned(),
+                namespaces: None,
+                operations: Vec::new(),
+            },
+            None => {
+                return Err(McpError::invalid_request(
+                    "missing Authorization bearer credential (API key or JWT)",
+                    None,
+                ));
+            }
+        };
+
+        let agent_id = AgentId::new(&identity.agent_id).map_err(|e| {
+            McpError::invalid_request(
+                format!("credential resolves to an invalid agent id: {e}"),
+                None,
+            )
+        })?;
+        let db = self.realms.get(&identity.realm).await.map_err(|e| {
+            McpError::internal_error(format!("failed to open realm database: {e}"), None)
+        })?;
+
+        Ok(Caller {
             identity,
             agent_id,
+            db,
         })
     }
 
-    /// Authorize a tool call as the authenticated identity: credential
-    /// operation scope, shared rate limit, then the Cedar policy engine —
-    /// mirroring the HTTP layer's check order.
-    async fn authorize(&self, action: Action, operation: &Operation) -> Result<(), McpError> {
-        crate::sleep::ActivityTracker::global().touch();
-        if !token_allows_operation(&self.identity.operations, operation) {
+    /// Authorize a call for the resolved caller: credential operation scope,
+    /// shared rate limit, then the Cedar policy engine — mirroring the HTTP
+    /// layer's check order.
+    async fn authorize(
+        &self,
+        caller: &Caller,
+        action: Action,
+        operation: &Operation,
+    ) -> Result<(), McpError> {
+        if !token_allows_operation(&caller.identity.operations, operation) {
             return Err(McpError::invalid_params(
                 format!("credential does not permit {operation:?} operations"),
                 None,
@@ -79,7 +168,7 @@ impl HirnMcpService {
         let class = rate_limit_class(operation);
         if !self
             .rate_limiter
-            .check_agent(class, &self.identity.realm, &self.identity.agent_id)
+            .check_agent(class, &caller.identity.realm, &caller.identity.agent_id)
         {
             return Err(McpError::internal_error(
                 format!("{} rate limit exceeded — try again later", class.as_str()),
@@ -87,19 +176,25 @@ impl HirnMcpService {
             ));
         }
 
-        self.db
+        caller
+            .db
             .policy()
-            .enforce(&self.identity.agent_id, action, &self.identity.realm, "")
+            .enforce(
+                &caller.identity.agent_id,
+                action,
+                &caller.identity.realm,
+                "",
+            )
             .await
             .map_err(|e| McpError::invalid_params(format!("access denied: {e}"), None))
     }
 
-    /// Check the credential's namespace scope for an explicit namespace
-    /// parameter. API-key identities are unrestricted; token identities carry
-    /// an allowlist, exactly as on the HTTP layer.
-    fn check_namespace(&self, namespace: Option<&str>) -> Result<(), McpError> {
-        if let Some(allowed) = &self.identity.namespaces {
-            if !token_allows_namespace(&self.agent_id, allowed, namespace) {
+    /// Check the caller credential's namespace scope for an explicit
+    /// namespace parameter. API-key identities are unrestricted; token
+    /// identities carry an allowlist, exactly as on the HTTP layer.
+    fn check_namespace(&self, caller: &Caller, namespace: Option<&str>) -> Result<(), McpError> {
+        if let Some(allowed) = &caller.identity.namespaces {
+            if !token_allows_namespace(&caller.agent_id, allowed, namespace) {
                 return Err(McpError::invalid_params(
                     format!(
                         "credential does not permit access to namespace '{}'",
@@ -210,7 +305,7 @@ struct MemoryStoreParams {
     event_type: Option<String>,
     /// Importance score from 0.0 to 1.0
     importance: Option<f64>,
-    /// Namespace to store in (defaults to "default")
+    /// Namespace to store in (defaults to the agent's private namespace)
     namespace: Option<String>,
 }
 
@@ -220,7 +315,7 @@ struct MemoryRecallParams {
     query: String,
     /// Maximum number of results (default: 10)
     limit: Option<usize>,
-    /// Target namespace (defaults to "default")
+    /// Target namespace (defaults to the agent's private + shared namespaces)
     namespace: Option<String>,
 }
 
@@ -258,7 +353,7 @@ struct MemoryIntrospectParams {
     id: Option<String>,
 }
 
-#[tool(tool_box)]
+#[tool_router]
 impl HirnMcpService {
     /// Store a new episodic memory (experience, event, observation) into hirn.
     #[tool(
@@ -267,11 +362,14 @@ impl HirnMcpService {
     )]
     async fn hirn_remember(
         &self,
-        #[tool(aggr)] params: RememberParams,
+        Parameters(params): Parameters<RememberParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.authorize(Action::Remember, &Operation::Write).await?;
-        self.check_namespace(params.namespace.as_deref())?;
-        let aid = self.agent_id;
+        let caller = self.caller(&ctx).await?;
+        self.authorize(&caller, Action::Remember, &Operation::Write)
+            .await?;
+        self.check_namespace(&caller, params.namespace.as_deref())?;
+        let aid = caller.agent_id;
 
         let mut builder = EpisodicRecord::builder()
             .content(&params.content)
@@ -297,17 +395,22 @@ impl HirnMcpService {
             }
         }
 
-        let record = builder
+        let mut record = builder
             .build()
             .map_err(|e| McpError::invalid_params(format!("failed to build record: {e}"), None))?;
-        let id = self
+        // Default namespace → agent's private namespace (mirrors the HTTP and
+        // gRPC remember surfaces and AgentContext::remember).
+        if record.namespace == Namespace::default() {
+            record.namespace = Namespace::private_for(&aid);
+        }
+        let id = caller
             .db
             .episodic()
             .remember(record)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
-        Ok(CallToolResult::success(vec![Content::text(format!(
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "Memory stored with ID: {id}"
         ))]))
     }
@@ -319,13 +422,26 @@ impl HirnMcpService {
     )]
     async fn hirn_recall(
         &self,
-        #[tool(aggr)] params: RecallParams,
+        Parameters(params): Parameters<RecallParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.authorize(Action::Recall, &Operation::Read).await?;
+        let caller = self.caller(&ctx).await?;
 
-        // If a HirnQL query is provided, execute it directly.
+        // If a HirnQL query is provided, classify its verb and authorize it
+        // exactly like `hirn_execute`: without this, a Read-scoped credential
+        // could run write/admin HirnQL (CORRECT/RETRACT/SUPERSEDE/MERGE/GRANT/
+        // REVOKE/SET TIER_POLICY/DROP REALM) through the recall tool. Execution
+        // uses `db.ql()` to match `hirn_execute` (some MCP principals — e.g. the
+        // daemon `system` identity — are not registered agents, so `as_agent`
+        // cannot be required here; the shared unscoped-`db.ql()` residual is
+        // tracked as R-72 and applies to both HirnQL tools consistently).
         if let Some(ref query) = params.query {
-            let result = self
+            let stmt = hirn_engine::ql::parser::parse(query)
+                .map_err(|e| McpError::invalid_params(format!("invalid HirnQL: {e}"), None))?;
+            let operation = crate::http::execute_statement_operation(&stmt);
+            self.authorize(&caller, Action::Execute, &operation).await?;
+
+            let result = caller
                 .db
                 .ql()
                 .execute(query)
@@ -341,18 +457,22 @@ impl HirnMcpService {
                         "conflicts": serde_json::to_value(&r.conflicts).unwrap_or(serde_json::Value::Null),
                         "conflict_groups": serde_json::to_value(&r.conflict_groups).unwrap_or(serde_json::Value::Null),
                     });
-                    Ok(CallToolResult::success(vec![Content::text(
+                    Ok(CallToolResult::success(vec![ContentBlock::text(
                         serde_json::to_string_pretty(&output).unwrap_or_default(),
                     )]))
                 }
                 other => {
                     let output = serde_json::json!({ "result": format!("{other:?}") });
-                    Ok(CallToolResult::success(vec![Content::text(
+                    Ok(CallToolResult::success(vec![ContentBlock::text(
                         serde_json::to_string_pretty(&output).unwrap_or_default(),
                     )]))
                 }
             };
         }
+
+        // Structured (vector similarity) recall.
+        self.authorize(&caller, Action::Recall, &Operation::Read)
+            .await?;
 
         let embedding: Vec<f32> = params
             .query_embedding
@@ -368,7 +488,7 @@ impl HirnMcpService {
             ));
         }
 
-        let mut builder = self.db.recall_view().query(embedding);
+        let mut builder = caller.db.recall_view().query(embedding);
 
         if let Some(limit) = params.limit {
             builder = builder.limit(limit as usize);
@@ -394,7 +514,7 @@ impl HirnMcpService {
             })
             .collect();
 
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string_pretty(&output).unwrap_or_default(),
         )]))
     }
@@ -406,9 +526,12 @@ impl HirnMcpService {
     )]
     async fn hirn_think(
         &self,
-        #[tool(aggr)] params: ThinkParams,
+        Parameters(params): Parameters<ThinkParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.authorize(Action::Think, &Operation::Read).await?;
+        let caller = self.caller(&ctx).await?;
+        self.authorize(&caller, Action::Think, &Operation::Read)
+            .await?;
         let embedding: Vec<f32> = params
             .query_embedding
             .into_iter()
@@ -422,7 +545,7 @@ impl HirnMcpService {
             ));
         }
 
-        let mut builder = self.db.recall_view().think(embedding);
+        let mut builder = caller.db.recall_view().think(embedding);
 
         if let Some(budget) = params.budget {
             builder = builder.budget(budget as usize);
@@ -446,7 +569,7 @@ impl HirnMcpService {
             "query_time_ms": result.query_time_ms,
         });
 
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string_pretty(&output).unwrap_or_default(),
         )]))
     }
@@ -458,19 +581,23 @@ impl HirnMcpService {
     )]
     async fn hirn_forget(
         &self,
-        #[tool(aggr)] params: ForgetParams,
+        Parameters(params): Parameters<ForgetParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.authorize(Action::Forget, &Operation::Write).await?;
+        let caller = self.caller(&ctx).await?;
+        self.authorize(&caller, Action::Forget, &Operation::Write)
+            .await?;
 
         let memory_id = parse_memory_id(&params.id)
             .map_err(|e| McpError::invalid_params(format!("invalid id: {e}"), None))?;
 
         let mode = params.mode.unwrap_or_else(|| "archive".to_owned());
         match mode.as_str() {
-            "purge" => match self.db.episodic().delete(memory_id).await {
+            "purge" => match caller.db.episodic().delete(memory_id).await {
                 Ok(()) => {}
                 Err(_) => {
-                    self.db
+                    caller
+                        .db
                         .semantic()
                         .purge(memory_id)
                         .await
@@ -478,7 +605,8 @@ impl HirnMcpService {
                 }
             },
             _ => {
-                self.db
+                caller
+                    .db
                     .episodic()
                     .archive(memory_id)
                     .await
@@ -486,7 +614,7 @@ impl HirnMcpService {
             }
         }
 
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             "Memory forgotten successfully",
         )]))
     }
@@ -498,15 +626,18 @@ impl HirnMcpService {
     )]
     async fn hirn_inspect(
         &self,
-        #[tool(aggr)] params: InspectParams,
+        Parameters(params): Parameters<InspectParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.authorize(Action::Recall, &Operation::Read).await?;
+        let caller = self.caller(&ctx).await?;
+        self.authorize(&caller, Action::Recall, &Operation::Read)
+            .await?;
 
         // Validate the ID as a ULID to prevent HirnQL injection.
         let memory_id = MemoryId::parse(&params.id)
             .map_err(|e| McpError::invalid_params(format!("invalid memory ID: {e}"), None))?;
         let ql = format!("INSPECT \"{}\"", memory_id);
-        let result = self
+        let result = caller
             .db
             .ql()
             .execute(&ql)
@@ -516,7 +647,7 @@ impl HirnMcpService {
         match result {
             QueryResult::Inspected(i) => {
                 let output = hirn_engine::inspected_result_to_json(&i);
-                Ok(CallToolResult::success(vec![Content::text(
+                Ok(CallToolResult::success(vec![ContentBlock::text(
                     serde_json::to_string_pretty(&output).unwrap_or_default(),
                 )]))
             }
@@ -531,12 +662,14 @@ impl HirnMcpService {
     )]
     async fn hirn_consolidate(
         &self,
-        #[tool(aggr)] params: ConsolidateParams,
+        Parameters(params): Parameters<ConsolidateParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.authorize(Action::Consolidate, &Operation::Admin)
+        let caller = self.caller(&ctx).await?;
+        self.authorize(&caller, Action::Consolidate, &Operation::Admin)
             .await?;
 
-        let mut builder = self.db.admin().consolidate();
+        let mut builder = caller.db.admin().consolidate();
 
         if let Some(archive) = params.archive {
             builder = builder.archive(archive);
@@ -557,7 +690,7 @@ impl HirnMcpService {
             "execution_time_ms": result.execution_time_ms,
         });
 
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string_pretty(&output).unwrap_or_default(),
         )]))
     }
@@ -569,11 +702,13 @@ impl HirnMcpService {
     )]
     async fn hirn_execute(
         &self,
-        #[tool(aggr)] params: ExecuteParams,
+        Parameters(params): Parameters<ExecuteParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         if params.query.is_empty() {
             return Err(McpError::invalid_params("query is required", None));
         }
+        let caller = self.caller(&ctx).await?;
 
         // Classify the statement's verb into the same Operation the HTTP
         // layer uses, so a read-scoped credential cannot run write/admin
@@ -581,9 +716,9 @@ impl HirnMcpService {
         let stmt = hirn_engine::ql::parser::parse(&params.query)
             .map_err(|e| McpError::invalid_params(format!("invalid HirnQL: {e}"), None))?;
         let operation = crate::http::execute_statement_operation(&stmt);
-        self.authorize(Action::Execute, &operation).await?;
+        self.authorize(&caller, Action::Execute, &operation).await?;
 
-        let result = self
+        let result = caller
             .db
             .ql()
             .execute(&params.query)
@@ -591,7 +726,7 @@ impl HirnMcpService {
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         let output = crate::convert::query_result_to_json(&result);
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string_pretty(&output).unwrap_or_default(),
         )]))
     }
@@ -603,10 +738,13 @@ impl HirnMcpService {
     )]
     async fn hirn_watch(
         &self,
-        #[tool(aggr)] params: WatchParams,
+        Parameters(params): Parameters<WatchParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.authorize(Action::Watch, &Operation::Read).await?;
-        self.check_namespace(params.namespace.as_deref())?;
+        let caller = self.caller(&ctx).await?;
+        self.authorize(&caller, Action::Watch, &Operation::Read)
+            .await?;
+        self.check_namespace(&caller, params.namespace.as_deref())?;
 
         let duration_ms = params.duration_ms.unwrap_or(5000).min(30_000);
         let mut rx = self.watch_tx.subscribe();
@@ -629,9 +767,9 @@ impl HirnMcpService {
         let min_importance = params.min_importance;
         // Token-restricted identities only see events inside their allowlist;
         // API-key identities are unrestricted, mirroring the HTTP watch route.
-        let namespace_scope = match &self.identity.namespaces {
+        let namespace_scope = match &caller.identity.namespaces {
             Some(allowed) => WatchNamespaceScope::token_scoped(
-                &self.agent_id,
+                &caller.agent_id,
                 params.namespace.clone(),
                 allowed.clone(),
             ),
@@ -650,17 +788,18 @@ impl HirnMcpService {
             match tokio::time::timeout(remaining, rx.recv()).await {
                 Ok(Ok(event)) => {
                     if let Some(proto_event) = event.to_proto(
+                        &caller.identity.realm,
                         &layer_filter,
                         &entity_filter,
                         min_importance,
                         &namespace_scope,
                     ) {
                         events.push(serde_json::json!({
-                            "event_type": match &event {
-                                WatchEvent::Created { .. } => "created",
-                                WatchEvent::Updated { .. } => "updated",
-                                WatchEvent::Consolidated { .. } => "consolidated",
-                                WatchEvent::Conflict { .. } => "conflict",
+                            "event_type": match &event.kind {
+                                WatchEventKind::Created { .. } => "created",
+                                WatchEventKind::Updated { .. } => "updated",
+                                WatchEventKind::Consolidated { .. } => "consolidated",
+                                WatchEventKind::Conflict { .. } => "conflict",
                             },
                             "description": proto_event.description,
                         }));
@@ -680,7 +819,7 @@ impl HirnMcpService {
             "events": events,
         });
 
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string_pretty(&output).unwrap_or_default(),
         )]))
     }
@@ -694,11 +833,14 @@ impl HirnMcpService {
     )]
     async fn memory_store(
         &self,
-        #[tool(aggr)] params: MemoryStoreParams,
+        Parameters(params): Parameters<MemoryStoreParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.authorize(Action::Remember, &Operation::Write).await?;
-        self.check_namespace(params.namespace.as_deref())?;
-        let aid = self.agent_id;
+        let caller = self.caller(&ctx).await?;
+        self.authorize(&caller, Action::Remember, &Operation::Write)
+            .await?;
+        self.check_namespace(&caller, params.namespace.as_deref())?;
+        let aid = caller.agent_id;
 
         let ns = params
             .namespace
@@ -706,8 +848,8 @@ impl HirnMcpService {
             .map(|n| Namespace::new(n).map_err(|e| McpError::invalid_params(e.to_string(), None)))
             .transpose()?;
 
-        let id = self
-            .toolkit
+        let toolkit = MemoryToolkit::new(Arc::clone(&caller.db));
+        let id = toolkit
             .store(
                 aid,
                 StoreRequest {
@@ -723,7 +865,7 @@ impl HirnMcpService {
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
-        Ok(CallToolResult::success(vec![Content::text(format!(
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "Memory stored with ID: {id}"
         ))]))
     }
@@ -735,11 +877,14 @@ impl HirnMcpService {
     )]
     async fn memory_recall(
         &self,
-        #[tool(aggr)] params: MemoryRecallParams,
+        Parameters(params): Parameters<MemoryRecallParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.authorize(Action::Recall, &Operation::Read).await?;
-        self.check_namespace(params.namespace.as_deref())?;
-        let aid = self.agent_id;
+        let caller = self.caller(&ctx).await?;
+        self.authorize(&caller, Action::Recall, &Operation::Read)
+            .await?;
+        self.check_namespace(&caller, params.namespace.as_deref())?;
+        let aid = caller.agent_id;
 
         let ns = params
             .namespace
@@ -747,8 +892,8 @@ impl HirnMcpService {
             .map(|n| Namespace::new(n).map_err(|e| McpError::invalid_params(e.to_string(), None)))
             .transpose()?;
 
-        let results = self
-            .toolkit
+        let toolkit = MemoryToolkit::new(Arc::clone(&caller.db));
+        let results = toolkit
             .recall(
                 aid,
                 &params.query,
@@ -771,7 +916,7 @@ impl HirnMcpService {
             })
             .collect();
 
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string_pretty(&output).unwrap_or_default(),
         )]))
     }
@@ -783,15 +928,19 @@ impl HirnMcpService {
     )]
     async fn memory_update(
         &self,
-        #[tool(aggr)] params: MemoryUpdateParams,
+        Parameters(params): Parameters<MemoryUpdateParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.authorize(Action::Correct, &Operation::Write).await?;
-        let aid = self.agent_id;
+        let caller = self.caller(&ctx).await?;
+        self.authorize(&caller, Action::Correct, &Operation::Write)
+            .await?;
+        let aid = caller.agent_id;
 
         let memory_id = parse_memory_id(&params.id)
             .map_err(|e| McpError::invalid_params(format!("invalid id: {e}"), None))?;
 
-        self.toolkit
+        let toolkit = MemoryToolkit::new(Arc::clone(&caller.db));
+        toolkit
             .update(
                 aid,
                 UpdateRequest {
@@ -804,7 +953,7 @@ impl HirnMcpService {
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             "Memory updated successfully",
         )]))
     }
@@ -816,20 +965,24 @@ impl HirnMcpService {
     )]
     async fn memory_delete(
         &self,
-        #[tool(aggr)] params: MemoryDeleteParams,
+        Parameters(params): Parameters<MemoryDeleteParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.authorize(Action::Forget, &Operation::Write).await?;
-        let aid = self.agent_id;
+        let caller = self.caller(&ctx).await?;
+        self.authorize(&caller, Action::Forget, &Operation::Write)
+            .await?;
+        let aid = caller.agent_id;
 
         let memory_id = parse_memory_id(&params.id)
             .map_err(|e| McpError::invalid_params(format!("invalid id: {e}"), None))?;
 
-        self.toolkit
+        let toolkit = MemoryToolkit::new(Arc::clone(&caller.db));
+        toolkit
             .delete(aid, memory_id)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             "Memory deleted (archived) successfully",
         )]))
     }
@@ -841,10 +994,13 @@ impl HirnMcpService {
     )]
     async fn memory_link(
         &self,
-        #[tool(aggr)] params: MemoryLinkParams,
+        Parameters(params): Parameters<MemoryLinkParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.authorize(Action::Connect, &Operation::Write).await?;
-        let aid = self.agent_id;
+        let caller = self.caller(&ctx).await?;
+        self.authorize(&caller, Action::Connect, &Operation::Write)
+            .await?;
+        let aid = caller.agent_id;
 
         let source_id = parse_memory_id(&params.source_id)
             .map_err(|e| McpError::invalid_params(format!("invalid source_id: {e}"), None))?;
@@ -853,8 +1009,8 @@ impl HirnMcpService {
         let relation =
             parse_edge_relation(&params.relation).map_err(|e| McpError::invalid_params(e, None))?;
 
-        let edge_id = self
-            .toolkit
+        let toolkit = MemoryToolkit::new(Arc::clone(&caller.db));
+        let edge_id = toolkit
             .link(
                 aid,
                 LinkRequest {
@@ -868,7 +1024,7 @@ impl HirnMcpService {
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
-        Ok(CallToolResult::success(vec![Content::text(format!(
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "Edge created with ID: {edge_id}"
         ))]))
     }
@@ -880,10 +1036,13 @@ impl HirnMcpService {
     )]
     async fn memory_introspect(
         &self,
-        #[tool(aggr)] params: MemoryIntrospectParams,
+        Parameters(params): Parameters<MemoryIntrospectParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.authorize(Action::Recall, &Operation::Read).await?;
-        let aid = self.agent_id;
+        let caller = self.caller(&ctx).await?;
+        self.authorize(&caller, Action::Recall, &Operation::Read)
+            .await?;
+        let aid = caller.agent_id;
 
         let memory_id = params
             .id
@@ -894,8 +1053,8 @@ impl HirnMcpService {
             })
             .transpose()?;
 
-        let result = self
-            .toolkit
+        let toolkit = MemoryToolkit::new(Arc::clone(&caller.db));
+        let result = toolkit
             .introspect(aid, memory_id)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
@@ -924,112 +1083,190 @@ impl HirnMcpService {
             );
         }
 
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string_pretty(&output).unwrap_or_default(),
         )]))
     }
 }
 
-#[tool(tool_box)]
+#[tool_handler]
 impl ServerHandler for HirnMcpService {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            instructions: Some(
-                "hirn is a cognitive memory database engine for LLM systems. \
-                 Use these tools to store, recall, and reason about memories."
-                    .into(),
-            ),
-            capabilities: ServerCapabilities::builder()
+        let mut info = ServerInfo::new(
+            ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()
                 .build(),
-            ..Default::default()
-        }
+        )
+        .with_instructions(
+            "hirn is a cognitive memory database engine for LLM systems. \
+             Use these tools to store, recall, and reason about memories.",
+        );
+        let mut server_info = Implementation::from_build_env();
+        "hirn".clone_into(&mut server_info.name);
+        env!("CARGO_PKG_VERSION").clone_into(&mut server_info.version);
+        info.server_info = server_info;
+        info
     }
 
-    #[allow(clippy::manual_async_fn)]
-    fn list_resources(
+    async fn list_resources(
         &self,
-        _request: PaginatedRequestParam,
-        _context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<ListResourcesResult, McpError>> + Send + '_ {
-        let stats_resource = RawResource {
-            uri: "hirn://stats".into(),
-            name: "Database Statistics".into(),
-            description: Some(
-                "Current database statistics including record counts and file size".into(),
-            ),
-            mime_type: Some("application/json".into()),
-            size: None,
-        };
-        let schema_resource = RawResource {
-            uri: "hirn://schema".into(),
-            name: "Database Schema".into(),
-            description: Some("The hirn database schema: supported layers, event types, knowledge types, and edge relations".into()),
-            mime_type: Some("application/json".into()),
-            size: None,
-        };
-        let resources = vec![
-            Annotated::new(stats_resource, None),
-            Annotated::new(schema_resource, None),
-        ];
-        std::future::ready(Ok(ListResourcesResult {
-            resources,
-            next_cursor: None,
-        }))
+        _request: Option<PaginatedRequestParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, McpError> {
+        // Resource metadata is static, but listing still requires a valid
+        // credential (per-request auth applies to every MCP surface).
+        let _caller = self.caller(&ctx).await?;
+        let stats_resource = Resource::new("hirn://stats", "Database Statistics")
+            .with_description("Current database statistics including record counts and file size")
+            .with_mime_type("application/json");
+        let schema_resource = Resource::new("hirn://schema", "Database Schema")
+            .with_description(
+                "The hirn database schema: supported layers, event types, knowledge types, \
+                 and edge relations",
+            )
+            .with_mime_type("application/json");
+        Ok(ListResourcesResult::with_all_items(vec![
+            stats_resource,
+            schema_resource,
+        ]))
     }
 
-    #[allow(clippy::manual_async_fn)]
-    fn read_resource(
+    async fn read_resource(
         &self,
-        request: ReadResourceRequestParam,
-        _context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<ReadResourceResult, McpError>> + Send + '_ {
-        async move {
-            match request.uri.as_str() {
-                "hirn://stats" => {
-                    let stats = self
-                        .db
-                        .admin()
-                        .stats()
-                        .await
-                        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-                    let json = serde_json::json!({
-                        "working_count": stats.working_count,
-                        "episodic_count": stats.episodic_count,
-                        "semantic_count": stats.semantic_count,
-                        "total_count": stats.total_count,
-                        "file_size_bytes": stats.file_size_bytes,
-                    });
-                    Ok(ReadResourceResult {
-                        contents: vec![ResourceContents::text(
-                            serde_json::to_string_pretty(&json).unwrap_or_default(),
-                            &request.uri,
-                        )],
-                    })
-                }
-                "hirn://schema" => {
-                    let schema = serde_json::json!({
-                        "layers": ["episodic", "semantic", "working", "procedural"],
-                        "event_types": ["conversation", "tool_call", "observation", "experiment", "error", "decision"],
-                        "knowledge_types": ["propositional", "prescriptive", "taxonomic"],
-                        "edge_relations": ["causes", "caused_by", "derived_from", "contradicts", "supports",
-                                           "temporal_next", "part_of", "instance_of", "similar_to", "inhibits", "participates_in", "related_to"],
-                        "forget_modes": ["archive", "purge"],
-                    });
-                    Ok(ReadResourceResult {
-                        contents: vec![ResourceContents::text(
-                            serde_json::to_string_pretty(&schema).unwrap_or_default(),
-                            &request.uri,
-                        )],
-                    })
-                }
-                other => Err(McpError::invalid_params(
-                    format!("unknown resource URI: {other}"),
-                    None,
-                )),
+        request: ReadResourceRequestParams,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResult, McpError> {
+        let caller = self.caller(&ctx).await?;
+        match request.uri.as_str() {
+            "hirn://stats" => {
+                // Stats reveal tenant data volumes — enforce the same checks
+                // as a read-class tool call against the caller's realm.
+                self.authorize(&caller, Action::Recall, &Operation::Read)
+                    .await?;
+                let stats = caller
+                    .db
+                    .admin()
+                    .stats()
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                let json = serde_json::json!({
+                    "working_count": stats.working_count,
+                    "episodic_count": stats.episodic_count,
+                    "semantic_count": stats.semantic_count,
+                    "total_count": stats.total_count,
+                    "file_size_bytes": stats.file_size_bytes,
+                });
+                Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                    serde_json::to_string_pretty(&json).unwrap_or_default(),
+                    &request.uri,
+                )]))
             }
+            "hirn://schema" => {
+                let schema = serde_json::json!({
+                    "layers": ["episodic", "semantic", "working", "procedural"],
+                    "event_types": ["conversation", "tool_call", "observation", "experiment", "error", "decision"],
+                    "knowledge_types": ["propositional", "prescriptive", "taxonomic"],
+                    "edge_relations": ["causes", "caused_by", "derived_from", "contradicts", "supports",
+                                       "temporal_next", "part_of", "instance_of", "similar_to", "inhibits", "participates_in", "related_to"],
+                    "forget_modes": ["archive", "purge"],
+                });
+                Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                    serde_json::to_string_pretty(&schema).unwrap_or_default(),
+                    &request.uri,
+                )]))
+            }
+            other => Err(McpError::resource_not_found(
+                format!("unknown resource URI: {other}"),
+                None,
+            )),
         }
+    }
+}
+
+// ── Transport wiring ────────────────────────────────────────────────────
+
+/// Options for the MCP Streamable HTTP listener.
+#[derive(Debug, Clone, Default)]
+pub struct McpTransportOptions {
+    /// `Host` authorities accepted by the transport. Empty = rmcp's
+    /// loopback-only default (`localhost`, `127.0.0.1`, `::1`) — the
+    /// DNS-rebinding protection from RUSTSEC-2026-0189. Entries without a
+    /// port match any port.
+    pub allowed_hosts: Vec<String>,
+    /// Browser origins accepted by the transport. Empty disables `Origin`
+    /// validation (non-browser MCP clients don't send one).
+    pub allowed_origins: Vec<String>,
+    /// Cancelled on daemon shutdown; terminates active MCP sessions.
+    pub cancellation_token: CancellationToken,
+}
+
+/// Build the axum router that serves the MCP Streamable HTTP endpoint at
+/// [`MCP_PATH`].
+///
+/// The router layers a bearer-auth middleware over the rmcp transport
+/// service: requests without a resolvable credential are rejected with
+/// `401` + `WWW-Authenticate: Bearer` before they reach the MCP protocol
+/// handler (unless the daemon runs in `insecure_dev_mode`). Host/Origin
+/// validation happens inside the transport service itself.
+pub fn http_router(
+    service: HirnMcpService,
+    auth: Arc<AuthState>,
+    options: McpTransportOptions,
+) -> axum::Router {
+    let mut config = StreamableHttpServerConfig::default();
+    if !options.allowed_hosts.is_empty() {
+        config = config.with_allowed_hosts(options.allowed_hosts);
+    }
+    if !options.allowed_origins.is_empty() {
+        config = config.with_allowed_origins(options.allowed_origins);
+    }
+    config = config.with_cancellation_token(options.cancellation_token);
+
+    let transport = StreamableHttpService::new(
+        move || Ok(service.clone()),
+        Arc::new(LocalSessionManager::default()),
+        config,
+    );
+
+    axum::Router::new().nest_service(MCP_PATH, transport).layer(
+        axum::middleware::from_fn_with_state(auth, mcp_auth_middleware),
+    )
+}
+
+/// Transport-level bearer check for the MCP listener.
+///
+/// Rejects requests that carry no resolvable credential with `401` +
+/// `WWW-Authenticate: Bearer` so unauthenticated clients cannot even
+/// initialize a session or enumerate tools. Per-call identity resolution in
+/// [`HirnMcpService`] remains the authority — this middleware is defense in
+/// depth and keeps error reporting at the HTTP layer where MCP clients
+/// expect authentication failures (RFC 6750).
+async fn mcp_auth_middleware(
+    State(auth): State<Arc<AuthState>>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let bearer = request
+        .headers()
+        .get(http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+
+    let authenticated = match bearer {
+        Some(credential) => auth.resolve_bearer(credential).is_ok(),
+        None => auth.allows_unauthenticated(),
+    };
+
+    if authenticated {
+        next.run(request).await
+    } else {
+        (
+            axum::http::StatusCode::UNAUTHORIZED,
+            [(axum::http::header::WWW_AUTHENTICATE, "Bearer")],
+            "missing or invalid bearer credential",
+        )
+            .into_response()
     }
 }
 

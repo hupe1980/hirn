@@ -1,6 +1,5 @@
 //! Test utilities for hirn-exec — shared `ExecutionPlan` stubs.
 
-use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
@@ -19,17 +18,17 @@ use datafusion_physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Plan
 pub struct MemoryBatchExec {
     schema: SchemaRef,
     batches: Vec<RecordBatch>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl MemoryBatchExec {
     pub fn new(schema: SchemaRef, batches: Vec<RecordBatch>) -> Self {
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             datafusion_physical_expr::EquivalenceProperties::new(schema.clone()),
             datafusion_physical_plan::Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
         Self {
             schema,
             batches,
@@ -49,15 +48,11 @@ impl ExecutionPlan for MemoryBatchExec {
         "MemoryBatchExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

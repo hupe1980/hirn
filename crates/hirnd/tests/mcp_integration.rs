@@ -1,164 +1,176 @@
+//! MCP integration tests over the real Streamable HTTP transport.
+//!
+//! Every test runs against an axum server hosting the rmcp
+//! `StreamableHttpService` — the same stack `hirnd` serves in production —
+//! so per-request bearer authentication, Host-header validation
+//! (DNS-rebinding protection), realm routing, and the auth middleware are
+//! all exercised end to end.
+
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use hirn::prelude::*;
 use hirn_engine::HirnDB;
-use hirn_storage::{HirnDb, HirnDbConfig};
-use hirnd::mcp::HirnMcpService;
-use hirnd::watch::WatchEvent;
+use hirnd::auth::AuthState;
+use hirnd::config::{AuthConfig, EngineConfig, KeyConfig, ThrottleConfig};
+use hirnd::mcp::{HirnMcpService, McpTransportOptions};
+use hirnd::realm::RealmManager;
+use hirnd::watch::{WatchEvent, WatchEventKind};
 use rmcp::ServiceExt;
-use rmcp::model::CallToolRequestParam;
+use rmcp::model::CallToolRequestParams;
+use rmcp::transport::StreamableHttpClientTransport;
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use tempfile::TempDir;
 use tokio::sync::broadcast;
 
-/// Start an MCP server/client pair over an in-memory duplex transport.
-async fn start_mcp_client() -> (rmcp::service::RunningService<rmcp::RoleClient, ()>, TempDir) {
-    let (client, _tx, _db, tmp) = start_mcp_client_parts().await;
-    (client, tmp)
+/// API key mapped to the unrestricted `system` agent in the default realm.
+const SYSTEM_KEY: &str = "test-system-key";
+
+type McpClient = rmcp::service::RunningService<rmcp::RoleClient, ()>;
+
+struct TestServer {
+    /// `http://127.0.0.1:{port}/mcp`
+    url: String,
+    /// Raw listener address (for transport-level tests).
+    addr: std::net::SocketAddr,
+    watch_tx: broadcast::Sender<WatchEvent>,
+    realms: Arc<RealmManager>,
+    _tmp: TempDir,
 }
 
-async fn start_mcp_client_with_db() -> (
-    rmcp::service::RunningService<rmcp::RoleClient, ()>,
-    Arc<HirnDB>,
-    TempDir,
-) {
-    let (client, _tx, db, tmp) = start_mcp_client_parts().await;
-    (client, db, tmp)
+impl TestServer {
+    async fn default_db(&self) -> Arc<HirnDB> {
+        self.realms.get("default").await.unwrap()
+    }
 }
 
-/// Start an MCP server/client pair and return the watch broadcast sender.
-async fn start_mcp_client_with_watch() -> (
-    rmcp::service::RunningService<rmcp::RoleClient, ()>,
-    broadcast::Sender<WatchEvent>,
-    TempDir,
-) {
-    let (client, watch_tx, _db, tmp) = start_mcp_client_parts().await;
-    (client, watch_tx, tmp)
-}
-
-async fn start_mcp_client_parts() -> (
-    rmcp::service::RunningService<rmcp::RoleClient, ()>,
-    broadcast::Sender<WatchEvent>,
-    Arc<HirnDB>,
-    TempDir,
-) {
-    let tmp = TempDir::new().unwrap();
-    let db_path = tmp.path().join("test");
-
-    let config = HirnConfig::builder().db_path(&db_path).build().unwrap();
-    let lance_path = tmp.path().join("lance_brain");
-    let storage_cfg = HirnDbConfig::local(lance_path.to_string_lossy());
-    let storage = HirnDb::open(storage_cfg.clone()).await.unwrap().store_arc();
-    let db = Arc::new(HirnDB::open_with_config(config, storage).await.unwrap());
-
-    let (watch_tx, _) = broadcast::channel::<WatchEvent>(128);
-    let rate_limiter = std::sync::Arc::new(hirnd::throttle::RateLimiter::from_config(
-        &hirnd::config::ThrottleConfig::default(),
-    ));
-    // Tests act as an unrestricted system credential in the default realm.
-    let identity = hirnd::auth::BearerIdentity {
-        realm: "default".to_string(),
-        agent_id: "system".to_string(),
-        namespaces: None,
-        operations: Vec::new(),
+fn auth_state_with_keys(keys: &[(&str, &str)]) -> Arc<AuthState> {
+    let mut api_keys = HashMap::new();
+    for (key, agent_id) in keys {
+        api_keys.insert(
+            (*key).to_owned(),
+            KeyConfig {
+                realm: "default".to_owned(),
+                agent_id: (*agent_id).to_owned(),
+            },
+        );
+    }
+    let auth_config = AuthConfig {
+        api_keys,
+        client_certs: HashMap::new(),
     };
-    let service = HirnMcpService::new(Arc::clone(&db), watch_tx.clone(), rate_limiter, identity)
-        .expect("valid MCP identity");
+    Arc::new(AuthState::new(Some(&auth_config), None))
+}
 
-    let (server_transport, client_transport) = tokio::io::duplex(65536);
+/// Start an MCP streamable HTTP server with the given credentials and an
+/// optional pre-built default-realm database.
+async fn spawn_server(auth: Arc<AuthState>, default_db: Option<Arc<HirnDB>>) -> TestServer {
+    let tmp = TempDir::new().unwrap();
+    let realms = match default_db {
+        Some(db) => Arc::new(RealmManager::from_db(db)),
+        None => Arc::new(RealmManager::new(
+            tmp.path().to_path_buf(),
+            EngineConfig::default(),
+        )),
+    };
+    let (watch_tx, _) = broadcast::channel::<WatchEvent>(128);
+    let rate_limiter = Arc::new(hirnd::throttle::RateLimiter::from_config(
+        &ThrottleConfig::default(),
+    ));
+    let service = HirnMcpService::new(
+        Arc::clone(&realms),
+        watch_tx.clone(),
+        rate_limiter,
+        Arc::clone(&auth),
+    );
+    let router = hirnd::mcp::http_router(service, auth, McpTransportOptions::default());
 
-    // Start server in background
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        let server = service.serve(server_transport).await.unwrap();
-        server.waiting().await.unwrap();
+        axum::serve(listener, router).await.unwrap();
     });
 
-    // Start client
-    let client = ().serve(client_transport).await.unwrap();
-
-    (client, watch_tx, db, tmp)
+    TestServer {
+        url: format!("http://127.0.0.1:{}/mcp", addr.port()),
+        addr,
+        watch_tx,
+        realms,
+        _tmp: tmp,
+    }
 }
 
-fn tool_params(name: &str, args: serde_json::Value) -> CallToolRequestParam {
-    CallToolRequestParam {
-        name: Cow::Owned(name.to_string()),
-        arguments: Some(args.as_object().unwrap().clone()),
-    }
+/// Connect an MCP client carrying the given bearer credential.
+async fn connect(server: &TestServer, bearer: &str) -> McpClient {
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(server.url.clone()).auth_header(bearer),
+    );
+    ().serve(transport).await.expect("MCP handshake")
+}
+
+/// Standard harness: one server + one client acting as the unrestricted
+/// `system` agent (via API key), mirroring the daemon's dev posture.
+async fn start_mcp_client() -> (McpClient, TestServer) {
+    let server = spawn_server(auth_state_with_keys(&[(SYSTEM_KEY, "system")]), None).await;
+    let client = connect(&server, SYSTEM_KEY).await;
+    (client, server)
+}
+
+fn tool_params(name: &str, args: serde_json::Value) -> CallToolRequestParams {
+    CallToolRequestParams::new(Cow::Owned(name.to_owned()))
+        .with_arguments(args.as_object().unwrap().clone())
+}
+
+fn result_text(result: &rmcp::model::CallToolResult) -> &str {
+    result
+        .content
+        .first()
+        .unwrap()
+        .as_text()
+        .unwrap()
+        .text
+        .as_str()
 }
 
 // ─── Tool Listing ────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mcp_list_tools() {
-    let (client, _tmp) = start_mcp_client().await;
+    let (client, _server) = start_mcp_client().await;
 
     let tools = client.list_all_tools().await.unwrap();
 
     let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
 
-    assert!(
-        tool_names.contains(&"hirn_remember"),
-        "missing hirn_remember: {tool_names:?}"
-    );
-    assert!(
-        tool_names.contains(&"hirn_recall"),
-        "missing hirn_recall: {tool_names:?}"
-    );
-    assert!(
-        tool_names.contains(&"hirn_think"),
-        "missing hirn_think: {tool_names:?}"
-    );
-    assert!(
-        tool_names.contains(&"hirn_forget"),
-        "missing hirn_forget: {tool_names:?}"
-    );
-    assert!(
-        tool_names.contains(&"hirn_inspect"),
-        "missing hirn_inspect: {tool_names:?}"
-    );
-    assert!(
-        tool_names.contains(&"hirn_consolidate"),
-        "missing hirn_consolidate: {tool_names:?}"
-    );
-    assert!(
-        tool_names.contains(&"hirn_execute"),
-        "missing hirn_execute: {tool_names:?}"
-    );
-    assert!(
-        tool_names.contains(&"hirn_watch"),
-        "missing hirn_watch: {tool_names:?}"
-    );
-    // MemoryToolkit tools (6 additional)
-    assert!(
-        tool_names.contains(&"memory_store"),
-        "missing memory_store: {tool_names:?}"
-    );
-    assert!(
-        tool_names.contains(&"memory_recall"),
-        "missing memory_recall: {tool_names:?}"
-    );
-    assert!(
-        tool_names.contains(&"memory_update"),
-        "missing memory_update: {tool_names:?}"
-    );
-    assert!(
-        tool_names.contains(&"memory_delete"),
-        "missing memory_delete: {tool_names:?}"
-    );
-    assert!(
-        tool_names.contains(&"memory_link"),
-        "missing memory_link: {tool_names:?}"
-    );
-    assert!(
-        tool_names.contains(&"memory_introspect"),
-        "missing memory_introspect: {tool_names:?}"
-    );
+    for expected in [
+        "hirn_remember",
+        "hirn_recall",
+        "hirn_think",
+        "hirn_forget",
+        "hirn_inspect",
+        "hirn_consolidate",
+        "hirn_execute",
+        "hirn_watch",
+        // MemoryToolkit tools (6 additional)
+        "memory_store",
+        "memory_recall",
+        "memory_update",
+        "memory_delete",
+        "memory_link",
+        "memory_introspect",
+    ] {
+        assert!(
+            tool_names.contains(&expected),
+            "missing {expected}: {tool_names:?}"
+        );
+    }
     assert_eq!(tools.len(), 14);
 
     // Verify every tool has a non-empty description and input schema
     for tool in &tools {
         assert!(
-            !tool.description.is_empty(),
+            !tool.description.as_deref().unwrap_or("").is_empty(),
             "tool {} has empty description",
             tool.name
         );
@@ -176,29 +188,20 @@ async fn test_mcp_list_tools() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mcp_remember() {
-    let (client, _tmp) = start_mcp_client().await;
+    let (client, _server) = start_mcp_client().await;
 
     let result = client
         .call_tool(tool_params(
             "hirn_remember",
             serde_json::json!({
-                "content": "MCP test memory",
-                "agent_id": "mcp-agent"
+                "content": "MCP test memory"
             }),
         ))
         .await
         .unwrap();
 
     assert!(!result.is_error.unwrap_or(false));
-    let text = result
-        .content
-        .first()
-        .unwrap()
-        .raw
-        .as_text()
-        .unwrap()
-        .text
-        .as_str();
+    let text = result_text(&result);
     assert!(
         text.contains("Memory stored with ID:"),
         "unexpected: {text}"
@@ -211,7 +214,7 @@ async fn test_mcp_remember() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mcp_recall() {
-    let (client, _tmp) = start_mcp_client().await;
+    let (client, _server) = start_mcp_client().await;
 
     let embedding: Vec<f64> = (0..768).map(|i| (i as f64) / 768.0).collect();
 
@@ -221,7 +224,6 @@ async fn test_mcp_recall() {
             "hirn_remember",
             serde_json::json!({
                 "content": "Recall test memory",
-                "agent_id": "mcp-agent",
                 "embedding": embedding
             }),
         ))
@@ -240,19 +242,11 @@ async fn test_mcp_recall() {
         .unwrap();
 
     assert!(!result.is_error.unwrap_or(false));
-    let text = result
-        .content
-        .first()
-        .unwrap()
-        .raw
-        .as_text()
-        .unwrap()
-        .text
-        .as_str();
+    let text = result_text(&result);
     // Should contain at least one result with an ID
     let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
     assert!(
-        parsed.as_array().unwrap().len() >= 1,
+        !parsed.as_array().unwrap().is_empty(),
         "expected at least one recall result"
     );
 
@@ -263,7 +257,7 @@ async fn test_mcp_recall() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mcp_think() {
-    let (client, _tmp) = start_mcp_client().await;
+    let (client, _server) = start_mcp_client().await;
 
     let embedding: Vec<f64> = (0..768).map(|i| (i as f64) / 768.0).collect();
 
@@ -273,7 +267,6 @@ async fn test_mcp_think() {
             "hirn_remember",
             serde_json::json!({
                 "content": "Think test content for context assembly",
-                "agent_id": "mcp-agent",
                 "embedding": embedding
             }),
         ))
@@ -293,16 +286,7 @@ async fn test_mcp_think() {
         .unwrap();
 
     assert!(!result.is_error.unwrap_or(false));
-    let text = result
-        .content
-        .first()
-        .unwrap()
-        .raw
-        .as_text()
-        .unwrap()
-        .text
-        .as_str();
-    let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(result_text(&result)).unwrap();
     assert!(parsed["token_count"].as_i64().unwrap() >= 0);
 
     client.cancel().await.unwrap();
@@ -312,29 +296,20 @@ async fn test_mcp_think() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mcp_forget() {
-    let (client, _tmp) = start_mcp_client().await;
+    let (client, _server) = start_mcp_client().await;
 
     // Store a memory
     let result = client
         .call_tool(tool_params(
             "hirn_remember",
             serde_json::json!({
-                "content": "Memory to forget",
-                "agent_id": "mcp-agent"
+                "content": "Memory to forget"
             }),
         ))
         .await
         .unwrap();
 
-    let text = result
-        .content
-        .first()
-        .unwrap()
-        .raw
-        .as_text()
-        .unwrap()
-        .text
-        .as_str();
+    let text = result_text(&result);
     let id = text.strip_prefix("Memory stored with ID: ").unwrap();
 
     // Forget it
@@ -344,15 +319,7 @@ async fn test_mcp_forget() {
         .unwrap();
 
     assert!(!result.is_error.unwrap_or(false));
-    let text = result
-        .content
-        .first()
-        .unwrap()
-        .raw
-        .as_text()
-        .unwrap()
-        .text
-        .as_str();
+    let text = result_text(&result);
     assert!(text.contains("forgotten"), "unexpected: {text}");
 
     client.cancel().await.unwrap();
@@ -362,29 +329,20 @@ async fn test_mcp_forget() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mcp_inspect() {
-    let (client, _tmp) = start_mcp_client().await;
+    let (client, _server) = start_mcp_client().await;
 
     // Store a memory
     let result = client
         .call_tool(tool_params(
             "hirn_remember",
             serde_json::json!({
-                "content": "Memory to inspect",
-                "agent_id": "mcp-agent"
+                "content": "Memory to inspect"
             }),
         ))
         .await
         .unwrap();
 
-    let text = result
-        .content
-        .first()
-        .unwrap()
-        .raw
-        .as_text()
-        .unwrap()
-        .text
-        .as_str();
+    let text = result_text(&result);
     let id = text.strip_prefix("Memory stored with ID: ").unwrap();
 
     // Inspect it
@@ -394,16 +352,7 @@ async fn test_mcp_inspect() {
         .unwrap();
 
     assert!(!result.is_error.unwrap_or(false));
-    let text = result
-        .content
-        .first()
-        .unwrap()
-        .raw
-        .as_text()
-        .unwrap()
-        .text
-        .as_str();
-    let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(result_text(&result)).unwrap();
     assert!(parsed["id"].as_str().is_some());
     assert_eq!(parsed["layer"].as_str().unwrap(), "Episodic");
 
@@ -414,29 +363,20 @@ async fn test_mcp_inspect() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mcp_execute() {
-    let (client, _tmp) = start_mcp_client().await;
+    let (client, _server) = start_mcp_client().await;
 
     // Store a memory to get an ID
     let result = client
         .call_tool(tool_params(
             "hirn_remember",
             serde_json::json!({
-                "content": "Memory for HirnQL execute",
-                "agent_id": "mcp-agent"
+                "content": "Memory for HirnQL execute"
             }),
         ))
         .await
         .unwrap();
 
-    let text = result
-        .content
-        .first()
-        .unwrap()
-        .raw
-        .as_text()
-        .unwrap()
-        .text
-        .as_str();
+    let text = result_text(&result);
     let id = text.strip_prefix("Memory stored with ID: ").unwrap();
 
     // Execute HirnQL INSPECT query
@@ -449,16 +389,7 @@ async fn test_mcp_execute() {
         .unwrap();
 
     assert!(!result.is_error.unwrap_or(false));
-    let text = result
-        .content
-        .first()
-        .unwrap()
-        .raw
-        .as_text()
-        .unwrap()
-        .text
-        .as_str();
-    let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(result_text(&result)).unwrap();
     assert_eq!(parsed["type"].as_str().unwrap(), "inspected");
 
     client.cancel().await.unwrap();
@@ -466,7 +397,8 @@ async fn test_mcp_execute() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mcp_semantic_inspect_and_execute_trace_include_revision_and_conflicts() {
-    let (client, db, _tmp) = start_mcp_client_with_db().await;
+    let (client, server) = start_mcp_client().await;
+    let db = server.default_db().await;
 
     let agent = AgentId::new("semantic-mcp-agent").unwrap();
     db.register_agent(&agent, "Semantic MCP Agent")
@@ -523,22 +455,12 @@ async fn test_mcp_semantic_inspect_and_execute_trace_include_revision_and_confli
             "hirn_inspect",
             serde_json::json!({
                 "id": left_head_id.to_string(),
-                "agent_id": agent.to_string(),
             }),
         ))
         .await
         .unwrap();
     assert!(!inspect.is_error.unwrap_or(false));
-    let inspect_text = inspect
-        .content
-        .first()
-        .unwrap()
-        .raw
-        .as_text()
-        .unwrap()
-        .text
-        .as_str();
-    let inspect_body: serde_json::Value = serde_json::from_str(inspect_text).unwrap();
+    let inspect_body: serde_json::Value = serde_json::from_str(result_text(&inspect)).unwrap();
     assert_eq!(inspect_body["type"], "inspected");
     assert_eq!(inspect_body["semantic_revision"]["logical_state"], "Active");
     assert_eq!(inspect_body["conflict_groups"].as_array().unwrap().len(), 1);
@@ -548,22 +470,12 @@ async fn test_mcp_semantic_inspect_and_execute_trace_include_revision_and_confli
             "hirn_execute",
             serde_json::json!({
                 "query": format!(r#"TRACE "{}""#, left_head_id),
-                "agent_id": agent.to_string(),
             }),
         ))
         .await
         .unwrap();
     assert!(!trace.is_error.unwrap_or(false));
-    let trace_text = trace
-        .content
-        .first()
-        .unwrap()
-        .raw
-        .as_text()
-        .unwrap()
-        .text
-        .as_str();
-    let trace_body: serde_json::Value = serde_json::from_str(trace_text).unwrap();
+    let trace_body: serde_json::Value = serde_json::from_str(result_text(&trace)).unwrap();
     assert_eq!(trace_body["type"], "traced");
     assert_eq!(trace_body["semantic_revision"]["logical_state"], "Active");
     assert_eq!(trace_body["conflict_groups"].as_array().unwrap().len(), 1);
@@ -573,7 +485,8 @@ async fn test_mcp_semantic_inspect_and_execute_trace_include_revision_and_confli
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mcp_execute_history_query_returns_revision_history_json() {
-    let (client, db, _tmp) = start_mcp_client_with_db().await;
+    let (client, server) = start_mcp_client().await;
+    let db = server.default_db().await;
 
     let agent = AgentId::new("semantic-mcp-agent").unwrap();
     db.register_agent(&agent, "Semantic MCP Agent")
@@ -619,23 +532,13 @@ async fn test_mcp_execute_history_query_returns_revision_history_json() {
             "hirn_execute",
             serde_json::json!({
                 "query": format!(r#"HISTORY LOGICAL "{}""#, original.logical_memory_id),
-                "agent_id": agent.to_string(),
             }),
         ))
         .await
         .unwrap();
 
     assert!(!result.is_error.unwrap_or(false));
-    let text = result
-        .content
-        .first()
-        .unwrap()
-        .raw
-        .as_text()
-        .unwrap()
-        .text
-        .as_str();
-    let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(result_text(&result)).unwrap();
     assert_eq!(parsed["type"], "history");
     assert_eq!(
         parsed["semantic_revision"]["logical_memory_id"],
@@ -655,7 +558,7 @@ async fn test_mcp_execute_history_query_returns_revision_history_json() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mcp_consolidate() {
-    let (client, _tmp) = start_mcp_client().await;
+    let (client, _server) = start_mcp_client().await;
 
     // Store a few memories
     for i in 0..3 {
@@ -663,8 +566,7 @@ async fn test_mcp_consolidate() {
             .call_tool(tool_params(
                 "hirn_remember",
                 serde_json::json!({
-                    "content": format!("Episode {i} for consolidation"),
-                    "agent_id": "mcp-agent"
+                    "content": format!("Episode {i} for consolidation")
                 }),
             ))
             .await
@@ -681,16 +583,7 @@ async fn test_mcp_consolidate() {
         .unwrap();
 
     assert!(!result.is_error.unwrap_or(false));
-    let text = result
-        .content
-        .first()
-        .unwrap()
-        .raw
-        .as_text()
-        .unwrap()
-        .text
-        .as_str();
-    let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(result_text(&result)).unwrap();
     assert!(parsed["records_processed"].as_i64().unwrap() >= 0);
 
     client.cancel().await.unwrap();
@@ -700,7 +593,7 @@ async fn test_mcp_consolidate() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mcp_invalid_tool_params() {
-    let (client, _tmp) = start_mcp_client().await;
+    let (client, _server) = start_mcp_client().await;
 
     // Call hirn_execute with empty query
     let result = client
@@ -726,13 +619,13 @@ async fn test_mcp_invalid_tool_params() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mcp_missing_required_param() {
-    let (client, _tmp) = start_mcp_client().await;
+    let (client, _server) = start_mcp_client().await;
 
     // Call hirn_remember without content (required field)
     let result = client
         .call_tool(tool_params(
             "hirn_remember",
-            serde_json::json!({ "agent_id": "test" }),
+            serde_json::json!({ "importance": 0.5 }),
         ))
         .await;
 
@@ -754,7 +647,7 @@ async fn test_mcp_missing_required_param() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mcp_llm_workflow() {
-    let (client, _tmp) = start_mcp_client().await;
+    let (client, _server) = start_mcp_client().await;
 
     let embedding: Vec<f64> = (0..768).map(|i| (i as f64) / 768.0).collect();
 
@@ -765,7 +658,6 @@ async fn test_mcp_llm_workflow() {
                 "hirn_remember",
                 serde_json::json!({
                     "content": format!("LLM workflow item {i}: important context about topic {i}"),
-                    "agent_id": "llm-agent",
                     "embedding": embedding
                 }),
             ))
@@ -787,16 +679,7 @@ async fn test_mcp_llm_workflow() {
         .unwrap();
 
     assert!(!result.is_error.unwrap_or(false));
-    let text = result
-        .content
-        .first()
-        .unwrap()
-        .raw
-        .as_text()
-        .unwrap()
-        .text
-        .as_str();
-    let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(result_text(&result)).unwrap();
     let token_count = parsed["token_count"].as_i64().unwrap();
     assert!(token_count > 0, "think should return non-zero tokens");
 
@@ -808,16 +691,8 @@ async fn test_mcp_llm_workflow() {
         ))
         .await
         .unwrap();
-    let recall_text = recall_result
-        .content
-        .first()
-        .unwrap()
-        .raw
-        .as_text()
-        .unwrap()
-        .text
-        .as_str();
-    let recalled: Vec<serde_json::Value> = serde_json::from_str(recall_text).unwrap();
+    let recalled: Vec<serde_json::Value> =
+        serde_json::from_str(result_text(&recall_result)).unwrap();
     assert!(!recalled.is_empty(), "should recall at least one memory");
 
     let first_id = recalled[0]["id"].as_str().unwrap();
@@ -837,15 +712,15 @@ async fn test_mcp_llm_workflow() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mcp_protocol_version_and_capabilities() {
-    let (client, _tmp) = start_mcp_client().await;
+    let (client, _server) = start_mcp_client().await;
 
-    let info = client.peer_info();
+    let info = client.peer_info().expect("initialized peer info");
 
-    // Protocol version must be the MCP spec version "2024-11-05"
+    // Server and client both speak the latest MCP protocol revision.
     assert_eq!(
         info.protocol_version,
-        rmcp::model::ProtocolVersion::V_2024_11_05,
-        "server must advertise MCP protocol version 2024-11-05"
+        rmcp::model::ProtocolVersion::LATEST,
+        "server must negotiate the latest MCP protocol version"
     );
 
     // Server must declare tools capability
@@ -855,10 +730,7 @@ async fn test_mcp_protocol_version_and_capabilities() {
     );
 
     // Server info must have non-empty name
-    assert!(
-        !info.server_info.name.is_empty(),
-        "server_info.name must not be empty"
-    );
+    assert_eq!(info.server_info.name, "hirn");
 
     // Server should provide instructions
     assert!(
@@ -871,7 +743,7 @@ async fn test_mcp_protocol_version_and_capabilities() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mcp_tool_schemas_conform_to_json_schema() {
-    let (client, _tmp) = start_mcp_client().await;
+    let (client, _server) = start_mcp_client().await;
 
     let tools = client.list_all_tools().await.unwrap();
 
@@ -881,7 +753,7 @@ async fn test_mcp_tool_schemas_conform_to_json_schema() {
 
         // Every tool must have a description
         assert!(
-            !tool.description.is_empty(),
+            !tool.description.as_deref().unwrap_or("").is_empty(),
             "tool '{}' must have a non-empty description",
             tool.name
         );
@@ -909,15 +781,14 @@ async fn test_mcp_tool_schemas_conform_to_json_schema() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mcp_tool_call_response_format() {
-    let (client, _tmp) = start_mcp_client().await;
+    let (client, _server) = start_mcp_client().await;
 
     // Successful tool call — verify response structure
     let result = client
         .call_tool(tool_params(
             "hirn_remember",
             serde_json::json!({
-                "content": "conformance test memory",
-                "agent_id": "conformance-agent"
+                "content": "conformance test memory"
             }),
         ))
         .await
@@ -937,7 +808,7 @@ async fn test_mcp_tool_call_response_format() {
     );
 
     // content[0] must be text type
-    let text_content = result.content[0].raw.as_text();
+    let text_content = result.content[0].as_text();
     assert!(text_content.is_some(), "response content must be text type");
     assert!(
         !text_content.unwrap().text.is_empty(),
@@ -949,13 +820,13 @@ async fn test_mcp_tool_call_response_format() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mcp_error_response_format() {
-    let (client, _tmp) = start_mcp_client().await;
+    let (client, _server) = start_mcp_client().await;
 
     // Call with missing required field → should produce error response
     let result = client
         .call_tool(tool_params(
             "hirn_remember",
-            serde_json::json!({ "agent_id": "test" }),
+            serde_json::json!({ "importance": 0.5 }),
         ))
         .await;
 
@@ -968,7 +839,7 @@ async fn test_mcp_error_response_format() {
                 "error response must have is_error: true"
             );
             assert!(!r.content.is_empty(), "error response must have content");
-            let text = r.content[0].raw.as_text();
+            let text = r.content[0].as_text();
             assert!(text.is_some(), "error content must be text");
             assert!(
                 !text.unwrap().text.is_empty(),
@@ -1001,7 +872,7 @@ async fn test_mcp_error_response_format() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mcp_nonexistent_tool_returns_error() {
-    let (client, _tmp) = start_mcp_client().await;
+    let (client, _server) = start_mcp_client().await;
 
     let result = client
         .call_tool(tool_params("hirn_nonexistent_tool", serde_json::json!({})))
@@ -1021,7 +892,7 @@ async fn test_mcp_nonexistent_tool_returns_error() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mcp_list_resources() {
-    let (client, _tmp) = start_mcp_client().await;
+    let (client, _server) = start_mcp_client().await;
 
     let resources = client.list_all_resources().await.unwrap();
 
@@ -1047,14 +918,12 @@ async fn test_mcp_list_resources() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mcp_read_resource_stats() {
-    use rmcp::model::ReadResourceRequestParam;
+    use rmcp::model::ReadResourceRequestParams;
 
-    let (client, _tmp) = start_mcp_client().await;
+    let (client, _server) = start_mcp_client().await;
 
     let result = client
-        .read_resource(ReadResourceRequestParam {
-            uri: "hirn://stats".into(),
-        })
+        .read_resource(ReadResourceRequestParams::new("hirn://stats"))
         .await
         .unwrap();
 
@@ -1069,40 +938,27 @@ async fn test_mcp_read_resource_stats() {
     };
 
     let json: serde_json::Value = serde_json::from_str(&text).unwrap();
-    assert!(
-        json.get("working_count").is_some(),
-        "stats must include working_count"
-    );
-    assert!(
-        json.get("episodic_count").is_some(),
-        "stats must include episodic_count"
-    );
-    assert!(
-        json.get("semantic_count").is_some(),
-        "stats must include semantic_count"
-    );
-    assert!(
-        json.get("total_count").is_some(),
-        "stats must include total_count"
-    );
-    assert!(
-        json.get("file_size_bytes").is_some(),
-        "stats must include file_size_bytes"
-    );
+    for key in [
+        "working_count",
+        "episodic_count",
+        "semantic_count",
+        "total_count",
+        "file_size_bytes",
+    ] {
+        assert!(json.get(key).is_some(), "stats must include {key}");
+    }
 
     client.cancel().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mcp_read_resource_schema() {
-    use rmcp::model::ReadResourceRequestParam;
+    use rmcp::model::ReadResourceRequestParams;
 
-    let (client, _tmp) = start_mcp_client().await;
+    let (client, _server) = start_mcp_client().await;
 
     let result = client
-        .read_resource(ReadResourceRequestParam {
-            uri: "hirn://schema".into(),
-        })
+        .read_resource(ReadResourceRequestParams::new("hirn://schema"))
         .await
         .unwrap();
 
@@ -1117,23 +973,15 @@ async fn test_mcp_read_resource_schema() {
     };
 
     let json: serde_json::Value = serde_json::from_str(&text).unwrap();
-    assert!(json.get("layers").is_some(), "schema must include layers");
-    assert!(
-        json.get("event_types").is_some(),
-        "schema must include event_types"
-    );
-    assert!(
-        json.get("knowledge_types").is_some(),
-        "schema must include knowledge_types"
-    );
-    assert!(
-        json.get("edge_relations").is_some(),
-        "schema must include edge_relations"
-    );
-    assert!(
-        json.get("forget_modes").is_some(),
-        "schema must include forget_modes"
-    );
+    for key in [
+        "layers",
+        "event_types",
+        "knowledge_types",
+        "edge_relations",
+        "forget_modes",
+    ] {
+        assert!(json.get(key).is_some(), "schema must include {key}");
+    }
 
     let layers = json["layers"].as_array().unwrap();
     assert!(layers.iter().any(|v| v == "episodic"));
@@ -1145,14 +993,12 @@ async fn test_mcp_read_resource_schema() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mcp_read_resource_unknown_uri() {
-    use rmcp::model::ReadResourceRequestParam;
+    use rmcp::model::ReadResourceRequestParams;
 
-    let (client, _tmp) = start_mcp_client().await;
+    let (client, _server) = start_mcp_client().await;
 
     let result = client
-        .read_resource(ReadResourceRequestParam {
-            uri: "hirn://nonexistent".into(),
-        })
+        .read_resource(ReadResourceRequestParams::new("hirn://nonexistent"))
         .await;
 
     assert!(result.is_err(), "reading unknown resource URI should fail");
@@ -1170,7 +1016,7 @@ async fn test_mcp_read_resource_unknown_uri() {
 /// replication tests, this proves end-to-end MCP data consistency.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mcp_write_then_read_consistency() {
-    let (client, _tmp) = start_mcp_client().await;
+    let (client, _server) = start_mcp_client().await;
 
     // Use a distinctive embedding
     let embedding: Vec<f64> = (0..768)
@@ -1183,7 +1029,6 @@ async fn test_mcp_write_then_read_consistency() {
             "hirn_remember",
             serde_json::json!({
                 "content": "MCP leader write for eventual consistency test",
-                "agent_id": "mcp-leader-agent",
                 "embedding": embedding
             }),
         ))
@@ -1204,16 +1049,7 @@ async fn test_mcp_write_then_read_consistency() {
         .unwrap();
     assert!(!recall_result.is_error.unwrap_or(false));
 
-    let text = recall_result
-        .content
-        .first()
-        .unwrap()
-        .raw
-        .as_text()
-        .unwrap()
-        .text
-        .as_str();
-    let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(result_text(&recall_result)).unwrap();
     let results = parsed.as_array().unwrap();
     assert!(
         !results.is_empty(),
@@ -1229,18 +1065,17 @@ async fn test_mcp_write_then_read_consistency() {
     client.cancel().await.unwrap();
 }
 
-// ─── MCP Server v2 Tests ─────────────────────────
+// ─── Namespaces / Entities ───────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mcp_remember_with_namespace_and_entities() {
-    let (client, _tmp) = start_mcp_client().await;
+    let (client, _server) = start_mcp_client().await;
 
     let result = client
         .call_tool(tool_params(
             "hirn_remember",
             serde_json::json!({
                 "content": "Project X meeting notes",
-                "agent_id": "agent-007",
                 "namespace": "project-x",
                 "entities": ["Alice", "Bob"],
                 "importance": 0.9
@@ -1250,15 +1085,7 @@ async fn test_mcp_remember_with_namespace_and_entities() {
         .unwrap();
 
     assert!(!result.is_error.unwrap_or(false));
-    let text = result
-        .content
-        .first()
-        .unwrap()
-        .raw
-        .as_text()
-        .unwrap()
-        .text
-        .as_str();
+    let text = result_text(&result);
     assert!(
         text.contains("Memory stored with ID:"),
         "unexpected: {text}"
@@ -1268,32 +1095,8 @@ async fn test_mcp_remember_with_namespace_and_entities() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_mcp_remember_without_agent_id() {
-    let (client, _tmp) = start_mcp_client().await;
-
-    // When no agent_id is supplied, the daemon falls back to the built-in
-    // "system" identity so MCP clients don't need to pass an explicit agent.
-    let result = client
-        .call_tool(tool_params(
-            "hirn_remember",
-            serde_json::json!({
-                "content": "Anonymous memory"
-            }),
-        ))
-        .await
-        .unwrap();
-
-    assert!(
-        !result.is_error.unwrap_or(false),
-        "remember without agent_id should succeed (defaults to system agent)"
-    );
-
-    client.cancel().await.unwrap();
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn test_mcp_recall_with_hirnql_query() {
-    let (client, _tmp) = start_mcp_client().await;
+    let (client, _server) = start_mcp_client().await;
 
     let embedding: Vec<f64> = (0..768).map(|i| (i as f64) / 768.0).collect();
 
@@ -1303,7 +1106,6 @@ async fn test_mcp_recall_with_hirnql_query() {
             "hirn_remember",
             serde_json::json!({
                 "content": "HirnQL recall test data",
-                "agent_id": "mcp-agent",
                 "embedding": embedding
             }),
         ))
@@ -1322,35 +1124,34 @@ async fn test_mcp_recall_with_hirnql_query() {
         .unwrap();
 
     assert!(!result.is_error.unwrap_or(false));
-    let text = result
-        .content
-        .first()
-        .unwrap()
-        .raw
-        .as_text()
-        .unwrap()
-        .text
-        .as_str();
-    let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(result_text(&result)).unwrap();
     assert_eq!(parsed["type"], "records");
 
     client.cancel().await.unwrap();
 }
 
+// ─── hirn_watch ──────────────────────────────────────────────
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mcp_watch_collects_events() {
-    let (client, watch_tx, _tmp) = start_mcp_client_with_watch().await;
+    let (client, server) = start_mcp_client().await;
+    // Warm the lazily-opened realm database so the watch call subscribes
+    // before the background event fires.
+    let _ = server.default_db().await;
 
     // Send a watch event in the background after a short delay.
-    let tx = watch_tx.clone();
+    let tx = server.watch_tx.clone();
     tokio::spawn(async move {
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        let _ = tx.send(WatchEvent::Created {
-            id: hirn::prelude::MemoryId::new(),
-            layer: Layer::Episodic,
-            entities: vec!["Alice".into()],
-            importance: 0.8,
-            namespace: Namespace::shared(),
+        let _ = tx.send(WatchEvent {
+            realm: "default".to_owned(),
+            kind: WatchEventKind::Created {
+                id: hirn::prelude::MemoryId::new(),
+                layer: Layer::Episodic,
+                entities: vec!["Alice".into()],
+                importance: 0.8,
+                namespace: Namespace::shared(),
+            },
         });
     });
 
@@ -1365,15 +1166,7 @@ async fn test_mcp_watch_collects_events() {
         .unwrap();
 
     assert!(!result.is_error.unwrap_or(false));
-    let text = result
-        .content
-        .first()
-        .unwrap()
-        .raw
-        .as_text()
-        .unwrap()
-        .text
-        .as_str();
+    let text = result_text(&result);
     let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
     assert!(
         parsed["events_collected"].as_u64().unwrap() >= 1,
@@ -1384,9 +1177,63 @@ async fn test_mcp_watch_collects_events() {
     client.cancel().await.unwrap();
 }
 
+/// Watch events from a different realm must never reach the subscriber —
+/// the watch broadcast is daemon-global, but delivery is realm-scoped by
+/// the subscriber's authenticated identity.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mcp_watch_is_realm_scoped() {
+    let (client, server) = start_mcp_client().await;
+    // Warm the lazily-opened realm database so the watch call subscribes
+    // before the background events fire.
+    let _ = server.default_db().await;
+
+    let tx = server.watch_tx.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        // Foreign-realm event: must be filtered out.
+        let _ = tx.send(WatchEvent {
+            realm: "other-tenant".to_owned(),
+            kind: WatchEventKind::Created {
+                id: hirn::prelude::MemoryId::new(),
+                layer: Layer::Episodic,
+                entities: vec![],
+                importance: 0.9,
+                namespace: Namespace::shared(),
+            },
+        });
+        // Own-realm event: must be delivered.
+        let _ = tx.send(WatchEvent {
+            realm: "default".to_owned(),
+            kind: WatchEventKind::Created {
+                id: hirn::prelude::MemoryId::new(),
+                layer: Layer::Episodic,
+                entities: vec![],
+                importance: 0.9,
+                namespace: Namespace::shared(),
+            },
+        });
+    });
+
+    let result = client
+        .call_tool(tool_params(
+            "hirn_watch",
+            serde_json::json!({ "duration_ms": 500 }),
+        ))
+        .await
+        .unwrap();
+
+    let parsed: serde_json::Value = serde_json::from_str(result_text(&result)).unwrap();
+    assert_eq!(
+        parsed["events_collected"], 1,
+        "only the same-realm event may be delivered: {parsed}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mcp_watch_returns_empty_on_no_events() {
-    let (client, _tmp) = start_mcp_client().await;
+    let (client, _server) = start_mcp_client().await;
 
     let result = client
         .call_tool(tool_params(
@@ -1399,16 +1246,7 @@ async fn test_mcp_watch_returns_empty_on_no_events() {
         .unwrap();
 
     assert!(!result.is_error.unwrap_or(false));
-    let text = result
-        .content
-        .first()
-        .unwrap()
-        .raw
-        .as_text()
-        .unwrap()
-        .text
-        .as_str();
-    let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(result_text(&result)).unwrap();
     assert_eq!(parsed["events_collected"], 0);
     assert_eq!(parsed["events"].as_array().unwrap().len(), 0);
 
@@ -1416,23 +1254,8 @@ async fn test_mcp_watch_returns_empty_on_no_events() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_mcp_watch_listed_in_tools() {
-    let (client, _tmp) = start_mcp_client().await;
-
-    let tools = client.list_all_tools().await.unwrap();
-    let watch_tool = tools.iter().find(|t| t.name.as_ref() == "hirn_watch");
-    assert!(watch_tool.is_some(), "hirn_watch should be in tool list");
-
-    let tool = watch_tool.unwrap();
-    assert!(!tool.description.is_empty());
-    assert!(tool.input_schema.contains_key("type"));
-
-    client.cancel().await.unwrap();
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn test_mcp_concurrent_requests() {
-    let (client, _tmp) = start_mcp_client().await;
+    let (client, _server) = start_mcp_client().await;
     let client = Arc::new(client);
 
     let mut handles = Vec::new();
@@ -1443,8 +1266,7 @@ async fn test_mcp_concurrent_requests() {
                 .call_tool(tool_params(
                     "hirn_remember",
                     serde_json::json!({
-                        "content": format!("Concurrent memory {i}"),
-                        "agent_id": format!("agent-{i}")
+                        "content": format!("Concurrent memory {i}")
                     }),
                 ))
                 .await
@@ -1464,7 +1286,7 @@ async fn test_mcp_concurrent_requests() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mcp_invalid_input_returns_error_not_crash() {
-    let (client, _tmp) = start_mcp_client().await;
+    let (client, _server) = start_mcp_client().await;
 
     // Invalid JSON for hirn_recall — neither query_embedding nor query
     let result = client
@@ -1485,21 +1307,344 @@ async fn test_mcp_invalid_input_returns_error_not_crash() {
     client.cancel().await.unwrap();
 }
 
+// ─── Transport Security ──────────────────────────────────────
+
+/// A client that presents no credential must not even complete the MCP
+/// handshake: the auth middleware answers 401 before the protocol layer.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mcp_unauthenticated_handshake_rejected() {
+    let server = spawn_server(auth_state_with_keys(&[(SYSTEM_KEY, "system")]), None).await;
+
+    let transport = StreamableHttpClientTransport::from_uri(server.url.clone());
+    let result = ().serve(transport).await;
+    assert!(
+        result.is_err(),
+        "handshake without credentials must fail: {result:?}"
+    );
+}
+
+/// An unknown bearer credential must be rejected the same way.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mcp_invalid_credential_rejected() {
+    let server = spawn_server(auth_state_with_keys(&[(SYSTEM_KEY, "system")]), None).await;
+
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(server.url.clone())
+            .auth_header("not-a-real-key"),
+    );
+    let result = ().serve(transport).await;
+    assert!(
+        result.is_err(),
+        "handshake with an unknown credential must fail: {result:?}"
+    );
+}
+
+/// DNS-rebinding protection: a request whose `Host` header is not in the
+/// allowlist (default: loopback only) must be rejected with 403 by the
+/// transport itself (RUSTSEC-2026-0189), even when it carries a valid
+/// credential.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mcp_foreign_host_header_rejected() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let server = spawn_server(auth_state_with_keys(&[(SYSTEM_KEY, "system")]), None).await;
+
+    let mut stream = tokio::net::TcpStream::connect(server.addr).await.unwrap();
+    let request = format!(
+        "POST /mcp HTTP/1.1\r\n\
+         Host: evil.attacker.example\r\n\
+         Authorization: Bearer {SYSTEM_KEY}\r\n\
+         Content-Type: application/json\r\n\
+         Accept: application/json, text/event-stream\r\n\
+         Content-Length: 2\r\n\
+         Connection: close\r\n\r\n{{}}"
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.unwrap();
+
+    let status_line = response.lines().next().unwrap_or("");
+    assert!(
+        status_line.contains("403"),
+        "foreign Host header must be rejected with 403, got: {status_line}"
+    );
+
+    // Sanity check: the same request with a loopback Host is not blocked by
+    // host validation (it fails later in the protocol layer, not with 403).
+    let mut stream = tokio::net::TcpStream::connect(server.addr).await.unwrap();
+    let request = format!(
+        "POST /mcp HTTP/1.1\r\n\
+         Host: 127.0.0.1:{}\r\n\
+         Authorization: Bearer {SYSTEM_KEY}\r\n\
+         Content-Type: application/json\r\n\
+         Accept: application/json, text/event-stream\r\n\
+         Content-Length: 2\r\n\
+         Connection: close\r\n\r\n{{}}",
+        server.addr.port()
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.unwrap();
+    let status_line = response.lines().next().unwrap_or("");
+    assert!(
+        !status_line.contains("403"),
+        "loopback Host must pass host validation, got: {status_line}"
+    );
+}
+
+/// Two clients with different credentials on the SAME server act as
+/// different agents: private memories stored by one are invisible to the
+/// other, and each sees its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mcp_per_request_identities_are_isolated() {
+    let server = spawn_server(
+        auth_state_with_keys(&[
+            (SYSTEM_KEY, "system"),
+            ("agent-a-key", "agent-a"),
+            ("agent-b-key", "agent-b"),
+        ]),
+        None,
+    )
+    .await;
+
+    let client_a = connect(&server, "agent-a-key").await;
+    let client_b = connect(&server, "agent-b-key").await;
+
+    // Agent A stores a private memory via the toolkit (defaults to the
+    // caller's private namespace).
+    let store = client_a
+        .call_tool(tool_params(
+            "memory_store",
+            serde_json::json!({ "content": "agent-a secret plan about warp drives" }),
+        ))
+        .await
+        .unwrap();
+    assert!(!store.is_error.unwrap_or(false), "store failed: {store:?}");
+
+    // Agent A can recall it.
+    let recall_a = client_a
+        .call_tool(tool_params(
+            "memory_recall",
+            serde_json::json!({ "query": "warp drives" }),
+        ))
+        .await
+        .unwrap();
+    let found_a: Vec<serde_json::Value> = serde_json::from_str(result_text(&recall_a)).unwrap();
+    assert!(
+        found_a
+            .iter()
+            .any(|r| r["content"].as_str().unwrap_or("").contains("warp drives")),
+        "agent-a must recall its own private memory: {found_a:?}"
+    );
+
+    // Agent B must NOT see agent A's private memory.
+    let recall_b = client_b
+        .call_tool(tool_params(
+            "memory_recall",
+            serde_json::json!({ "query": "warp drives" }),
+        ))
+        .await
+        .unwrap();
+    let found_b: Vec<serde_json::Value> = serde_json::from_str(result_text(&recall_b)).unwrap();
+    assert!(
+        !found_b
+            .iter()
+            .any(|r| r["content"].as_str().unwrap_or("").contains("warp drives")),
+        "agent-b must not see agent-a's private memory: {found_b:?}"
+    );
+
+    client_a.cancel().await.unwrap();
+    client_b.cancel().await.unwrap();
+}
+
+/// A JWT restricted to read operations cannot invoke write-class tools,
+/// while read-class tools keep working — per request, on the same server.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mcp_read_scoped_token_cannot_write() {
+    use hirnd::auth::{KeyIdentity, Operation};
+    use hirnd::config::TokenConfig;
+
+    let mut api_keys = HashMap::new();
+    api_keys.insert(
+        SYSTEM_KEY.to_owned(),
+        KeyConfig {
+            realm: "default".to_owned(),
+            agent_id: "system".to_owned(),
+        },
+    );
+    let auth_config = AuthConfig {
+        api_keys,
+        client_certs: HashMap::new(),
+    };
+    let token_config: TokenConfig = toml::from_str(
+        r#"
+        secret = "0123456789abcdef0123456789abcdef"
+        "#,
+    )
+    .unwrap();
+    let auth = Arc::new(AuthState::new(Some(&auth_config), Some(&token_config)));
+
+    let read_only_jwt = auth
+        .issue_token(
+            &KeyIdentity {
+                realm: "default".to_owned(),
+                agent_id: "scoped-agent".to_owned(),
+            },
+            vec![],
+            vec![Operation::Read],
+            None,
+            None,
+        )
+        .unwrap();
+
+    let server = spawn_server(auth, None).await;
+    let client = connect(&server, &read_only_jwt).await;
+
+    // Write-class tool must be denied.
+    let write = client
+        .call_tool(tool_params(
+            "memory_store",
+            serde_json::json!({ "content": "should be rejected" }),
+        ))
+        .await;
+    let denied = match write {
+        Ok(r) => r.is_error.unwrap_or(false),
+        Err(_) => true,
+    };
+    assert!(denied, "read-scoped token must not be able to write");
+
+    // Read-class tool keeps working.
+    let read = client
+        .call_tool(tool_params(
+            "memory_recall",
+            serde_json::json!({ "query": "anything" }),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        !read.is_error.unwrap_or(false),
+        "read-scoped token must be able to read: {read:?}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+/// R-27: `hirn_recall` must classify a supplied HirnQL query and authorize it
+/// exactly like `hirn_execute`. A Read-scoped credential cannot run write/admin
+/// HirnQL (e.g. `RETRACT`) through the recall tool, while a read query (`RECALL`)
+/// still works — same server, same tool, per request.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mcp_recall_query_is_verb_classified() {
+    use hirn_storage::{HirnDb, HirnDbConfig};
+    use hirnd::auth::{KeyIdentity, Operation};
+    use hirnd::config::TokenConfig;
+
+    let mut api_keys = HashMap::new();
+    api_keys.insert(
+        SYSTEM_KEY.to_owned(),
+        KeyConfig {
+            realm: "default".to_owned(),
+            agent_id: "system".to_owned(),
+        },
+    );
+    let auth_config = AuthConfig {
+        api_keys,
+        client_certs: HashMap::new(),
+    };
+    let token_config: TokenConfig = toml::from_str(
+        r#"
+        secret = "0123456789abcdef0123456789abcdef"
+        "#,
+    )
+    .unwrap();
+    let auth = Arc::new(AuthState::new(Some(&auth_config), Some(&token_config)));
+
+    let read_only_jwt = auth
+        .issue_token(
+            &KeyIdentity {
+                realm: "default".to_owned(),
+                agent_id: "scoped-agent".to_owned(),
+            },
+            vec![],
+            vec![Operation::Read],
+            None,
+            None,
+        )
+        .unwrap();
+
+    // Build a db and register the scoped agent so the read-query path (which
+    // now routes through the agent context) can execute.
+    let tmp = TempDir::new().unwrap();
+    let config = HirnConfig::builder()
+        .db_path(tmp.path().join("r27-db"))
+        .build()
+        .unwrap();
+    let storage = HirnDb::open(HirnDbConfig::local(
+        tmp.path().join("r27-lance").to_string_lossy(),
+    ))
+    .await
+    .unwrap()
+    .store_arc();
+    let db = HirnDB::open_with_config(config, storage).await.unwrap();
+    db.register_agent(&AgentId::new("scoped-agent").unwrap(), "scoped")
+        .await
+        .unwrap();
+
+    let server = spawn_server(auth, Some(Arc::new(db))).await;
+    let client = connect(&server, &read_only_jwt).await;
+
+    // Write-class HirnQL through hirn_recall MUST be denied.
+    let write = client
+        .call_tool(tool_params(
+            "hirn_recall",
+            serde_json::json!({
+                "query": r#"RETRACT "01ARZ3NDEKTSV4RRFFQ69G5FAV" REASON "obsolete""#
+            }),
+        ))
+        .await;
+    let denied = match write {
+        Ok(r) => r.is_error.unwrap_or(false),
+        Err(_) => true,
+    };
+    assert!(
+        denied,
+        "read-scoped token must not run write HirnQL (RETRACT) via hirn_recall"
+    );
+
+    // A read query keeps working.
+    let read = client
+        .call_tool(tool_params(
+            "hirn_recall",
+            serde_json::json!({
+                "query": r#"RECALL episodic ABOUT "test query" LIMIT 10"#
+            }),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        !read.is_error.unwrap_or(false),
+        "read HirnQL (RECALL) via hirn_recall must still work: {read:?}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
 // ─── Cedar Authorization Tests ───────────────────────────────
 
-/// Start an MCP server/client pair with Cedar policies that restrict
-/// remember to writers team only.
-async fn start_mcp_client_with_cedar()
--> (rmcp::service::RunningService<rmcp::RoleClient, ()>, TempDir) {
+/// Start an MCP server with Cedar policies that restrict remember to the
+/// writers team only, plus one API key per test agent — Cedar decisions are
+/// exercised per request via each client's own credential.
+async fn start_cedar_server() -> TestServer {
     use hirn_engine::policy::PolicyEngine;
+    use hirn_storage::{HirnDb, HirnDbConfig};
 
     let tmp = TempDir::new().unwrap();
-    let db_path = tmp.path().join("test");
+    let db_path = tmp.path().join("cedar-db");
 
     let config = HirnConfig::builder().db_path(&db_path).build().unwrap();
-    let lance_path = tmp.path().join("lance_brain");
+    let lance_path = tmp.path().join("cedar-lance");
     let storage_cfg = HirnDbConfig::local(lance_path.to_string_lossy());
-    let storage = HirnDb::open(storage_cfg.clone()).await.unwrap().store_arc();
+    let storage = HirnDb::open(storage_cfg).await.unwrap().store_arc();
     let mut db = HirnDB::open_with_config(config, storage).await.unwrap();
 
     // Set up Cedar policies: only writers team can remember
@@ -1550,42 +1695,26 @@ async fn start_mcp_client_with_cedar()
 
     db.set_policy_engine(engine);
 
-    let db = Arc::new(db);
-    let (watch_tx, _) = broadcast::channel::<WatchEvent>(128);
-    let rate_limiter = std::sync::Arc::new(hirnd::throttle::RateLimiter::from_config(
-        &hirnd::config::ThrottleConfig::default(),
-    ));
-    let identity = hirnd::auth::BearerIdentity {
-        realm: "default".to_string(),
-        agent_id: "system".to_string(),
-        namespaces: None,
-        operations: Vec::new(),
-    };
-    let service =
-        HirnMcpService::new(db, watch_tx, rate_limiter, identity).expect("valid MCP identity");
-
-    let (server_transport, client_transport) = tokio::io::duplex(65536);
-
-    tokio::spawn(async move {
-        let server = service.serve(server_transport).await.unwrap();
-        server.waiting().await.unwrap();
-    });
-
-    let client = ().serve(client_transport).await.unwrap();
-
-    (client, tmp)
+    spawn_server(
+        auth_state_with_keys(&[
+            ("writer-key", "writer-agent"),
+            ("reader-key", "reader-agent"),
+        ]),
+        Some(Arc::new(db)),
+    )
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mcp_authorized_agent_can_remember() {
-    let (client, _tmp) = start_mcp_client_with_cedar().await;
+    let server = start_cedar_server().await;
+    let client = connect(&server, "writer-key").await;
 
     let result = client
         .call_tool(tool_params(
             "hirn_remember",
             serde_json::json!({
-                "content": "Writer memory",
-                "agent_id": "writer-agent"
+                "content": "Writer memory"
             }),
         ))
         .await
@@ -1601,14 +1730,14 @@ async fn test_mcp_authorized_agent_can_remember() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mcp_unauthorized_agent_denied() {
-    let (client, _tmp) = start_mcp_client_with_cedar().await;
+    let server = start_cedar_server().await;
+    let client = connect(&server, "reader-key").await;
 
     let result = client
         .call_tool(tool_params(
             "hirn_remember",
             serde_json::json!({
-                "content": "Unauthorized memory",
-                "agent_id": "reader-agent"
+                "content": "Unauthorized memory"
             }),
         ))
         .await;
@@ -1637,14 +1766,13 @@ async fn test_mcp_unauthorized_agent_denied() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mcp_memory_store_returns_id() {
-    let (client, _tmp) = start_mcp_client().await;
+    let (client, _server) = start_mcp_client().await;
 
     let result = client
         .call_tool(tool_params(
             "memory_store",
             serde_json::json!({
-                "content": "Toolkit store test memory",
-                "agent_id": "toolkit-agent"
+                "content": "Toolkit store test memory"
             }),
         ))
         .await
@@ -1654,15 +1782,7 @@ async fn test_mcp_memory_store_returns_id() {
         !result.is_error.unwrap_or(false),
         "store failed: {result:?}"
     );
-    let text = result
-        .content
-        .first()
-        .unwrap()
-        .raw
-        .as_text()
-        .unwrap()
-        .text
-        .as_str();
+    let text = result_text(&result);
     assert!(
         text.contains("Memory stored with ID:"),
         "expected MemoryId in response: {text}"
@@ -1673,15 +1793,14 @@ async fn test_mcp_memory_store_returns_id() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mcp_memory_recall_returns_records() {
-    let (client, _tmp) = start_mcp_client().await;
+    let (client, _server) = start_mcp_client().await;
 
     // Store a memory first
     let store_result = client
         .call_tool(tool_params(
             "memory_store",
             serde_json::json!({
-                "content": "The capital of France is Paris",
-                "agent_id": "toolkit-agent"
+                "content": "The capital of France is Paris"
             }),
         ))
         .await
@@ -1696,8 +1815,7 @@ async fn test_mcp_memory_recall_returns_records() {
         .call_tool(tool_params(
             "memory_recall",
             serde_json::json!({
-                "query": "capital of France",
-                "agent_id": "toolkit-agent"
+                "query": "capital of France"
             }),
         ))
         .await
@@ -1707,15 +1825,7 @@ async fn test_mcp_memory_recall_returns_records() {
         "recall failed: {recall_result:?}"
     );
 
-    let text = recall_result
-        .content
-        .first()
-        .unwrap()
-        .raw
-        .as_text()
-        .unwrap()
-        .text
-        .as_str();
+    let text = result_text(&recall_result);
     // The recall result should be a JSON array containing our memory
     let parsed: serde_json::Value = serde_json::from_str(text).expect("expected valid JSON");
     assert!(parsed.is_array(), "expected JSON array: {text}");
@@ -1725,14 +1835,14 @@ async fn test_mcp_memory_recall_returns_records() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mcp_memory_store_invalid_params() {
-    let (client, _tmp) = start_mcp_client().await;
+    let (client, _server) = start_mcp_client().await;
 
     // Missing required 'content' field
     let result = client
         .call_tool(tool_params(
             "memory_store",
             serde_json::json!({
-                "agent_id": "toolkit-agent"
+                "importance": 0.5
             }),
         ))
         .await;
@@ -1755,29 +1865,20 @@ async fn test_mcp_memory_store_invalid_params() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mcp_memory_store_recall_update_delete_roundtrip() {
-    let (client, _tmp) = start_mcp_client().await;
+    let (client, _server) = start_mcp_client().await;
 
     // 1. Store
     let store_result = client
         .call_tool(tool_params(
             "memory_store",
             serde_json::json!({
-                "content": "Original content for roundtrip",
-                "agent_id": "toolkit-agent"
+                "content": "Original content for roundtrip"
             }),
         ))
         .await
         .unwrap();
     assert!(!store_result.is_error.unwrap_or(false));
-    let store_text = store_result
-        .content
-        .first()
-        .unwrap()
-        .raw
-        .as_text()
-        .unwrap()
-        .text
-        .as_str();
+    let store_text = result_text(&store_result);
     let id = store_text
         .strip_prefix("Memory stored with ID: ")
         .expect("expected MemoryId prefix");
@@ -1788,8 +1889,7 @@ async fn test_mcp_memory_store_recall_update_delete_roundtrip() {
             "memory_update",
             serde_json::json!({
                 "id": id,
-                "content": "Updated content for roundtrip",
-                "agent_id": "toolkit-agent"
+                "content": "Updated content for roundtrip"
             }),
         ))
         .await
@@ -1804,8 +1904,7 @@ async fn test_mcp_memory_store_recall_update_delete_roundtrip() {
         .call_tool(tool_params(
             "memory_delete",
             serde_json::json!({
-                "id": id,
-                "agent_id": "toolkit-agent"
+                "id": id
             }),
         ))
         .await

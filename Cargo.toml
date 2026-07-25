@@ -34,31 +34,31 @@ bincode = "1"
 thiserror = "2"
 
 # Storage
-lance = "=4.0.0"
-lance-index = "=4.0.0"
-lance-linalg = "=4.0.0"
-lance-table = "=4.0.0"
-lance-namespace = "=4.0.0"
-lance-namespace-impls = { version = "=4.0.0", default-features = false }
-arrow-schema = "57"
-arrow-array = "57"
-arrow-ipc = "57"
-arrow-select = "57"
-arrow-ord = "57"
-arrow-cast = "57"
-object_store = "0.12"
+lance = "=9.0.0"
+lance-index = "=9.0.0"
+lance-linalg = "=9.0.0"
+lance-table = "=9.0.0"
+lance-namespace = "=9.0.0"
+lance-namespace-impls = { version = "=9.0.0", default-features = false }
+arrow-schema = "58"
+arrow-array = "58"
+arrow-ipc = "58"
+arrow-select = "58"
+arrow-ord = "58"
+arrow-cast = "58"
+object_store = "0.13"
 futures = "0.3"
 
 # DataFusion
-datafusion = { version = "52", default-features = false }
-datafusion-physical-plan = "52"
-datafusion-physical-expr = "52"
-datafusion-expr = "52"
-datafusion-common = "52"
-datafusion-execution = "52"
-datafusion-optimizer = "52"
-datafusion-physical-optimizer = "52"
-datafusion-datasource = "52"
+datafusion = { version = "54", default-features = false }
+datafusion-physical-plan = "54"
+datafusion-physical-expr = "54"
+datafusion-expr = "54"
+datafusion-common = "54"
+datafusion-execution = "54"
+datafusion-optimizer = "54"
+datafusion-physical-optimizer = "54"
+datafusion-datasource = "54"
 
 # Logging
 tracing = "0.1"
@@ -166,8 +166,10 @@ rcgen = "0.13"
 x509-parser = "0.18"
 
 # MCP
-rmcp = { version = "0.1", features = ["server", "transport-sse-server"] }
-schemars = "0.8"
+rmcp = { version = "2.2", features = ["server", "transport-streamable-http-server"] }
+schemars = "1"
+http = "1"
+tokio-util = "0.7"
 
 # JWT
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }

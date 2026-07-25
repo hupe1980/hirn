@@ -1,22 +1,21 @@
-//! `hirn-exec` — DataFusion physical operators, scoring UDFs, and optimizer rules.
+//! `hirn-exec` — DataFusion physical operators and optimizer rules.
 //!
 //! This crate provides the execution layer for hirn's cognitive memory engine,
 //! built on top of Apache DataFusion. Every cognitive operation (activation,
 //! scoring, budgeting, causal reasoning) is expressed as a composable DataFusion
-//! physical operator over Arrow columnar batches.
+//! physical operator over Arrow columnar batches. Ranking math delegates to the
+//! canonical formula in `hirn_core::scoring`.
 //!
 //! # Modules
 //!
-//! - [`operators`] — Physical `ExecutionPlan` implementations (19 operators)
-//! - [`udfs`] — Scalar UDF implementations (8 UDFs)
-//! - [`rules`] — Physical optimizer rule implementations (5 rules)
+//! - [`operators`] — Physical `ExecutionPlan` implementations
+//! - [`rules`] — Physical optimizer rule implementations
 //! - [`extensions`] — `HirnSessionExt` for runtime state injection
 
 pub mod extensions;
 pub mod operators;
 pub mod planner;
 pub mod rules;
-pub mod udfs;
 
 #[cfg(test)]
 pub(crate) mod test_utils;
@@ -36,8 +35,4 @@ pub use operators::{
     TargetedQueryReadExec, TargetedReadKind,
 };
 pub use planner::{HirnExtensionPlanner, HirnQueryPlanner};
-pub use rules::{ActivationFusionRule, TemporalIndexRule, all_rules};
-pub use udfs::{
-    CausalRelevanceUdf, CompositeScoreUdf, FadeMemDecayUdf, RpeScoreUdf, SourceReliabilityUdf,
-    SurpriseScoreUdf, TemporalDecayUdf, TokenCountUdf, register_all_udfs,
-};
+pub use rules::{ActivationFusionRule, all_rules};

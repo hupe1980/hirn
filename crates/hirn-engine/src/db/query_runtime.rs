@@ -111,7 +111,6 @@ impl QueryRuntime {
             hirn_core::HirnError::storage(format!("Failed to register HirnSessionExt: {e}"))
         })?;
 
-        hirn_exec::udfs::register_all_udfs(session);
         Ok(())
     }
 }

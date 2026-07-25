@@ -1,7 +1,6 @@
 //! `LanceHybridSearchExec` — DataFusion operator wrapping storage-backed
 //! vector and hybrid search.
 
-use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
@@ -80,18 +79,18 @@ pub struct HybridSearchParams {
 #[derive(Debug)]
 pub struct LanceHybridSearchExec {
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     params: HybridSearchParams,
 }
 
 impl LanceHybridSearchExec {
     pub fn new(schema: SchemaRef, params: HybridSearchParams) -> Self {
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             datafusion_physical_expr::EquivalenceProperties::new(schema.clone()),
             datafusion_physical_plan::Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
 
         Self {
             schema,
@@ -123,15 +122,11 @@ impl ExecutionPlan for LanceHybridSearchExec {
         "LanceHybridSearchExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

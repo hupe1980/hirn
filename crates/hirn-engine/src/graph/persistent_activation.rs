@@ -75,6 +75,7 @@ pub async fn spread_activation(
         apply_lateral_inhibition(
             graph,
             &mut state.activations,
+            &present_seeds,
             config.inhibition_strength,
             config.inhibition_threshold,
             embs,
@@ -105,14 +106,28 @@ pub async fn static_activation(
 /// Lateral inhibition on the persistent graph: builds the seed-connectivity
 /// context (2-hop connected set + 1-hop out-neighbor sets) via batched reads,
 /// then applies the shared Jaccard-modulated formula from `activation_core`.
+///
+/// `query_seeds` are the actual query seeds — passed through explicitly rather
+/// than inferred from the post-spread activation values, mirroring the hot
+/// tier. Inferring seeds from "activation ≈ 1.0" misclassifies a convergent
+/// non-seed clamped to 1.0 as a seed.
 async fn apply_lateral_inhibition(
     graph: &PersistentGraph,
     activations: &mut HashMap<MemoryId, f64>,
+    query_seeds: &[MemoryId],
     mu: f64,
     threshold: f64,
     embeddings: &HashMap<MemoryId, Vec<f32>>,
 ) -> HirnResult<()> {
-    let seeds = activation_core::identify_seeds(activations);
+    // Only seeds present in the activation map matter; sort for deterministic
+    // tie-breaking (matches `identify_seeds`).
+    let mut seeds: Vec<MemoryId> = query_seeds
+        .iter()
+        .copied()
+        .filter(|s| activations.contains_key(s))
+        .collect();
+    seeds.sort_unstable();
+    seeds.dedup();
 
     // Collect connected nodes for each seed (within 2 hops).
     let mut connected_to_seeds: HashSet<MemoryId> = HashSet::new();
@@ -465,6 +480,11 @@ mod tests {
         let (pg, _dir) = temp_graph().await;
         // upstream → seed → downstream: the reachable set must include the
         // upstream cause even though the seed has no outgoing edge to it.
+        // Note: a node with no incoming edges inside the subgraph receives
+        // exactly zero walk mass and is dropped from the ranked output by the
+        // > 1e-10 filter (identical on both tiers) — so subgraph membership
+        // is asserted on the reachable set, and ranked output is asserted
+        // after adding a return edge that routes mass back upstream.
         let upstream = MemoryId::new();
         let seed = MemoryId::new();
         let downstream = MemoryId::new();
@@ -480,6 +500,20 @@ mod tests {
             .await
             .unwrap();
 
+        // Backward direction: the incoming-adjacency read pulls the upstream
+        // cause into the PPR subgraph.
+        let reachable = collect_reachable_nodes(&pg, &[seed], None).await.unwrap();
+        assert!(
+            reachable.contains(&upstream),
+            "backward reachability must pull upstream causes into the PPR subgraph"
+        );
+        assert!(reachable.contains(&downstream));
+
+        // Close the loop so the upstream cause receives walk mass and shows
+        // up in the ranked output.
+        pg.add_edge(seed, upstream, EdgeRelation::Causes, 0.3, Metadata::new())
+            .await
+            .unwrap();
         let result = personalized_pagerank(
             &pg,
             &[seed],
@@ -492,7 +526,7 @@ mod tests {
         assert!(result.contains_key(&downstream));
         assert!(
             result.contains_key(&upstream),
-            "backward reachability must pull upstream causes into the PPR subgraph"
+            "upstream cause with a return path must receive PPR mass"
         );
     }
 

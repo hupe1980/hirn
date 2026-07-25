@@ -319,6 +319,22 @@ pub fn filter_batches_inverted(
     filter_batches_impl(predicate, batches, true)
 }
 
+/// Evaluate `predicate` against a single batch, returning one boolean per row.
+///
+/// A row is `true` only when the predicate is definitely TRUE (SQL three-valued
+/// logic: FALSE and UNKNOWN both yield `false`), matching `WHERE`/`filter_batches`
+/// semantics. Unlike [`filter_batches`], the row identity (index) is preserved,
+/// which is what a conditional `merge_insert` needs to decide, per target row,
+/// whether an update is permitted.
+pub fn evaluate_predicate_mask(
+    predicate: &str,
+    batch: &RecordBatch,
+) -> Result<Vec<bool>, HirnDbError> {
+    let expr = parse_filter_expr(predicate)?;
+    let tri_mask = eval_expr(&expr, batch)?;
+    Ok(tri_mask.into_iter().map(|v| v == Some(true)).collect())
+}
+
 fn filter_batches_impl(
     predicate: &str,
     batches: &[RecordBatch],
@@ -400,7 +416,7 @@ fn eval_expr(expr: &FilterExpr, batch: &RecordBatch) -> Result<Vec<Option<bool>>
                     bits.push(None);
                     continue;
                 };
-                let ordering = cmp_values(&cell, value);
+                let ordering = cmp_values(&cell, value, col.data_type().is_numeric());
                 let matched = match op {
                     CmpOp::Eq => ordering == std::cmp::Ordering::Equal,
                     CmpOp::Ne => ordering != std::cmp::Ordering::Equal,
@@ -465,14 +481,19 @@ fn eval_expr(expr: &FilterExpr, batch: &RecordBatch) -> Result<Vec<Option<bool>>
     }
 }
 
-/// Compare two scalar cell values: numerically when both parse as numbers
-/// (so `x = 1.0` matches an integer cell `1`, as SQL type coercion would),
-/// otherwise lexicographically as strings.
-fn cmp_values(a: &str, b: &str) -> std::cmp::Ordering {
-    match (a.parse::<f64>(), b.parse::<f64>()) {
-        (Ok(x), Ok(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
-        _ => a.cmp(b),
+/// Compare a column cell value `a` to a filter literal `b`.
+///
+/// Numeric coercion is applied **only when the column is numeric** (R-43): a
+/// numeric column compares by value so `col = 1.0` matches the stored integer
+/// `1` and `col > 9` correctly orders `10` after `9`. A `Utf8` (string) column
+/// is compared lexicographically and is never coerced to `f64` — otherwise a
+/// text cell like `"1.0"`, `"1e3"`, or `"007"` would spuriously match a numeric
+/// literal, and the Lance backend (which compares typed values) would disagree.
+fn cmp_values(a: &str, b: &str, column_is_numeric: bool) -> std::cmp::Ordering {
+    if column_is_numeric && let (Ok(x), Ok(y)) = (a.parse::<f64>(), b.parse::<f64>()) {
+        return x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal);
     }
+    a.cmp(b)
 }
 
 /// Stringify the cell at `row`, or `None` when the cell is NULL.
@@ -851,6 +872,53 @@ mod tests {
         let result = apply_limit_offset(&[batch], Some(3), Some(2));
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].num_rows(), 3);
+    }
+
+    /// R-43: a `Utf8` column value must not be numerically coerced when compared
+    /// to a numeric-looking literal. Text cells `"1.0"` / `"01"` must NOT match
+    /// `code = '1'`; only the exact string `"1"` matches, matching Lance's typed
+    /// comparison.
+    #[test]
+    fn utf8_column_is_not_coerced_to_number() {
+        let schema = Arc::new(Schema::new(vec![Field::new("code", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec!["1", "1.0", "01", "2"]))],
+        )
+        .unwrap();
+
+        let matched = filter_batches("code = '1'", std::slice::from_ref(&batch)).unwrap();
+        let total = total_row_count(&matched);
+        assert_eq!(
+            total, 1,
+            "only the exact string '1' matches, not '1.0'/'01'"
+        );
+        let codes = matched[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(codes.value(0), "1");
+    }
+
+    /// R-43: numeric columns still compare by value (ordering, not lexicographic),
+    /// so `n > 9` correctly orders `10` after `9`.
+    #[test]
+    fn numeric_column_compares_by_value() {
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![2, 9, 10, 100]))],
+        )
+        .unwrap();
+
+        let matched = filter_batches("n > 9", std::slice::from_ref(&batch)).unwrap();
+        // Lexicographic would wrongly drop "10"/"100" (they sort before "9").
+        assert_eq!(
+            total_row_count(&matched),
+            2,
+            "10 and 100 are > 9 numerically"
+        );
     }
 
     #[test]

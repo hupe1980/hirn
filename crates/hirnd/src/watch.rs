@@ -74,8 +74,22 @@ impl WatchNamespaceScope {
 }
 
 /// Internal watch event that is broadcast to all subscribers.
+///
+/// The broadcast channel is daemon-global, so every event carries the realm
+/// it originated in; [`WatchEvent::to_proto`] drops events whose realm does
+/// not match the subscriber's authenticated realm, preventing cross-tenant
+/// event leaks on the HTTP SSE, gRPC, and MCP watch surfaces.
 #[derive(Clone, Debug)]
-pub enum WatchEvent {
+pub struct WatchEvent {
+    /// Realm the event originated in (from the publisher's authenticated
+    /// identity, never from client input).
+    pub realm: String,
+    pub kind: WatchEventKind,
+}
+
+/// What happened, plus the metadata subscriber filters run against.
+#[derive(Clone, Debug)]
+pub enum WatchEventKind {
     Created {
         id: MemoryId,
         layer: Layer,
@@ -100,17 +114,25 @@ pub enum WatchEvent {
 }
 
 impl WatchEvent {
-    /// Convert to proto `WatchEvent` if it matches the subscriber's filter.
-    /// Returns `None` if the event should be filtered out.
+    /// Convert to proto `WatchEvent` if it matches the subscriber's realm and
+    /// filters. Returns `None` if the event should be filtered out.
+    ///
+    /// `subscriber_realm` must be the subscriber's authenticated realm — the
+    /// realm check lives here (not at the call sites) so no watch surface can
+    /// forget it.
     pub fn to_proto(
         &self,
+        subscriber_realm: &str,
         layer_filter: &Option<Layer>,
         entities: &[String],
         min_importance: Option<f32>,
         namespace_scope: &WatchNamespaceScope,
     ) -> Option<proto::WatchEvent> {
-        match self {
-            WatchEvent::Created {
+        if self.realm != subscriber_realm {
+            return None;
+        }
+        match &self.kind {
+            WatchEventKind::Created {
                 id,
                 layer,
                 entities: event_entities,
@@ -136,7 +158,7 @@ impl WatchEvent {
                     description: Some(format!("Memory created: {id} ({layer:?})")),
                 })
             }
-            WatchEvent::Updated {
+            WatchEventKind::Updated {
                 id,
                 layer,
                 entities: event_entities,
@@ -162,7 +184,7 @@ impl WatchEvent {
                     description: Some(format!("Memory updated: {id} ({layer:?})")),
                 })
             }
-            WatchEvent::Consolidated { records_processed } => {
+            WatchEventKind::Consolidated { records_processed } => {
                 if !namespace_scope.allows_namespace(None) {
                     return None;
                 }
@@ -175,7 +197,7 @@ impl WatchEvent {
                     )),
                 })
             }
-            WatchEvent::Conflict { memory_a, memory_b } => {
+            WatchEventKind::Conflict { memory_a, memory_b } => {
                 if !namespace_scope.allows_namespace(None) {
                     return None;
                 }

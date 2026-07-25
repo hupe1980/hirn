@@ -159,7 +159,7 @@ Hirn uses a **hybrid two-tier architecture** for graph traversal:
 
 ### Cold Tier — Batched Lance BFS
 
-- **Engine**: `PersistentGraph::deep_causal_bfs()` on Lance 4.0 datasets
+- **Engine**: `PersistentGraph::deep_causal_bfs()` on Lance 9.0 datasets
 - **Algorithm**: Batched BFS (one Lance scan per depth level) → DFS over BFS results for chain enumeration
 - **Latency**: ~2-10ms depending on depth and data volume
 - **Use case**: Depth > `graph_depth_delegation_threshold`

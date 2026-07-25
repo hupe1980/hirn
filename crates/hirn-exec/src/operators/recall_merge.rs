@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
@@ -19,17 +18,17 @@ use crate::operators::lance_hybrid_search::{RecallRow, build_output_batch};
 pub struct RecallMergeExec {
     inputs: Vec<Arc<dyn ExecutionPlan>>,
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl RecallMergeExec {
     pub fn new(schema: SchemaRef, inputs: Vec<Arc<dyn ExecutionPlan>>) -> Self {
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             datafusion_physical_expr::EquivalenceProperties::new(schema.clone()),
             datafusion_physical_plan::Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
 
         Self {
             inputs,
@@ -50,15 +49,11 @@ impl ExecutionPlan for RecallMergeExec {
         "RecallMergeExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -157,11 +152,23 @@ fn recall_rows_from_batch(batch: &RecordBatch) -> Result<Vec<RecallRow>> {
                 _ => "semantic",
             },
             namespace: namespaces.value(row).to_string(),
-            score: scores.value(row),
+            score: if scores.is_null(row) {
+                0.0
+            } else {
+                scores.value(row)
+            },
             temporal_ms: temporal.value(row),
             created_at_ms: created_at.value(row),
-            importance: importances.value(row),
-            access_count: access_counts.value(row),
+            importance: if importances.is_null(row) {
+                0.0
+            } else {
+                importances.value(row)
+            },
+            access_count: if access_counts.is_null(row) {
+                0
+            } else {
+                access_counts.value(row)
+            },
             surprise: surprises
                 .and_then(|values| (!values.is_null(row)).then(|| values.value(row))),
             evidence_count: evidence_counts
@@ -208,4 +215,139 @@ fn uint32_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a UInt32Arr
         .ok_or_else(|| {
             DataFusionError::Execution(format!("RecallMergeExec missing `{name}` column"))
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion::prelude::SessionContext;
+    use datafusion_datasource::memory::MemorySourceConfig;
+    use futures::StreamExt;
+
+    /// Full recall output schema. `score`, `importance`, and `access_count` are
+    /// declared NULLABLE (community/global-merge rows carry NULL scores).
+    fn recall_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("content", DataType::Utf8, false),
+            Field::new("full_content", DataType::Utf8, false),
+            Field::new("layer", DataType::Utf8, false),
+            Field::new("namespace", DataType::Utf8, false),
+            Field::new("score", DataType::Float32, true),
+            Field::new("temporal_ms", DataType::Int64, false),
+            Field::new("created_at_ms", DataType::Int64, false),
+            Field::new("importance", DataType::Float32, true),
+            Field::new("access_count", DataType::UInt32, true),
+            Field::new("surprise", DataType::Float32, true),
+            Field::new("evidence_count", DataType::UInt32, true),
+            Field::new("invocation_count", DataType::UInt64, true),
+            Field::new("confidence", DataType::Float32, true),
+            Field::new("success_rate", DataType::Float32, true),
+        ]))
+    }
+
+    /// Build a recall batch. `scores`/`importances`/`access` may contain NULLs.
+    fn recall_batch(
+        schema: SchemaRef,
+        ids: &[&str],
+        scores: Vec<Option<f32>>,
+        importances: Vec<Option<f32>>,
+        access: Vec<Option<u32>>,
+    ) -> RecordBatch {
+        let n = ids.len();
+        let text: Vec<&str> = ids.to_vec();
+        let layers = vec!["semantic"; n];
+        let namespaces = vec!["default"; n];
+        let temporal = vec![0i64; n];
+        let created_at = vec![0i64; n];
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(ids.to_vec())),
+                Arc::new(StringArray::from(text.clone())),
+                Arc::new(StringArray::from(text)),
+                Arc::new(StringArray::from(layers)),
+                Arc::new(StringArray::from(namespaces)),
+                Arc::new(Float32Array::from(scores)),
+                Arc::new(Int64Array::from(temporal)),
+                Arc::new(Int64Array::from(created_at)),
+                Arc::new(Float32Array::from(importances)),
+                Arc::new(UInt32Array::from(access)),
+                Arc::new(Float32Array::from(vec![None::<f32>; n])),
+                Arc::new(UInt32Array::from(vec![None::<u32>; n])),
+                Arc::new(UInt64Array::from(vec![None::<u64>; n])),
+                Arc::new(Float32Array::from(vec![None::<f32>; n])),
+                Arc::new(Float32Array::from(vec![None::<f32>; n])),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// A row whose `score` (and other nullable fields) is NULL — modelling a
+    /// community/global-merge row — must be treated as 0.0 and sort last, with
+    /// a deterministic ordering across repeated runs. Prior to the fix,
+    /// `.value()` on a NULL slot yielded an undefined value that corrupted the
+    /// final sort ordering.
+    #[tokio::test]
+    async fn null_score_row_merges_deterministically() {
+        let schema = recall_schema();
+
+        // Branch 1 carries a high-scoring row and the NULL-score merge row.
+        let left = recall_batch(
+            schema.clone(),
+            &["a", "b"],
+            vec![Some(0.9), None],
+            vec![Some(0.5), None],
+            vec![Some(3), None],
+        );
+        // Branch 2 carries a mid-scoring row.
+        let right = recall_batch(
+            schema.clone(),
+            &["c"],
+            vec![Some(0.5)],
+            vec![Some(0.2)],
+            vec![Some(1)],
+        );
+
+        let expected = vec!["a", "c", "b"];
+
+        // Run twice: the ordering must be stable (deterministic), which is only
+        // true once the NULL score is coerced to 0.0 rather than read from an
+        // undefined buffer slot.
+        for _ in 0..8 {
+            let input_left: Arc<dyn ExecutionPlan> =
+                MemorySourceConfig::try_new_exec(&[vec![left.clone()]], schema.clone(), None)
+                    .unwrap();
+            let input_right: Arc<dyn ExecutionPlan> =
+                MemorySourceConfig::try_new_exec(&[vec![right.clone()]], schema.clone(), None)
+                    .unwrap();
+
+            let exec = RecallMergeExec::new(schema.clone(), vec![input_left, input_right]);
+            let ctx = SessionContext::new();
+            let mut stream = exec.execute(0, ctx.task_ctx()).unwrap();
+            let out = stream.next().await.unwrap().unwrap();
+
+            let ids = out
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let got: Vec<&str> = (0..out.num_rows()).map(|r| ids.value(r)).collect();
+            assert_eq!(
+                got, expected,
+                "NULL-score row must sort last, deterministically"
+            );
+
+            // The NULL-score row must surface a coerced 0.0 score, not garbage.
+            let scores = out
+                .column_by_name("score")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap();
+            assert_eq!(scores.value(2), 0.0, "NULL score must be coerced to 0.0");
+        }
+    }
 }

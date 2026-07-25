@@ -47,6 +47,9 @@ cross-encoder = ["dep:ort", "dep:ndarray", "dep:hf-hub", "dep:tokenizers"]
 tempfile = { workspace = true }
 tokio = { workspace = true }
 metrics-util = { workspace = true }
+# Used to fabricate a `reqwest::Response` from a raw body so error-classification
+# paths can be unit-tested without a live network.
+http = "1"
 
 [lints]
 workspace = true

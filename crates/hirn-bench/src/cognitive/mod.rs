@@ -9,6 +9,7 @@ pub mod external;
 pub mod loader;
 pub mod openai;
 pub mod precompute;
+pub mod reader;
 pub mod runner;
 pub mod synthetic;
 pub mod tracker;
@@ -567,6 +568,15 @@ impl TokenCostEstimate {
     }
 }
 
+/// Blake3 checksum of one loaded dataset file, published for dataset pinning.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatasetFileChecksum {
+    /// Path relative to the dataset directory.
+    pub path: String,
+    /// Blake3 hex digest of the file contents.
+    pub blake3: String,
+}
+
 /// Runtime/environment metadata published with benchmark artifacts.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EnvironmentInfo {
@@ -612,6 +622,28 @@ pub struct SuiteMetadata {
     pub synthetic_scale: Option<usize>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub baseline_strategies: Vec<String>,
+    /// Seed recorded for reproducibility. The benchmark currently has no
+    /// sampling/subsetting paths; the seed is still pinned in provenance so
+    /// future sampling stays reproducible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
+    /// Blake3 checksums of the dataset files that were loaded for this run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dataset_files: Vec<DatasetFileChecksum>,
+    /// Combined blake3 over the sorted per-file checksums; compare against
+    /// `--expect-dataset-hash` for fail-fast dataset pinning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataset_hash_blake3: Option<String>,
+    /// Upstream dataset revision (e.g. the pinned HuggingFace commit used for
+    /// LongMemEval auto-download).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataset_revision: Option<String>,
+    /// LLM QA reader model when the opt-in reader ran (e.g. `gpt-4o`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reader_model: Option<String>,
+    /// LLM judge model when the opt-in judge ran (e.g. `gpt-4o`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judge_model: Option<String>,
     #[serde(default)]
     pub environment: EnvironmentInfo,
 }
@@ -736,6 +768,22 @@ pub struct CognitiveResult {
     /// (e.g. `tiktoken-rs/cl100k_base`). Empty for legacy artifacts.
     #[serde(default)]
     pub token_estimator: String,
+    /// Mean retrieval-context tokens per query (assembled THINK context only,
+    /// estimated with `token_estimator`). This is the retrieval-side cost;
+    /// publishable reader cost lives in `reader.reader_*_tokens_per_query_*`.
+    #[serde(default)]
+    pub context_tokens_per_query_mean: f64,
+    /// p50 of retrieval-context tokens per query.
+    #[serde(default)]
+    pub context_tokens_per_query_p50: usize,
+    /// p95 of retrieval-context tokens per query.
+    #[serde(default)]
+    pub context_tokens_per_query_p95: usize,
+    /// Opt-in LLM reader/judge results (`--reader` / `--judge`), including
+    /// `official_reader_accuracy` and exact reader token usage. `None` for
+    /// retrieval-only runs (the default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reader: Option<reader::ReaderJudgeReport>,
     /// True when query routing derived namespace/temporal hints from
     /// ground-truth labels (H2/H4/H6). Oracle-assisted scores measure
     /// retrieval *given* routing hints, not end-to-end routing.

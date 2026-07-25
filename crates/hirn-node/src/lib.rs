@@ -80,10 +80,27 @@ impl From<MemoryEvent> for JsWatchEvent {
     }
 }
 
+/// Clears `WatchStream::in_flight` when a `next()` call returns.
+///
+/// A Drop guard resets the flag on every exit path (including `?`
+/// short-circuits and panics), so a completed or aborted `next()` never leaves
+/// the stream permanently marked busy.
+struct InFlightGuard<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// A watch stream that yields memory events.
 ///
 /// Call `next()` repeatedly to receive events. Returns `null` when the
 /// database is closed or the stream is unsubscribed.
+///
+/// **Single consumer:** `next()` is not re-entrant. Await each `next()` promise
+/// before calling it again; a `next()` invoked while another is still pending
+/// rejects with an error rather than silently ending the stream.
 ///
 /// ```js
 /// const stream = db.watch();
@@ -98,6 +115,10 @@ pub struct WatchStream {
     /// Without this flag, the take/restore pattern on `rx` cannot distinguish
     /// "we took it ourselves" from "unsubscribe() set it to None".
     cancelled: Arc<std::sync::atomic::AtomicBool>,
+    /// `true` while a `next()` call is active. Serializes the single-consumer
+    /// contract: a concurrent `next()` observes this and returns an error
+    /// instead of taking `None` off `rx` and looking like end-of-stream.
+    in_flight: Arc<std::sync::atomic::AtomicBool>,
     /// Wakes an in-flight `next()` when `unsubscribe()` is called, so a pending
     /// promise resolves to `null` immediately instead of waiting for the next
     /// event. `notify_one()` stores a permit, so the wakeup is not lost even if
@@ -111,6 +132,21 @@ impl WatchStream {
     /// Wait for the next event. Returns `null` if the stream is closed.
     #[napi]
     pub async fn next(&self, filter_type: Option<String>) -> napi::Result<Option<JsWatchEvent>> {
+        // Enforce the single-consumer contract: only one next() may hold the
+        // receiver at a time. A concurrent caller returns a clear error rather
+        // than take()ing None and silently reporting end-of-stream.
+        if self
+            .in_flight
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Err(napi::Error::new(
+                napi::Status::GenericFailure,
+                "WatchStream.next() is already in progress; await the pending call before calling next() again",
+            ));
+        }
+        // Clears in_flight on every exit path (event, end-of-stream, or error).
+        let _in_flight = InFlightGuard(&*self.in_flight);
+
         let filter_layer = self.filter_layer.clone();
         loop {
             if self.cancelled.load(std::sync::atomic::Ordering::Acquire) {
@@ -1679,6 +1715,7 @@ impl Hirn {
         Ok(WatchStream {
             rx: Arc::new(parking_lot::Mutex::new(Some(async_rx))),
             cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cancel_notify: Arc::new(tokio::sync::Notify::new()),
             filter_layer,
         })

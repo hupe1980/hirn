@@ -119,6 +119,81 @@ Use `--full-corpus` only when you intentionally want an unrestricted run and hav
 cargo run -p hirn-bench -- external --format-name longmemeval --auto-download --runs 1 --no-baselines --max-sessions 50 --max-records 1000 --max-queries 20
 ```
 
+## LLM Reader & Judge (opt-in)
+
+By default every run is **retrieval-only**: no chat-completion network calls are made and the published scores are retrieval metrics (containment, token F1, recall accuracy, MRR, nDCG). The `external` subcommand can additionally run an LLM QA reader and an LLM judge:
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--reader <MODEL>` | disabled | Generate an answer per query from the SAME retrieved context the harness scores (e.g. `gpt-4o`). Requires `OPENAI_API_KEY` (or a `.env` file, same convention as `precompute`). |
+| `--judge <MODEL>` | disabled | Judge the generated answers (requires `--reader`). LongMemEval runs use the official question-type-aware GPT-4o judge prompts from the LongMemEval repo, including the abstention variant for `_abs` question ids. BEAM runs use a gold-answer-cited yes/no judge (`beam-reader-judged`); other formats get a generic gold-answer-cited judge. |
+| `--reader-base-url <URL>` | `$OPENAI_BASE_URL`, else `https://api.openai.com/v1` | Any OpenAI-compatible chat-completions endpoint. |
+| `--reader-temperature <F>` | `0.0` | Keep 0.0 for deterministic, publishable runs. |
+| `--reader-concurrency <N>` | `4` | Concurrent reader/judge requests (each retried with exponential backoff). |
+| `--seed <U64>` | unset | Recorded in provenance. No sampling/subsetting path currently consumes it (the crate uses no RNG); the flag pins provenance for future sampling. |
+| `--expect-dataset-hash <HEX>` | unset | Fail fast unless the combined blake3 of the loaded dataset files matches. |
+
+### Honest metrics — never conflate
+
+- `containment` / `token_f1` / `recall_accuracy` are **retrieval-only** scores over the assembled context. They are cheap, deterministic, and NOT comparable to published end-to-end QA numbers.
+- `official_reader_accuracy` is **LLM-judged end-to-end QA accuracy** over answers the reader generated from the retrieved context. Only this number is comparable to LongMemEval/BEAM paper results, and only when produced with the official reader/judge models (`gpt-4o`).
+- Tokens are reported separately and mean different things:
+  - `context_tokens_per_query_{mean,p50,p95}` — retrieval-context size (estimator-based, `tiktoken-rs/cl100k_base`).
+  - `tokens_per_query_{mean,p50,p95}` — context plus RECALL result contents returned to a hypothetical reader (estimator-based).
+  - `reader_prompt_tokens_per_query_{mean,p50,p95}` / `reader_completion_tokens_per_query_{mean,p50,p95}` — **EXACT** `usage` values from the chat-completions API. Publishable cost per query = reader prompt + completion tokens.
+
+### Dataset pinning
+
+Every `external` run checksums (blake3) the format's known dataset files present under the data directory (e.g. `longmemeval_oracle`/`longmemeval_s`/`longmemeval_m`, every BEAM `chat.json` + `probing_questions.json`) and publishes them in the artifact metadata as `dataset_files` plus a combined `dataset_hash_blake3` (blake3 over the sorted `path\n<hex>\n` lines). Re-run with `--expect-dataset-hash <combined-hash>` to fail fast on any drift. Record the hash printed by your first verified run; upstream files are large and hashes depend on the exact snapshot, so no universal known-good hash is checked in here.
+
+LongMemEval auto-download is pinned to HuggingFace revision `2ec2a557f339b6c0369619b1ed5793734cc87533` of `xiaowu0162/longmemeval` (the `main` commit as of 2025-09-19); the revision is recorded in artifact metadata as `dataset_revision`. Override with `HIRN_BENCH_LME_REVISION=<sha>` when you deliberately target a different snapshot.
+
+### Reproduction runbook: LongMemEval with the official GPT-4o reader
+
+```bash
+# 1. Acquire the dataset (pinned HF revision; needs HF_TOKEN if gated for you)
+cargo run -p hirn-bench -- precompute-external --format-name longmemeval --auto-download \
+  --output embeddings/longmemeval_embeddings.json
+
+# 2. Full-corpus run with reader + official judge, seed + dataset hash pinned
+cargo run --release -p hirn-bench -- external --format-name longmemeval --auto-download \
+  --embeddings embeddings/longmemeval_embeddings.json --embedding-model-label text-embedding-3-small \
+  --full-corpus --runs 1 --seed 0 \
+  --reader gpt-4o --judge gpt-4o --reader-temperature 0.0 --reader-concurrency 4 \
+  --format markdown --output bench-results/longmemeval.md --json-output bench-results/longmemeval.json
+
+# 3. Re-runs: pin the dataset bytes with the hash printed in step 2
+#    (also published as metadata.dataset_hash_blake3 in the JSON artifact)
+#    ... --expect-dataset-hash <hash-from-step-2>
+```
+
+Cost estimate before running: expected reader spend ≈ `queries × (avg context tokens + question + answer)` — read `context_tokens_per_query_mean` from a prior retrieval-only run. Example: 500 questions × (~4 100 prompt + ~50 completion) tokens ≈ 2.1M prompt + 25K completion tokens per reader pass, plus one judge call per question (≈ question + gold + answer, typically < 300 tokens each). The judge uses temperature 0.0 unconditionally.
+
+### Reproduction runbook: BEAM-10M
+
+BEAM has no auto-download. Acquire the corpus, then point `--data-dir` at the 10M tier:
+
+```bash
+git clone https://github.com/mohammadtavakoli78/BEAM   # or HF: Mohammadta/BEAM-10M
+
+# Precompute embeddings for the tier (spend guard: raise --max-api-texts deliberately)
+cargo run -p hirn-bench -- precompute-external --format-name beam --data-dir BEAM/chats/10M \
+  --output embeddings/beam10m_embeddings.json --max-api-texts 200000
+
+# Full run: full corpus, reader + judge, pinned seed; record the printed dataset hash
+cargo run --release -p hirn-bench -- external --format-name beam --data-dir BEAM/chats/10M \
+  --embeddings embeddings/beam10m_embeddings.json --embedding-model-label text-embedding-3-small \
+  --full-corpus --runs 1 --seed 0 \
+  --reader gpt-4o --judge gpt-4o --reader-temperature 0.0 \
+  --format markdown --output bench-results/beam10m.md --json-output bench-results/beam10m.json
+
+# Re-runs: add --expect-dataset-hash <hash printed above>
+```
+
+Memory behaviour at 10M tokens: `chat.json` batches are streamed out of the file one batch at a time (never a whole-file `Vec` of batches), so the loader's peak overhead beyond the retained dataset is one batch. The retained dataset (all turns of the conversation) is inherently in-memory — a 10M-token conversation is roughly 40–60 MB of text, comfortably within a dev machine. Ingest into the store is batch-bounded (2 000–5 000 records per flush at this scale), so ingest memory does not grow with corpus size. Results are labeled reader-judged (`beam-reader-judged`), not the official BEAM rubric pipeline.
+
+Scores from BEAM runs are per-question averages over the probing questions of the conversations under `--data-dir`; keep tiers separate (one run per tier) so 100K/1M/10M numbers stay comparable.
+
 ## Advanced Offline Cognition Workflow
 
 Use this workflow when validating the offline cognition layer end to end:

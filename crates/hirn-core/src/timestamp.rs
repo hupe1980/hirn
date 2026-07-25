@@ -40,11 +40,18 @@ impl Timestamp {
     }
 
     /// Construct from milliseconds since Unix epoch (F-36).
+    ///
+    /// On overflow (a `ms` value beyond chrono's representable range) the
+    /// timestamp **saturates** to [`DateTime::<Utc>::MAX_UTC`] rather than
+    /// silently collapsing to the Unix epoch (1970), which would mis-date the
+    /// record as ancient instead of far-future. This mirrors the TTL
+    /// saturation used elsewhere. `ms / 1000` never exceeds `i64::MAX`, so the
+    /// cast to signed seconds cannot itself overflow.
     #[must_use]
     pub fn from_millis(ms: u64) -> Self {
         let secs = (ms / 1000).cast_signed();
         let nanos = ((ms % 1000) * 1_000_000) as u32;
-        let dt = DateTime::from_timestamp(secs, nanos).unwrap_or_default();
+        let dt = DateTime::from_timestamp(secs, nanos).unwrap_or(DateTime::<Utc>::MAX_UTC);
         Self(dt)
     }
 
@@ -128,5 +135,24 @@ mod tests {
     #[test]
     fn parse_date_or_rfc3339_rejects_invalid_input() {
         assert!(Timestamp::parse_date_or_rfc3339("not-a-date").is_none());
+    }
+
+    #[test]
+    fn from_millis_round_trips_normal_value() {
+        let ts = Timestamp::from_millis(1_700_000_000_000);
+        assert_eq!(ts.millis(), 1_700_000_000_000);
+    }
+
+    #[test]
+    fn from_millis_saturates_on_overflow() {
+        use chrono::Datelike;
+        // A wildly out-of-range value must saturate to the far future, not
+        // collapse to the Unix epoch (1970), which would mis-date the record.
+        let ts = Timestamp::from_millis(u64::MAX);
+        assert_eq!(ts.as_datetime(), DateTime::<Utc>::MAX_UTC);
+        assert!(
+            ts.as_datetime().year() > 2100,
+            "overflow must map to the far future, not 1970"
+        );
     }
 }

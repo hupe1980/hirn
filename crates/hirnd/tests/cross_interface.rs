@@ -18,7 +18,7 @@ use hirnd::throttle::RateLimiter;
 use hirnd::watch::WatchEvent;
 use reqwest::Client;
 use rmcp::ServiceExt;
-use rmcp::model::{CallToolRequestParam, CallToolResult};
+use rmcp::model::{CallToolRequestParams, CallToolResult};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -132,7 +132,7 @@ where
         forward_client: hirnd::http::default_forward_client().expect("forward client should build"),
         idempotency_cache: Arc::new(hirnd::http::IdempotencyCache::default()),
     });
-    let router = hirnd::http::router(http_state, auth_state);
+    let router = hirnd::http::router(http_state, Arc::clone(&auth_state));
     let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let http_addr = http_listener.local_addr().unwrap();
     let http_url = format!("http://{http_addr}");
@@ -141,34 +141,35 @@ where
         axum::serve(http_listener, router).await.unwrap();
     });
 
-    // ── MCP server (in-memory duplex) ──
+    // ── MCP server (streamable HTTP) ──
     let (mcp_watch_tx, _) = tokio::sync::broadcast::channel::<WatchEvent>(128);
     let mcp_rate_limiter = std::sync::Arc::new(hirnd::throttle::RateLimiter::from_config(
         &hirnd::config::ThrottleConfig::default(),
     ));
-    // MCP tools run as one authenticated identity resolved at startup; tests
-    // act as an unrestricted system credential in the default realm.
-    let mcp_identity = hirnd::auth::BearerIdentity {
-        realm: "default".to_string(),
-        agent_id: "system".to_string(),
-        namespaces: None,
-        operations: Vec::new(),
-    };
+    // Dev-mode auth: requests without a credential run as the unrestricted
+    // system agent in the default realm (per-request resolution still applies).
     let mcp_service = HirnMcpService::new(
-        Arc::clone(&db),
+        Arc::clone(&realms),
         mcp_watch_tx,
         mcp_rate_limiter,
-        mcp_identity,
-    )
-    .expect("valid MCP identity");
-    let (server_transport, client_transport) = tokio::io::duplex(65536);
-
+        Arc::clone(&auth_state),
+    );
+    let mcp_router = hirnd::mcp::http_router(
+        mcp_service,
+        Arc::clone(&auth_state),
+        hirnd::mcp::McpTransportOptions::default(),
+    );
+    let mcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mcp_addr = mcp_listener.local_addr().unwrap();
     let mcp_server_handle = tokio::spawn(async move {
-        let server = mcp_service.serve(server_transport).await.unwrap();
-        server.waiting().await.unwrap();
+        axum::serve(mcp_listener, mcp_router).await.unwrap();
     });
 
-    let mcp_client = ().serve(client_transport).await.unwrap();
+    let mcp_transport = rmcp::transport::StreamableHttpClientTransport::from_uri(format!(
+        "http://127.0.0.1:{}/mcp",
+        mcp_addr.port()
+    ));
+    let mcp_client = ().serve(mcp_transport).await.unwrap();
 
     // Wait for TCP servers to be ready
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -193,9 +194,19 @@ where
 }
 
 fn install_test_policy_engine(db: &mut HirnDB) {
+    // "system" is permitted alongside "writer-agent": the harness MCP client
+    // connects without a credential (dev mode), so its calls run as the
+    // `system` fallback identity. The conformance tests name the inspected
+    // agent explicitly in the query text, so the executing identity does not
+    // affect the compared output.
     let policies = r#"
         permit(
             principal == Hirn::Agent::"writer-agent",
+            action in [Hirn::Action::"execute", Hirn::Action::"recall"],
+            resource in Hirn::Realm::"default"
+        );
+        permit(
+            principal == Hirn::Agent::"system",
             action in [Hirn::Action::"execute", Hirn::Action::"recall"],
             resource in Hirn::Realm::"default"
         );
@@ -212,6 +223,9 @@ fn install_test_policy_engine(db: &mut HirnDB) {
         .unwrap();
     engine
         .register_agent("writer-agent", 100, "2025-01-01T00:00:00Z", &[])
+        .unwrap();
+    engine
+        .register_agent("system", 100, "2025-01-01T00:00:00Z", &[])
         .unwrap();
 
     db.set_policy_engine(engine);
@@ -234,16 +248,13 @@ fn request_with_named_agent<T>(inner: T, agent_id: &str) -> tonic::Request<T> {
     req
 }
 
-fn mcp_tool(name: &str, args: Value) -> CallToolRequestParam {
+fn mcp_tool(name: &str, args: Value) -> CallToolRequestParams {
     let mut arguments = args.as_object().unwrap().clone();
     arguments
         .entry("agent_id".to_string())
         .or_insert_with(|| Value::String("cross-interface-agent".to_string()));
 
-    CallToolRequestParam {
-        name: Cow::Owned(name.to_string()),
-        arguments: Some(arguments),
-    }
+    CallToolRequestParams::new(Cow::Owned(name.to_string())).with_arguments(arguments)
 }
 
 fn http_client() -> Client {
@@ -262,7 +273,6 @@ fn parse_mcp_json_result(result: &CallToolResult) -> Value {
         .content
         .first()
         .unwrap()
-        .raw
         .as_text()
         .unwrap()
         .text
@@ -1374,7 +1384,6 @@ async fn test_grpc_remember_mcp_inspect() {
         .content
         .first()
         .unwrap()
-        .raw
         .as_text()
         .unwrap()
         .text
@@ -2847,7 +2856,6 @@ async fn test_mcp_think_vs_grpc_think() {
         .content
         .first()
         .unwrap()
-        .raw
         .as_text()
         .unwrap()
         .text
@@ -3052,7 +3060,7 @@ async fn test_persistence_across_restart() {
                 .expect("forward client should build"),
             idempotency_cache: Arc::new(hirnd::http::IdempotencyCache::default()),
         });
-        let router = hirnd::http::router(http_state, auth_state);
+        let router = hirnd::http::router(http_state, Arc::clone(&auth_state));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let url = format!("http://{addr}");

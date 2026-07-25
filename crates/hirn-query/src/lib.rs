@@ -23,6 +23,7 @@ pub use compiler::typed_ast::{
     TypedFilterValue, TypedRecall, TypedRecallEvents, TypedStatement, TypedSubqueryFilter,
     TypedTemporalRange, TypedThink, TypedTraverse, TypedWhatIf, analyze,
 };
+pub use compiler::validate::{AnalysisError, AnalysisErrorKind, validate};
 pub use parser::ast;
 pub use parser::ast::*;
 pub use parser::{ParseError, QueryLimits, parse, parse_with_limits};

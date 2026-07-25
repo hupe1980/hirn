@@ -18,10 +18,10 @@
 //! Namespace ∈ Realm
 //! ```
 //!
-//! Eighteen actions: `remember`, `correct`, `supersede`, `merge`,
+//! Twenty actions: `remember`, `correct`, `reflect`, `supersede`, `merge`,
 //! `retract`, `purge`, `recall`, `think`, `forget`, `consolidate`,
-//! `watch`, `connect`, `execute`, `admin`, `recall_raw_text`, `read`,
-//! `write`, `delete`.
+//! `watch`, `connect`, `execute`, `admin`, `review`, `recall_raw_text`,
+//! `read`, `write`, `delete`.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -50,6 +50,11 @@ pub const DEFAULT_OPEN_POLICY: &str = include_str!("cedar/default.cedar");
 pub enum Action {
     Remember,
     Correct,
+    /// Reflect evidence against beliefs, producing corrective belief
+    /// revisions. Distinct from [`Action::Correct`] so policies can grant
+    /// manual correction without granting (potentially LLM-driven)
+    /// reflection, and vice versa.
+    Reflect,
     Supersede,
     Merge,
     Retract,
@@ -62,6 +67,12 @@ pub enum Action {
     Connect,
     Execute,
     Admin,
+    /// Review anomalous/quarantined records: approve, reject, or roll back the
+    /// promotion of quarantined (potentially poisoned) records into the main
+    /// store. Distinct from [`Action::Correct`] and [`Action::Admin`] so
+    /// policies can grant the quarantine review gate without granting general
+    /// correction or full admin, and vice versa.
+    Review,
     RecallRawText,
     Read,
     Write,
@@ -75,6 +86,7 @@ impl Action {
         match self {
             Self::Remember => "remember",
             Self::Correct => "correct",
+            Self::Reflect => "reflect",
             Self::Supersede => "supersede",
             Self::Merge => "merge",
             Self::Retract => "retract",
@@ -87,6 +99,7 @@ impl Action {
             Self::Connect => "connect",
             Self::Execute => "execute",
             Self::Admin => "admin",
+            Self::Review => "review",
             Self::RecallRawText => "recall_raw_text",
             Self::Read => "read",
             Self::Write => "write",
@@ -108,6 +121,7 @@ impl std::str::FromStr for Action {
         match s.to_ascii_lowercase().as_str() {
             "remember" => Ok(Self::Remember),
             "correct" => Ok(Self::Correct),
+            "reflect" => Ok(Self::Reflect),
             "supersede" => Ok(Self::Supersede),
             "merge" => Ok(Self::Merge),
             "retract" => Ok(Self::Retract),
@@ -120,6 +134,7 @@ impl std::str::FromStr for Action {
             "connect" => Ok(Self::Connect),
             "execute" => Ok(Self::Execute),
             "admin" => Ok(Self::Admin),
+            "review" => Ok(Self::Review),
             "recall_raw_text" => Ok(Self::RecallRawText),
             "read" => Ok(Self::Read),
             "write" => Ok(Self::Write),
@@ -1130,6 +1145,7 @@ mod tests {
         for action in [
             "remember",
             "correct",
+            "reflect",
             "supersede",
             "merge",
             "retract",
@@ -1142,6 +1158,7 @@ mod tests {
             "connect",
             "execute",
             "admin",
+            "review",
             "recall_raw_text",
             "read",
             "write",
@@ -1159,6 +1176,7 @@ mod tests {
         for action in [
             "remember",
             "correct",
+            "reflect",
             "supersede",
             "merge",
             "retract",
@@ -1171,6 +1189,7 @@ mod tests {
             "connect",
             "execute",
             "admin",
+            "review",
             "recall_raw_text",
             "read",
             "write",
@@ -1179,6 +1198,100 @@ mod tests {
             let parsed: Action = action.parse().unwrap();
             assert_eq!(parsed.as_str(), action);
         }
+    }
+
+    #[test]
+    fn correct_does_not_imply_reflect() {
+        // The whole point of the dedicated reflect action: a policy granting
+        // "correct" must NOT grant "reflect" (and vice versa).
+        let policy = r#"
+            permit(
+                principal == Hirn::Agent::"corrector",
+                action == Hirn::Action::"correct",
+                resource == Hirn::Realm::"production"
+            );
+            permit(
+                principal == Hirn::Agent::"reflector",
+                action == Hirn::Action::"reflect",
+                resource == Hirn::Realm::"production"
+            );
+        "#;
+        let engine = PolicyEngine::new(DEFAULT_SCHEMA, &[("split.cedar", policy)]).unwrap();
+        engine.register_realm("production", "Prod").unwrap();
+        engine
+            .register_agent("corrector", 100, "2025-01-01T00:00:00Z", &[])
+            .unwrap();
+        engine
+            .register_agent("reflector", 100, "2025-01-01T00:00:00Z", &[])
+            .unwrap();
+
+        let authz = |agent: &str, action: Action| {
+            engine.authorize(&AuthzRequest {
+                agent_id: agent.to_string(),
+                action,
+                realm: "production".to_string(),
+                namespace: String::new(),
+            })
+        };
+
+        assert!(authz("corrector", Action::Correct).allowed);
+        assert!(
+            !authz("corrector", Action::Reflect).allowed,
+            "correct right must not imply reflect"
+        );
+        assert!(authz("reflector", Action::Reflect).allowed);
+        assert!(
+            !authz("reflector", Action::Correct).allowed,
+            "reflect right must not imply correct"
+        );
+    }
+
+    #[test]
+    fn correct_does_not_imply_review() {
+        // The quarantine review gate is a dedicated right: a policy granting
+        // "correct" must NOT grant "review" (and vice versa), so approving the
+        // promotion of quarantined/poisoned records can be delegated
+        // independently of general correction.
+        let policy = r#"
+            permit(
+                principal == Hirn::Agent::"corrector",
+                action == Hirn::Action::"correct",
+                resource == Hirn::Realm::"production"
+            );
+            permit(
+                principal == Hirn::Agent::"reviewer",
+                action == Hirn::Action::"review",
+                resource == Hirn::Realm::"production"
+            );
+        "#;
+        let engine = PolicyEngine::new(DEFAULT_SCHEMA, &[("split.cedar", policy)]).unwrap();
+        engine.register_realm("production", "Prod").unwrap();
+        engine
+            .register_agent("corrector", 100, "2025-01-01T00:00:00Z", &[])
+            .unwrap();
+        engine
+            .register_agent("reviewer", 100, "2025-01-01T00:00:00Z", &[])
+            .unwrap();
+
+        let authz = |agent: &str, action: Action| {
+            engine.authorize(&AuthzRequest {
+                agent_id: agent.to_string(),
+                action,
+                realm: "production".to_string(),
+                namespace: String::new(),
+            })
+        };
+
+        assert!(authz("reviewer", Action::Review).allowed);
+        assert!(
+            !authz("reviewer", Action::Correct).allowed,
+            "review right must not imply correct"
+        );
+        assert!(authz("corrector", Action::Correct).allowed);
+        assert!(
+            !authz("corrector", Action::Review).allowed,
+            "correct right must not imply review"
+        );
     }
 
     #[test]

@@ -1,7 +1,6 @@
 //! `SvoEventScanExec` — DataFusion operator wrapping storage-backed scans of
 //! the `svo_events` dataset.
 
-use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
@@ -21,7 +20,7 @@ use crate::extensions::HirnSessionExt;
 #[derive(Debug, Clone)]
 pub struct SvoEventScanExec {
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     namespace: Option<String>,
     filter: Option<String>,
     limit: usize,
@@ -34,12 +33,12 @@ impl SvoEventScanExec {
         filter: Option<String>,
         limit: usize,
     ) -> Self {
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             datafusion_physical_expr::EquivalenceProperties::new(schema.clone()),
             datafusion_physical_plan::Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
 
         Self {
             schema,
@@ -68,15 +67,11 @@ impl ExecutionPlan for SvoEventScanExec {
         "SvoEventScanExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

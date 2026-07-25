@@ -374,7 +374,10 @@ impl HirnDB {
         config: HirnConfig,
         storage: Arc<dyn PhysicalStore>,
     ) -> HirnResult<Self> {
-        config.validate()?;
+        // `validate_for_open` runs the standard `validate()` plus the `db_path`
+        // filesystem writability check (which was removed from `validate()` so
+        // that plain config deserialization no longer touches the disk — R-32).
+        config.validate_for_open()?;
 
         let path = config.db_path.clone();
 
@@ -425,10 +428,18 @@ impl HirnDB {
         let event_runtime = EventRuntime::new();
         // When an event-HMAC secret is configured, open the event log in signed
         // mode so every event on the production emit path is HMAC-signed and
-        // hash-chained (tamper-evident). Otherwise events are unsigned.
+        // hash-chained (tamper-evident). The anti-rollback guard additionally
+        // maintains a high-water-mark sidecar in the DB directory so whole-log
+        // rollbacks / tail truncations to a consistent prefix are detected on
+        // reopen. Otherwise events are unsigned.
         let event_log = Arc::new(match config.event_hmac_key() {
             Some(secret) => {
-                EventLog::open_signed(storage_runtime.storage_arc(), secret.to_vec()).await?
+                EventLog::open_signed_with_rollback_guard(
+                    storage_runtime.storage_arc(),
+                    secret.to_vec(),
+                    storage_runtime.path(),
+                )
+                .await?
             }
             None => EventLog::open(storage_runtime.storage_arc()).await?,
         });
@@ -913,7 +924,11 @@ impl HirnDB {
 
     /// Build and set the default admission pipeline from config.
     ///
-    /// Default order: [SurpriseGate, DuplicateDetector, TokenBudgetGate, RateLimiter].
+    /// Default order: [TrustGate*, PoisoningGate*, SurpriseGate,
+    /// DuplicateDetector, TokenBudgetGate, RateLimiter] — the starred gates
+    /// are installed only when `admission_min_trust`/
+    /// `admission_trust_quarantine_below` respectively
+    /// `admission_poisoning_action` are configured.
     /// Only sets the pipeline if `config.admission_enabled` is true.
     pub fn setup_default_admission_pipeline(&mut self) {
         self.admission_runtime.setup_default_pipeline(
@@ -1242,8 +1257,8 @@ impl HirnDB {
     }
 
     #[must_use]
-    pub(crate) fn file_size_bytes(&self) -> u64 {
-        self.storage_runtime.file_size_bytes()
+    pub(crate) async fn file_size_bytes(&self) -> u64 {
+        self.storage_runtime.file_size_bytes().await
     }
 
     /// Get the configured embedder, if any.

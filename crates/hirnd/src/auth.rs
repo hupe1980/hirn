@@ -18,7 +18,14 @@ const INTERNAL_REQUEST_HEADERS: &[&str] = &[
     "x-client-cert-cn",
     "x-token-namespaces",
     "x-token-operations",
+    "x-hirnd-issuer-kid",
 ];
+
+/// Daemon-authored header carrying the fingerprint of the credential that
+/// authenticated the request (see [`credential_kid`]). Stripped from all
+/// inbound requests and re-injected by [`auth_middleware`], so downstream
+/// handlers (token issuance) can bind minted JWTs to their issuing credential.
+pub const ISSUER_KID_HEADER: &str = "x-hirnd-issuer-kid";
 
 /// Hash an API key to a fixed 32-byte digest for constant-time comparison.
 ///
@@ -26,6 +33,23 @@ const INTERNAL_REQUEST_HEADERS: &[&str] = &[
 /// does not leak the expected key length via response timing (N-H05).
 fn hash_api_key(key: &str) -> [u8; 32] {
     *blake3::hash(key.as_bytes()).as_bytes()
+}
+
+/// Compute a short, stable fingerprint ("kid") for an authenticating
+/// credential, used as the `iss_kid` claim in minted JWTs.
+///
+/// `kind` domain-separates the credential class (`"key"` for API keys,
+/// `"cn"` for mTLS client-certificate CNs) so an API key that happens to
+/// equal a certificate CN cannot produce a colliding kid. The output is the
+/// first 16 bytes (32 hex chars) of a domain-separated blake3 hash — a
+/// one-way fingerprint, so the kid can be logged and shipped in tokens
+/// without revealing the credential.
+pub fn credential_kid(kind: &str, credential: &str) -> String {
+    let mut hasher = blake3::Hasher::new_derive_key("hirnd credential kid v1");
+    hasher.update(kind.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(credential.as_bytes());
+    hasher.finalize().to_hex()[..32].to_string()
 }
 
 /// Resolved identity from an API key: realm + agent_id.
@@ -36,12 +60,38 @@ pub struct KeyIdentity {
 }
 
 /// Operations a token is allowed to perform.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Operations form a privilege hierarchy: `Admin ⊇ Write ⊇ Read`. A token
+/// granted a higher operation implicitly permits the lower ones (an `[Admin]`
+/// token may Read and Write); see [`Operation::rank`] and
+/// [`token_allows_operation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Operation {
     Read,
     Write,
     Admin,
+}
+
+impl Operation {
+    /// Privilege rank used for hierarchical implication: `Read < Write < Admin`.
+    /// A granted operation permits every required operation of equal-or-lower
+    /// rank.
+    #[must_use]
+    pub const fn rank(self) -> u8 {
+        match self {
+            Self::Read => 0,
+            Self::Write => 1,
+            Self::Admin => 2,
+        }
+    }
+
+    /// Whether holding `self` implies permission to perform `required`
+    /// (i.e. `self` is at least as privileged).
+    #[must_use]
+    pub const fn implies(self, required: Operation) -> bool {
+        self.rank() >= required.rank()
+    }
 }
 
 /// Issuer claim embedded in every hirnd-minted JWT.
@@ -70,6 +120,96 @@ pub struct TokenClaims {
     pub iat: u64,
     /// Expiry (seconds since epoch).
     pub exp: u64,
+    /// Unique token id (ULID), minted at issuance. Enables per-token
+    /// revocation before `exp`. Required — tokens without a `jti` are
+    /// rejected at validation.
+    pub jti: String,
+    /// Fingerprint of the credential that (transitively) issued this token —
+    /// see [`credential_kid`]. Tokens minted by a restricted token inherit
+    /// the parent's kid, so revoking the root credential (e.g. a rotated-out
+    /// API key) invalidates the whole issuance tree. `None` only for tokens
+    /// minted through paths where no issuing credential is known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iss_kid: Option<String>,
+}
+
+/// How long (seconds) past a token's `exp` its revocation entry is retained,
+/// covering the validator's clock-skew leeway before the entry is pruned.
+const REVOCATION_PRUNE_LEEWAY_SECS: u64 = 300;
+
+/// In-process revocation list for hirnd-minted JWTs.
+///
+/// Two revocation axes:
+/// - **per-token** (`jti`): entries carry the token's `exp` and are pruned
+///   once the token would have expired anyway, so the list is naturally
+///   bounded by the number of live revoked tokens.
+/// - **per-issuer** (`iss_kid`): revoking an issuing credential's kid
+///   rejects every token whose `iss_kid` matches and whose `iat` is not
+///   strictly newer than the revocation, so rotating an API key kills all
+///   outstanding tokens it issued while tokens minted after a later re-add
+///   of the credential remain valid.
+///
+/// **Scope: node-local.** Entries live only in this process. In a Raft
+/// cluster each node must be told about revocations separately (or tokens
+/// simply age out at `exp`); propagating revocations through the Raft log
+/// is intentionally out of scope for this layer.
+#[derive(Default)]
+pub struct RevocationList {
+    inner: parking_lot::RwLock<RevocationInner>,
+}
+
+#[derive(Default)]
+struct RevocationInner {
+    /// jti → token `exp` (seconds since epoch).
+    jtis: HashMap<String, u64>,
+    /// issuer kid → revocation timestamp (seconds since epoch).
+    issuers: HashMap<String, u64>,
+}
+
+impl RevocationList {
+    fn now() -> u64 {
+        jsonwebtoken::get_current_timestamp()
+    }
+
+    /// Revoke a single token by its `jti`. `exp` is the token's expiry;
+    /// the entry is pruned once the token would have expired on its own.
+    pub fn revoke_jti(&self, jti: impl Into<String>, exp: u64) {
+        let now = Self::now();
+        let mut inner = self.inner.write();
+        // Amortized TTL-bound: drop entries for tokens that are already
+        // expired (plus leeway) on every insert.
+        inner
+            .jtis
+            .retain(|_, entry_exp| entry_exp.saturating_add(REVOCATION_PRUNE_LEEWAY_SECS) > now);
+        inner.jtis.insert(jti.into(), exp);
+    }
+
+    /// Revoke every outstanding token issued by the credential with this kid.
+    pub fn revoke_issuer(&self, kid: impl Into<String>) {
+        self.inner.write().issuers.insert(kid.into(), Self::now());
+    }
+
+    /// Whether this `jti` has been revoked (and would not have expired anyway).
+    pub fn is_jti_revoked(&self, jti: &str) -> bool {
+        self.inner.read().jtis.contains_key(jti)
+    }
+
+    /// Whether tokens issued by `kid` at `iat` are revoked. Tokens minted
+    /// strictly after the revocation timestamp are accepted again (the
+    /// credential was re-added / re-trusted).
+    pub fn is_issuer_revoked(&self, kid: &str, iat: u64) -> bool {
+        self.inner
+            .read()
+            .issuers
+            .get(kid)
+            .is_some_and(|revoked_at| *revoked_at >= iat)
+    }
+
+    /// Number of live per-token revocation entries (test observability).
+    #[cfg(test)]
+    fn jti_entries(&self) -> usize {
+        self.inner.read().jtis.len()
+    }
 }
 
 /// Resolved identity from either an API key or JWT token.
@@ -83,11 +223,18 @@ pub struct ResolvedIdentity {
     pub operations: Vec<Operation>,
 }
 
+/// Whether a token's operation allowlist permits `required`, applying the
+/// `Admin ⊇ Write ⊇ Read` hierarchy: an empty allowlist means "all
+/// operations", and any granted operation of equal-or-higher rank than
+/// `required` satisfies it (so `[Admin]` permits Read and Write).
 pub(crate) fn token_allows_operation(
     allowed_operations: &[Operation],
     required: &Operation,
 ) -> bool {
-    allowed_operations.is_empty() || allowed_operations.contains(required)
+    allowed_operations.is_empty()
+        || allowed_operations
+            .iter()
+            .any(|allowed| allowed.implies(*required))
 }
 
 pub(crate) fn token_allows_namespace(
@@ -132,6 +279,8 @@ pub struct AuthState {
     token_config: Option<TokenConfig>,
     /// Whether explicit insecure development mode permits unauthenticated requests.
     allow_unauthenticated: bool,
+    /// Node-local JWT revocation list (per-jti and per-issuer-kid).
+    revocations: RevocationList,
 }
 
 impl AuthState {
@@ -186,7 +335,21 @@ impl AuthState {
             client_certs,
             token_config: token_config.cloned(),
             allow_unauthenticated,
+            revocations: RevocationList::default(),
         }
+    }
+
+    /// The node-local JWT revocation list.
+    pub fn revocations(&self) -> &RevocationList {
+        &self.revocations
+    }
+
+    /// Revoke every outstanding JWT issued by the given API key.
+    ///
+    /// Call this when an API key is rotated out or removed so already-minted
+    /// tokens die with the key instead of remaining valid until `exp`.
+    pub fn revoke_api_key(&self, key: &str) {
+        self.revocations.revoke_issuer(credential_kid("key", key));
     }
 
     /// Validate an API key using constant-time comparison to prevent timing
@@ -231,13 +394,23 @@ impl AuthState {
         self.token_config.is_some()
     }
 
+    /// Configured default token TTL in seconds (0 when tokens are disabled).
+    pub fn token_ttl_secs(&self) -> u64 {
+        self.token_config.as_ref().map_or(0, |tc| tc.ttl_secs)
+    }
+
     /// Issue a JWT token for the given identity with optional namespace/operation scoping.
+    ///
+    /// `iss_kid` is the fingerprint of the credential that authenticated the
+    /// issuance request (see [`credential_kid`]); it is embedded in the token
+    /// so revoking that credential also revokes this token.
     pub fn issue_token(
         &self,
         identity: &KeyIdentity,
         namespaces: Vec<String>,
         operations: Vec<Operation>,
         ttl_override: Option<u64>,
+        iss_kid: Option<String>,
     ) -> Result<String, String> {
         let tc = self
             .token_config
@@ -256,6 +429,8 @@ impl AuthState {
             aud: identity.realm.clone(),
             iat: now,
             exp: now + ttl,
+            jti: ulid::Ulid::new().to_string(),
+            iss_kid,
         };
 
         encode(
@@ -305,7 +480,42 @@ impl AuthState {
             ));
         }
 
+        // Revocation checks: the token itself, then its issuing credential.
+        if self.revocations.is_jti_revoked(&data.claims.jti) {
+            return Err(TokenError::Revoked);
+        }
+        if let Some(kid) = data.claims.iss_kid.as_deref() {
+            if self.revocations.is_issuer_revoked(kid, data.claims.iat) {
+                return Err(TokenError::Revoked);
+            }
+        }
+
         Ok(data.claims)
+    }
+
+    /// Decode a token for revocation purposes: the signature, issuer, and
+    /// claim shape are verified, but expiry is **not** — an operator must be
+    /// able to revoke a token (e.g. to persist an issuer-kid revocation)
+    /// even when it has just expired. Never use this for authentication.
+    pub fn decode_for_revocation(&self, token: &str) -> Result<TokenClaims, TokenError> {
+        let tc = self
+            .token_config
+            .as_ref()
+            .ok_or(TokenError::NotConfigured)?;
+
+        let mut validation = Validation::default();
+        validation.set_required_spec_claims(&["iss"]);
+        validation.set_issuer(&[TOKEN_ISSUER]);
+        validation.validate_exp = false;
+        validation.validate_aud = false;
+
+        decode::<TokenClaims>(
+            token,
+            &DecodingKey::from_secret(tc.secret.as_bytes()),
+            &validation,
+        )
+        .map(|data| data.claims)
+        .map_err(|e| TokenError::Invalid(e.to_string()))
     }
 
     /// Resolve a bearer credential to an identity using the same acceptance
@@ -323,6 +533,7 @@ impl AuthState {
                     });
                 }
                 Err(TokenError::Expired) => return Err("token expired".to_owned()),
+                Err(TokenError::Revoked) => return Err("token revoked".to_owned()),
                 // Not a valid JWT — fall through to API key lookup.
                 Err(TokenError::Invalid(_) | TokenError::NotConfigured) => {}
             }
@@ -359,6 +570,8 @@ pub struct BearerIdentity {
 #[derive(Debug)]
 pub enum TokenError {
     Expired,
+    /// The token (or its issuing credential) has been revoked before expiry.
+    Revoked,
     Invalid(String),
     NotConfigured,
 }
@@ -406,6 +619,14 @@ pub async fn auth_middleware(
                 namespaces: vec![],
                 operations: vec![],
             };
+
+            // Bind tokens minted by this request to the client certificate.
+            request.headers_mut().insert(
+                ISSUER_KID_HEADER,
+                credential_kid("cn", cn)
+                    .parse()
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+            );
 
             // Inject realm and agent_id as headers for downstream handlers
             request.headers_mut().insert(
@@ -465,6 +686,14 @@ pub async fn auth_middleware(
                         .parse()
                         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
                 );
+                // Tokens minted by this token inherit the root credential's
+                // kid, so revoking the root kills the whole issuance tree.
+                if let Some(ref kid) = claims.iss_kid {
+                    request.headers_mut().insert(
+                        ISSUER_KID_HEADER,
+                        kid.parse().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+                    );
+                }
                 ResolvedIdentity {
                     realm: claims.realm,
                     agent_id: claims.agent_id,
@@ -476,6 +705,10 @@ pub async fn auth_middleware(
                 tracing::warn!("HTTP auth failed: token expired");
                 return Err(StatusCode::UNAUTHORIZED);
             }
+            Err(TokenError::Revoked) => {
+                tracing::warn!("HTTP auth failed: token revoked");
+                return Err(StatusCode::UNAUTHORIZED);
+            }
             Err(TokenError::NotConfigured) => {
                 // Shouldn't happen since we checked tokens_enabled
                 return Err(StatusCode::INTERNAL_SERVER_ERROR);
@@ -483,12 +716,21 @@ pub async fn auth_middleware(
             Err(TokenError::Invalid(_)) => {
                 // Not a valid JWT — try as API key
                 match state.validate(bearer) {
-                    Some(ki) => ResolvedIdentity {
-                        realm: ki.realm.clone(),
-                        agent_id: ki.agent_id.clone(),
-                        namespaces: vec![],
-                        operations: vec![],
-                    },
+                    Some(ki) => {
+                        // Compute before headers_mut(): `bearer` borrows the request.
+                        let kid = credential_kid("key", bearer);
+                        let identity = ResolvedIdentity {
+                            realm: ki.realm.clone(),
+                            agent_id: ki.agent_id.clone(),
+                            namespaces: vec![],
+                            operations: vec![],
+                        };
+                        request.headers_mut().insert(
+                            ISSUER_KID_HEADER,
+                            kid.parse().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+                        );
+                        identity
+                    }
                     None => {
                         tracing::warn!("HTTP auth failed: invalid JWT and invalid API key");
                         return Err(StatusCode::UNAUTHORIZED);
@@ -499,12 +741,21 @@ pub async fn auth_middleware(
     } else {
         // No token config — API key only
         match state.validate(bearer) {
-            Some(ki) => ResolvedIdentity {
-                realm: ki.realm.clone(),
-                agent_id: ki.agent_id.clone(),
-                namespaces: vec![],
-                operations: vec![],
-            },
+            Some(ki) => {
+                // Compute before headers_mut(): `bearer` borrows the request.
+                let kid = credential_kid("key", bearer);
+                let identity = ResolvedIdentity {
+                    realm: ki.realm.clone(),
+                    agent_id: ki.agent_id.clone(),
+                    namespaces: vec![],
+                    operations: vec![],
+                };
+                request.headers_mut().insert(
+                    ISSUER_KID_HEADER,
+                    kid.parse().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+                );
+                identity
+            }
             None => {
                 tracing::warn!("HTTP auth failed: invalid API key");
                 return Err(StatusCode::UNAUTHORIZED);
@@ -569,7 +820,7 @@ mod tests {
     fn issued_tokens_carry_issuer_and_realm_audience() {
         let state = auth_state_with_tokens();
         let token = state
-            .issue_token(&identity(), vec![], vec![Operation::Read], None)
+            .issue_token(&identity(), vec![], vec![Operation::Read], None, None)
             .unwrap();
 
         let claims = state.validate_token(&token).unwrap();
@@ -577,6 +828,166 @@ mod tests {
         assert_eq!(claims.aud, "default");
         assert_eq!(claims.aud, claims.realm);
         assert_eq!(claims.operations, vec![Operation::Read]);
+        assert!(!claims.jti.is_empty(), "every token must carry a jti");
+    }
+
+    #[test]
+    fn issued_tokens_have_unique_jtis() {
+        let state = auth_state_with_tokens();
+        let a = state
+            .issue_token(&identity(), vec![], vec![], None, None)
+            .unwrap();
+        let b = state
+            .issue_token(&identity(), vec![], vec![], None, None)
+            .unwrap();
+        let jti_a = state.validate_token(&a).unwrap().jti;
+        let jti_b = state.validate_token(&b).unwrap().jti;
+        assert_ne!(jti_a, jti_b);
+    }
+
+    #[test]
+    fn revoked_jti_is_rejected_and_others_unaffected() {
+        let state = auth_state_with_tokens();
+        let revoked = state
+            .issue_token(&identity(), vec![], vec![], None, None)
+            .unwrap();
+        let untouched = state
+            .issue_token(&identity(), vec![], vec![], None, None)
+            .unwrap();
+
+        // Both valid (unexpired) before revocation.
+        let claims = state.validate_token(&revoked).unwrap();
+        state.revocations().revoke_jti(claims.jti, claims.exp);
+
+        // Unexpired but revoked → rejected.
+        assert!(matches!(
+            state.validate_token(&revoked),
+            Err(TokenError::Revoked)
+        ));
+        // Unrevoked token keeps working.
+        state.validate_token(&untouched).unwrap();
+    }
+
+    #[test]
+    fn expired_revocation_entries_are_pruned() {
+        let list = RevocationList::default();
+        let now = jsonwebtoken::get_current_timestamp();
+
+        // Entry for a token that expired long ago (past the prune leeway).
+        list.revoke_jti("stale-jti", now - 10_000);
+        assert_eq!(list.jti_entries(), 1);
+
+        // The next insert prunes the stale entry.
+        list.revoke_jti("live-jti", now + 3600);
+        assert_eq!(list.jti_entries(), 1);
+        assert!(list.is_jti_revoked("live-jti"));
+        assert!(!list.is_jti_revoked("stale-jti"));
+    }
+
+    #[test]
+    fn issuer_kid_revocation_kills_all_its_tokens() {
+        let state = auth_state_with_tokens();
+        let kid = credential_kid("key", "the-api-key");
+        let other_kid = credential_kid("key", "another-api-key");
+
+        let t1 = state
+            .issue_token(&identity(), vec![], vec![], None, Some(kid.clone()))
+            .unwrap();
+        let t2 = state
+            .issue_token(&identity(), vec![], vec![], None, Some(kid.clone()))
+            .unwrap();
+        let t3 = state
+            .issue_token(&identity(), vec![], vec![], None, Some(other_kid))
+            .unwrap();
+
+        state.validate_token(&t1).unwrap();
+        state.validate_token(&t2).unwrap();
+
+        state.revoke_api_key("the-api-key");
+
+        assert!(matches!(
+            state.validate_token(&t1),
+            Err(TokenError::Revoked)
+        ));
+        assert!(matches!(
+            state.validate_token(&t2),
+            Err(TokenError::Revoked)
+        ));
+        // Tokens from a different issuing credential are unaffected.
+        state.validate_token(&t3).unwrap();
+    }
+
+    #[test]
+    fn tokens_minted_after_issuer_revocation_are_accepted() {
+        let state = auth_state_with_tokens();
+        let kid = credential_kid("key", "rotating-key");
+        state.revocations().revoke_issuer(kid.clone());
+
+        // A token whose iat is strictly after the revocation timestamp
+        // (credential re-added later) validates again.
+        let now = jsonwebtoken::get_current_timestamp();
+        let token = encode_raw_claims(&serde_json::json!({
+            "realm": "default",
+            "agent_id": "agent-a",
+            "iss": TOKEN_ISSUER,
+            "aud": "default",
+            "iat": now + 60,
+            "exp": now + 3600,
+            "jti": "post-revocation-token",
+            "iss_kid": kid,
+        }));
+        state.validate_token(&token).unwrap();
+    }
+
+    #[test]
+    fn tokens_without_jti_are_rejected() {
+        let state = auth_state_with_tokens();
+        let now = jsonwebtoken::get_current_timestamp();
+        // Correctly signed, correct iss/aud, but no jti (legacy shape).
+        let token = encode_raw_claims(&serde_json::json!({
+            "realm": "default",
+            "agent_id": "agent-a",
+            "iss": TOKEN_ISSUER,
+            "aud": "default",
+            "iat": now,
+            "exp": now + 3600,
+        }));
+
+        assert!(matches!(
+            state.validate_token(&token),
+            Err(TokenError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn decode_for_revocation_accepts_expired_tokens() {
+        let state = auth_state_with_tokens();
+        let now = jsonwebtoken::get_current_timestamp();
+        let token = encode_raw_claims(&serde_json::json!({
+            "realm": "default",
+            "agent_id": "agent-a",
+            "iss": TOKEN_ISSUER,
+            "aud": "default",
+            "iat": now - 7200,
+            "exp": now - 3600,
+            "jti": "expired-jti",
+        }));
+
+        // validate_token refuses it, but the revocation path can still read it.
+        assert!(matches!(
+            state.validate_token(&token),
+            Err(TokenError::Expired)
+        ));
+        let claims = state.decode_for_revocation(&token).unwrap();
+        assert_eq!(claims.jti, "expired-jti");
+    }
+
+    #[test]
+    fn credential_kid_is_stable_and_domain_separated() {
+        assert_eq!(credential_kid("key", "abc"), credential_kid("key", "abc"));
+        assert_ne!(credential_kid("key", "abc"), credential_kid("cn", "abc"));
+        assert_ne!(credential_kid("key", "abc"), credential_kid("key", "abd"));
+        assert_eq!(credential_kid("key", "abc").len(), 32);
     }
 
     fn encode_raw_claims(claims: &serde_json::Value) -> String {
@@ -642,6 +1053,41 @@ mod tests {
             state.validate_token(&token),
             Err(TokenError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn admin_token_implies_write_and_read() {
+        // R-72: Admin ⊇ Write ⊇ Read. An [Admin] token must satisfy Read/Write.
+        let admin = [Operation::Admin];
+        assert!(token_allows_operation(&admin, &Operation::Read));
+        assert!(token_allows_operation(&admin, &Operation::Write));
+        assert!(token_allows_operation(&admin, &Operation::Admin));
+
+        let write = [Operation::Write];
+        assert!(token_allows_operation(&write, &Operation::Read));
+        assert!(token_allows_operation(&write, &Operation::Write));
+        assert!(!token_allows_operation(&write, &Operation::Admin));
+
+        let read = [Operation::Read];
+        assert!(token_allows_operation(&read, &Operation::Read));
+        assert!(!token_allows_operation(&read, &Operation::Write));
+        assert!(!token_allows_operation(&read, &Operation::Admin));
+    }
+
+    #[test]
+    fn empty_operations_allow_everything() {
+        assert!(token_allows_operation(&[], &Operation::Read));
+        assert!(token_allows_operation(&[], &Operation::Write));
+        assert!(token_allows_operation(&[], &Operation::Admin));
+    }
+
+    #[test]
+    fn operation_implication_is_transitive() {
+        assert!(Operation::Admin.implies(Operation::Read));
+        assert!(Operation::Admin.implies(Operation::Write));
+        assert!(Operation::Write.implies(Operation::Read));
+        assert!(!Operation::Read.implies(Operation::Write));
+        assert!(!Operation::Write.implies(Operation::Admin));
     }
 
     #[tokio::test]

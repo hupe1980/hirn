@@ -6,12 +6,13 @@
 //! # Compilation Pipeline
 //!
 //! ```text
-//! HirnQL text → Parser → AST → Semantic analysis → Query planner → Physical plan → Execute
+//! HirnQL text → Parser → AST → typed_ast::analyze → LogicalPlan → Physical plan → Execute
 //! ```
 //!
-//! Each stage is independently testable. Compiled plans are cached by
-//! `hirn_query::PlanCache` (the single plan cache, attached to the engine's
-//! `QueryPipeline`).
+//! All stages live in `hirn_query` (the single compiler stack); this module
+//! re-exports the language surface and owns the prepared-statement front-end.
+//! Compiled plans are cached by `hirn_query::PlanCache` (the single plan
+//! cache, attached to the engine's `QueryPipeline`).
 //!
 //! # Example
 //! ```ignore
@@ -27,20 +28,17 @@
 pub use hirn_query::ast;
 pub use hirn_query::parser;
 
-pub mod analyzer;
 pub mod builder;
 pub mod compiler;
 pub mod context;
 pub(crate) mod direct_support;
-pub mod planner;
 pub(crate) mod read_support;
 pub(crate) mod results;
 
-pub use analyzer::{AnalysisError, AnalysisErrorKind, analyze};
 pub use ast::Statement;
-pub use compiler::{CompileError, CompiledQuery, PreparedStatement, bind, compile, prepare};
+pub use compiler::{CompileError, PreparedStatement, bind, prepare};
+pub use hirn_query::compiler::validate::{AnalysisError, AnalysisErrorKind, validate as analyze};
 pub use parser::{ParseError, parse};
-pub use planner::{QueryPlan, plan};
 pub use results::{
     AggregatedGroup, AggregatedResults, CausalQueryKind, CausalQueryResult, CausalRow,
     ConsolidatedResult, CorrectedResult, CreatedResult, ExplainResult, ForgottenResult,

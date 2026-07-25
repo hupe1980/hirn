@@ -17,8 +17,8 @@ use crate::proto;
 use crate::proto::hirn_service_server::HirnService;
 use crate::realm::RealmManager;
 use crate::throttle::{RateLimitClass, RateLimiter};
-use crate::watch::WatchEvent;
 use crate::watch::WatchNamespaceScope;
+use crate::watch::{WatchEvent, WatchEventKind};
 
 const INTERNAL_GRPC_METADATA_HEADERS: &[&str] = &["x-token-namespaces", "x-token-operations"];
 
@@ -121,6 +121,10 @@ pub fn grpc_auth_interceptor(
                 Err(TokenError::Expired) => {
                     tracing::warn!("gRPC auth failed: token expired");
                     return Err(Status::unauthenticated("token expired"));
+                }
+                Err(TokenError::Revoked) => {
+                    tracing::warn!("gRPC auth failed: token revoked");
+                    return Err(Status::unauthenticated("token revoked"));
                 }
                 Err(TokenError::NotConfigured) => {
                     return Err(Status::internal("token validation misconfigured"));
@@ -498,7 +502,10 @@ impl HirnService for HirnGrpcService {
                 (id, Layer::Semantic, vec![], w_importance, w_namespace)
             }
             Some(proto::remember_request::Record::Working(wm)) => {
-                let agent_id = AgentId::new(&wm.agent_id).unwrap_or_else(|_| agent.clone());
+                // R-70: ignore any body-supplied `agent_id`; the authenticated
+                // (interceptor-resolved) identity is the only actor, so a caller
+                // cannot write working memory as another agent.
+                let agent_id = agent.clone();
 
                 let mut builder = WorkingMemoryEntry::builder()
                     .content(&wm.content)
@@ -522,12 +529,15 @@ impl HirnService for HirnGrpcService {
         };
 
         // Broadcast watch event
-        let _ = self.watch_tx.send(WatchEvent::Created {
-            id: id.clone(),
-            layer: layer.clone(),
-            entities: watch_entities,
-            importance: watch_importance,
-            namespace: watch_namespace,
+        let _ = self.watch_tx.send(WatchEvent {
+            realm: extract_realm_id(&metadata)?,
+            kind: WatchEventKind::Created {
+                id: id.clone(),
+                layer: layer.clone(),
+                entities: watch_entities,
+                importance: watch_importance,
+                namespace: watch_namespace,
+            },
         });
 
         Ok(Response::new(proto::RememberResponse {
@@ -1076,12 +1086,10 @@ impl HirnService for HirnGrpcService {
             .ok_or_else(|| Status::invalid_argument("id is required"))?;
         let memory_id = convert::memory_id_from_proto(id).map_err(map_err)?;
 
-        let agent_id = if inner.agent_id.is_empty() {
-            agent
-        } else {
-            AgentId::new(&inner.agent_id)
-                .map_err(|e| Status::invalid_argument(format!("invalid agent_id: {e}")))?
-        };
+        // R-70: the sharing actor is always the interceptor-authenticated
+        // identity. A body-supplied `agent_id` is ignored so a caller cannot
+        // share another agent's memory by spoofing the field.
+        let agent_id = agent;
 
         let target_ns = Namespace::new(&inner.target_namespace)
             .map_err(|e| Status::invalid_argument(format!("invalid target_namespace: {e}")))?;
@@ -1143,6 +1151,8 @@ impl HirnService for HirnGrpcService {
         let entities: Vec<String> = inner.entities;
         let min_importance = inner.min_importance;
         let namespace_scope = watch_namespace_scope(&metadata, &agent, inner.namespace.clone())?;
+        // Subscribers only see events from their own authenticated realm.
+        let subscriber_realm = extract_realm_id(&metadata)?;
 
         let mut rx = self.watch_tx.subscribe();
 
@@ -1150,7 +1160,7 @@ impl HirnService for HirnGrpcService {
             loop {
                 match rx.recv().await {
                     Ok(event) => {
-                        if let Some(proto_event) = event.to_proto(&layer_filter, &entities, min_importance, &namespace_scope) {
+                        if let Some(proto_event) = event.to_proto(&subscriber_realm, &layer_filter, &entities, min_importance, &namespace_scope) {
                             yield Ok(proto_event);
                         }
                     }

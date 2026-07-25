@@ -6,9 +6,9 @@
 //   MemoryLayer, Operation, Tool — standalone entities for fine-grained policies
 //
 // Actions covering all hirn memory operations:
-//   remember, correct, supersede, merge, retract, purge, recall, think,
-//   forget, consolidate, watch, connect, execute, admin, recall_raw_text,
-//   read, write, delete
+//   remember, correct, reflect, supersede, merge, retract, purge, recall,
+//   think, forget, consolidate, watch, connect, execute, admin, review,
+//   recall_raw_text, read, write, delete
 
 namespace Hirn {
     entity Agent in [Team] = {
@@ -50,6 +50,14 @@ namespace Hirn {
     };
 
     action "correct" appliesTo {
+        principal: [Agent, Team],
+        resource: [Namespace, Realm],
+    };
+
+    // Reflection produces corrective belief revisions but is a distinct
+    // right from "correct": policies can allow manual correction without
+    // allowing (potentially LLM-driven) reflection, and vice versa.
+    action "reflect" appliesTo {
         principal: [Agent, Team],
         resource: [Namespace, Realm],
     };
@@ -110,6 +118,14 @@ namespace Hirn {
     };
 
     action "admin" appliesTo {
+        principal: [Agent, Team],
+        resource: [Namespace, Realm],
+    };
+
+    // Quarantine review gate: approve, reject, or roll back the promotion of
+    // quarantined (potentially poisoned) records into the main store. Distinct
+    // from "correct" and "admin" so the gate can be delegated independently.
+    action "review" appliesTo {
         principal: [Agent, Team],
         resource: [Namespace, Realm],
     };

@@ -487,14 +487,35 @@ impl<'a> RecallBuilder<'a> {
         );
 
         async {
-            // Cedar policy enforcement.
+            // Cedar policy enforcement. Recall is ALWAYS enforced: when a single
+            // namespace is in scope (requested, or the sole allowed one) it is
+            // checked directly; when multiple namespaces are allowed and none is
+            // specifically requested, Recall is enforced for EACH allowed
+            // namespace so a deny on any one of them is honoured (previously this
+            // multi-namespace case skipped enforcement entirely); when recall is
+            // unrestricted, a single realm-scoped check is performed.
             let authz_start = std::time::Instant::now();
-            let authz_us = if self.allowed_namespaces.is_some() && authz_namespace.is_none() {
-                0
-            } else {
-                self.db
-                    .enforce(&agent, crate::policy::Action::Recall, &realm, &ns)
-                    .await?;
+            let authz_us = {
+                if let Some(ns) = authz_namespace.as_ref() {
+                    self.db
+                        .enforce(&agent, crate::policy::Action::Recall, &realm, ns.as_str())
+                        .await?;
+                } else if let Some(allowed) = self.allowed_namespaces.as_deref() {
+                    for allowed_ns in allowed {
+                        self.db
+                            .enforce(
+                                &agent,
+                                crate::policy::Action::Recall,
+                                &realm,
+                                allowed_ns.as_str(),
+                            )
+                            .await?;
+                    }
+                } else {
+                    self.db
+                        .enforce(&agent, crate::policy::Action::Recall, &realm, &ns)
+                        .await?;
+                }
                 authz_start.elapsed().as_micros() as u64
             };
 
@@ -740,5 +761,106 @@ fn push_evidence_item(
 ) {
     if !resource_evidence.is_empty() {
         items.push(RecallPresentationItem::Evidence);
+    }
+}
+
+#[cfg(test)]
+mod recall_authz_tests {
+    use super::*;
+    use crate::policy::{DEFAULT_SCHEMA, PolicyEngine};
+    use hirn_core::HirnConfig;
+    use hirn_core::types::{AgentId, Namespace};
+    use hirn_storage::memory_store::MemoryStore;
+    use std::sync::Arc;
+
+    async fn temp_db() -> (HirnDB, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recall-authz");
+        let config = HirnConfig::builder()
+            .db_path(&path)
+            .embedding_dimensions(4)
+            .build()
+            .unwrap();
+        let db = HirnDB::open_with_config(config, Arc::new(MemoryStore::new()))
+            .await
+            .unwrap();
+        (db, dir)
+    }
+
+    async fn db_with_policy(policy: &str) -> (HirnDB, tempfile::TempDir) {
+        let engine = PolicyEngine::new(DEFAULT_SCHEMA, &[("recall.cedar", policy)]).unwrap();
+        engine.register_realm("default", "Default realm").unwrap();
+        engine
+            .register_agent("analyst", 100, "2025-01-01T00:00:00Z", &[])
+            .unwrap();
+
+        let (mut db, dir) = temp_db().await;
+        db.set_policy_engine(engine);
+        db.register_agent(&AgentId::new("analyst").unwrap(), "analyst")
+            .await
+            .unwrap();
+        (db, dir)
+    }
+
+    /// R-06 regression: a multi-namespace (private + shared) recall with no
+    /// specific namespace requested must still enforce Cedar `Recall`. Cedar is
+    /// default-deny and this policy grants no `recall`, so the recall must be
+    /// blocked rather than silently skipping enforcement.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn multi_namespace_recall_enforces_cedar_deny() {
+        let policy = r#"
+            permit(
+                principal == Hirn::Agent::"analyst",
+                action == Hirn::Action::"remember",
+                resource == Hirn::Realm::"default"
+            );
+        "#;
+        let (db, _dir) = db_with_policy(policy).await;
+
+        let agent = AgentId::new("analyst").unwrap();
+        let allowed = vec![Namespace::private_for(&agent), Namespace::shared()];
+
+        let result = db
+            .recall(vec![0.1, 0.2, 0.3, 0.4])
+            .agent_id("analyst")
+            .allowed_namespaces(allowed)
+            .execute()
+            .await;
+
+        assert!(
+            matches!(result, Err(HirnError::AccessDenied(_))),
+            "multi-namespace recall must enforce Cedar Recall deny, got {result:?}"
+        );
+    }
+
+    /// Preserve behavior: when `Recall` is permitted, the multi-namespace recall
+    /// succeeds (enforcement runs for every allowed namespace and all pass).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn multi_namespace_recall_allowed_when_permitted() {
+        // `resource` is left unconstrained so the permit applies to the
+        // per-namespace `Hirn::Namespace` resources the enforcement loop checks.
+        let policy = r#"
+            permit(
+                principal == Hirn::Agent::"analyst",
+                action == Hirn::Action::"recall",
+                resource
+            );
+        "#;
+        let (db, _dir) = db_with_policy(policy).await;
+
+        let agent = AgentId::new("analyst").unwrap();
+        let allowed = vec![Namespace::private_for(&agent), Namespace::shared()];
+
+        let result = db
+            .recall(vec![0.1, 0.2, 0.3, 0.4])
+            .agent_id("analyst")
+            .allowed_namespaces(allowed)
+            .execute()
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "permitted multi-namespace recall should succeed, got {result:?}"
+        );
     }
 }

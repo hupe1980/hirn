@@ -22,6 +22,11 @@ pub struct MemoryStore {
     versions: DashMap<String, u64>,
     tags: DashMap<String, Vec<VersionTag>>,
     namespaces: DashMap<String, ()>,
+    /// Per-dataset version history for time-travel. `snapshots[dataset][v]` is
+    /// the full state at version `v` (index 0 = the empty pre-write state), so
+    /// `open_at_version` / `rollback_to` can honor a real historical snapshot
+    /// (R-12) instead of the previous no-op checkout.
+    snapshots: DashMap<String, Vec<Vec<RecordBatch>>>,
 }
 
 impl MemoryStore {
@@ -32,12 +37,32 @@ impl MemoryStore {
             versions: DashMap::new(),
             tags: DashMap::new(),
             namespaces: DashMap::new(),
+            snapshots: DashMap::new(),
         }
     }
 
-    fn bump_version(&self, dataset: &str) {
-        let mut entry = self.versions.entry(dataset.to_string()).or_insert(0);
-        *entry += 1;
+    /// Bump the dataset version and record `snapshot` as the state at the new
+    /// version for time-travel (`open_at_version` / `rollback_to`).
+    ///
+    /// The snapshot is passed in by the caller rather than read from
+    /// `self.tables` here: callers hold a `tables` entry/`RefMut` when they call
+    /// this, and re-reading `self.tables` under that held lock would deadlock the
+    /// shard. `snapshots`/`versions` are distinct maps, so recording under a held
+    /// `tables` lock is safe.
+    fn bump_version(&self, dataset: &str, snapshot: Vec<RecordBatch>) {
+        let new_version = {
+            let mut entry = self.versions.entry(dataset.to_string()).or_insert(0);
+            *entry += 1;
+            *entry
+        };
+        let mut hist = self.snapshots.entry(dataset.to_string()).or_default();
+        if hist.is_empty() {
+            hist.push(Vec::new()); // version 0 = empty pre-write state
+        }
+        while hist.len() < new_version as usize {
+            hist.push(Vec::new());
+        }
+        hist.push(snapshot); // hist[new_version] = state at this version
     }
 
     /// Remove a dataset entirely (for testing `ensure_datasets` recreation).
@@ -46,6 +71,7 @@ impl MemoryStore {
         self.indices.remove(name);
         self.versions.remove(name);
         self.tags.remove(name);
+        self.snapshots.remove(name);
     }
 
     fn get_batches(&self, dataset: &str) -> Result<Vec<RecordBatch>, HirnDbError> {
@@ -155,11 +181,12 @@ fn apply_float_multiply(
 #[async_trait]
 impl PhysicalStore for MemoryStore {
     async fn append(&self, dataset: &str, batch: RecordBatch) -> Result<(), HirnDbError> {
-        self.tables
-            .entry(dataset.to_string())
-            .or_default()
-            .push(batch);
-        self.bump_version(dataset);
+        let snapshot = {
+            let mut entry = self.tables.entry(dataset.to_string()).or_default();
+            entry.push(batch);
+            entry.value().clone()
+        };
+        self.bump_version(dataset, snapshot);
         Ok(())
     }
 
@@ -208,7 +235,8 @@ impl PhysicalStore for MemoryStore {
         }
 
         *entry.value_mut() = scan::filter_batches_inverted(predicate, entry.value())?;
-        self.bump_version(dataset);
+        let snapshot = entry.value().clone();
+        self.bump_version(dataset, snapshot);
         Ok(deleted)
     }
 
@@ -218,11 +246,27 @@ impl PhysicalStore for MemoryStore {
         on: &[&str],
         batch: RecordBatch,
     ) -> Result<(), HirnDbError> {
+        self.merge_insert_where(dataset, on, batch, None).await
+    }
+
+    async fn merge_insert_where(
+        &self,
+        dataset: &str,
+        on: &[&str],
+        batch: RecordBatch,
+        when_matched_condition: Option<&str>,
+    ) -> Result<(), HirnDbError> {
         if on.is_empty() {
             return Err(HirnDbError::InvalidArgument(
                 "merge_insert requires at least one key column".into(),
             ));
         }
+
+        // The condition (if any) is a SQL predicate over the matched TARGET row,
+        // qualified with `target.` (e.g. `target.namespace IN ('ns1')`). The
+        // MemoryStore filter parser is column-name based, so strip the qualifier
+        // before evaluating it against the stored rows.
+        let stripped_condition = when_matched_condition.map(|cond| cond.replace("target.", ""));
 
         let schema = batch.schema();
         let key_indices: Vec<usize> = on
@@ -239,7 +283,8 @@ impl PhysicalStore for MemoryStore {
         let mut entry = self.tables.entry(dataset.to_string()).or_default();
         if entry.is_empty() {
             *entry.value_mut() = vec![batch];
-            self.bump_version(dataset);
+            let snapshot = entry.value().clone();
+            self.bump_version(dataset, snapshot);
             return Ok(());
         }
 
@@ -248,7 +293,8 @@ impl PhysicalStore for MemoryStore {
             Some(batch) => batch,
             None => {
                 *entry.value_mut() = vec![batch];
-                self.bump_version(dataset);
+                let snapshot = entry.value().clone();
+                self.bump_version(dataset, snapshot);
                 return Ok(());
             }
         };
@@ -261,6 +307,13 @@ impl PhysicalStore for MemoryStore {
             );
         }
 
+        // Per-target-row guard: `Some(mask)` when a `when_matched` condition was
+        // supplied — a matched row may be overwritten only when its bit is set.
+        let update_allowed: Option<Vec<bool>> = match stripped_condition.as_deref() {
+            Some(cond) => Some(scan::evaluate_predicate_mask(cond, &existing_combined)?),
+            None => None,
+        };
+
         // Separate new batch into updates and inserts.
         let mut updated_rows: HashMap<usize, usize> = HashMap::new();
         let mut insert_rows: Vec<usize> = Vec::new();
@@ -268,7 +321,15 @@ impl PhysicalStore for MemoryStore {
         for new_row in 0..batch.num_rows() {
             let key = row_key(&batch, &key_indices, new_row);
             if let Some(&existing_row) = existing_keys.get(&key) {
-                updated_rows.insert(existing_row, new_row);
+                let allowed = match update_allowed.as_ref() {
+                    Some(mask) => mask[existing_row],
+                    None => true,
+                };
+                if allowed {
+                    updated_rows.insert(existing_row, new_row);
+                }
+                // Matched but guard failed → keep the stored row untouched and
+                // drop the incoming row (it must not clobber a foreign tenant).
             } else {
                 insert_rows.push(new_row);
             }
@@ -312,7 +373,8 @@ impl PhysicalStore for MemoryStore {
             *entry.value_mut() = vec![result_batch];
         }
 
-        self.bump_version(dataset);
+        let snapshot = entry.value().clone();
+        self.bump_version(dataset, snapshot);
         Ok(())
     }
 
@@ -402,8 +464,9 @@ impl PhysicalStore for MemoryStore {
             None => return Ok(0),
         };
 
+        let snapshot = vec![final_batch.clone()];
         self.tables.insert(dataset.to_string(), vec![final_batch]);
-        self.bump_version(dataset);
+        self.bump_version(dataset, snapshot);
         Ok(num_matching as u64)
     }
 
@@ -790,16 +853,49 @@ impl PhysicalStore for MemoryStore {
         Ok(())
     }
 
-    async fn checkout(&self, dataset: &str, version: u64) -> Result<(), HirnDbError> {
+    async fn open_at_version(
+        &self,
+        dataset: &str,
+        version: u64,
+    ) -> Result<Vec<RecordBatch>, HirnDbError> {
+        // Read-only: return the recorded historical snapshot without touching
+        // the live `tables` state (R-12).
+        let hist = self
+            .snapshots
+            .get(dataset)
+            .ok_or_else(|| HirnDbError::DatasetNotFound(dataset.to_string()))?;
+        hist.get(version as usize).cloned().ok_or_else(|| {
+            HirnDbError::InvalidArgument(format!("version {version} does not exist"))
+        })
+    }
+
+    async fn rollback_to(&self, dataset: &str, version: u64) -> Result<(), HirnDbError> {
         let current = self.version(dataset).await?;
         if version > current {
             return Err(HirnDbError::InvalidArgument(format!(
                 "version {version} does not exist (current: {current})"
             )));
         }
-        // In memory store, checkout is a conceptual operation
-        // Real implementation would open dataset at historical version
+        // Destructive: restore the live state to the historical snapshot, then
+        // bump the version so the rollback is itself a new version (R-12).
+        let snapshot = {
+            let hist = self
+                .snapshots
+                .get(dataset)
+                .ok_or_else(|| HirnDbError::DatasetNotFound(dataset.to_string()))?;
+            hist.get(version as usize).cloned().ok_or_else(|| {
+                HirnDbError::InvalidArgument(format!("version {version} does not exist"))
+            })?
+        };
+        let snapshot_for_version = snapshot.clone();
+        self.tables.insert(dataset.to_string(), snapshot);
+        self.bump_version(dataset, snapshot_for_version);
         Ok(())
+    }
+
+    #[allow(deprecated)]
+    async fn checkout(&self, dataset: &str, version: u64) -> Result<(), HirnDbError> {
+        self.rollback_to(dataset, version).await
     }
 
     async fn list_tags(&self, dataset: &str) -> Result<Vec<VersionTag>, HirnDbError> {
@@ -926,7 +1022,8 @@ impl PhysicalStore for MemoryStore {
         }
 
         *batches = new_batches;
-        self.bump_version(dataset);
+        let snapshot = batches.clone();
+        self.bump_version(dataset, snapshot);
         Ok(())
     }
 
@@ -952,7 +1049,8 @@ impl PhysicalStore for MemoryStore {
         }
 
         *batches = new_batches;
-        self.bump_version(dataset);
+        let snapshot = batches.clone();
+        self.bump_version(dataset, snapshot);
         Ok(())
     }
 
@@ -1451,6 +1549,39 @@ mod tests {
         assert_eq!(tags.len(), 1);
         assert_eq!(tags[0].name, "v1");
         assert_eq!(tags[0].version, 1);
+    }
+
+    /// R-12: `open_at_version` returns a historical snapshot WITHOUT mutating the
+    /// live dataset, while `rollback_to` destructively restores it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn open_at_version_is_readonly_rollback_is_destructive() {
+        let store = MemoryStore::new();
+        store.append("t", make_batch(&[1], &["a"])).await.unwrap(); // v1: 1 row
+        store.append("t", make_batch(&[2], &["b"])).await.unwrap(); // v2: 2 rows
+        assert_eq!(store.version("t").await.unwrap(), 2);
+
+        // open_at_version(1) yields the 1-row snapshot and does NOT mutate live.
+        let hist = store.open_at_version("t", 1).await.unwrap();
+        let hist_rows: usize = hist.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(hist_rows, 1, "historical view has the v1 row count");
+        assert_eq!(
+            store.count("t", None).await.unwrap(),
+            2,
+            "live dataset is untouched by open_at_version"
+        );
+
+        // rollback_to(1) restores the live dataset to the v1 state and bumps.
+        store.rollback_to("t", 1).await.unwrap();
+        assert_eq!(
+            store.count("t", None).await.unwrap(),
+            1,
+            "rollback is destructive"
+        );
+        assert_eq!(
+            store.version("t").await.unwrap(),
+            3,
+            "rollback is itself a new version"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -11,6 +11,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use hirn_core::id::MemoryId;
+use hirn_core::timestamp::Timestamp;
 use hirn_core::types::Namespace;
 use hirn_core::{HirnError, HirnResult};
 
@@ -257,6 +258,11 @@ fn spread_activation_unchecked(
     // Initialize seeds with A₀ = 1.0 and run the shared BFS wavefront core:
     // each depth level is processed exactly once, adjacency is materialized
     // per level from the petgraph, and the math lives in `activation_core`.
+    // Snapshot a single `now` for the whole query (R-21): every wavefront level
+    // and the lateral-inhibition context are judged against one instant, so the
+    // traversal is temporally atomic and pays one syscall rather than one per edge.
+    let now = Timestamp::now();
+
     let present_seeds: Vec<MemoryId> = seeds
         .iter()
         .copied()
@@ -268,7 +274,7 @@ fn spread_activation_unchecked(
         if frontier.is_empty() {
             break;
         }
-        let adjacency = frontier_adjacency(graph, &frontier, allowed_namespaces);
+        let adjacency = frontier_adjacency(graph, &frontier, allowed_namespaces, now);
         frontier = activation_core::spread_level(&mut state, &frontier, &adjacency, depth, config);
     }
 
@@ -279,9 +285,11 @@ fn spread_activation_unchecked(
         apply_lateral_inhibition(
             graph,
             &mut state.activations,
+            &present_seeds,
             config.inhibition_strength,
             config.inhibition_threshold,
             embs,
+            now,
         );
     }
 
@@ -298,6 +306,7 @@ fn frontier_adjacency(
     graph: &PropertyGraph,
     frontier: &[(MemoryId, f64)],
     allowed_namespaces: Option<&[Namespace]>,
+    as_of: Timestamp,
 ) -> AdjacencyMap {
     let mut adjacency: AdjacencyMap = HashMap::with_capacity(frontier.len());
     for (node_id, _) in frontier {
@@ -305,7 +314,7 @@ fn frontier_adjacency(
             continue;
         };
         let neighbors: Vec<(MemoryId, f32)> = graph
-            .outgoing_weighted_iter(node_idx)
+            .outgoing_weighted_iter_at(node_idx, as_of)
             .filter_map(|(neighbor_idx, weight, _relation)| {
                 let neighbor = graph.node_id(neighbor_idx)?;
                 // Namespace boundary enforcement.
@@ -334,7 +343,7 @@ pub fn static_activation(
     allowed_namespaces: Option<&[Namespace]>,
 ) -> HashMap<MemoryId, f64> {
     let seed_frontier: Vec<(MemoryId, f64)> = seeds.iter().map(|&s| (s, 1.0)).collect();
-    let adjacency = frontier_adjacency(graph, &seed_frontier, allowed_namespaces);
+    let adjacency = frontier_adjacency(graph, &seed_frontier, allowed_namespaces, Timestamp::now());
     activation_core::static_activation_from_adjacency(seeds, &adjacency)
 }
 
@@ -378,9 +387,13 @@ fn personalized_pagerank_unchecked(
         return HashMap::new();
     }
 
+    // Snapshot a single `now` for the whole PPR query (R-21) so subgraph
+    // discovery and the transition-matrix build see one consistent instant.
+    let now = Timestamp::now();
+
     // Restrict PPR to the seed-reachable induced subgraph. Full-graph ranking
     // biases toward hubs and turns each query into a global walk.
-    let all_nodes = collect_reachable_nodes(graph, seeds, allowed_namespaces);
+    let all_nodes = collect_reachable_nodes(graph, seeds, allowed_namespaces, now);
     if all_nodes.is_empty() {
         return HashMap::new();
     }
@@ -391,7 +404,7 @@ fn personalized_pagerank_unchecked(
     let mut out_adjacency: AdjacencyMap = HashMap::with_capacity(all_nodes.len());
     for &node in &all_nodes {
         let neighbors: Vec<(MemoryId, f32)> = graph
-            .outgoing_weighted(node)
+            .outgoing_weighted_at(node, now)
             .into_iter()
             .map(|(nb, w, _)| (nb, w))
             .collect();
@@ -407,6 +420,7 @@ fn collect_reachable_nodes(
     graph: &PropertyGraph,
     seeds: &[MemoryId],
     allowed_namespaces: Option<&[Namespace]>,
+    as_of: Timestamp,
 ) -> Vec<MemoryId> {
     let mut visited = HashSet::new();
     let mut queue = VecDeque::new();
@@ -437,10 +451,10 @@ fn collect_reachable_nodes(
         // AND incoming edges (backward reachability: what caused this node?).
         // Including both directions ensures upstream causes appear in the PPR subgraph.
         let forward = graph
-            .outgoing_weighted_iter(node_idx)
+            .outgoing_weighted_iter_at(node_idx, as_of)
             .map(|(nb_idx, _, _)| nb_idx);
         let backward = graph
-            .incoming_weighted_iter(node_idx)
+            .incoming_weighted_iter_at(node_idx, as_of)
             .map(|(nb_idx, _, _)| nb_idx);
 
         for neighbor_idx in forward.chain(backward) {
@@ -466,12 +480,13 @@ fn collect_reachable_nodes(
 fn precompute_one_hop_neighbors(
     graph: &PropertyGraph,
     ids: impl IntoIterator<Item = MemoryId>,
+    as_of: Timestamp,
 ) -> HashMap<MemoryId, HashSet<MemoryId>> {
     ids.into_iter()
         .filter_map(|id| {
             let idx = graph.node_index(id)?;
             let neighbors = graph
-                .outgoing_weighted_iter(idx)
+                .outgoing_weighted_iter_at(idx, as_of)
                 .filter_map(|(neighbor_idx, _, _)| graph.node_id(neighbor_idx))
                 .collect::<HashSet<_>>();
             Some((id, neighbors))
@@ -484,20 +499,35 @@ fn precompute_one_hop_neighbors(
 /// applies the shared Jaccard-modulated formula from `activation_core`.
 ///
 /// Competitors: high embedding similarity BUT low graph connectivity.
+///
+/// `query_seeds` are the actual query seeds — passed through explicitly rather
+/// than inferred from the post-spread activation values. Inferring seeds from
+/// "activation ≈ 1.0" misclassifies a convergent non-seed clamped to 1.0 as a
+/// seed, wrongly exempting it from inhibition and using it as an inhibitor.
 fn apply_lateral_inhibition(
     graph: &PropertyGraph,
     activations: &mut HashMap<MemoryId, f64>,
+    query_seeds: &[MemoryId],
     mu: f64,
     threshold: f64,
     embeddings: &HashMap<MemoryId, Vec<f32>>,
+    as_of: Timestamp,
 ) {
-    let seeds = activation_core::identify_seeds(activations);
+    // Only seeds present in the activation map matter; sort for deterministic
+    // tie-breaking in the inhibition formula (matches `identify_seeds`).
+    let mut seeds: Vec<MemoryId> = query_seeds
+        .iter()
+        .copied()
+        .filter(|s| activations.contains_key(s))
+        .collect();
+    seeds.sort_unstable();
+    seeds.dedup();
 
     // Collect connected nodes for each seed (within 2 hops).
     let mut connected_to_seeds: HashSet<MemoryId> = HashSet::new();
     for &seed in &seeds {
         connected_to_seeds.insert(seed);
-        for neighbor in graph.get_neighbors(seed, 2, 0.0) {
+        for neighbor in graph.get_neighbors_filtered_at(seed, 2, 0.0, None, as_of) {
             connected_to_seeds.insert(neighbor);
         }
     }
@@ -505,6 +535,7 @@ fn apply_lateral_inhibition(
     let neighbor_sets = precompute_one_hop_neighbors(
         graph,
         activations.keys().copied().chain(seeds.iter().copied()),
+        as_of,
     );
 
     activation_core::apply_lateral_inhibition(
@@ -1706,7 +1737,15 @@ mod tests {
         // The test verifies that Jaccard modulation reduces inhibition relative
         // to what uniform inhibition would produce.
         let original = activations[&competitor];
-        super::apply_lateral_inhibition(&pg, &mut activations, 0.1, 0.5, &embeddings);
+        super::apply_lateral_inhibition(
+            &pg,
+            &mut activations,
+            &[seed],
+            0.1,
+            0.5,
+            &embeddings,
+            Timestamp::now(),
+        );
         let final_val = activations[&competitor];
         // With same-cluster (Jaccard=1.0): inhibition = µ × 0 × sim = 0
         // So activation should be unchanged or very close.
@@ -1750,13 +1789,103 @@ mod tests {
         let mut activations: HashMap<MemoryId, f64> =
             [(seed, 1.0), (competitor, 0.5)].into_iter().collect();
 
-        super::apply_lateral_inhibition(&pg, &mut activations, 0.1, 0.5, &embeddings);
+        super::apply_lateral_inhibition(
+            &pg,
+            &mut activations,
+            &[seed],
+            0.1,
+            0.5,
+            &embeddings,
+            Timestamp::now(),
+        );
         let final_val = activations[&competitor];
         // Different clusters (Jaccard=0): inhibition = 0.1 × 1.0 × 1.0 = 0.1
         // final = max(0.5 - 0.1, 0.5 * 0.2) = 0.4
         assert!(
             final_val < 0.5,
             "different-cluster inhibition should be strong: final={final_val}"
+        );
+    }
+
+    #[test]
+    fn convergent_non_seed_at_one_is_still_inhibited() {
+        // R-17: a NON-seed node driven to activation exactly 1.0 by convergent
+        // paths (spread_level clamps additive activation to min(1.0)) must still
+        // be subject to lateral inhibition — inferring seeds from "activation ≈
+        // 1.0" would misclassify it as a seed and wrongly exempt it.
+        let mut pg = PropertyGraph::new();
+        let seed = make_graph_node(&mut pg);
+        let phantom = make_graph_node(&mut pg); // disconnected from seed
+
+        // Identical embeddings → cosine 1.0 (> threshold), and phantom is not
+        // within 2 hops of the seed, so it is an inhibition candidate.
+        let emb = vec![1.0_f32, 0.0, 0.0, 0.0];
+        let embeddings: HashMap<MemoryId, Vec<f32>> =
+            [(seed, emb.clone()), (phantom, emb)].into_iter().collect();
+
+        let mut activations: HashMap<MemoryId, f64> =
+            [(seed, 1.0), (phantom, 1.0)].into_iter().collect();
+
+        // The real query seed is `seed` only.
+        super::apply_lateral_inhibition(
+            &pg,
+            &mut activations,
+            &[seed],
+            0.5,
+            0.5,
+            &embeddings,
+            Timestamp::now(),
+        );
+
+        assert!(
+            activations[&phantom] < 1.0,
+            "a convergent non-seed at 1.0 must be inhibited, got {}",
+            activations[&phantom]
+        );
+        // The true seed is never inhibited.
+        assert!((activations[&seed] - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn convergent_non_seed_at_one_is_not_used_as_inhibitor() {
+        // R-17: the phantom must also NOT act as an inhibition source. A victim
+        // similar to the phantom (but dissimilar to the real seed) must survive.
+        let mut pg = PropertyGraph::new();
+        let seed = make_graph_node(&mut pg);
+        let phantom = make_graph_node(&mut pg);
+        let victim = make_graph_node(&mut pg);
+
+        // seed is orthogonal to both phantom and victim (cosine 0 < threshold),
+        // so the real seed inhibits neither. phantom and victim are identical.
+        let embeddings: HashMap<MemoryId, Vec<f32>> = [
+            (seed, vec![1.0_f32, 0.0, 0.0, 0.0]),
+            (phantom, vec![0.0_f32, 1.0, 0.0, 0.0]),
+            (victim, vec![0.0_f32, 1.0, 0.0, 0.0]),
+        ]
+        .into_iter()
+        .collect();
+
+        let mut activations: HashMap<MemoryId, f64> = [(seed, 1.0), (phantom, 1.0), (victim, 0.6)]
+            .into_iter()
+            .collect();
+
+        super::apply_lateral_inhibition(
+            &pg,
+            &mut activations,
+            &[seed],
+            0.5,
+            0.5,
+            &embeddings,
+            Timestamp::now(),
+        );
+
+        // If phantom were misclassified as a seed it would inhibit the victim
+        // (cosine 1.0). With the fix, only `seed` inhibits, and it is orthogonal
+        // to the victim, so the victim is untouched.
+        assert!(
+            (activations[&victim] - 0.6).abs() < 1e-12,
+            "phantom must not act as an inhibitor: victim={}",
+            activations[&victim]
         );
     }
 
@@ -1822,7 +1951,15 @@ mod tests {
         let mut actual = baseline;
 
         apply_lateral_inhibition_naive(&pg, &mut expected, 0.2, 0.5, &embeddings);
-        super::apply_lateral_inhibition(&pg, &mut actual, 0.2, 0.5, &embeddings);
+        super::apply_lateral_inhibition(
+            &pg,
+            &mut actual,
+            &[seed],
+            0.2,
+            0.5,
+            &embeddings,
+            Timestamp::now(),
+        );
 
         for node in [seed, same_cluster, different_cluster] {
             let expected_value = expected.get(&node).copied().unwrap_or_default();

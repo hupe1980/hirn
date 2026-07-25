@@ -33,6 +33,27 @@ pub fn schema() -> SchemaRef {
     ]))
 }
 
+/// Create a BTree scalar index on `resource_id` (R-24).
+///
+/// Blob reads/deletes filter by `resource_id = '…'`; without an index each is an
+/// O(n) full scan of `_resource_blobs`. Idempotent — `replace: false` is a no-op
+/// when the index already exists.
+pub async fn create_resource_id_index(
+    store: &dyn crate::store::PhysicalStore,
+) -> Result<(), HirnDbError> {
+    store
+        .create_index(
+            DATASET_NAME,
+            crate::store::IndexConfig {
+                columns: vec!["resource_id".to_string()],
+                index_type: crate::store::IndexType::BTree,
+                params: crate::store::IndexParams::default(),
+                replace: false,
+            },
+        )
+        .await
+}
+
 /// Convert a slice of `ResourceBlobRow` to an Arrow `RecordBatch`.
 pub fn to_batch(rows: &[ResourceBlobRow]) -> Result<RecordBatch, HirnDbError> {
     let len = rows.len();

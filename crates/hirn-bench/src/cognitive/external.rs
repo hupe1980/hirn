@@ -102,8 +102,8 @@ fn format_huggingface_request_error(repo: &str, error: ureq::Error) -> String {
     }
 }
 
-fn huggingface_resolve_file_url(repo: &str, path: &str) -> String {
-    format!("https://huggingface.co/datasets/{repo}/resolve/main/{path}")
+fn huggingface_resolve_file_url(repo: &str, revision: &str, path: &str) -> String {
+    format!("https://huggingface.co/datasets/{repo}/resolve/{revision}/{path}")
 }
 
 fn github_raw_file_url(repo: &str, path: &str) -> String {
@@ -146,11 +146,12 @@ fn download_public_file(url: &str, destination: &Path, label: &str) -> Result<()
 
 fn download_huggingface_file(
     repo: &str,
+    revision: &str,
     path: &str,
     destination: &Path,
     token: Option<&str>,
 ) -> Result<(), String> {
-    let url = huggingface_resolve_file_url(repo, path);
+    let url = huggingface_resolve_file_url(repo, revision, path);
     download_huggingface_file_from_url(&url, repo, destination, token)
 }
 
@@ -1068,6 +1069,23 @@ pub fn load_dmr_cached(cache_dir: &Path) -> Result<CognitiveDataset, String> {
 /// HuggingFace Hub repo for the LongMemEval dataset.
 const LME_HF_REPO: &str = "xiaowu0162/longmemeval";
 
+/// Pinned HuggingFace revision for LongMemEval auto-download (commit sha of
+/// `main` as of 2025-09-19). Pinning keeps downloads byte-stable; the revision
+/// is recorded in the provenance metadata of published artifacts. Override
+/// with `HIRN_BENCH_LME_REVISION` to target a different snapshot.
+const LME_HF_PINNED_REVISION: &str = "2ec2a557f339b6c0369619b1ed5793734cc87533";
+
+/// Environment variable overriding the pinned LongMemEval revision.
+const LME_REVISION_ENV: &str = "HIRN_BENCH_LME_REVISION";
+
+/// The LongMemEval HuggingFace revision used for auto-download.
+pub fn longmemeval_revision() -> String {
+    match std::env::var(LME_REVISION_ENV) {
+        Ok(revision) if !revision.trim().is_empty() => revision.trim().to_string(),
+        _ => LME_HF_PINNED_REVISION.to_string(),
+    }
+}
+
 /// LongMemEval is published as direct JSON files instead of a rows-backed viewer dataset.
 const LME_HF_FILES: &[&str] = &["longmemeval_oracle", "longmemeval_s", "longmemeval_m"];
 
@@ -1431,7 +1449,8 @@ pub fn download_longmemeval(cache_dir: &Path) -> Result<PathBuf, String> {
     std::fs::create_dir_all(cache_dir)
         .map_err(|e| format!("cannot create cache dir {}: {e}", cache_dir.display()))?;
 
-    eprintln!("Downloading LongMemEval dataset from HuggingFace ({LME_HF_REPO})...");
+    let revision = longmemeval_revision();
+    eprintln!("Downloading LongMemEval dataset from HuggingFace ({LME_HF_REPO} @ {revision})...");
 
     let mut available_files = 0usize;
     for file_name in LME_HF_FILES {
@@ -1443,7 +1462,13 @@ pub fn download_longmemeval(cache_dir: &Path) -> Result<PathBuf, String> {
         }
 
         eprintln!("  downloading {file_name}");
-        download_huggingface_file(LME_HF_REPO, file_name, &file_path, auth_token.as_deref())?;
+        download_huggingface_file(
+            LME_HF_REPO,
+            &revision,
+            file_name,
+            &file_path,
+            auth_token.as_deref(),
+        )?;
         available_files += 1;
     }
 
@@ -1451,8 +1476,11 @@ pub fn download_longmemeval(cache_dir: &Path) -> Result<PathBuf, String> {
         return Err("no LongMemEval files retrieved from HuggingFace".to_string());
     }
 
-    std::fs::write(&marker_path, format!("{} files", available_files))
-        .map_err(|e| format!("failed to write marker file: {e}"))?;
+    std::fs::write(
+        &marker_path,
+        format!("{available_files} files @ revision {revision}"),
+    )
+    .map_err(|e| format!("failed to write marker file: {e}"))?;
 
     eprintln!(
         "LongMemEval dataset cached: {} files at {}",
@@ -1718,15 +1746,23 @@ fn append_beam_conversation(
     limits: Option<ExternalLoadLimits>,
     truncation: &mut TruncationSummary,
 ) -> Result<(), String> {
-    let batches: Vec<BeamChatBatch> = read_beam_json(&conversation_dir.join(BEAM_CHAT_FILE))?;
+    // Stream batches out of chat.json one at a time instead of materializing
+    // the whole file as a Vec first: for a 10M-token BEAM conversation this
+    // keeps the parse-side overhead to one batch, while the retained memory is
+    // bounded by the session turns the dataset keeps anyway.
+    let chat_path = conversation_dir.join(BEAM_CHAT_FILE);
+    let chat_file = std::fs::File::open(&chat_path)
+        .map_err(|error| format!("cannot read {}: {error}", chat_path.display()))?;
 
     let mut conversation_session_ids = Vec::new();
     let mut chat_id_to_session: HashMap<u64, String> = HashMap::new();
+    let mut batch_index = 0usize;
 
-    for (batch_index, batch) in batches.iter().enumerate() {
+    process_json_array_reader::<BeamChatBatch, _, _>(BufReader::new(chat_file), |batch| {
         let batch_number = batch
             .batch_number
             .unwrap_or_else(|| (batch_index + 1) as u64);
+        batch_index += 1;
         let session_id = format!("beam-{conversation}-b{batch_number}");
         let mut current_anchor = batch.time_anchor.clone();
         let mut turns = Vec::new();
@@ -1777,7 +1813,7 @@ fn append_beam_conversation(
         }
 
         if turns.is_empty() {
-            continue;
+            return Ok(());
         }
 
         if let Some(limits) = limits {
@@ -1787,7 +1823,7 @@ fn append_beam_conversation(
             {
                 truncation.sessions += 1;
                 truncation.records += turns.len();
-                continue;
+                return Ok(());
             }
         }
 
@@ -1800,7 +1836,9 @@ fn append_beam_conversation(
             id: session_id,
             turns,
         });
-    }
+        Ok(())
+    })
+    .map_err(|error| format!("parse error in {}: {error}", chat_path.display()))?;
 
     let probing_path = conversation_dir
         .join(BEAM_PROBING_DIR)
@@ -1920,6 +1958,76 @@ pub fn load_beam_with_limits(
         queries,
         truncated,
     })
+}
+
+// ─── Dataset File Enumeration (for provenance pinning) ──────
+
+/// Enumerate the on-disk files a format's loader reads from `data_dir`, so
+/// callers can record blake3 checksums in provenance and enforce
+/// `--expect-dataset-hash` pinning.
+pub fn dataset_files_for_format(
+    format: ExternalFormat,
+    data_dir: &Path,
+) -> Result<Vec<PathBuf>, String> {
+    let mut files = Vec::new();
+
+    match format {
+        ExternalFormat::LoCoMo => {
+            for candidate in [LOCOMO_CACHE_FILE, LOCOMO_SOURCE_FILE] {
+                let path = data_dir.join(candidate);
+                if path.exists() {
+                    files.push(path);
+                }
+            }
+        }
+        ExternalFormat::Dmr => {
+            let path = data_dir.join(DMR_CACHE_FILE);
+            if path.exists() {
+                files.push(path);
+            }
+        }
+        ExternalFormat::LongMemEval => {
+            let cases = data_dir.join(LME_CACHE_FILE);
+            if cases.exists() {
+                files.push(cases);
+            }
+            for file_name in LME_HF_FILES {
+                let path = data_dir.join(file_name);
+                if path.exists() {
+                    files.push(path);
+                }
+            }
+        }
+        ExternalFormat::Beam => {
+            for (_, conversation_dir) in beam_conversation_dirs(data_dir)? {
+                let chat_path = conversation_dir.join(BEAM_CHAT_FILE);
+                if chat_path.exists() {
+                    files.push(chat_path);
+                }
+                let nested = conversation_dir
+                    .join(BEAM_PROBING_DIR)
+                    .join(BEAM_PROBING_FILE);
+                if nested.exists() {
+                    files.push(nested);
+                } else {
+                    let flat = conversation_dir.join(BEAM_PROBING_FILE);
+                    if flat.exists() {
+                        files.push(flat);
+                    }
+                }
+            }
+        }
+    }
+
+    if files.is_empty() {
+        return Err(format!(
+            "no dataset files found for checksum recording under {}",
+            data_dir.display()
+        ));
+    }
+
+    files.sort();
+    Ok(files)
 }
 
 #[cfg(test)]
@@ -2422,5 +2530,66 @@ mod tests {
         let error = load_beam(dir.path()).unwrap_err();
         assert!(error.contains("no BEAM conversations found"));
         assert!(error.contains("chat.json"));
+    }
+
+    #[test]
+    fn dataset_files_for_beam_enumerates_chat_and_probing_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let conversation_dir = dir.path().join("100K").join("1");
+        write_beam_conversation(&conversation_dir);
+
+        let files = dataset_files_for_format(ExternalFormat::Beam, dir.path()).unwrap();
+
+        let names: Vec<String> = files
+            .iter()
+            .map(|path| {
+                path.strip_prefix(dir.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "100K/1/chat.json".to_string(),
+                "100K/1/probing_questions/probing_questions.json".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn dataset_files_for_longmemeval_prefers_present_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("longmemeval_s"), "[]").unwrap();
+        std::fs::write(dir.path().join("longmemeval_oracle"), "[]").unwrap();
+
+        let files = dataset_files_for_format(ExternalFormat::LongMemEval, dir.path()).unwrap();
+        let names: Vec<&str> = files
+            .iter()
+            .map(|path| path.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["longmemeval_oracle", "longmemeval_s"]);
+    }
+
+    #[test]
+    fn dataset_files_errors_when_nothing_matches() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let error = dataset_files_for_format(ExternalFormat::Dmr, dir.path()).unwrap_err();
+        assert!(error.contains("no dataset files found"), "got: {error}");
+    }
+
+    #[test]
+    fn longmemeval_revision_is_pinned_by_default() {
+        // Note: does not exercise the env override to avoid mutating process
+        // env in parallel tests; the override path is a trivial trim+fallback.
+        if std::env::var(LME_REVISION_ENV).is_err() {
+            assert_eq!(longmemeval_revision(), LME_HF_PINNED_REVISION);
+        }
+        assert_eq!(
+            LME_HF_PINNED_REVISION.len(),
+            40,
+            "expected a full commit sha"
+        );
     }
 }

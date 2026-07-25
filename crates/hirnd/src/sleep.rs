@@ -10,8 +10,8 @@
 //!
 //! 1. the consolidation pipeline (segmentation → patterns → communities →
 //!    RAPTOR → forgetting) via `db.admin().consolidate()`, and
-//! 2. a bounded set of offline cognition jobs (one dream + one reconcile)
-//!    when the engine's offline scheduler is enabled.
+//! 2. a bounded set of offline cognition jobs (one dream + one reconcile +
+//!    one reflect) when the engine's offline scheduler is enabled.
 //!
 //! The pass aborts between phases as soon as foreground activity resumes, so
 //! interactive traffic never waits behind maintenance work.
@@ -24,7 +24,113 @@ use hirn_core::{CognitiveJob, CognitiveJobKind, OfflineJobTarget};
 use tracing::{debug, info, warn};
 
 use crate::config::SleepConfig;
+use crate::raft::{ClusterCoordinator, LeaseOutcome};
 use crate::realm::RealmManager;
+
+/// Lease duration requested for one consolidation pass over a realm. Long
+/// enough to cover a budgeted pass; short enough that a crashed holder's lease
+/// expires and another node can consolidate on the next window.
+const CONSOLIDATION_LEASE_SECS: u64 = crate::raft::ConsolidationLease::DEFAULT_DURATION_SECS;
+
+/// Coordinates which node runs the (expensive) consolidation pass for a realm.
+///
+/// This is *duplicated-compute* avoidance, not a write-correctness fence — the
+/// consolidation pass's own Lance commits are CAS-fenced regardless. In a
+/// cluster only the lease holder consolidates a given realm; other nodes skip
+/// it. Single-node / non-cluster deployments use [`ConsolidationCoordinator::Local`]
+/// and always run.
+#[derive(Clone, Default)]
+pub enum ConsolidationCoordinator {
+    /// No cluster coordination: always consolidate locally.
+    #[default]
+    Local,
+    /// Cluster mode: gate on the Raft consolidation lease (with fencing token).
+    Raft(ClusterCoordinator),
+    /// Serverless mode: gate on a DynamoDB conditional-write lease (fenced).
+    #[cfg(feature = "serverless")]
+    Dynamo(Arc<crate::dynamo::DynamoConsolidationLease>),
+}
+
+/// Result of attempting to claim consolidation rights for a realm.
+pub enum LeaseClaim {
+    /// Proceed — this node may consolidate. `fence` is the fencing token.
+    Granted { fence: u64 },
+    /// Skip — another node holds the lease this window.
+    Denied,
+}
+
+impl ConsolidationCoordinator {
+    /// Try to claim consolidation rights for `realm`.
+    async fn claim(&self, realm: &str) -> LeaseClaim {
+        match self {
+            Self::Local => LeaseClaim::Granted { fence: 0 },
+            Self::Raft(coord) => match coord.acquire_lease(realm, CONSOLIDATION_LEASE_SECS).await {
+                Ok(LeaseOutcome::Acquired { fence }) => LeaseClaim::Granted { fence },
+                Ok(LeaseOutcome::Conflict { holder }) => {
+                    debug!(
+                        realm,
+                        holder, "consolidation lease held by another node — skipping"
+                    );
+                    LeaseClaim::Denied
+                }
+                Err(error) => {
+                    // Fail closed: if we cannot establish the lease we must not
+                    // risk duplicated consolidation across nodes.
+                    warn!(realm, %error, "consolidation lease acquire failed — skipping realm");
+                    LeaseClaim::Denied
+                }
+            },
+            #[cfg(feature = "serverless")]
+            Self::Dynamo(lease) => match lease.acquire(realm, CONSOLIDATION_LEASE_SECS).await {
+                Ok(Some(fence)) => LeaseClaim::Granted { fence },
+                Ok(None) => {
+                    debug!(realm, "consolidation lease held by another node — skipping");
+                    LeaseClaim::Denied
+                }
+                Err(error) => {
+                    warn!(realm, %error, "consolidation lease acquire failed — skipping realm");
+                    LeaseClaim::Denied
+                }
+            },
+        }
+    }
+
+    /// Renew an in-progress lease so a long pass does not expire mid-flight.
+    async fn renew(&self, realm: &str) {
+        match self {
+            Self::Local => {}
+            Self::Raft(coord) => {
+                if let Err(error) = coord.renew_lease(realm, CONSOLIDATION_LEASE_SECS).await {
+                    warn!(realm, %error, "consolidation lease renewal failed");
+                }
+            }
+            #[cfg(feature = "serverless")]
+            Self::Dynamo(lease) => {
+                if let Err(error) = lease.acquire(realm, CONSOLIDATION_LEASE_SECS).await {
+                    warn!(realm, %error, "consolidation lease renewal failed");
+                }
+            }
+        }
+    }
+
+    /// Release the lease once the pass over `realm` is done.
+    async fn release(&self, realm: &str) {
+        match self {
+            Self::Local => {}
+            Self::Raft(coord) => {
+                if let Err(error) = coord.release_lease(realm).await {
+                    debug!(realm, %error, "consolidation lease release failed (will expire)");
+                }
+            }
+            #[cfg(feature = "serverless")]
+            Self::Dynamo(lease) => {
+                if let Err(error) = lease.release(realm).await {
+                    debug!(realm, %error, "consolidation lease release failed (will expire)");
+                }
+            }
+        }
+    }
+}
 
 /// Agent identity used for daemon-initiated maintenance (Cedar policy checks
 /// and offline-job attribution). Matches the identity the MCP surface falls
@@ -158,8 +264,10 @@ pub struct SleepPassOutcome {
     pub realms_processed: usize,
     /// Consolidation runs that finished successfully.
     pub consolidations_run: usize,
-    /// Offline cognition jobs enqueued (dream/reconcile).
+    /// Offline cognition jobs enqueued (dream/reconcile/reflect).
     pub jobs_enqueued: usize,
+    /// Realms skipped because another node holds the consolidation lease.
+    pub realms_skipped_no_lease: usize,
     /// True when foreground activity resumed and the pass stopped early.
     pub aborted: bool,
 }
@@ -169,9 +277,13 @@ pub struct SleepPassOutcome {
 /// Between phases the tracker is re-checked: any foreground request that
 /// arrives after the pass started aborts the remaining work so maintenance
 /// never competes with live traffic.
-pub async fn run_sleep_pass(realms: &RealmManager, tracker: &ActivityTracker) -> SleepPassOutcome {
+pub async fn run_sleep_pass(
+    realms: &RealmManager,
+    tracker: &ActivityTracker,
+    coordinator: &ConsolidationCoordinator,
+) -> SleepPassOutcome {
     use tracing::Instrument;
-    run_sleep_pass_inner(realms, tracker)
+    run_sleep_pass_inner(realms, tracker, coordinator)
         .instrument(tracing::info_span!("sleep_pass"))
         .await
 }
@@ -179,6 +291,7 @@ pub async fn run_sleep_pass(realms: &RealmManager, tracker: &ActivityTracker) ->
 async fn run_sleep_pass_inner(
     realms: &RealmManager,
     tracker: &ActivityTracker,
+    coordinator: &ConsolidationCoordinator,
 ) -> SleepPassOutcome {
     let pass_start_ms = now_unix_ms();
     let pass_start = Instant::now();
@@ -210,9 +323,22 @@ async fn run_sleep_pass_inner(
             }
         };
 
+        // Cluster coordination: only the consolidation-lease holder runs the
+        // (expensive) pass for this realm — every other node skips it. Local /
+        // single-node deployments always hold the lease. A crashed holder's
+        // lease expires so another node picks the realm up next window.
+        let fence = match coordinator.claim(&realm).await {
+            LeaseClaim::Granted { fence } => fence,
+            LeaseClaim::Denied => {
+                outcome.realms_skipped_no_lease += 1;
+                continue;
+            }
+        };
+
         // Phase 1: consolidation pipeline (segmentation → patterns →
         // communities → RAPTOR → forgetting). Engine defaults keep the run
         // budgeted; the daemon does not override thresholds.
+        debug!(realm, fence, "sleep pass: holding consolidation lease");
         let phase_start = Instant::now();
         match db
             .admin()
@@ -240,15 +366,24 @@ async fn run_sleep_pass_inner(
         if activity_resumed(&outcome) {
             outcome.aborted = true;
             info!(realm, "sleep pass: offline job phase skipped");
+            coordinator.release(&realm).await;
             break;
         }
 
-        // Phase 2: bounded offline cognition (one dream + one reconcile),
-        // only when the engine's offline scheduler is enabled. Budgets come
-        // from the scheduler's configured default budget.
+        // Renew the lease before the second phase so a long pass does not
+        // expire mid-flight and let another node start consolidating.
+        coordinator.renew(&realm).await;
+
+        // Phase 2: bounded offline cognition (one dream + one reconcile +
+        // one reflect), only when the engine's offline scheduler is enabled.
+        // Budgets come from the scheduler's configured default budget.
         if db.config().offline_scheduler.enabled {
             let phase_start = Instant::now();
-            for kind in [CognitiveJobKind::Dream, CognitiveJobKind::Reconcile] {
+            for kind in [
+                CognitiveJobKind::Dream,
+                CognitiveJobKind::Reconcile,
+                CognitiveJobKind::Reflect,
+            ] {
                 let mut job = CognitiveJob::new(kind, OfflineJobTarget::realm(&realm));
                 job.scheduled_by = hirn_core::types::AgentId::new(SLEEP_AGENT_ID).ok();
                 job.rationale = Some("idle-time sleep pass".to_string());
@@ -271,10 +406,11 @@ async fn run_sleep_pass_inner(
         } else {
             debug!(
                 realm,
-                "sleep pass: offline scheduler disabled — dream/reconcile skipped"
+                "sleep pass: offline scheduler disabled — dream/reconcile/reflect skipped"
             );
         }
 
+        coordinator.release(&realm).await;
         outcome.realms_processed += 1;
     }
 
@@ -283,6 +419,7 @@ async fn run_sleep_pass_inner(
         realms_processed = outcome.realms_processed,
         consolidations_run = outcome.consolidations_run,
         jobs_enqueued = outcome.jobs_enqueued,
+        realms_skipped_no_lease = outcome.realms_skipped_no_lease,
         aborted = outcome.aborted,
         "sleep pass finished"
     );
@@ -295,15 +432,28 @@ async fn run_sleep_pass_inner(
 pub struct SleepScheduler {
     cfg: SleepConfig,
     realms: Arc<RealmManager>,
+    coordinator: ConsolidationCoordinator,
     last_pass_finished_ms: Option<u64>,
 }
 
 impl SleepScheduler {
+    /// Create a scheduler with no cluster coordination (single-node / local).
     #[must_use]
     pub fn new(cfg: SleepConfig, realms: Arc<RealmManager>) -> Self {
+        Self::with_coordinator(cfg, realms, ConsolidationCoordinator::Local)
+    }
+
+    /// Create a scheduler that gates consolidation on the given coordinator.
+    #[must_use]
+    pub fn with_coordinator(
+        cfg: SleepConfig,
+        realms: Arc<RealmManager>,
+        coordinator: ConsolidationCoordinator,
+    ) -> Self {
         Self {
             cfg,
             realms,
+            coordinator,
             last_pass_finished_ms: None,
         }
     }
@@ -343,7 +493,8 @@ impl SleepScheduler {
     /// Run exactly one sleep pass and record its completion timestamp.
     /// Public so operators/tests can trigger a pass without the timer loop.
     pub async fn run_pass_once(&mut self) -> SleepPassOutcome {
-        let outcome = run_sleep_pass(&self.realms, ActivityTracker::global()).await;
+        let outcome =
+            run_sleep_pass(&self.realms, ActivityTracker::global(), &self.coordinator).await;
 
         let finished_ms = now_unix_ms();
         self.last_pass_finished_ms = Some(finished_ms);
@@ -456,6 +607,23 @@ mod tests {
         Arc::new(RealmManager::from_db(Arc::new(db)))
     }
 
+    /// Like [`memory_realm`], but with the engine's offline scheduler
+    /// enabled so the sleep pass actually enqueues cognition jobs.
+    async fn memory_realm_with_offline_scheduler() -> Arc<RealmManager> {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage: Arc<dyn hirn_storage::PhysicalStore> =
+            Arc::new(hirn_storage::memory_store::MemoryStore::new());
+        let mut config = hirn_core::HirnConfig::builder()
+            .db_path(tmp.path().join("brain"))
+            .build()
+            .unwrap();
+        config.offline_scheduler.enabled = true;
+        let db = hirn_engine::HirnDB::open_with_config(config, storage)
+            .await
+            .unwrap();
+        Arc::new(RealmManager::from_db(Arc::new(db)))
+    }
+
     /// Smoke test: a pass over a MemoryStore-backed default realm runs the
     /// consolidation phase and completes without abort. Offline jobs are
     /// skipped because the engine's offline scheduler defaults to disabled.
@@ -464,11 +632,29 @@ mod tests {
         let realms = memory_realm().await;
         let tracker = ActivityTracker::new();
 
-        let outcome = run_sleep_pass(&realms, &tracker).await;
+        let outcome = run_sleep_pass(&realms, &tracker, &ConsolidationCoordinator::Local).await;
 
         assert_eq!(outcome.realms_processed, 1);
         assert_eq!(outcome.consolidations_run, 1);
         assert_eq!(outcome.jobs_enqueued, 0);
+        assert!(!outcome.aborted);
+    }
+
+    /// With the offline scheduler enabled, one job per cognitive kind
+    /// (dream + reconcile + reflect) is enqueued per realm and pass.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sleep_pass_enqueues_dream_reconcile_and_reflect_jobs() {
+        let realms = memory_realm_with_offline_scheduler().await;
+        let tracker = ActivityTracker::new();
+
+        let outcome = run_sleep_pass(&realms, &tracker, &ConsolidationCoordinator::Local).await;
+
+        assert_eq!(outcome.realms_processed, 1);
+        assert_eq!(outcome.consolidations_run, 1);
+        assert_eq!(
+            outcome.jobs_enqueued, 3,
+            "expected exactly one dream + one reconcile + one reflect job"
+        );
         assert!(!outcome.aborted);
     }
 
@@ -480,7 +666,7 @@ mod tests {
         // between-phase check to see resumed traffic immediately.
         tracker.mark_active_at(now_unix_ms() + 60_000);
 
-        let outcome = run_sleep_pass(&realms, &tracker).await;
+        let outcome = run_sleep_pass(&realms, &tracker, &ConsolidationCoordinator::Local).await;
 
         assert!(outcome.aborted);
         assert_eq!(outcome.realms_processed, 0);

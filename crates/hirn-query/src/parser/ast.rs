@@ -108,7 +108,7 @@ impl fmt::Display for RecallSnapshotAst {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecallStmt {
     pub layers: Vec<Layer>,
-    pub about: String,
+    pub about: StringOrParam,
     pub involving: Option<Vec<String>>,
     pub temporal: Option<TemporalClause>,
     pub as_of: Option<RecallSnapshotAst>,
@@ -183,7 +183,7 @@ pub enum RetrievalMode {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ThinkStmt {
-    pub about: String,
+    pub about: StringOrParam,
     pub involving: Option<Vec<String>>,
     pub temporal: Option<TemporalClause>,
     pub expand: Option<ExpandClause>,
@@ -447,6 +447,92 @@ pub enum ConditionValue {
     Param(String),
 }
 
+/// A value in a free-text string position (e.g. `ABOUT`) that is either a
+/// literal string or an unbound parameter placeholder.
+///
+/// The distinction is captured **at parse time** from the grammar (a quoted
+/// `string_literal` vs a bare `parameter` token) and preserved through the
+/// AST. This is what lets a quoted literal such as `ABOUT "$q"` be treated as
+/// a search for the text `$q` (a `Literal`) while a bare `ABOUT $q` is a
+/// placeholder (a `Param`) that must be bound before execution — mirroring
+/// [`ConditionValue::Param`] for WHERE values (R-50). Without this, the old
+/// `$`-prefix heuristic on a plain `String` could not tell them apart, so a
+/// quoted `"$q"` was wrongly re-bound and an unbound `$q` silently reached
+/// execution as a literal search.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StringOrParam {
+    /// A literal string value (verbatim search text).
+    Literal(String),
+    /// An unbound parameter placeholder, stored **with** its `$` prefix
+    /// (e.g. `$1`, `$query`).
+    Param(String),
+}
+
+impl StringOrParam {
+    /// The parameter name (with `$` prefix) if this is an unbound placeholder.
+    pub fn param_name(&self) -> Option<&str> {
+        match self {
+            Self::Param(name) => Some(name.as_str()),
+            Self::Literal(_) => None,
+        }
+    }
+
+    /// The literal text if this is a `Literal`, otherwise `None`.
+    pub fn as_literal(&self) -> Option<&str> {
+        match self {
+            Self::Literal(value) => Some(value.as_str()),
+            Self::Param(_) => None,
+        }
+    }
+
+    /// True when this is a `Literal` whose (trimmed) content is empty — used to
+    /// detect a missing/blank `ABOUT` clause. A `Param` is never blank.
+    pub fn is_blank_literal(&self) -> bool {
+        matches!(self, Self::Literal(value) if value.trim().is_empty())
+    }
+}
+
+impl Default for StringOrParam {
+    fn default() -> Self {
+        Self::Literal(String::new())
+    }
+}
+
+impl From<String> for StringOrParam {
+    fn from(value: String) -> Self {
+        Self::Literal(value)
+    }
+}
+
+impl From<&str> for StringOrParam {
+    fn from(value: &str) -> Self {
+        Self::Literal(value.to_string())
+    }
+}
+
+impl PartialEq<str> for StringOrParam {
+    fn eq(&self, other: &str) -> bool {
+        matches!(self, Self::Literal(value) if value == other)
+    }
+}
+
+impl PartialEq<&str> for StringOrParam {
+    fn eq(&self, other: &&str) -> bool {
+        matches!(self, Self::Literal(value) if value == *other)
+    }
+}
+
+impl fmt::Display for StringOrParam {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            // Literals re-render as quoted+escaped so the statement re-parses
+            // to an equal AST; params render as the bare `$name` token.
+            Self::Literal(value) => write!(f, "\"{}\"", EscapeStr(value)),
+            Self::Param(name) => write!(f, "{name}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputFormat {
     Narrative,
@@ -495,7 +581,7 @@ pub struct SubqueryFilter {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Subquery {
     pub layers: Vec<Layer>,
-    pub about: String,
+    pub about: StringOrParam,
     pub involving: Option<Vec<String>>,
     pub temporal: Option<TemporalClause>,
     pub limit: Option<usize>,
@@ -692,7 +778,7 @@ impl fmt::Display for RecallStmt {
         // hirnql.pest) so the rendered statement re-parses to an equal AST.
         write!(f, "RECALL ")?;
         write_layer_filter(f, &self.layers)?;
-        write!(f, " ABOUT \"{}\"", EscapeStr(&self.about))?;
+        write!(f, " ABOUT {}", self.about)?;
         if let Some(ref inv) = self.involving {
             write!(f, " INVOLVING ")?;
             write_string_list(f, inv)?;
@@ -817,7 +903,7 @@ impl fmt::Display for ThinkStmt {
         if self.mode == RetrievalMode::Global {
             write!(f, " GLOBAL")?;
         }
-        write!(f, " ABOUT \"{}\"", EscapeStr(&self.about))?;
+        write!(f, " ABOUT {}", self.about)?;
         if let Some(ref inv) = self.involving {
             write!(f, " INVOLVING ")?;
             write_string_list(f, inv)?;
@@ -1133,7 +1219,7 @@ impl fmt::Display for Subquery {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "RECALL ")?;
         write_layer_filter(f, &self.layers)?;
-        write!(f, " ABOUT \"{}\"", EscapeStr(&self.about))?;
+        write!(f, " ABOUT {}", self.about)?;
         if let Some(ref inv) = self.involving {
             write!(f, " INVOLVING ")?;
             write_string_list(f, inv)?;
@@ -1432,9 +1518,17 @@ pub fn collect_parameters(stmt: &Statement) -> Vec<String> {
         }
     }
 
+    fn check_str_param(s: &StringOrParam, params: &mut Vec<String>) {
+        if let Some(name) = s.param_name()
+            && !params.iter().any(|p| p == name)
+        {
+            params.push(name.to_string());
+        }
+    }
+
     match stmt {
         Statement::Recall(r) => {
-            check(&r.about, &mut params);
+            check_str_param(&r.about, &mut params);
             if let Some(ref topic) = r.topic {
                 check(topic, &mut params);
             }
@@ -1442,12 +1536,12 @@ pub fn collect_parameters(stmt: &Statement) -> Vec<String> {
                 check(ns, &mut params);
             }
             for sf in &r.subquery_filters {
-                check(&sf.subquery.about, &mut params);
+                check_str_param(&sf.subquery.about, &mut params);
             }
             check_wheres(&r.where_clauses, &mut params);
         }
         Statement::Think(t) => {
-            check(&t.about, &mut params);
+            check_str_param(&t.about, &mut params);
             if let Some(ref ns) = t.namespace {
                 check(ns, &mut params);
             }
@@ -1574,6 +1668,26 @@ pub fn bind_parameters(stmt: &mut Statement, values: &HashMap<String, String>) -
         }
     }
 
+    // Bind a string-or-param position: an unbound `Param` becomes a `Literal`
+    // once its value is supplied; a `Literal` (e.g. a quoted `"$q"`) is never
+    // re-bound.
+    fn subst_str(
+        s: &mut StringOrParam,
+        values: &HashMap<String, String>,
+        missing: &mut Vec<String>,
+    ) {
+        if let StringOrParam::Param(name) = s {
+            match values.get(name.as_str()) {
+                Some(v) => *s = StringOrParam::Literal(v.clone()),
+                None => {
+                    if !missing.contains(name) {
+                        missing.push(name.clone());
+                    }
+                }
+            }
+        }
+    }
+
     fn subst_wheres(
         wcs: &mut [WhereCondition],
         values: &HashMap<String, String>,
@@ -1595,7 +1709,7 @@ pub fn bind_parameters(stmt: &mut Statement, values: &HashMap<String, String>) -
 
     match stmt {
         Statement::Recall(r) => {
-            subst(&mut r.about, values, &mut missing);
+            subst_str(&mut r.about, values, &mut missing);
             if let Some(ref mut topic) = r.topic {
                 subst(topic, values, &mut missing);
             }
@@ -1603,12 +1717,12 @@ pub fn bind_parameters(stmt: &mut Statement, values: &HashMap<String, String>) -
                 subst(ns, values, &mut missing);
             }
             for sf in &mut r.subquery_filters {
-                subst(&mut sf.subquery.about, values, &mut missing);
+                subst_str(&mut sf.subquery.about, values, &mut missing);
             }
             subst_wheres(&mut r.where_clauses, values, &mut missing);
         }
         Statement::Think(t) => {
-            subst(&mut t.about, values, &mut missing);
+            subst_str(&mut t.about, values, &mut missing);
             if let Some(ref mut ns) = t.namespace {
                 subst(ns, values, &mut missing);
             }

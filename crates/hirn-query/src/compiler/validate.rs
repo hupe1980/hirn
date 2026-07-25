@@ -1,13 +1,21 @@
-//! Semantic analysis — validates a parsed AST before planning.
+//! Untyped-AST semantic validation — value ranges, field whitelists, and
+//! format checks that go beyond what the PEG grammar can enforce.
 //!
-//! Checks field names, value types, temporal format validity, and other
-//! semantic constraints that go beyond what the PEG grammar can enforce.
+//! This is Stage 2a of the compilation pipeline: [`validate`] runs at the top
+//! of `typed_ast::analyze`, so every execution path (text compile, bound
+//! prepared statements) gets the same checks exactly once. It is also called
+//! directly by the engine's prepared-statement front-end to reject invalid
+//! parameter-free templates at `prepare()` time.
+//!
+//! Parameter placeholders (`$name`) are skipped by value checks — they are
+//! validated after `bind()` substitutes concrete values, when the bound AST
+//! is compiled for execution.
 
 use std::collections::HashSet;
 
-use hirn_query::ast::*;
+use crate::parser::ast::*;
 
-/// A semantic error discovered during analysis.
+/// A semantic error discovered during validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnalysisError {
     pub message: String,
@@ -54,20 +62,20 @@ const NUMERIC_FIELDS: &[&str] = &[
     "episodic.access_count",
 ];
 
-/// Analyze a parsed statement for semantic correctness.
+/// Validate a parsed statement for semantic correctness.
 ///
 /// Returns a list of errors (empty = valid).
-pub fn analyze(stmt: &Statement) -> Vec<AnalysisError> {
+pub fn validate(stmt: &Statement) -> Vec<AnalysisError> {
     match stmt {
-        Statement::Recall(r) => analyze_recall(r),
-        Statement::Think(t) => analyze_think(t),
-        Statement::Correct(c) => analyze_correct(c),
-        Statement::Supersede(s) => analyze_supersede(s),
-        Statement::MergeMemory(m) => analyze_merge_memory(m),
-        Statement::Retract(r) => analyze_retract(r),
+        Statement::Recall(r) => validate_recall(r),
+        Statement::Think(t) => validate_think(t),
+        Statement::Correct(c) => validate_correct(c),
+        Statement::Supersede(s) => validate_supersede(s),
+        Statement::MergeMemory(m) => validate_merge_memory(m),
+        Statement::Retract(r) => validate_retract(r),
         Statement::Inspect(_) | Statement::History(_) | Statement::Trace(_) => vec![],
-        Statement::Traverse(t) => analyze_traverse(t),
-        Statement::Explain(e) => analyze(&e.inner),
+        Statement::Traverse(t) => validate_traverse(t),
+        Statement::Explain(e) => validate(&e.inner),
         Statement::CreateRealm(_)
         | Statement::DropRealm(_)
         | Statement::Grant(_)
@@ -87,10 +95,10 @@ fn semantic_target_is_empty(target: &SemanticTargetRef) -> bool {
     target.raw_value().trim().is_empty()
 }
 
-fn analyze_recall(r: &RecallStmt) -> Vec<AnalysisError> {
+fn validate_recall(r: &RecallStmt) -> Vec<AnalysisError> {
     let mut errors = Vec::new();
 
-    if r.about.trim().is_empty() {
+    if r.about.is_blank_literal() {
         errors.push(AnalysisError {
             message: "ABOUT clause cannot be empty".into(),
             kind: AnalysisErrorKind::MissingRequired,
@@ -104,31 +112,31 @@ fn analyze_recall(r: &RecallStmt) -> Vec<AnalysisError> {
         });
     }
 
-    errors.extend(analyze_where_clauses(&r.where_clauses));
-    errors.extend(analyze_temporal(r.temporal.as_ref()));
-    errors.extend(analyze_expand(r.expand.as_ref()));
-    errors.extend(analyze_budget(r.budget));
+    errors.extend(validate_recall_where_clauses(&r.where_clauses));
+    errors.extend(validate_temporal(r.temporal.as_ref()));
+    errors.extend(validate_expand(r.expand.as_ref()));
+    errors.extend(validate_budget(r.budget));
     errors
 }
 
-fn analyze_think(t: &ThinkStmt) -> Vec<AnalysisError> {
+fn validate_think(t: &ThinkStmt) -> Vec<AnalysisError> {
     let mut errors = Vec::new();
 
-    if t.about.trim().is_empty() {
+    if t.about.is_blank_literal() {
         errors.push(AnalysisError {
             message: "THINK ABOUT clause cannot be empty".into(),
             kind: AnalysisErrorKind::MissingRequired,
         });
     }
 
-    errors.extend(analyze_where_clauses(&t.where_clauses));
-    errors.extend(analyze_temporal(t.temporal.as_ref()));
-    errors.extend(analyze_expand(t.expand.as_ref()));
-    errors.extend(analyze_budget(t.budget));
+    errors.extend(validate_recall_where_clauses(&t.where_clauses));
+    errors.extend(validate_temporal(t.temporal.as_ref()));
+    errors.extend(validate_expand(t.expand.as_ref()));
+    errors.extend(validate_budget(t.budget));
     errors
 }
 
-fn analyze_correct(c: &CorrectStmt) -> Vec<AnalysisError> {
+fn validate_correct(c: &CorrectStmt) -> Vec<AnalysisError> {
     let mut errors = Vec::new();
 
     if semantic_target_is_empty(&c.target) {
@@ -138,8 +146,8 @@ fn analyze_correct(c: &CorrectStmt) -> Vec<AnalysisError> {
         });
     }
 
-    errors.extend(analyze_semantic_updates(&c.updates, "CORRECT", true));
-    errors.extend(analyze_semantic_observed_at(
+    errors.extend(validate_semantic_updates(&c.updates, "CORRECT", true));
+    errors.extend(validate_semantic_observed_at(
         c.observed_at.as_ref(),
         "CORRECT",
     ));
@@ -147,7 +155,7 @@ fn analyze_correct(c: &CorrectStmt) -> Vec<AnalysisError> {
     errors
 }
 
-fn analyze_semantic_updates(
+fn validate_semantic_updates(
     updates: &[SetAssignment],
     verb: &str,
     require_updates: bool,
@@ -217,7 +225,7 @@ fn analyze_semantic_updates(
     errors
 }
 
-fn analyze_semantic_observed_at(observed_at: Option<&String>, verb: &str) -> Vec<AnalysisError> {
+fn validate_semantic_observed_at(observed_at: Option<&String>, verb: &str) -> Vec<AnalysisError> {
     let mut errors = Vec::new();
 
     if let Some(observed_at) = observed_at
@@ -232,7 +240,7 @@ fn analyze_semantic_observed_at(observed_at: Option<&String>, verb: &str) -> Vec
     errors
 }
 
-fn analyze_supersede(s: &SupersedeStmt) -> Vec<AnalysisError> {
+fn validate_supersede(s: &SupersedeStmt) -> Vec<AnalysisError> {
     let mut errors = Vec::new();
 
     if semantic_target_is_empty(&s.target) {
@@ -242,8 +250,8 @@ fn analyze_supersede(s: &SupersedeStmt) -> Vec<AnalysisError> {
         });
     }
 
-    errors.extend(analyze_semantic_updates(&s.updates, "SUPERSEDE", true));
-    errors.extend(analyze_semantic_observed_at(
+    errors.extend(validate_semantic_updates(&s.updates, "SUPERSEDE", true));
+    errors.extend(validate_semantic_observed_at(
         s.observed_at.as_ref(),
         "SUPERSEDE",
     ));
@@ -251,7 +259,7 @@ fn analyze_supersede(s: &SupersedeStmt) -> Vec<AnalysisError> {
     errors
 }
 
-fn analyze_merge_memory(m: &MergeMemoryStmt) -> Vec<AnalysisError> {
+fn validate_merge_memory(m: &MergeMemoryStmt) -> Vec<AnalysisError> {
     let mut errors = Vec::new();
 
     if m.sources.is_empty() {
@@ -298,8 +306,8 @@ fn analyze_merge_memory(m: &MergeMemoryStmt) -> Vec<AnalysisError> {
         }
     }
 
-    errors.extend(analyze_semantic_updates(&m.updates, "MERGE MEMORY", false));
-    errors.extend(analyze_semantic_observed_at(
+    errors.extend(validate_semantic_updates(&m.updates, "MERGE MEMORY", false));
+    errors.extend(validate_semantic_observed_at(
         m.observed_at.as_ref(),
         "MERGE MEMORY",
     ));
@@ -307,7 +315,7 @@ fn analyze_merge_memory(m: &MergeMemoryStmt) -> Vec<AnalysisError> {
     errors
 }
 
-fn analyze_retract(r: &RetractStmt) -> Vec<AnalysisError> {
+fn validate_retract(r: &RetractStmt) -> Vec<AnalysisError> {
     let mut errors = Vec::new();
 
     if semantic_target_is_empty(&r.target) {
@@ -329,7 +337,7 @@ fn analyze_retract(r: &RetractStmt) -> Vec<AnalysisError> {
     errors
 }
 
-fn analyze_traverse(t: &TraverseStmt) -> Vec<AnalysisError> {
+fn validate_traverse(t: &TraverseStmt) -> Vec<AnalysisError> {
     let mut errors = Vec::new();
 
     if t.from.trim().is_empty() {
@@ -346,22 +354,81 @@ fn analyze_traverse(t: &TraverseStmt) -> Vec<AnalysisError> {
         });
     }
 
-    errors.extend(analyze_where_clauses(&t.where_clauses));
+    errors.extend(validate_where_clauses(&t.where_clauses));
     errors
 }
 
-fn analyze_where_clauses(clauses: &[WhereCondition]) -> Vec<AnalysisError> {
+/// WHERE fields that RECALL and THINK actually support end-to-end (the plan
+/// compiler translates exactly these into physical-column predicates). Any
+/// other field is silently dropped downstream, which makes results either
+/// over-return or come back empty — so unknown fields are rejected up front
+/// (fail closed), matching how RECALL EVENTS and CORRECT/SUPERSEDE SET already
+/// reject unknown fields (R-49).
+const RECALL_THINK_WHERE_FIELDS: &[&str] = &[
+    "importance",
+    "confidence",
+    "success_rate",
+    "surprise",
+    "access_count",
+    "evidence_count",
+    "invocation_count",
+    // `trust` is enforced as a post-load filter (provenance trust score) and
+    // `relevance_score` is an alias for importance — both are supported by the
+    // engine's recall filter path (see hirn-engine `ql::read_support`).
+    "trust",
+    "relevance_score",
+];
+
+/// Strip an optional `<layer>.` table qualifier (e.g. `episodic.access_count`)
+/// so qualified and bare field names validate identically — the engine's recall
+/// filter accepts both forms.
+fn unqualified_field(field: &str) -> &str {
+    field.rsplit('.').next().unwrap_or(field)
+}
+
+fn validate_where_clauses(clauses: &[WhereCondition]) -> Vec<AnalysisError> {
+    validate_where_clauses_inner(clauses, None)
+}
+
+/// Like [`validate_where_clauses`], but additionally rejects any field not in
+/// `whitelist` as an `UnknownField`. Used for RECALL/THINK where the set of
+/// supported filter fields is closed.
+fn validate_recall_where_clauses(clauses: &[WhereCondition]) -> Vec<AnalysisError> {
+    validate_where_clauses_inner(clauses, Some(RECALL_THINK_WHERE_FIELDS))
+}
+
+fn validate_where_clauses_inner(
+    clauses: &[WhereCondition],
+    whitelist: Option<&[&str]>,
+) -> Vec<AnalysisError> {
     let mut errors = Vec::new();
 
     for wc in clauses {
+        // Reject fields outside the supported set (fail closed) so they are
+        // never silently dropped by the plan compiler.
+        if let Some(allowed) = whitelist
+            && !allowed.contains(&unqualified_field(&wc.field))
+        {
+            errors.push(AnalysisError {
+                message: format!(
+                    "unknown WHERE field '{}' (supported: {})",
+                    wc.field,
+                    allowed.join(", ")
+                ),
+                kind: AnalysisErrorKind::UnknownField,
+            });
+            // Skip further type/range checks for a field we do not support.
+            continue;
+        }
+
         // Check that numeric fields are compared with numeric values.
-        if NUMERIC_FIELDS.contains(&wc.field.as_str()) {
-            if matches!(wc.value, ConditionValue::String(_)) {
-                errors.push(AnalysisError {
-                    message: format!("field '{}' expects a numeric value, got string", wc.field),
-                    kind: AnalysisErrorKind::TypeMismatch,
-                });
-            }
+        if NUMERIC_FIELDS.contains(&wc.field.as_str())
+            && matches!(wc.value, ConditionValue::String(_))
+        {
+            errors.push(AnalysisError {
+                message: format!("field '{}' expects a numeric value, got string", wc.field),
+                kind: AnalysisErrorKind::TypeMismatch,
+            });
         }
 
         // Check numeric range for known bounded fields.
@@ -391,7 +458,7 @@ fn analyze_where_clauses(clauses: &[WhereCondition]) -> Vec<AnalysisError> {
     errors
 }
 
-fn analyze_temporal(temporal: Option<&TemporalClause>) -> Vec<AnalysisError> {
+fn validate_temporal(temporal: Option<&TemporalClause>) -> Vec<AnalysisError> {
     let Some(tc) = temporal else { return vec![] };
     let mut errors = Vec::new();
 
@@ -405,7 +472,7 @@ fn analyze_temporal(temporal: Option<&TemporalClause>) -> Vec<AnalysisError> {
         if !is_valid_temporal(ts) {
             errors.push(AnalysisError {
                 message: format!(
-                    "invalid temporal value: '{ts}' (expected YYYY-MM-DD or RFC 3339)"
+                    "invalid temporal format: '{ts}' (expected YYYY-MM-DD or RFC 3339)"
                 ),
                 kind: AnalysisErrorKind::InvalidTemporal,
             });
@@ -415,7 +482,7 @@ fn analyze_temporal(temporal: Option<&TemporalClause>) -> Vec<AnalysisError> {
     errors
 }
 
-fn analyze_expand(expand: Option<&ExpandClause>) -> Vec<AnalysisError> {
+fn validate_expand(expand: Option<&ExpandClause>) -> Vec<AnalysisError> {
     let Some(ex) = expand else { return vec![] };
     let mut errors = Vec::new();
 
@@ -438,7 +505,7 @@ fn analyze_expand(expand: Option<&ExpandClause>) -> Vec<AnalysisError> {
     errors
 }
 
-fn analyze_budget(budget: Option<usize>) -> Vec<AnalysisError> {
+fn validate_budget(budget: Option<usize>) -> Vec<AnalysisError> {
     if let Some(b) = budget {
         if b == 0 {
             return vec![AnalysisError {
@@ -466,139 +533,163 @@ fn is_valid_temporal(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::parse;
 
     #[test]
     fn valid_recall_passes() {
-        let stmt = hirn_query::parse(r#"RECALL episodic ABOUT "test""#).unwrap();
-        assert!(analyze(&stmt).is_empty());
+        let stmt = parse(r#"RECALL episodic ABOUT "test""#).unwrap();
+        assert!(validate(&stmt).is_empty());
     }
 
     #[test]
     fn recall_with_valid_where() {
-        let stmt =
-            hirn_query::parse(r#"RECALL episodic ABOUT "x" WHERE importance > 0.5"#).unwrap();
-        assert!(analyze(&stmt).is_empty());
+        let stmt = parse(r#"RECALL episodic ABOUT "x" WHERE importance > 0.5"#).unwrap();
+        assert!(validate(&stmt).is_empty());
     }
 
     #[test]
     fn recall_with_out_of_range_importance() {
-        let stmt =
-            hirn_query::parse(r#"RECALL episodic ABOUT "x" WHERE importance > 2.0"#).unwrap();
-        let errors = analyze(&stmt);
+        let stmt = parse(r#"RECALL episodic ABOUT "x" WHERE importance > 2.0"#).unwrap();
+        let errors = validate(&stmt);
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].kind, AnalysisErrorKind::ValueOutOfRange);
     }
 
     #[test]
     fn recall_with_invalid_temporal() {
-        let stmt = hirn_query::parse(r#"RECALL episodic ABOUT "x" AFTER "not-a-date""#).unwrap();
-        let errors = analyze(&stmt);
+        let stmt = parse(r#"RECALL episodic ABOUT "x" AFTER "not-a-date""#).unwrap();
+        let errors = validate(&stmt);
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].kind, AnalysisErrorKind::InvalidTemporal);
     }
 
     #[test]
-    fn remember_is_rejected_before_analysis() {
-        let error =
-            hirn_query::parse(r#"REMEMBER episode CONTENT "x" IMPORTANCE 1.5"#).unwrap_err();
+    fn parameterized_where_value_is_skipped() {
+        // $threshold is validated after bind(), not at template validation.
+        let stmt = parse(r#"RECALL episodic ABOUT $1 WHERE importance > $threshold"#).unwrap();
+        assert!(validate(&stmt).is_empty());
+    }
+
+    #[test]
+    fn recall_unknown_where_field_is_rejected() {
+        // R-49: an unknown RECALL WHERE field is dropped by the plan compiler
+        // (over-returns) or fails the engine post-load filter (empty). Reject
+        // it up front instead of silently mis-answering.
+        let stmt = parse(r#"RECALL episodic ABOUT "x" WHERE nonexistent = "y""#).unwrap();
+        let errors = validate(&stmt);
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].kind, AnalysisErrorKind::UnknownField);
+    }
+
+    #[test]
+    fn recall_engine_supported_fields_and_qualifiers_pass() {
+        // `trust` (post-load provenance filter) and `relevance_score` (an
+        // importance alias) ARE supported by the engine's recall filter path, as
+        // is a `<layer>.` table qualifier — none may be rejected as unknown.
+        for query in [
+            r#"RECALL episodic ABOUT "x" WHERE trust < 0.95"#,
+            r#"RECALL episodic ABOUT "x" WHERE relevance_score > 0.5"#,
+            r#"RECALL episodic ABOUT "x" WHERE episodic.access_count >= 2"#,
+        ] {
+            let stmt = parse(query).unwrap();
+            let errors = validate(&stmt);
+            assert!(
+                !errors
+                    .iter()
+                    .any(|e| e.kind == AnalysisErrorKind::UnknownField),
+                "query '{query}' must not report an unknown field, got: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn think_unknown_where_field_is_rejected() {
+        let stmt = parse(r#"THINK ABOUT "x" WHERE bogus > 1"#).unwrap();
+        let errors = validate(&stmt);
         assert!(
-            error
-                .to_string()
-                .contains("REMEMBER is not supported via embedded HirnQL anymore")
+            errors
+                .iter()
+                .any(|e| e.kind == AnalysisErrorKind::UnknownField),
+            "errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn recall_supported_where_fields_pass() {
+        for field in [
+            "importance",
+            "confidence",
+            "success_rate",
+            "surprise",
+            "access_count",
+            "evidence_count",
+            "invocation_count",
+        ] {
+            let stmt = parse(&format!(r#"RECALL episodic ABOUT "x" WHERE {field} > 1"#)).unwrap();
+            let errors = validate(&stmt);
+            assert!(
+                !errors
+                    .iter()
+                    .any(|e| e.kind == AnalysisErrorKind::UnknownField),
+                "field '{field}' must be accepted, got: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn traverse_where_field_is_not_whitelisted() {
+        // TRAVERSE filters on traversal-output columns (e.g. `weight`, `depth`)
+        // — these must NOT be rejected by the RECALL/THINK whitelist.
+        let stmt = parse(r#"TRAVERSE FROM "node1" VIA causes DEPTH 2 WHERE weight > 0.5"#).unwrap();
+        let errors = validate(&stmt);
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.kind == AnalysisErrorKind::UnknownField),
+            "traverse WHERE fields must not be whitelisted: {errors:?}"
         );
     }
 
     #[test]
     fn correct_unknown_field_is_rejected() {
-        let stmt = hirn_query::parse(r#"CORRECT "x" SET unsupported = 1"#).unwrap();
-        let errors = analyze(&stmt);
+        let stmt = parse(r#"CORRECT "x" SET unsupported = 1"#).unwrap();
+        let errors = validate(&stmt);
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].kind, AnalysisErrorKind::UnknownField);
     }
 
     #[test]
     fn supersede_unknown_field_is_rejected() {
-        let stmt = hirn_query::parse(r#"SUPERSEDE "x" SET unsupported = 1"#).unwrap();
-        let errors = analyze(&stmt);
+        let stmt = parse(r#"SUPERSEDE "x" SET unsupported = 1"#).unwrap();
+        let errors = validate(&stmt);
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].kind, AnalysisErrorKind::UnknownField);
     }
 
     #[test]
     fn retract_invalid_observed_at_is_rejected() {
-        let stmt = hirn_query::parse(r#"RETRACT "x" OBSERVED AT "not-a-date""#).unwrap();
-        let errors = analyze(&stmt);
+        let stmt = parse(r#"RETRACT "x" OBSERVED AT "not-a-date""#).unwrap();
+        let errors = validate(&stmt);
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].kind, AnalysisErrorKind::InvalidTemporal);
     }
 
     #[test]
-    fn connect_unknown_relation() {
-        let error = hirn_query::parse(r#"CONNECT "a" TO "b" AS unknown_rel"#).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("CONNECT is not supported via embedded HirnQL anymore")
-        );
-    }
-
-    #[test]
-    fn connect_valid_relation() {
-        let error =
-            hirn_query::parse(r#"CONNECT "a" TO "b" AS related_to WEIGHT 0.5"#).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("CONNECT is not supported via embedded HirnQL anymore")
-        );
-    }
-
-    #[test]
-    fn connect_weight_out_of_range() {
-        let error = hirn_query::parse(r#"CONNECT "a" TO "b" AS causes WEIGHT 1.5"#).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("CONNECT is not supported via embedded HirnQL anymore")
-        );
-    }
-
-    #[test]
     fn think_valid_passes() {
-        let stmt = hirn_query::parse(r#"THINK ABOUT "test" BUDGET 4096"#).unwrap();
-        assert!(analyze(&stmt).is_empty());
+        let stmt = parse(r#"THINK ABOUT "test" BUDGET 4096"#).unwrap();
+        assert!(validate(&stmt).is_empty());
     }
 
     #[test]
     fn think_global_valid() {
-        let stmt = hirn_query::parse(r#"THINK GLOBAL ABOUT "test""#).unwrap();
-        assert!(analyze(&stmt).is_empty());
-    }
-
-    #[test]
-    fn consolidate_valid() {
-        let error = hirn_query::parse("CONSOLIDATE").unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("CONSOLIDATE is not supported via HirnQL anymore")
-        );
-    }
-
-    #[test]
-    fn watch_valid() {
-        let error = hirn_query::parse(r#"WATCH ALL"#).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("WATCH is not supported via embedded HirnQL anymore")
-        );
+        let stmt = parse(r#"THINK GLOBAL ABOUT "test""#).unwrap();
+        assert!(validate(&stmt).is_empty());
     }
 
     #[test]
     fn budget_zero_rejected() {
-        let stmt = hirn_query::parse(r#"RECALL episodic ABOUT "x" BUDGET 0"#).unwrap();
-        let errors = analyze(&stmt);
+        let stmt = parse(r#"RECALL episodic ABOUT "x" BUDGET 0"#).unwrap();
+        let errors = validate(&stmt);
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].kind, AnalysisErrorKind::ValueOutOfRange);
     }
@@ -615,69 +706,48 @@ mod tests {
     #[test]
     fn between_with_valid_dates() {
         let stmt =
-            hirn_query::parse(r#"RECALL episodic ABOUT "x" BETWEEN "2026-01-01" AND "2026-03-01""#)
-                .unwrap();
-        assert!(analyze(&stmt).is_empty());
+            parse(r#"RECALL episodic ABOUT "x" BETWEEN "2026-01-01" AND "2026-03-01""#).unwrap();
+        assert!(validate(&stmt).is_empty());
     }
-
-    // ── TRAVERSE, Batch FORGET ──
 
     #[test]
     fn traverse_valid() {
-        let stmt = hirn_query::parse(r#"TRAVERSE FROM "node1" DEPTH 3"#).unwrap();
-        assert!(analyze(&stmt).is_empty());
+        let stmt = parse(r#"TRAVERSE FROM "node1" DEPTH 3"#).unwrap();
+        assert!(validate(&stmt).is_empty());
     }
 
     #[test]
     fn traverse_with_via_and_where() {
-        let stmt =
-            hirn_query::parse(r#"TRAVERSE FROM "node1" VIA causes DEPTH 2 WHERE weight > 0.5"#)
-                .unwrap();
-        assert!(analyze(&stmt).is_empty());
+        let stmt = parse(r#"TRAVERSE FROM "node1" VIA causes DEPTH 2 WHERE weight > 0.5"#).unwrap();
+        assert!(validate(&stmt).is_empty());
     }
-
-    #[test]
-    fn batch_forget_valid() {
-        let error =
-            hirn_query::parse(r#"FORGET episodic WHERE importance < 0.1 ARCHIVE"#).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("FORGET is not supported via embedded HirnQL anymore")
-        );
-    }
-
-    #[test]
-    fn forget_hard_mode_valid() {
-        let error = hirn_query::parse(r#"FORGET "id123" HARD"#).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("FORGET is not supported via embedded HirnQL anymore")
-        );
-    }
-
-    // ── EXPLAIN ──
 
     #[test]
     fn explain_valid_recall_no_warnings() {
-        let stmt = hirn_query::parse(r#"EXPLAIN RECALL episodic ABOUT "test""#).unwrap();
-        assert!(analyze(&stmt).is_empty());
+        let stmt = parse(r#"EXPLAIN RECALL episodic ABOUT "test""#).unwrap();
+        assert!(validate(&stmt).is_empty());
     }
 
     #[test]
     fn explain_analyze_delegates_to_inner() {
         // EXPLAIN ANALYZE on a query with an invalid range should still report the inner warning
-        let stmt = hirn_query::parse(
-            r#"EXPLAIN ANALYZE RECALL episodic ABOUT "test" WHERE importance > 2.0"#,
-        )
-        .unwrap();
-        let warnings = analyze(&stmt);
+        let stmt = parse(r#"EXPLAIN ANALYZE RECALL episodic ABOUT "test" WHERE importance > 2.0"#)
+            .unwrap();
+        let warnings = validate(&stmt);
         assert!(
             warnings
                 .iter()
                 .any(|w| matches!(w.kind, AnalysisErrorKind::ValueOutOfRange)),
             "should propagate inner analysis warnings: {warnings:?}"
         );
+    }
+
+    #[test]
+    fn expand_min_weight_out_of_range_rejected() {
+        let stmt =
+            parse(r#"RECALL episodic ABOUT "x" EXPAND GRAPH DEPTH 2 MIN_WEIGHT 1.5"#).unwrap();
+        let errors = validate(&stmt);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].kind, AnalysisErrorKind::ValueOutOfRange);
     }
 }

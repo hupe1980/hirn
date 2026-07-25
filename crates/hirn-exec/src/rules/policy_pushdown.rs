@@ -205,7 +205,7 @@ mod tests {
         let config = config_with_namespaces(None);
         let result = rule.optimize(plan.clone(), &config).unwrap();
         // No filter injected — plan should be unchanged.
-        assert!(result.as_any().downcast_ref::<FilterExec>().is_none());
+        assert!(result.downcast_ref::<FilterExec>().is_none());
     }
 
     #[test]
@@ -214,7 +214,7 @@ mod tests {
         let rule = PolicyPushdownRule::new();
         let config = config_with_namespaces(Some(vec![]));
         let result = rule.optimize(plan, &config).unwrap();
-        assert!(result.as_any().downcast_ref::<EmptyExec>().is_some());
+        assert!(result.downcast_ref::<EmptyExec>().is_some());
     }
 
     #[test]
@@ -224,7 +224,7 @@ mod tests {
         let config = config_with_namespaces(Some(vec!["ns_a".to_string()]));
         let result = rule.optimize(plan, &config).unwrap();
         // Should be a FilterExec wrapping the scan.
-        let filter = result.as_any().downcast_ref::<FilterExec>();
+        let filter = result.downcast_ref::<FilterExec>();
         assert!(filter.is_some(), "expected FilterExec");
         let filter = filter.unwrap();
         let pred_str = format!("{}", filter.predicate());
@@ -240,7 +240,7 @@ mod tests {
         let rule = PolicyPushdownRule::new();
         let config = config_with_namespaces(Some(vec!["ns_a".to_string(), "ns_b".to_string()]));
         let result = rule.optimize(plan, &config).unwrap();
-        let filter = result.as_any().downcast_ref::<FilterExec>();
+        let filter = result.downcast_ref::<FilterExec>();
         assert!(filter.is_some(), "expected FilterExec");
         let pred_str = format!("{}", filter.unwrap().predicate());
         assert!(
@@ -256,7 +256,7 @@ mod tests {
         let config = config_with_namespaces(Some(vec!["ns_a".to_string()]));
         let result = rule.optimize(plan.clone(), &config).unwrap();
         // No namespace column → no filter injected.
-        assert!(result.as_any().downcast_ref::<FilterExec>().is_none());
+        assert!(result.downcast_ref::<FilterExec>().is_none());
     }
 
     #[test]
@@ -266,6 +266,6 @@ mod tests {
         let config = ConfigOptions::default();
         let result = rule.optimize(plan.clone(), &config).unwrap();
         // No HirnSessionExt → open mode → no filter.
-        assert!(result.as_any().downcast_ref::<FilterExec>().is_none());
+        assert!(result.downcast_ref::<FilterExec>().is_none());
     }
 }

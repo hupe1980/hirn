@@ -3,7 +3,6 @@
 //! Loop: retrieve → extract entities → compare coverage → if gaps, reformulate → retrieve again.
 //! Maximum configurable rounds (default: 3). Results deduplicated by memory ID.
 
-use std::any::Any;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
@@ -61,7 +60,7 @@ pub struct IterativeRetrievalExec {
     input: Arc<dyn ExecutionPlan>,
     config: IterativeConfig,
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     base_search_params: Option<HybridSearchParams>,
 }
 
@@ -76,12 +75,12 @@ impl IterativeRetrievalExec {
         )));
         let schema = Arc::new(Schema::new(fields));
 
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             datafusion_physical_expr::EquivalenceProperties::new(schema.clone()),
             datafusion_physical_plan::Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
 
         Self {
             base_search_params: find_base_search_params(input.as_ref()),
@@ -116,15 +115,11 @@ impl ExecutionPlan for IterativeRetrievalExec {
         "IterativeRetrievalExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -295,7 +290,7 @@ struct IterativeRecallRow {
 }
 
 fn find_base_search_params(plan: &dyn ExecutionPlan) -> Option<HybridSearchParams> {
-    if let Some(search) = plan.as_any().downcast_ref::<LanceHybridSearchExec>() {
+    if let Some(search) = plan.downcast_ref::<LanceHybridSearchExec>() {
         return Some(search.params().clone());
     }
 

@@ -6,18 +6,19 @@
 //!
 //! Survives restarts — the Lance dataset is automatically available on reopen.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use hirn_core::circuit_breaker::CircuitBreaker;
 use hirn_core::embed::{Embedder, Embedding, MultivectorEmbedding};
 use hirn_core::{HirnError, HirnResult, PartialEmbeddingBatch};
 use hirn_storage::datasets::embed_cache;
 use hirn_storage::embed_cache_ops;
 use hirn_storage::store::PhysicalStore;
+use tokio::sync::watch;
 use tracing::{debug, warn};
 
 use super::error::EmbedError;
@@ -53,10 +54,73 @@ struct L1Entry {
     last_access_tick: u64,
 }
 
+/// Failure published to single-flight waiters when the leader's provider call
+/// fails. Errors are never cached: waiters receive the leader's error (with
+/// its retryability preserved) and the in-flight entry is removed, so the next
+/// non-coalesced request retries the provider from scratch.
+#[derive(Debug, Clone)]
+struct FlightFailure {
+    retryable: bool,
+    message: String,
+}
+
+/// `None` while the flight is pending; `Some(outcome)` once the leader has
+/// published a result for the key.
+type FlightOutcome = Option<Result<Vec<f32>, FlightFailure>>;
+
+/// Removes this leader's in-flight entries when it finishes — including on
+/// panic or cancellation. Dropping the guard (and the associated senders)
+/// closes the watch channels, which wakes every waiter; a waiter that never
+/// saw a published value treats the flight as failed instead of deadlocking.
+struct FlightGuard<'a> {
+    inflight: &'a DashMap<String, watch::Receiver<FlightOutcome>>,
+    keys: Vec<String>,
+}
+
+impl Drop for FlightGuard<'_> {
+    fn drop(&mut self) {
+        for key in &self.keys {
+            self.inflight.remove(key);
+        }
+    }
+}
+
+/// Await the outcome of a flight owned by a concurrent caller.
+async fn await_flight(mut rx: watch::Receiver<FlightOutcome>) -> Result<Vec<f32>, FlightFailure> {
+    loop {
+        // Clone out of the watch borrow immediately — holding the internal
+        // read lock across the `if let` body would be a significant-drop
+        // hazard.
+        let current = rx.borrow_and_update().clone();
+        if let Some(outcome) = current {
+            return outcome;
+        }
+        if rx.changed().await.is_err() {
+            // The leader dropped its sender. Either it published just before
+            // finishing (read the final value) or it panicked/was cancelled
+            // before publishing (surface a retryable failure).
+            let last = rx.borrow().clone();
+            return match last {
+                Some(outcome) => outcome,
+                None => Err(FlightFailure {
+                    retryable: true,
+                    message: "in-flight embedding request failed before producing a result"
+                        .to_owned(),
+                }),
+            };
+        }
+    }
+}
+
 pub struct PersistentCachedEmbedder<E> {
     inner: E,
     store: Arc<dyn PhysicalStore>,
     l1: DashMap<String, L1Entry>,
+    /// Single-flight map: cache key → receiver for the in-flight computation.
+    /// The first caller to miss on a key becomes the leader and calls the
+    /// provider; concurrent callers for the same key await the leader's
+    /// result instead of issuing duplicate provider calls.
+    inflight: DashMap<String, watch::Receiver<FlightOutcome>>,
     config: PersistentCacheConfig,
     hits: AtomicU64,
     misses: AtomicU64,
@@ -75,6 +139,7 @@ impl<E: Embedder> PersistentCachedEmbedder<E> {
             inner,
             store,
             l1: DashMap::new(),
+            inflight: DashMap::new(),
             config,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
@@ -193,6 +258,7 @@ impl<E: Embedder> Embedder for PersistentCachedEmbedder<E> {
         let mut results: Vec<Option<Embedding>> = vec![None; texts.len()];
         let mut miss_indices: Vec<usize> = Vec::new();
         let mut miss_texts: Vec<&str> = Vec::new();
+        let mut miss_keys: Vec<String> = Vec::new();
 
         for (i, &text) in texts.iter().enumerate() {
             let key = self.cache_key(text);
@@ -224,6 +290,7 @@ impl<E: Embedder> Embedder for PersistentCachedEmbedder<E> {
                     self.misses.fetch_add(1, Ordering::Relaxed);
                     miss_indices.push(i);
                     miss_texts.push(text);
+                    miss_keys.push(key);
                 }
                 Err(e) => {
                     // Storage I/O error — treat as a miss, the embedding is recomputable.
@@ -231,92 +298,177 @@ impl<E: Embedder> Embedder for PersistentCachedEmbedder<E> {
                     self.misses.fetch_add(1, Ordering::Relaxed);
                     miss_indices.push(i);
                     miss_texts.push(text);
+                    miss_keys.push(key);
                 }
             }
         }
 
-        if !miss_texts.is_empty() {
-            let mut l2_texts: Vec<&str> = Vec::new();
-            let mut l2_embeddings: Vec<Vec<f32>> = Vec::new();
+        // Collected as (global index, retryable, message); turned into a
+        // partial embedding failure at the end if non-empty.
+        let mut failures: Vec<(usize, bool, String)> = Vec::new();
 
-            // Check circuit breaker after collecting cache hits so mixed hit/miss
-            // requests still surface the hit portion through the partial result.
-            if let Some(ref breaker) = self.breaker
-                && !breaker.allow_call()
-            {
-                let time_until = breaker
-                    .time_until_probe()
-                    .unwrap_or(std::time::Duration::ZERO);
-                let circuit_error: HirnError = EmbedError::CircuitOpen {
-                    provider: breaker.provider().to_owned(),
-                    time_until_probe: time_until,
+        if !miss_texts.is_empty() {
+            // ── Single-flight partition ─────────────────────────────
+            // Misses split into "leader" keys (this call registers the flight
+            // and calls the provider) and "waiter" keys (a concurrent call —
+            // or an earlier duplicate in this very batch — already owns the
+            // flight; await its result instead of stampeding the provider).
+            let mut leader_locals: Vec<usize> = Vec::new();
+            let mut leader_senders: Vec<watch::Sender<FlightOutcome>> = Vec::new();
+            let mut waiters: Vec<(usize, watch::Receiver<FlightOutcome>)> = Vec::new();
+            let mut guard = FlightGuard {
+                inflight: &self.inflight,
+                keys: Vec::new(),
+            };
+
+            for (local, key) in miss_keys.iter().enumerate() {
+                match self.inflight.entry(key.clone()) {
+                    Entry::Occupied(entry) => {
+                        waiters.push((miss_indices[local], entry.get().clone()));
+                    }
+                    Entry::Vacant(vacant) => {
+                        let (tx, rx) = watch::channel(None);
+                        vacant.insert(rx);
+                        guard.keys.push(key.clone());
+                        leader_locals.push(local);
+                        leader_senders.push(tx);
+                    }
                 }
-                .into();
-                let mut partial = PartialEmbeddingBatch {
-                    embeddings: results,
-                    failures: Vec::new(),
-                };
-                for &index in &miss_indices {
-                    partial.push_error(index, &circuit_error);
-                }
-                return Err(HirnError::partial_embedding_failure(partial));
             }
 
-            let result = self.inner.embed(&miss_texts).await;
+            if !leader_locals.is_empty() {
+                let leader_texts: Vec<&str> =
+                    leader_locals.iter().map(|&l| miss_texts[l]).collect();
 
-            match result {
-                Ok(fresh) => {
-                    if let Some(ref breaker) = self.breaker {
-                        breaker.record_success();
+                let mut l2_texts: Vec<&str> = Vec::new();
+                let mut l2_embeddings: Vec<Vec<f32>> = Vec::new();
+
+                // Publish one outcome to the flight's waiters and record the
+                // failure for this call's own partial result.
+                let fail_leader =
+                    |slot: usize, retryable: bool, message: String, failures: &mut Vec<_>| {
+                        let _ = leader_senders[slot].send(Some(Err(FlightFailure {
+                            retryable,
+                            message: message.clone(),
+                        })));
+                        failures.push((miss_indices[leader_locals[slot]], retryable, message));
+                    };
+
+                // Check circuit breaker after collecting cache hits so mixed
+                // hit/miss requests still surface the hit portion through the
+                // partial result. Waiter keys don't issue provider calls, so
+                // they are allowed to await already-admitted flights.
+                if let Some(ref breaker) = self.breaker
+                    && !breaker.allow_call()
+                {
+                    let time_until = breaker
+                        .time_until_probe()
+                        .unwrap_or(std::time::Duration::ZERO);
+                    let circuit_error: HirnError = EmbedError::CircuitOpen {
+                        provider: breaker.provider().to_owned(),
+                        time_until_probe: time_until,
                     }
+                    .into();
+                    let retryable = circuit_error.is_retryable();
+                    let message = circuit_error.to_string();
+                    for slot in 0..leader_locals.len() {
+                        fail_leader(slot, retryable, message.clone(), &mut failures);
+                    }
+                } else {
+                    match self.inner.embed(&leader_texts).await {
+                        Ok(fresh) => {
+                            if let Some(ref breaker) = self.breaker {
+                                breaker.record_success();
+                            }
 
-                    if fresh.len() != miss_indices.len() {
-                        let returned = fresh.len();
-                        let mut partial = PartialEmbeddingBatch {
-                            embeddings: results,
-                            failures: Vec::new(),
-                        };
-                        let message = format!(
-                            "embedder returned {} embeddings for {} cache misses",
-                            returned,
-                            miss_indices.len()
-                        );
-                        for (local_idx, embedding) in fresh.into_iter().enumerate() {
-                            if let Some(&global_idx) = miss_indices.get(local_idx) {
-                                let key = self.cache_key(texts[global_idx]);
-                                self.insert_l1(key, embedding.vector.clone());
-                                l2_texts.push(texts[global_idx]);
+                            let returned = fresh.len();
+                            let expected = leader_locals.len();
+                            for (slot, embedding) in fresh.into_iter().enumerate() {
+                                // Ignore surplus embeddings beyond the miss count.
+                                let Some(&local) = leader_locals.get(slot) else {
+                                    break;
+                                };
+                                self.insert_l1(miss_keys[local].clone(), embedding.vector.clone());
+                                l2_texts.push(miss_texts[local]);
                                 l2_embeddings.push(embedding.vector.clone());
-                                partial.set_embedding(global_idx, embedding);
+                                let _ =
+                                    leader_senders[slot].send(Some(Ok(embedding.vector.clone())));
+                                results[miss_indices[local]] = Some(embedding);
+                            }
+                            if returned < expected {
+                                let message = format!(
+                                    "embedder returned {returned} embeddings for {expected} cache misses"
+                                );
+                                for slot in returned..expected {
+                                    fail_leader(slot, false, message.clone(), &mut failures);
+                                }
                             }
                         }
-                        for local_idx in returned..miss_indices.len() {
-                            partial.push_failure(miss_indices[local_idx], false, message.clone());
-                        }
-                        if !l2_texts.is_empty() {
-                            if let Err(e) = embed_cache_ops::put_cached_embeddings(
-                                self.store.as_ref(),
-                                &self.inner.embedding_space_id(),
-                                &l2_texts,
-                                &l2_embeddings,
-                            )
-                            .await
-                            {
-                                warn!(%e, "embed cache L2 write failed — L1 still warm");
+                        Err(e) => {
+                            let retryable = e.is_retryable();
+                            let message = e.to_string();
+                            if let Some(ref breaker) = self.breaker {
+                                breaker.record_failure();
+                            }
+
+                            if let Some(miss_partial) = e.into_partial_embedding_batch() {
+                                let mut settled = vec![false; leader_locals.len()];
+
+                                for (slot, maybe_embedding) in
+                                    miss_partial.embeddings.into_iter().enumerate()
+                                {
+                                    let Some(&local) = leader_locals.get(slot) else {
+                                        break;
+                                    };
+                                    if let Some(embedding) = maybe_embedding {
+                                        settled[slot] = true;
+                                        self.insert_l1(
+                                            miss_keys[local].clone(),
+                                            embedding.vector.clone(),
+                                        );
+                                        l2_texts.push(miss_texts[local]);
+                                        l2_embeddings.push(embedding.vector.clone());
+                                        let _ = leader_senders[slot]
+                                            .send(Some(Ok(embedding.vector.clone())));
+                                        results[miss_indices[local]] = Some(embedding);
+                                    }
+                                }
+
+                                for failure in miss_partial.failures {
+                                    if failure.index < settled.len() {
+                                        settled[failure.index] = true;
+                                        fail_leader(
+                                            failure.index,
+                                            failure.retryable,
+                                            failure.message,
+                                            &mut failures,
+                                        );
+                                    }
+                                }
+
+                                for (slot, done) in settled.iter().enumerate() {
+                                    if !done {
+                                        fail_leader(
+                                            slot,
+                                            false,
+                                            "provider returned no embedding result for this cache miss"
+                                                .to_owned(),
+                                            &mut failures,
+                                        );
+                                    }
+                                }
+                            } else {
+                                for slot in 0..leader_locals.len() {
+                                    fail_leader(slot, retryable, message.clone(), &mut failures);
+                                }
                             }
                         }
-                        return Err(HirnError::partial_embedding_failure(partial));
                     }
+                }
 
-                    for (idx, embedding) in miss_indices.iter().zip(&fresh) {
-                        let key = self.cache_key(texts[*idx]);
-                        self.insert_l1(key, embedding.vector.clone());
-                        l2_texts.push(texts[*idx]);
-                        l2_embeddings.push(embedding.vector.clone());
-                        results[*idx] = Some(embedding.clone());
-                    }
-
-                    // Batch write to L2 (Lance).
+                // Batch write to L2 (Lance). Failure is non-fatal — L1 still
+                // has the data.
+                if !l2_texts.is_empty() {
                     if let Err(e) = embed_cache_ops::put_cached_embeddings(
                         self.store.as_ref(),
                         &self.inner.embedding_space_id(),
@@ -325,83 +477,43 @@ impl<E: Embedder> Embedder for PersistentCachedEmbedder<E> {
                     )
                     .await
                     {
-                        // L2 write failure is non-fatal — L1 still has the data.
                         warn!(%e, "embed cache L2 write failed — L1 still warm");
                     }
                 }
-                Err(e) => {
-                    let retryable = e.is_retryable();
-                    let message = e.to_string();
-                    if let Some(ref breaker) = self.breaker {
-                        breaker.record_failure();
+            }
+
+            // All leader outcomes are published (success or failure — errors
+            // are never cached). Drop the senders and clear the pending map so
+            // late arrivals become fresh leaders; successful vectors are
+            // already in L1, so they'll hit the cache instead.
+            drop(leader_senders);
+            drop(guard);
+
+            // ── Await flights owned by concurrent callers ───────────
+            for (global_idx, rx) in waiters {
+                match await_flight(rx).await {
+                    Ok(vector) => {
+                        results[global_idx] = Some(Embedding {
+                            vector,
+                            model_id: self.inner.model_id().to_string(),
+                        });
                     }
-
-                    let mut partial = PartialEmbeddingBatch {
-                        embeddings: results,
-                        failures: Vec::new(),
-                    };
-
-                    if let Some(miss_partial) = e.into_partial_embedding_batch() {
-                        let mut failure_locals = HashSet::new();
-
-                        for (local_idx, maybe_embedding) in
-                            miss_partial.embeddings.into_iter().enumerate()
-                        {
-                            if let Some(embedding) = maybe_embedding {
-                                if let Some(&global_idx) = miss_indices.get(local_idx) {
-                                    let key = self.cache_key(texts[global_idx]);
-                                    self.insert_l1(key, embedding.vector.clone());
-                                    l2_texts.push(texts[global_idx]);
-                                    l2_embeddings.push(embedding.vector.clone());
-                                    partial.set_embedding(global_idx, embedding);
-                                }
-                            }
-                        }
-
-                        for failure in miss_partial.failures {
-                            failure_locals.insert(failure.index);
-                            if let Some(&global_idx) = miss_indices.get(failure.index) {
-                                partial.push_failure(
-                                    global_idx,
-                                    failure.retryable,
-                                    failure.message,
-                                );
-                            }
-                        }
-
-                        for local_idx in 0..miss_indices.len() {
-                            if partial.embeddings[miss_indices[local_idx]].is_none()
-                                && !failure_locals.contains(&local_idx)
-                            {
-                                partial.push_failure(
-                                    miss_indices[local_idx],
-                                    false,
-                                    "provider returned no embedding result for this cache miss",
-                                );
-                            }
-                        }
-                    } else {
-                        for &global_idx in &miss_indices {
-                            partial.push_failure(global_idx, retryable, message.clone());
-                        }
+                    Err(failure) => {
+                        failures.push((global_idx, failure.retryable, failure.message));
                     }
-
-                    if !l2_texts.is_empty() {
-                        if let Err(write_error) = embed_cache_ops::put_cached_embeddings(
-                            self.store.as_ref(),
-                            &self.inner.embedding_space_id(),
-                            &l2_texts,
-                            &l2_embeddings,
-                        )
-                        .await
-                        {
-                            warn!(%write_error, "embed cache L2 write failed — L1 still warm");
-                        }
-                    }
-
-                    return Err(HirnError::partial_embedding_failure(partial));
                 }
             }
+        }
+
+        if !failures.is_empty() {
+            let mut partial = PartialEmbeddingBatch {
+                embeddings: results,
+                failures: Vec::new(),
+            };
+            for (index, retryable, message) in failures {
+                partial.push_failure(index, retryable, message);
+            }
+            return Err(HirnError::partial_embedding_failure(partial));
         }
 
         // Periodic L1 eviction.
@@ -680,6 +792,223 @@ mod tests {
         // PseudoEmbedder produces deterministic but different embeddings.
         assert_ne!(r1[0].vector, r2[0].vector);
         assert_eq!(cache.misses(), 2);
+    }
+
+    // ── Single-flight tests ─────────────────────────────────────────
+
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    /// Deterministic per-text vector so tests can verify result ordering.
+    fn test_vector(text: &str, dims: usize) -> Vec<f32> {
+        let seed = text.bytes().map(f32::from).sum::<f32>();
+        (0..dims).map(|i| seed + i as f32).collect()
+    }
+
+    /// Counting mock embedder whose calls block on a semaphore permit, so
+    /// tests can hold a flight open while concurrent callers pile up.
+    struct GatedEmbedder {
+        dims: usize,
+        calls: Arc<AtomicUsize>,
+        call_texts: Arc<parking_lot::Mutex<Vec<Vec<String>>>>,
+        gate: Arc<tokio::sync::Semaphore>,
+        fail: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl Embedder for GatedEmbedder {
+        async fn embed(&self, texts: &[&str]) -> HirnResult<Vec<Embedding>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.call_texts
+                .lock()
+                .push(texts.iter().map(|t| (*t).to_owned()).collect());
+            let _permit = self.gate.acquire().await.expect("gate closed");
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(EmbedError::local("gated-test", "provider failure").into());
+            }
+            Ok(texts
+                .iter()
+                .map(|t| Embedding {
+                    vector: test_vector(t, self.dims),
+                    model_id: self.model_id().to_owned(),
+                })
+                .collect())
+        }
+
+        fn dimensions(&self) -> usize {
+            self.dims
+        }
+
+        fn model_id(&self) -> &str {
+            "gated-test-embedder"
+        }
+
+        fn max_input_tokens(&self) -> usize {
+            usize::MAX
+        }
+    }
+
+    struct GatedFixture {
+        cache: Arc<PersistentCachedEmbedder<GatedEmbedder>>,
+        calls: Arc<AtomicUsize>,
+        call_texts: Arc<parking_lot::Mutex<Vec<Vec<String>>>>,
+        gate: Arc<tokio::sync::Semaphore>,
+        fail: Arc<AtomicBool>,
+    }
+
+    fn gated_fixture(dims: usize) -> GatedFixture {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let call_texts = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let fail = Arc::new(AtomicBool::new(false));
+        let embedder = GatedEmbedder {
+            dims,
+            calls: Arc::clone(&calls),
+            call_texts: Arc::clone(&call_texts),
+            gate: Arc::clone(&gate),
+            fail: Arc::clone(&fail),
+        };
+        GatedFixture {
+            cache: Arc::new(PersistentCachedEmbedder::with_store(embedder, test_store())),
+            calls,
+            call_texts,
+            gate,
+            fail,
+        }
+    }
+
+    /// Spin until the provider has seen `target` calls (each call then parks
+    /// on the gate), so concurrent tasks are deterministically in flight.
+    async fn wait_for_calls(calls: &AtomicUsize, target: usize) {
+        for _ in 0..2000 {
+            if calls.load(Ordering::SeqCst) >= target {
+                // Grace period: let remaining tasks reach their wait points.
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        panic!("provider never reached {target} calls");
+    }
+
+    #[tokio::test]
+    async fn concurrent_cold_misses_use_single_flight() {
+        let fx = gated_fixture(8);
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let c = Arc::clone(&fx.cache);
+            handles.push(tokio::spawn(async move { c.embed(&["stampede"]).await }));
+        }
+
+        // Leader reaches the provider and parks; everyone else must coalesce.
+        wait_for_calls(&fx.calls, 1).await;
+        assert_eq!(
+            fx.calls.load(Ordering::SeqCst),
+            1,
+            "only the leader may call the provider"
+        );
+
+        fx.gate.add_permits(64);
+
+        let expected = test_vector("stampede", 8);
+        for h in handles {
+            let result = h.await.unwrap().unwrap();
+            assert_eq!(result[0].vector, expected);
+        }
+        assert_eq!(
+            fx.calls.load(Ordering::SeqCst),
+            1,
+            "waiters must reuse the leader's result, not re-call the provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_leader_does_not_poison_or_deadlock_waiters() {
+        let fx = gated_fixture(8);
+        fx.fail.store(true, Ordering::SeqCst);
+
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let c = Arc::clone(&fx.cache);
+            handles.push(tokio::spawn(async move { c.embed(&["doomed"]).await }));
+        }
+
+        wait_for_calls(&fx.calls, 1).await;
+        fx.gate.add_permits(64);
+
+        // Every caller (leader and waiters) gets the error — nobody hangs.
+        for h in handles {
+            let err = h.await.unwrap().unwrap_err();
+            let partial = err
+                .into_partial_embedding_batch()
+                .expect("failure should surface as partial embedding batch");
+            assert_eq!(partial.failed(), 1);
+            assert!(
+                partial.failures[0].message.contains("provider failure"),
+                "waiters should receive the leader's error: {}",
+                partial.failures[0].message
+            );
+        }
+        assert_eq!(fx.calls.load(Ordering::SeqCst), 1);
+
+        // Errors must not be cached: the next request retries the provider.
+        fx.fail.store(false, Ordering::SeqCst);
+        let result = fx.cache.embed(&["doomed"]).await.unwrap();
+        assert_eq!(result[0].vector, test_vector("doomed", 8));
+        assert_eq!(
+            fx.calls.load(Ordering::SeqCst),
+            2,
+            "a fresh request after a failed flight must retry the provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_batch_awaits_inflight_and_embeds_only_fresh_texts() {
+        let fx = gated_fixture(8);
+
+        // Task 1 becomes the leader for "shared" and parks in the provider.
+        let c1 = Arc::clone(&fx.cache);
+        let t1 = tokio::spawn(async move { c1.embed(&["shared"]).await });
+        wait_for_calls(&fx.calls, 1).await;
+
+        // Task 2's batch overlaps the in-flight key: it must only forward the
+        // fresh subset ("fresh") and await the in-flight "shared".
+        let c2 = Arc::clone(&fx.cache);
+        let t2 = tokio::spawn(async move { c2.embed(&["shared", "fresh"]).await });
+        wait_for_calls(&fx.calls, 2).await;
+
+        fx.gate.add_permits(64);
+
+        let r1 = t1.await.unwrap().unwrap();
+        assert_eq!(r1[0].vector, test_vector("shared", 8));
+
+        // Order must be preserved: in-flight result first, fresh second.
+        let r2 = t2.await.unwrap().unwrap();
+        assert_eq!(r2.len(), 2);
+        assert_eq!(r2[0].vector, test_vector("shared", 8));
+        assert_eq!(r2[1].vector, test_vector("fresh", 8));
+
+        // "shared" reached the provider exactly once, in task 1's call.
+        let recorded = fx.call_texts.lock().clone();
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[0], vec!["shared".to_owned()]);
+        assert_eq!(recorded[1], vec!["fresh".to_owned()]);
+        assert_eq!(fx.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn duplicate_texts_in_one_batch_coalesce_to_one_provider_input() {
+        let fx = gated_fixture(8);
+        fx.gate.add_permits(64);
+
+        let result = fx.cache.embed(&["dup", "dup"]).await.unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].vector, test_vector("dup", 8));
+        assert_eq!(result[1].vector, test_vector("dup", 8));
+
+        // The provider saw "dup" exactly once.
+        let recorded = fx.call_texts.lock().clone();
+        assert_eq!(recorded, vec![vec!["dup".to_owned()]]);
     }
 
     #[tokio::test]

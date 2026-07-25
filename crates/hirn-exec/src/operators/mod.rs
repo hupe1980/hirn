@@ -38,14 +38,14 @@ pub use context_budget::ContextBudgetExec;
 pub use global_search::{GlobalSearchExec, GlobalSearchParams};
 pub use graph_activation::{ActivationMode, GraphActivationExec};
 pub use graph_traverse::GraphTraverseExec;
-pub use hebbian_buffer::HebbianBufferExec;
+pub use hebbian_buffer::{CoRetrievalQueue, HebbianBufferExec};
 pub use interference_detector::{InterferenceConfig, InterferenceDetectorExec, InterferenceFlags};
 pub use iterative_retrieval::{IterativeConfig, IterativeRetrievalExec};
 pub use lance_hybrid_search::{
     HybridSearchParams, LanceHybridSearchExec, SearchComparisonOp, SearchNumericField,
     SearchNumericFilter,
 };
-pub use mcfa_defense::{McfaAuditSink, McfaConfig, McfaDefenseExec, detect_threat};
+pub use mcfa_defense::{McfaConfig, detect_threat};
 pub use nli_contradiction::{NliConfig, NliContradictionExec, NliLabel};
 pub use policy_filter::{PolicyFilterExec, PolicyPredicate};
 pub use policy_query_read::{PolicyQueryReadExec, PolicyReadKind};

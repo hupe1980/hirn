@@ -8,11 +8,10 @@
 //!
 //! Fast-path admission: RPE < threshold (default 0.3) → skip LLM analysis.
 
-use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
-use arrow_array::{Array, Float32Array, RecordBatch, StringArray};
+use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion_common::Result;
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
@@ -65,7 +64,7 @@ pub struct RpeScoreExec {
     input: Arc<dyn ExecutionPlan>,
     config: RpeConfig,
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl RpeScoreExec {
@@ -74,12 +73,12 @@ impl RpeScoreExec {
         fields.push(Arc::new(Field::new("rpe_score", DataType::Float32, false)));
         let schema = Arc::new(Schema::new(fields));
 
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             datafusion_physical_expr::EquivalenceProperties::new(schema.clone()),
             datafusion_physical_plan::Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
 
         Self {
             input,
@@ -109,15 +108,11 @@ impl ExecutionPlan for RpeScoreExec {
         "RpeScoreExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -188,9 +183,17 @@ impl ExecutionPlan for RpeScoreExec {
             let contents = content_col.and_then(|c| c.as_any().downcast_ref::<StringArray>());
 
             let embedding_col = merged.column_by_name("embedding");
+            // Pre-computed embeddings arrive as a FixedSizeList<Float32>; downcast
+            // once so we can read row slices back into `row_embeddings`.
+            let embedding_fsl =
+                embedding_col.and_then(|c| c.as_any().downcast_ref::<FixedSizeListArray>());
 
             // ── Batch embedding: collect all content, embed once ──
             let mut rpe_scores = Vec::with_capacity(n);
+
+            // Map: row_idx → embedding vector. Populated below from pre-computed
+            // embeddings and, for the remaining rows, from freshly embedded text.
+            let mut row_embeddings: Vec<Option<Vec<f32>>> = vec![None; n];
 
             // Collect texts that need embedding (non-null content without pre-computed embedding).
             let mut text_indices: Vec<usize> = Vec::new();
@@ -198,6 +201,18 @@ impl ExecutionPlan for RpeScoreExec {
             for i in 0..n {
                 let has_embedding = embedding_col.map(|c| !c.is_null(i)).unwrap_or(false);
                 if has_embedding {
+                    // Read the pre-computed embedding back so a real distance is
+                    // computed instead of falling through to the 0.5 RPE fallback.
+                    if let Some(fsl) = embedding_fsl {
+                        if !fsl.is_null(i) {
+                            let values = fsl.value(i);
+                            if let Some(f32s) = values.as_any().downcast_ref::<Float32Array>() {
+                                let vec: Vec<f32> =
+                                    (0..f32s.len()).map(|j| f32s.value(j)).collect();
+                                row_embeddings[i] = Some(vec);
+                            }
+                        }
+                    }
                     continue; // pre-computed embedding exists
                 }
                 if let Some(c) = contents {
@@ -226,8 +241,8 @@ impl ExecutionPlan for RpeScoreExec {
                 Some(Vec::new())
             };
 
-            // Build a map: row_idx → embedding vector.
-            let mut row_embeddings: Vec<Option<Vec<f32>>> = vec![None; n];
+            // Fill in the remaining rows from freshly embedded text (pre-computed
+            // rows were already populated above).
             if let Some(embs) = batch_embeddings {
                 for (idx_pos, &row_idx) in text_indices.iter().enumerate() {
                     if idx_pos < embs.len() {
@@ -502,5 +517,58 @@ mod tests {
             .unwrap();
         // Without embedder, default RPE = 0.5 (moderate novelty)
         assert!((rpe_col.value(0) - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn precomputed_embedding_yields_real_rpe() {
+        // R-53a: a row carrying a pre-computed embedding must have that vector
+        // read back into `row_embeddings` so a REAL distance is computed, rather
+        // than falling through to the 0.5 fallback (which would defeat novelty).
+        use crate::test_utils::MemoryBatchExec;
+        use arrow_array::RecordBatch;
+        use futures::StreamExt;
+
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let embedding_type = DataType::FixedSizeList(item_field.clone(), 4);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("content", DataType::Utf8, false),
+            Field::new("embedding", embedding_type, true),
+        ]));
+
+        // A single row with a pre-computed 4-dim embedding.
+        let values = Float32Array::from(vec![0.1_f32, 0.2, 0.3, 0.4]);
+        let embedding = FixedSizeListArray::new(item_field, 4, Arc::new(values), None);
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["id1"])),
+                Arc::new(StringArray::from(vec!["hello world test"])),
+                Arc::new(embedding),
+            ],
+        )
+        .unwrap();
+
+        let mem = MemoryBatchExec::new(schema, vec![batch]);
+        let exec = RpeScoreExec::new(Arc::new(mem), RpeConfig::default());
+        let ctx = Arc::new(TaskContext::default());
+        let mut stream = exec.execute(0, ctx).unwrap();
+        let result = stream.next().await.unwrap().unwrap();
+        assert_eq!(result.num_rows(), 1);
+
+        let rpe_col = result
+            .column_by_name("rpe_score")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        // With no storage, max_similarity = 0 → distance = 1.0, so RPE reflects a
+        // real computed novelty score, NOT the 0.5 no-embedding fallback.
+        let rpe = rpe_col.value(0);
+        assert!(
+            (rpe - 0.5).abs() > f32::EPSILON,
+            "pre-computed embedding must yield a real RPE, not the 0.5 fallback: got {rpe}"
+        );
     }
 }

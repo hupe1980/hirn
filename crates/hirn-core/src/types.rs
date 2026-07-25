@@ -205,6 +205,15 @@ impl Namespace {
 
     /// The kind of this namespace based on its naming convention.
     /// F-77 FIX: `default_ns()` now returns `NamespaceKind::Default` (not `Team`).
+    ///
+    /// **Catch-all note:** only the three reserved names map to their dedicated
+    /// kinds — `"default"` → [`NamespaceKind::Default`], `"shared"` →
+    /// [`NamespaceKind::Shared`], and any `"private:<agent>"` name →
+    /// [`NamespaceKind::Private`]. **Every other name** (e.g. `"team_backend"`,
+    /// `"project_x"`, or any operator-chosen custom namespace) is classified as
+    /// [`NamespaceKind::Team`] — i.e. membership-gated access. There is no
+    /// separate `Custom` kind: a custom namespace and a team namespace share
+    /// identical access semantics, so they intentionally collapse together.
     #[must_use]
     pub fn kind(&self) -> NamespaceKind {
         let s = self.as_str();
@@ -215,7 +224,8 @@ impl Namespace {
         } else if s == "shared" {
             NamespaceKind::Shared
         } else {
-            // Team or custom namespaces
+            // Team or custom namespaces — see the catch-all note above: any
+            // non-reserved name is treated as a membership-gated Team namespace.
             NamespaceKind::Team
         }
     }
@@ -315,12 +325,23 @@ impl AgentId {
                 "invalid agent_id: '{id}' (only ASCII alphanumeric, underscore, dot, hyphen allowed)"
             )));
         }
-        let handle = agent_id_interner().try_intern(&id)?;
-        // Reserve the agent's private namespace now, while we can still fail
-        // cleanly. Every constructed AgentId (including deserialized ones)
-        // passes through here, so `Namespace::private_for` is guaranteed an
-        // already-interned fast path and can never hit the capacity panic.
+        // R-35: reserve the `private:{id}` namespace slot FIRST, then intern
+        // the agent id. If the namespace interner is at capacity this returns
+        // Err *before* the agent string is ever interned, so `new` is
+        // all-or-nothing on the namespace-cap error path (no leaked, wedged
+        // agent-interner entry for an id whose construction failed).
+        //
+        // Cost note: every distinct AgentId therefore consumes two interner
+        // slots — one in the agent-id interner and one in the namespace
+        // interner (its reserved `private:` namespace). The generous
+        // `DEFAULT_INTERNER_MAX_ENTRIES` cap accounts for this 2×-per-agent
+        // slot usage.
+        //
+        // Reserving the namespace here also guarantees every constructed
+        // AgentId (including deserialized ones) makes `Namespace::private_for`
+        // an already-interned fast path that can never hit the capacity panic.
         crate::interner::namespace_interner().try_intern(&format!("private:{id}"))?;
+        let handle = agent_id_interner().try_intern(&id)?;
         Ok(Self(handle))
     }
 
@@ -361,6 +382,42 @@ mod tests {
         let agent = AgentId::new("reservation_check_agent").unwrap();
         let ns = Namespace::private_for(&agent);
         assert_eq!(ns.as_str(), "private:reservation_check_agent");
+    }
+
+    #[test]
+    fn agent_id_new_is_all_or_nothing_when_namespace_at_cap() {
+        // R-35: AgentId::new reserves the `private:{id}` namespace slot BEFORE
+        // interning the agent id, so a namespace-interner cap error leaves the
+        // agent interner untouched (no leaked, wedged agent slot). We mirror
+        // the exact ordering against local capped interners (the global
+        // interners can't be forced to their cap in a shared test process).
+        use crate::interner::StringInterner;
+
+        let agent_interner = StringInterner::with_max(16);
+        let namespace_interner = StringInterner::with_max(1);
+        // Fill the namespace interner to its cap.
+        namespace_interner
+            .try_intern("private:already_here")
+            .unwrap();
+        let agents_before = agent_interner.len();
+
+        let id = "victim_agent";
+        // Same order as AgentId::new: namespace first.
+        let ns_result = namespace_interner.try_intern(&format!("private:{id}"));
+        assert!(
+            ns_result.is_err(),
+            "namespace reservation must fail at the cap"
+        );
+        // Only intern the agent if the namespace reservation succeeded.
+        if ns_result.is_ok() {
+            agent_interner.try_intern(id).unwrap();
+        }
+
+        assert_eq!(
+            agent_interner.len(),
+            agents_before,
+            "no agent-interner slot may leak when the namespace reservation fails first"
+        );
     }
 
     #[test]

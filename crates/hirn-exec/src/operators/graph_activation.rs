@@ -6,7 +6,6 @@
 //! neighbors back into recall rows while appending `activation_score` and
 //! `depth`.
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
@@ -54,7 +53,7 @@ pub enum ActivationMode {
 pub struct GraphActivationExec {
     input: Arc<dyn ExecutionPlan>,
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     seed_limit: usize,
     mode: ActivationMode,
     max_depth: u32,
@@ -94,14 +93,14 @@ impl GraphActivationExec {
         } else {
             Self::output_schema()
         };
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             datafusion_physical_expr::EquivalenceProperties::new(schema.clone()),
             datafusion_physical_plan::Partitioning::UnknownPartitioning(1),
             // N-M18: operator collects all results into a single batch before emitting;
             // declare Final not Incremental to match actual emission semantics.
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
         Ok(Self {
             input,
             schema,
@@ -174,15 +173,11 @@ impl ExecutionPlan for GraphActivationExec {
         "GraphActivationExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -813,6 +808,7 @@ fn recall_rows_from_batch(
 
 #[cfg(test)]
 mod tests {
+    use std::any::Any;
     use std::sync::Mutex;
 
     use super::*;

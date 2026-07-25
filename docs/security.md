@@ -38,8 +38,8 @@ below defend against a concrete set of adversaries:
 | Adversary | Goal | Primary control |
 |-----------|------|-----------------|
 | A compromised or misbehaving agent | Read or mutate memory outside its scope | Cedar authorization + namespace isolation |
-| A prompt-injection payload embedded in stored content | Hijack a future agent's control flow | MCFA defense + input sanitization |
-| A memory-poisoning campaign | Flood the store with near-duplicate or adversarial records | Admission pipeline + burst rate limiting |
+| A prompt-injection payload embedded in stored content | Hijack a future agent's control flow | Poisoning admission gate (ingest) + MCFA defense (reads) + egress sanitization |
+| A memory-poisoning campaign | Flood the store with near-duplicate, low-provenance, or adversarial records | Admission pipeline (trust gate + poisoning gate + duplicate/surprise/contradiction) + burst rate limiting |
 | An insider tampering with history | Alter, delete, or truncate the audit trail | HMAC hash-chained event log and `_audit` trail |
 | A cross-tenant escalation | Reach another tenant's realm | Realm isolation policies + fail-closed defaults |
 
@@ -57,22 +57,23 @@ authorization, injection defense, admission, and audit before it becomes durable
 
 ```
 1. Cedar Policy (plan rewrite)   → namespace/classification filter injection
-2. MCFA Defense (plan operator)  → prompt injection detection + audit
-3. Admission Pipeline (pre-write)→ quarantine or reject
+2. MCFA Defense (scored reads)   → stored prompt-injection detection + audit
+3. Admission Pipeline (pre-write)→ trust gate, poisoning gate, duplicate/
+                                   surprise/contradiction/budget — reject or flag
 4. Generated Cognition Gates     → quality thresholds, review state, rollback receipts
 5. Storage Write                 → namespace isolation via column filter
-6. Event Log                     → HMAC-signed audit trail
+6. Event Log                     → HMAC-signed audit trail + anti-rollback HWM
 7. Post-Recovery                 → per-agent burst rate limiting
 ```
 
 ```mermaid
 flowchart TD
   req[Agent request] --> cedar[1 · Cedar policy<br/>plan rewrite + enforce]
-  cedar --> mcfa[2 · MCFA defense<br/>prompt-injection detection]
-  mcfa --> adm[3 · Admission pipeline<br/>quarantine or reject]
+  cedar --> mcfa[2 · MCFA defense<br/>stored prompt-injection detection on reads]
+  mcfa --> adm[3 · Admission pipeline<br/>trust + poisoning gates · reject or flag]
   adm --> gcog[4 · Generated cognition gates<br/>quality + review + rollback]
   gcog --> ns[5 · Storage write<br/>namespace column isolation]
-  ns --> log[6 · Event log<br/>HMAC-signed, hash-chained]
+  ns --> log[6 · Event log<br/>HMAC-signed, hash-chained + HWM]
   log --> rl[7 · Post-recovery<br/>per-agent burst limiting]
   classDef s fill:#1a1b26,stroke:#7c9cff,color:#e6e8f0;
   class req,cedar,mcfa,adm,gcog,ns,log,rl s;
@@ -128,7 +129,7 @@ All Cedar-related code lives in `hirn-policy`:
 
 - **`PolicyEngine`** — Cedar authorization engine with entity management
 - **Cedar entity model:** `Agent` ∈ `Team` ∈ `Organization`; `Namespace` ∈ `Realm`; `MemoryLayer`; `Operation`; `Tool`
-- **18 actions:** `remember`, `correct`, `supersede`, `merge`, `retract`, `purge`, `recall`, `think`, `forget`, `consolidate`, `watch`, `connect`, `execute`, `admin`, `recall_raw_text`, `read`, `write`, `delete`
+- **20 actions:** `remember`, `correct`, `reflect`, `supersede`, `merge`, `retract`, `purge`, `recall`, `think`, `forget`, `consolidate`, `watch`, `connect`, `execute`, `review`, `admin`, `recall_raw_text`, `read`, `write`, `delete` (`reflect` gates belief revision distinctly from `correct`; `review` gates quarantine approval/rollback)
 - **HMAC audit:** `compute_hmac()`, `verify_hmac()`, `derive_key()`, `canonical_audit_bytes()` — the keyed-hash primitives the engine uses to sign and hash-chain `_audit` entries when `event_hmac_secret` is configured
 - **Open mode:** `PolicyEngine::open_mode()` and `PolicyEngine::load_from_brain_insecure_dev_mode()` permit all — explicit development/testing only
 
@@ -144,13 +145,6 @@ All Cedar-related code lives in `hirn-policy`:
 
 Namespace access is pre-resolved via `PolicyEngine::allowed_namespaces_for(agent_id, action)` and
 set on `HirnSessionExt` before plan optimization.
-
-### NamespacePartitionPruneRule
-
-`NamespacePartitionPruneRule` (in `hirn-exec::rules`) runs after `PolicyPushdownRule`:
-
-- Simplifies single-element `IN (...)` predicates to equality (`=`) for more efficient Lance scan pushdown
-- No-op when the filter is already an equality predicate or has multiple elements
 
 ### PolicyFilterExec
 
@@ -168,44 +162,80 @@ method also logs an audit event for every authorization decision (both allow and
 
 ## MCFA Defense
 
-Memory Control-Flow Attack detection prevents prompt injection and memory poisoning
-via `McfaDefenseExec` (in `hirn-exec::operators`):
+Memory Control-Flow Attack detection prevents stored prompt-injection payloads
+from reaching an agent's context. Detection is single-sourced in
+`hirn_exec::operators::mcfa_defense::detect_threat` and enforced on the
+engine's scored read path.
 
 ### Detection Methods
 
 | Method | Description |
 |--------|-------------|
-| **Pattern matching** | 21 known injection patterns (instruction override, persona hijack, system prompt leak, chat template delimiters). Case-insensitive substring matching. |
+| **Pattern matching** | Known injection patterns (instruction override, persona hijack, system prompt leak, chat template delimiters). Case-insensitive Aho-Corasick matching, accepted only at word boundaries (so "act as" flags but "contract asset" does not). |
 | **Length anomaly** | Content outside configurable bounds (min: 5, max: 50,000 bytes default). |
 | **Template similarity** | Future: cosine similarity against known attack templates. |
-
-### Write Path (Always On)
-
-- `REMEMBER` plan always includes `McfaDefenseExec` as the first operator
-- Flagged content is rejected before RPE scoring or storage
-- Audit entry created in `mcfa_audit_log` dataset
 
 ### Read Path (Configurable)
 
 - `RECALL` and `THINK` support `WITH MCFA_DEFENSE ON|OFF`
-- When enabled, flagged memories are removed from the result set
+- When enabled, flagged memories are removed from the scored result set and
+  every flag is recorded in the `mcfa_audit_log` dataset
 - When disabled (default for reads), all memories pass through
+
+### Write Path (Admission Pipeline)
+
+Ingest-time poisoning defense lives in the admission pipeline (below), not in
+the query plan: the `PoisoningGate` scans candidate content with the
+homoglyph-resistant detector from `hirn_core::sanitize::detect_injection`
+before anything is persisted.
 
 ### Audit Sink
 
-`McfaAuditSink` trait records flagged content with:
+Every read-path flag is appended to the `mcfa_audit_log` Lance dataset with:
 - `memory_id` — ID of the flagged memory
 - `content_snippet` — truncated content for review
 - `flag_reason` — which detection method triggered
 - `agent_id` — requesting agent
 - `timestamp` — when the flag was raised
-- `hmac` — integrity signature
+- `hmac` — keyed BLAKE3 integrity tag (domain-separated from the event-log key)
 
-### HirnOp Integration
+## Admission Control (Ingest-Time Governance)
 
-`HirnOp::McfaDefense` in the plan compiler:
-- Unconditionally emitted for `REMEMBER` (first stage, before RPE)
-- Conditionally emitted for `RECALL`/`THINK` when `WITH MCFA_DEFENSE ON`
+The admission pipeline gates every write before it is persisted. Beyond the
+duplicate/surprise/contradiction/token-budget/rate controllers, two gates form
+the poisoning-defense layer (both off by default; enable via config):
+
+### Trust Gate
+
+`admission_min_trust` (and the stricter `admission_trust_quarantine_below`
+tier) reject writes whose **effective trust** falls below the floor. Effective
+trust blends:
+
+- **provenance trust** — origin-based (`DirectObservation` 1.0 …
+  `DreamReplay` 0.3) plus evidence-diversity bonus, minus mutation and
+  contradiction penalties (the same `compute_trust_score` surfaced by
+  `INSPECT`), and
+- **agent reputation** — the authoring agent's Bayesian trust score
+  (confirmed vs contradicted history); neutral reputation (0.5) is a fixed
+  point, contradicted agents halve the score, confirmed agents boost it.
+
+Rejections carry machine-readable reasons (`trust_below_minimum`,
+`trust_quarantine_recommended`).
+
+### Poisoning Gate
+
+`admission_poisoning_action = "off" | "audit" | "reject"` scans candidate
+content with `hirn_core::sanitize::detect_injection` — the same UTS-39
+confusables-skeleton matcher used for LLM egress sanitization, so Cyrillic
+homoglyph variants of injection phrases are caught at ingest. Stored content
+is **never mutated** (recall fidelity is preserved):
+
+- **audit** — the write is admitted verbatim, findings are stamped into the
+  record's metadata (`admission_flags`), the HMAC-chained `AdmissionEvaluated`
+  audit event carries the flags, and
+  `hirn_admission_poisoning_flagged_total` increments.
+- **reject** — the write is refused with the machine-readable reason
+  `poisoning_detected`.
 
 ## Namespace Isolation
 
@@ -261,6 +291,53 @@ Lance scan filters use string interpolation. **Always escape single quotes:**
 let escaped = value.replace('\'', "''");
 let filter = format!("namespace = '{escaped}'");
 ```
+
+## Daemon Token Scopes & Rate Limiting
+
+The `hirnd` HTTP/gRPC/MCP surfaces authenticate a request to a realm + agent
+identity (API key, mTLS client cert, or a hirnd-minted JWT), then apply two
+authorization checks before the request reaches the engine.
+
+### Operation-scope hierarchy
+
+A minted JWT carries an `operations` allowlist. Operations form a **privilege
+hierarchy**: `Admin ⊇ Write ⊇ Read`. A token granted a higher operation
+implicitly permits the lower ones — an `[Admin]` token may Read and Write, and a
+`[Write]` token may Read. An **empty** `operations` list means "all operations".
+
+- **Enforcement** (`token_allows_operation`): a required operation is permitted
+  if the allowlist is empty, or any granted operation is of equal-or-higher rank
+  (`Read` < `Write` < `Admin`). This is applied uniformly on every mutating and
+  admin route (`/v1/remember`, `/v1/consolidate`, `/v1/cluster/*`, …).
+- **Issuance subset check** (`POST /v1/auth/token`): a restricted (token-scoped)
+  caller may only mint a token whose scope its own scope *implies*. An `[Admin]`
+  caller can mint `[Read]` / `[Write]` tokens; a `[Read]` caller **cannot** mint
+  a `[Write]` token. Unrestricted principals (API key / mTLS) may mint any scope
+  for their realm.
+
+Before this hierarchy, membership was exact-match, so an `[Admin]` token was
+paradoxically *denied* Read and Write. The hierarchy closes that gap while
+keeping least-privilege for narrow tokens.
+
+### Rate limiting (two actor axes)
+
+The `RateLimiter` keys a per-route-class sliding window (`Auth` / `Read` /
+`Write` / `Admin`) on the request actor:
+
+- **Per-agent** — authenticated routes are throttled on `(realm, agent_id)`.
+- **Per-source-IP** — the unauthenticated public probe routes (`/health`,
+  `/healthz`, `/readyz`, `/metrics`) are throttled on the peer IP
+  (`check_ip`), so an unauthenticated scanner cannot flood them. The peer
+  address comes from the connection (`ConnectInfo`); the two actor axes use
+  disjoint keys, so per-IP and per-agent budgets never interfere.
+  The `/raft/*` transport routes are intentionally exempt — they are
+  authenticated by the shared `raft.transport_secret` and run at heartbeat
+  frequency, so IP-throttling them would risk breaking consensus.
+
+Entry eviction is **incremental**: each insert sweeps at most a fixed number of
+entries and drops those whose window has fully aged out, bounding per-request
+work regardless of how many distinct actors are tracked (no O(n) `retain`
+latency spike at the capacity ceiling).
 
 ## Admission Control
 
@@ -343,8 +420,19 @@ verified.
 
 Each event's tag folds in the previous event's tag, so the log is only valid as a
 whole. This is what makes the trail **tamper-evident**: an attacker cannot mutate
-one record, delete a record, or truncate the tail without breaking a downstream
-link or leaving a `seq` gap that `verify_chain` detects.
+one record or delete a mid-log record without breaking a downstream link or
+leaving a `seq` gap that `verify_chain` detects.
+
+**Anti-rollback high-water mark.** Chain linkage alone cannot detect a rollback
+to a *consistent prefix* (dropping the last N events, or restoring the whole
+dataset from an earlier snapshot, leaves a valid chain `0..k`). The signed event
+log therefore maintains a sidecar high-water mark (`.hirn_event_hwm` in the DB
+directory), written atomically after every append call and authenticated with a
+keyed BLAKE3 tag under its own domain-separated key. On reopen, a recovered log
+whose head is behind the sidecar — or whose head tag does not match it — fails
+with a dedicated tamper error instead of silently resuming. A missing sidecar is
+accepted once (first boot / legacy database) and created from the recovered
+state.
 
 ```mermaid
 flowchart LR

@@ -39,7 +39,7 @@ impl PhysicalOptimizerRule for ActivationFusionRule {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         plan.transform_down(|node| {
             // Check if this node is a GraphActivationExec
-            let Some(outer) = node.as_any().downcast_ref::<GraphActivationExec>() else {
+            let Some(outer) = node.downcast_ref::<GraphActivationExec>() else {
                 return Ok(Transformed::no(node));
             };
 
@@ -49,7 +49,7 @@ impl PhysicalOptimizerRule for ActivationFusionRule {
                 return Ok(Transformed::no(node));
             }
             let child_plan = children[0];
-            let Some(inner) = child_plan.as_any().downcast_ref::<GraphActivationExec>() else {
+            let Some(inner) = child_plan.downcast_ref::<GraphActivationExec>() else {
                 return Ok(Transformed::no(node));
             };
 
@@ -141,10 +141,7 @@ mod tests {
 
         // Should be fused into a single GraphActivationExec
         assert!(
-            optimized
-                .as_any()
-                .downcast_ref::<GraphActivationExec>()
-                .is_some(),
+            optimized.downcast_ref::<GraphActivationExec>().is_some(),
             "should still be GraphActivationExec"
         );
 
@@ -152,10 +149,7 @@ mod tests {
         let children = optimized.children();
         assert_eq!(children.len(), 1);
         assert!(
-            children[0]
-                .as_any()
-                .downcast_ref::<GraphActivationExec>()
-                .is_none(),
+            children[0].downcast_ref::<GraphActivationExec>().is_none(),
             "child should no longer be GraphActivationExec"
         );
     }
@@ -180,10 +174,7 @@ mod tests {
         let children = optimized.children();
         assert_eq!(children.len(), 1);
         assert!(
-            children[0]
-                .as_any()
-                .downcast_ref::<GraphActivationExec>()
-                .is_some(),
+            children[0].downcast_ref::<GraphActivationExec>().is_some(),
             "mixed-mode chain must not be fused"
         );
     }
@@ -207,10 +198,7 @@ mod tests {
         let children = optimized.children();
         assert_eq!(children.len(), 1);
         assert!(
-            children[0]
-                .as_any()
-                .downcast_ref::<GraphActivationExec>()
-                .is_some(),
+            children[0].downcast_ref::<GraphActivationExec>().is_some(),
             "differing min_weight cutoffs must not be fused"
         );
     }
@@ -228,11 +216,6 @@ mod tests {
         let optimized = rule.optimize(plan.clone(), &config).unwrap();
 
         // Still a GraphActivationExec with MemoryExec child — no change
-        assert!(
-            optimized
-                .as_any()
-                .downcast_ref::<GraphActivationExec>()
-                .is_some()
-        );
+        assert!(optimized.downcast_ref::<GraphActivationExec>().is_some());
     }
 }

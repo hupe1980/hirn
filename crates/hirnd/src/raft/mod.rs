@@ -9,6 +9,7 @@
 //! - Consolidation lease protocol (`ConsolidationLease`)
 //! - Realm-to-node shard affinity (via state machine)
 
+pub mod coordinator;
 pub mod durable_store;
 pub mod lease;
 pub mod network;
@@ -16,6 +17,7 @@ pub mod state_machine;
 pub mod store;
 pub mod types;
 
+pub use coordinator::{ClusterCoordinator, LeaseOutcome};
 pub use durable_store::DurableLogStore;
 pub use lease::ConsolidationLease;
 pub use state_machine::HirnStateMachine;

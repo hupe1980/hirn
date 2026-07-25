@@ -20,6 +20,13 @@ pub struct ConsolidationLease {
     pub expires_at: u64,
     /// The realm this lease covers.
     pub realm: String,
+    /// Monotonic fencing token, issued by consensus and strictly increasing
+    /// across every acquisition cluster-wide (Kleppmann fencing token). A
+    /// stalled ex-holder that resumes after a GC/VM pause carries a stale
+    /// fence, so downstream storage mutations can reject it. Renewal preserves
+    /// the fence (same acquisition session); a fresh acquisition bumps it.
+    #[serde(default)]
+    pub fence: u64,
 }
 
 impl ConsolidationLease {
@@ -30,18 +37,21 @@ impl ConsolidationLease {
     ///
     /// The timestamp must be the one stamped into the Raft log entry at
     /// proposal time — never the local clock — so that every replica applying
-    /// the entry computes the identical `expires_at`.
+    /// the entry computes the identical `expires_at`. `fence` is the
+    /// consensus-issued monotonic fencing token for this acquisition.
     pub fn new(
         realm: String,
         holder: NodeId,
         duration_secs: u64,
         acquired_at_epoch_secs: u64,
+        fence: u64,
     ) -> Self {
         Self {
             holder,
             acquired_at: acquired_at_epoch_secs,
             expires_at: acquired_at_epoch_secs.saturating_add(duration_secs),
             realm,
+            fence,
         }
     }
 
@@ -99,11 +109,12 @@ mod tests {
     #[test]
     fn lease_creation_and_expiry() {
         let now = now_epoch_secs();
-        let lease = ConsolidationLease::new("test-realm".into(), 1, 300, now);
+        let lease = ConsolidationLease::new("test-realm".into(), 1, 300, now, 7);
         assert_eq!(lease.holder, 1);
         assert_eq!(lease.realm, "test-realm");
         assert_eq!(lease.acquired_at, now);
         assert_eq!(lease.expires_at, now + 300);
+        assert_eq!(lease.fence, 7);
         assert!(!lease.is_expired());
         assert!(!lease.is_expired_at(now));
         assert!(lease.is_expired_at(now + 300));
@@ -119,6 +130,7 @@ mod tests {
             acquired_at: 0,
             expires_at: 1, // expired long ago
             realm: "test".into(),
+            fence: 1,
         };
         assert!(lease.is_expired());
         assert!(!lease.is_held_by(1));
@@ -128,9 +140,11 @@ mod tests {
     #[test]
     fn renewal() {
         let now = now_epoch_secs();
-        let mut lease = ConsolidationLease::new("r".into(), 1, 10, now);
+        let mut lease = ConsolidationLease::new("r".into(), 1, 10, now, 3);
         lease.renew_at(600, now + 5);
         assert_eq!(lease.expires_at, now + 605);
+        // Renewal preserves the fencing token (same acquisition session).
+        assert_eq!(lease.fence, 3);
         assert!(lease.remaining_secs() > 500);
     }
 
@@ -138,8 +152,8 @@ mod tests {
     fn expiry_is_deterministic_for_a_fixed_timestamp() {
         // Two leases built from the same entry data must agree on expiry
         // regardless of when (or where) the check runs.
-        let a = ConsolidationLease::new("r".into(), 1, 300, 1_000);
-        let b = ConsolidationLease::new("r".into(), 1, 300, 1_000);
+        let a = ConsolidationLease::new("r".into(), 1, 300, 1_000, 1);
+        let b = ConsolidationLease::new("r".into(), 1, 300, 1_000, 1);
         assert_eq!(a.expires_at, b.expires_at);
         assert!(!a.is_expired_at(1_299));
         assert!(a.is_expired_at(1_300));

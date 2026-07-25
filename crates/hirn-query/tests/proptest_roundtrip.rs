@@ -2,7 +2,7 @@
 
 use proptest::prelude::*;
 
-use hirn_query::parse;
+use hirn_query::{parse, query_hash};
 
 // ── Strategies ──────────────────────────────────────────────────────────
 
@@ -289,6 +289,38 @@ proptest! {
     #[test]
     fn traverse_round_trip(query in traverse_query()) {
         assert_round_trip(&query);
+    }
+
+    /// R-47: the plan-cache key must distinguish string literals that differ
+    /// only by ASCII case. Whenever lowercasing the literal actually changes
+    /// it, the two RECALL queries must hash to distinct cache keys — otherwise
+    /// one query would be served the other's compiled plan (wrong embedding
+    /// vector + FTS term). Lowercasing the *keywords* must never change the key.
+    #[test]
+    fn case_variant_literals_get_distinct_keys(about in "[A-Za-z][A-Za-z ]{0,19}") {
+        let about = about.trim().to_string();
+        prop_assume!(!about.is_empty());
+        let lowered = about.to_ascii_lowercase();
+
+        let q_upper = format!("RECALL episodic ABOUT \"{about}\"");
+        let q_lower_lit = format!("RECALL episodic ABOUT \"{lowered}\"");
+        if about != lowered {
+            prop_assert_ne!(
+                query_hash(&q_upper),
+                query_hash(&q_lower_lit),
+                "case-variant literal must not collide: {:?} vs {:?}",
+                q_upper, q_lower_lit
+            );
+        }
+
+        // Lowercasing only the KEYWORDS (literal unchanged) keeps the same key.
+        let q_lower_kw = format!("recall episodic about \"{about}\"");
+        prop_assert_eq!(
+            query_hash(&q_upper),
+            query_hash(&q_lower_kw),
+            "case-variant keywords must share a key: {:?} vs {:?}",
+            q_upper, q_lower_kw
+        );
     }
 
     #[test]

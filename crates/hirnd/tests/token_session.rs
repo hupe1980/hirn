@@ -544,9 +544,10 @@ async fn test_token_read_only_blocks_write() {
     assert_eq!(resp.status(), 403);
 }
 
-/// Token with write-only operations → read attempt → 403.
+/// Token with [write] operations → write succeeds, and read is implicitly
+/// allowed by the Admin ⊇ Write ⊇ Read hierarchy (R-72).
 #[tokio::test(flavor = "multi_thread")]
-async fn test_token_write_only_blocks_read() {
+async fn test_token_write_implies_read() {
     let (url, _tmp, _h) = start_token_server().await;
     let c = client();
 
@@ -577,7 +578,8 @@ async fn test_token_write_only_blocks_read() {
         .unwrap();
     assert_eq!(resp.status(), 201);
 
-    // Read operation → 403
+    // Read operation → allowed: the operation hierarchy is Admin ⊇ Write ⊇ Read,
+    // so a [write] token implicitly permits Read (R-72).
     let resp = c
         .post(format!("{url}/v1/recall"))
         .bearer_auth(&token)
@@ -585,7 +587,53 @@ async fn test_token_write_only_blocks_read() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 403);
+    assert_eq!(resp.status(), 200);
+}
+
+/// Token with [admin] operations → implicitly permits Read and Write (R-72):
+/// Admin ⊇ Write ⊇ Read. Before the hierarchy an [admin] token was paradoxically
+/// denied Read/Write by exact-match scope checking.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_token_admin_implies_read_and_write() {
+    let (url, _tmp, _h) = start_token_server().await;
+    let c = client();
+
+    // Issue an admin-only token.
+    let resp = c
+        .post(format!("{url}/v1/auth/token"))
+        .bearer_auth("key-alpha")
+        .json(&json!({ "operations": ["admin"] }))
+        .send()
+        .await
+        .unwrap();
+    let token = resp.json::<Value>().await.unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Write (remember) succeeds under an admin token.
+    let resp = c
+        .post(format!("{url}/v1/remember"))
+        .bearer_auth(&token)
+        .json(&json!({
+            "layer": "episodic",
+            "content": "admin memory",
+            "embedding": embedding(),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+
+    // Read (recall) also succeeds under the same admin token.
+    let resp = c
+        .post(format!("{url}/v1/recall"))
+        .bearer_auth(&token)
+        .json(&json!({ "query_embedding": embedding() }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
 }
 
 /// Token without admin operation → consolidate attempt → 403.
@@ -976,4 +1024,146 @@ async fn test_key_rotation_old_revoked_new_works() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
+}
+
+// ─── Token Revocation Tests ──────────────────────────────────
+
+/// Helper: mint a token via the HTTP endpoint.
+async fn mint_token(c: &Client, url: &str, api_key: &str, body: Value) -> String {
+    let resp = c
+        .post(format!("{url}/v1/auth/token"))
+        .bearer_auth(api_key)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    body["token"].as_str().unwrap().to_owned()
+}
+
+/// Helper: probe whether a bearer credential is accepted by /v1/recall.
+async fn recall_status(c: &Client, url: &str, bearer: &str) -> u16 {
+    c.post(format!("{url}/v1/recall"))
+        .bearer_auth(bearer)
+        .json(&json!({ "query_embedding": embedding() }))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+/// Revoking a token by full JWT invalidates it immediately (well before exp),
+/// while other tokens keep working.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_revoke_token_by_jwt() {
+    let (url, _tmp, _h) = start_token_server().await;
+    let c = client();
+
+    let victim = mint_token(&c, &url, "key-alpha", json!({})).await;
+    let survivor = mint_token(&c, &url, "key-alpha", json!({})).await;
+
+    assert_eq!(recall_status(&c, &url, &victim).await, 200);
+
+    let resp = c
+        .post(format!("{url}/v1/auth/revoke"))
+        .bearer_auth("key-alpha")
+        .json(&json!({ "token": victim }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["revoked_jtis"].as_array().unwrap().len(), 1);
+
+    // Unexpired but revoked → rejected; unrevoked token unaffected.
+    assert_eq!(recall_status(&c, &url, &victim).await, 401);
+    assert_eq!(recall_status(&c, &url, &survivor).await, 200);
+}
+
+/// Revoking an API key kills every JWT it issued (issuer-kid revocation).
+#[tokio::test(flavor = "multi_thread")]
+async fn test_revoke_api_key_kills_issued_tokens() {
+    let (url, _tmp, _h) = start_token_server().await;
+    let c = client();
+
+    let t1 = mint_token(&c, &url, "key-alpha", json!({})).await;
+    let t2 = mint_token(&c, &url, "key-alpha", json!({ "operations": ["read"] })).await;
+    let beta = mint_token(&c, &url, "key-beta", json!({})).await;
+
+    assert_eq!(recall_status(&c, &url, &t1).await, 200);
+
+    let resp = c
+        .post(format!("{url}/v1/auth/revoke"))
+        .bearer_auth("key-alpha")
+        .json(&json!({ "api_key": "key-alpha" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["revoked_issuers"].as_array().unwrap().len(), 1);
+
+    // Every token issued by key-alpha is dead; key-beta's token survives.
+    assert_eq!(recall_status(&c, &url, &t1).await, 401);
+    assert_eq!(recall_status(&c, &url, &t2).await, 401);
+    assert_eq!(recall_status(&c, &url, &beta).await, 200);
+}
+
+/// A restricted token without the admin operation cannot revoke.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_revoke_requires_admin_for_restricted_tokens() {
+    let (url, _tmp, _h) = start_token_server().await;
+    let c = client();
+
+    let victim = mint_token(&c, &url, "key-alpha", json!({})).await;
+    let read_only = mint_token(&c, &url, "key-alpha", json!({ "operations": ["read"] })).await;
+
+    let resp = c
+        .post(format!("{url}/v1/auth/revoke"))
+        .bearer_auth(&read_only)
+        .json(&json!({ "token": victim.clone() }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+
+    // The victim token was not revoked.
+    assert_eq!(recall_status(&c, &url, &victim).await, 200);
+}
+
+/// A caller cannot revoke a token that belongs to another realm.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_revoke_cross_realm_forbidden() {
+    let (url, _tmp, _h) = start_token_server().await;
+    let c = client();
+
+    let alpha_token = mint_token(&c, &url, "key-alpha", json!({})).await;
+
+    let resp = c
+        .post(format!("{url}/v1/auth/revoke"))
+        .bearer_auth("key-beta")
+        .json(&json!({ "token": alpha_token.clone() }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    assert_eq!(recall_status(&c, &url, &alpha_token).await, 200);
+}
+
+/// An empty revocation request is rejected.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_revoke_empty_request_rejected() {
+    let (url, _tmp, _h) = start_token_server().await;
+    let c = client();
+
+    let resp = c
+        .post(format!("{url}/v1/auth/revoke"))
+        .bearer_auth("key-alpha")
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
 }

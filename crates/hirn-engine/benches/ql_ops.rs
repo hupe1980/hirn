@@ -130,20 +130,21 @@ fn bench_ql_parse(c: &mut Criterion) {
 // ─── Plan Benchmarks ─────────────────────────────────────────
 
 fn bench_ql_plan(c: &mut Criterion) {
+    let pipeline = hirn_query::QueryPipeline::new(hirn_query::AnalyzeContext::default());
     let recall_stmt =
         ql::parse(r#"RECALL episodic ABOUT "deployment strategies" LIMIT 10"#).unwrap();
     let think_stmt = ql::parse(r#"THINK ABOUT "deployment strategies" BUDGET 4096"#).unwrap();
 
     c.bench_function("ql_plan_recall", |b| {
         b.iter(|| {
-            let plan = ql::plan(&recall_stmt, None);
+            let plan = pipeline.compile_statement(recall_stmt.clone()).unwrap();
             black_box(&plan);
         });
     });
 
     c.bench_function("ql_plan_think", |b| {
         b.iter(|| {
-            let plan = ql::plan(&think_stmt, None);
+            let plan = pipeline.compile_statement(think_stmt.clone()).unwrap();
             black_box(&plan);
         });
     });

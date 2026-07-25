@@ -273,6 +273,125 @@ async fn state_machine_lease_conflict() {
     assert!(matches!(resp[0], RaftResponse::Ok));
 }
 
+#[tokio::test]
+async fn state_machine_lease_issues_monotonic_fences() {
+    use openraft::storage::RaftStateMachine;
+
+    let sm = Arc::new(HirnStateMachine::new());
+    let mut sm_ref = sm.clone();
+
+    // First acquisition on realm-a.
+    sm_ref
+        .apply(vec![openraft::Entry::<TypeConfig> {
+            log_id: openraft::LogId::new(openraft::CommittedLeaderId::new(1, 0), 1),
+            payload: openraft::EntryPayload::Normal(RaftRequest::acquire_lease("realm-a", 1, 300)),
+        }])
+        .await
+        .unwrap();
+    let fence_a = sm.active_lease("realm-a").await.unwrap().fence;
+    assert!(fence_a >= 1, "first fence must be positive");
+
+    // A second acquisition (different realm) must observe a strictly greater
+    // fence — the counter is monotonic cluster-wide, not per-realm.
+    sm_ref
+        .apply(vec![openraft::Entry::<TypeConfig> {
+            log_id: openraft::LogId::new(openraft::CommittedLeaderId::new(1, 0), 2),
+            payload: openraft::EntryPayload::Normal(RaftRequest::acquire_lease("realm-b", 1, 300)),
+        }])
+        .await
+        .unwrap();
+    let fence_b = sm.active_lease("realm-b").await.unwrap().fence;
+    assert!(
+        fence_b > fence_a,
+        "fences must strictly increase: {fence_a} -> {fence_b}"
+    );
+
+    // Renewal preserves the fence (same acquisition session).
+    sm_ref
+        .apply(vec![openraft::Entry::<TypeConfig> {
+            log_id: openraft::LogId::new(openraft::CommittedLeaderId::new(1, 0), 3),
+            payload: openraft::EntryPayload::Normal(RaftRequest::renew_lease("realm-a", 1, 300)),
+        }])
+        .await
+        .unwrap();
+    assert_eq!(sm.active_lease("realm-a").await.unwrap().fence, fence_a);
+}
+
+// ─── Cluster Coordinator (single-node, drives client_write) ──
+
+async fn single_node_coordinator() -> (ClusterCoordinator, Arc<HirnStateMachine>, HirnRaft) {
+    let raft_config = Arc::new(default_raft_config().validate().unwrap());
+    let log_store = DevMemLogStore::new();
+    let state_machine = Arc::new(HirnStateMachine::new());
+    let network = network::HirnRaftNetworkFactory::new(None).expect("raft network");
+    let raft = new_raft_dev(
+        7,
+        raft_config,
+        log_store,
+        Arc::clone(&state_machine),
+        network,
+    )
+    .await
+    .unwrap();
+
+    let mut members = std::collections::BTreeMap::new();
+    members.insert(
+        7,
+        openraft::BasicNode {
+            addr: "http://127.0.0.1:7000".to_string(),
+        },
+    );
+    raft.initialize(members).await.unwrap();
+    // Wait for this node to elect itself leader so client_write succeeds locally.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let coordinator = ClusterCoordinator::new(
+        raft.clone(),
+        Arc::clone(&state_machine),
+        hirnd::http::default_forward_client().unwrap(),
+        None,
+    );
+    (coordinator, state_machine, raft)
+}
+
+#[tokio::test]
+async fn coordinator_drives_consolidation_lease_lifecycle() {
+    let (coordinator, sm, _raft) = single_node_coordinator().await;
+
+    // Acquire → held by node 7 with a positive fence.
+    let first = match coordinator.acquire_lease("realm-x", 300).await.unwrap() {
+        LeaseOutcome::Acquired { fence } => fence,
+        other => panic!("expected Acquired, got {other:?}"),
+    };
+    assert!(first >= 1);
+    let lease = sm.active_lease("realm-x").await.unwrap();
+    assert_eq!(lease.holder, 7);
+    assert_eq!(lease.fence, first);
+
+    // Renew keeps the lease held by us.
+    assert!(coordinator.renew_lease("realm-x", 300).await.unwrap());
+
+    // Release drops it.
+    coordinator.release_lease("realm-x").await.unwrap();
+    assert!(sm.active_lease("realm-x").await.is_none());
+}
+
+#[tokio::test]
+async fn coordinator_registers_membership_nodes() {
+    let (coordinator, sm, _raft) = single_node_coordinator().await;
+
+    // Nothing registered until the coordinator reconciles.
+    assert!(sm.nodes().await.is_empty());
+
+    coordinator.reconcile_once().await;
+
+    let nodes = sm.nodes().await;
+    assert_eq!(
+        nodes.get(&7).map(String::as_str),
+        Some("http://127.0.0.1:7000")
+    );
+}
+
 // ─── Log Store ───────────────────────────────────────────────
 
 #[tokio::test]
@@ -575,7 +694,7 @@ fn epoch_now_secs() -> u64 {
 fn consolidation_lease_lifecycle() {
     // Lease time is supplied by the proposer (deterministic apply), so the
     // test stamps its own acquisition instant.
-    let lease = ConsolidationLease::new("realm-a".to_string(), 42, 300, epoch_now_secs());
+    let lease = ConsolidationLease::new("realm-a".to_string(), 42, 300, epoch_now_secs(), 1);
     assert!(!lease.is_expired());
     assert!(lease.is_held_by(42));
     assert!(!lease.is_held_by(99));
@@ -585,7 +704,7 @@ fn consolidation_lease_lifecycle() {
 #[test]
 fn consolidation_lease_renew() {
     let now = epoch_now_secs();
-    let mut lease = ConsolidationLease::new("realm-b".to_string(), 1, 10, now);
+    let mut lease = ConsolidationLease::new("realm-b".to_string(), 1, 10, now, 1);
     lease.renew_at(600, now);
     assert!(!lease.is_expired());
     assert!(lease.remaining_secs() > 590);
@@ -629,7 +748,6 @@ uri = "s3://my-bucket/hirn-data"
         cfg.properties.get("storage.region"),
         Some(&"us-east-1".to_string())
     );
-    assert!(cfg.fragment_cache_dir.is_none());
 }
 
 // ─── Config Validation ───────────────────────────────────────

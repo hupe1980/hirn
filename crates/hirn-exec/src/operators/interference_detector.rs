@@ -20,7 +20,6 @@
 //! Inject `Arc<dyn NliClassifier>` backed by a loaded DeBERTa-MNLI ONNX session into
 //! `HirnSessionExt` at database open time. The planner picks it up automatically.
 
-use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
@@ -138,7 +137,7 @@ pub struct InterferenceDetectorExec {
     /// NLI classifier for Check 3. Defaults to heuristic; injectable for ONNX upgrade.
     nli_classifier: Arc<dyn NliClassifier>,
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl InterferenceDetectorExec {
@@ -166,12 +165,12 @@ impl InterferenceDetectorExec {
         )));
         let schema = Arc::new(Schema::new(fields));
 
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             datafusion_physical_expr::EquivalenceProperties::new(schema.clone()),
             datafusion_physical_plan::Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
 
         Self {
             input,
@@ -208,15 +207,11 @@ impl ExecutionPlan for InterferenceDetectorExec {
         "InterferenceDetectorExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -312,22 +307,33 @@ impl ExecutionPlan for InterferenceDetectorExec {
             let content_col = merged.column_by_name("content");
             let contents = content_col.and_then(|c| c.as_any().downcast_ref::<StringArray>());
 
+            // Maps content hash → first row index seen with that hash. The stored
+            // index lets us confirm BYTE-equality of the actual content before
+            // flagging a duplicate: a 64-bit FNV collision between two distinct
+            // strings must never drop a legitimately different memory.
             let mut content_hashes: HashMap<u64, usize> = HashMap::new();
             let mut all_flags: Vec<InterferenceFlags> = Vec::with_capacity(n);
 
             for i in 0..n {
                 let mut flags = InterferenceFlags::default();
 
-                // Check 1: Exact content duplicate (hash-based).
+                // Check 1: Exact content duplicate (hash-indexed, byte-confirmed).
                 if let Some(contents) = contents {
                     if !contents.is_null(i) {
                         let content = contents.value(i);
                         let h = fnv1a_64(content.as_bytes());
-                        if content_hashes.contains_key(&h) {
-                            flags.is_duplicate = true;
-                            flags.score = dup_threshold;
+                        // Hash equality is only a candidate: confirm the stored
+                        // content is byte-identical before flagging. On a hash
+                        // collision (different bytes) this is false, so the row
+                        // is left unflagged and the first occurrence is retained.
+                        if let Some(&prev) = content_hashes.get(&h) {
+                            if !contents.is_null(prev) && contents.value(prev) == content {
+                                flags.is_duplicate = true;
+                                flags.score = dup_threshold;
+                            }
+                        } else {
+                            content_hashes.insert(h, i);
                         }
-                        content_hashes.insert(h, i);
                     }
                 }
 
@@ -744,6 +750,57 @@ mod tests {
         assert_eq!(flags.value(1), "none");
         // Row 2: duplicate of row 0 → flagged.
         assert_eq!(flags.value(2), "duplicate");
+    }
+
+    /// Check 1: duplicate detection must confirm byte-equality of content, not
+    /// rely on FNV-1a hash equality alone. Distinct contents (which could in
+    /// principle collide) must NOT be flagged as duplicates, while genuinely
+    /// byte-equal content MUST be flagged.
+    #[tokio::test]
+    async fn interference_requires_byte_equality_not_just_hash() {
+        use futures::StreamExt;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("content", DataType::Utf8, false),
+        ]));
+
+        // Rows 0/1/2 are all distinct; row 3 is byte-equal to row 0.
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["r0", "r1", "r2", "r3"])),
+                Arc::new(StringArray::from(vec![
+                    "alpha content",
+                    "beta content",
+                    "gamma content",
+                    "alpha content", // byte-equal to row 0
+                ])),
+            ],
+        )
+        .unwrap();
+
+        let input = Arc::new(crate::test_utils::MemoryBatchExec::new(
+            schema.clone(),
+            vec![batch],
+        ));
+        let exec = InterferenceDetectorExec::new(input, InterferenceConfig::default());
+        let ctx = Arc::new(TaskContext::default());
+        let mut stream = exec.execute(0, ctx).unwrap();
+        let result = stream.next().await.unwrap().unwrap();
+
+        let flags = result
+            .column_by_name("interference_flags")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        // Distinct contents are never flagged as duplicates.
+        assert_eq!(flags.value(0), "none", "row 0: first occurrence");
+        assert_eq!(flags.value(1), "none", "row 1: distinct content");
+        assert_eq!(flags.value(2), "none", "row 2: distinct content");
+        // Byte-equal content IS flagged.
+        assert_eq!(flags.value(3), "duplicate", "row 3: byte-equal to row 0");
     }
 
     #[tokio::test]

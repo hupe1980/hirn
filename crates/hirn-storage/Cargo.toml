@@ -21,6 +21,7 @@ arrow-select = { workspace = true }
 arrow-ord = { workspace = true }
 arrow-cast = { workspace = true }
 object_store = { workspace = true }
+chrono = { workspace = true }
 dashmap = { workspace = true }
 blake3 = { workspace = true }
 image = { workspace = true }

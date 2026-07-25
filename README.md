@@ -21,7 +21,7 @@ LLMs are evolving from stateless chatbots into long-running autonomous agents. T
 
 - **Four-layer memory model** — episodic (events), semantic (knowledge), procedural (skills/workflows), and working memory (scratch space), mirroring human cognitive architecture (CLS theory + CoALA)
 - **Procedural execution** — `ToolExecutor` trait dispatches stored action-step sequences to external tool runtimes (MCP servers, shell, function-calling agents) with short-circuit-on-failure semantics and EMA-based success tracking
-- **Lance 4.0-powered storage** — object-storage-native lakehouse (local, S3, GCS, Azure) with built-in IVF-HNSW vector indexing, BTree, Bitmap, and LabelList indices, full-text search, and hybrid search with RRF via hirn-storage (`PhysicalStore` trait)
+- **Lance 9.0-powered storage** — object-storage-native lakehouse (local, S3, GCS, Azure) with built-in IVF-HNSW vector indexing, BTree, Bitmap, and LabelList indices, full-text search, and hybrid search with RRF via hirn-storage (`PhysicalStore` trait)
 - **Full-text search (BM25)** — Lance built-in Tantivy-powered FTS with configurable tokenizers, stemming (30+ languages), fuzzy matching, phrase queries, boolean operators (AND/OR/NOT), and field boosting
 - **Hybrid search with RRF** — hirn-storage fuses vector search and FTS/BM25 via reciprocal rank fusion in a single query, with pluggable rerankers (Cohere, CrossEncoder, ColBERT, custom)
 - **Multivector search** — MaxSim-based late interaction search (ColBERT/ColPaLi) for token-level similarity matching via Lance
@@ -47,11 +47,12 @@ LLMs are evolving from stateless chatbots into long-running autonomous agents. T
 - **Memory defense system** — anomaly detection with quarantine, collective corruption defense (per-agent rate limiting), graph injection prevention (fan-out caps), and GDPR right-to-erasure (`purge_agent`)
 - **Domain-scoped API views** — typed views (`EpisodicView`, `SemanticView`, `ProceduralView`, `WorkingView`, `GraphView`, `RecallView`, `NamespaceView`) accessed via `db.episodic()`, `db.semantic()`, etc., providing focused, discoverable APIs per memory layer
 - **Unified GraphStore trait** — async `GraphStore` trait for pluggable graph backends; `PersistentGraph` implements it, accessed via `HirnDB::graph_store()`
-- **Cedar authorization** — fine-grained RBAC/ABAC via `cedar-policy` v4.9.1 with entity hierarchies (Agent ∈ Team ∈ Organization, Namespace ∈ Realm), 10 action types, schema validation, and automated policy reasoning
-- **Tamper-evident audit trail** — every authorization decision and mutation is logged with agent, action, resource, decision, and policy IDs. When `event_hmac_secret` is configured, each event on the production emit path is HMAC-SHA256 signed **and hash-chained** to its predecessor (`prev_hmac`), so not only mutation but also deletion or truncation of audit rows is detectable. Auditors verify the full chain (per-event tag + linkage + gap-free sequence) via `EventLog::verify_chain`.
+- **Cedar authorization** — fine-grained RBAC/ABAC via `cedar-policy` v4.9.1 with entity hierarchies (Agent ∈ Team ∈ Organization, Namespace ∈ Realm), 20 action types (including dedicated `reflect` and `review` actions so belief revision and quarantine approval are policy-distinguishable from ordinary corrections), schema validation, and automated policy reasoning
+- **Tamper-evident audit trail** — every authorization decision and mutation is logged with agent, action, resource, decision, and policy IDs. When `event_hmac_secret` is configured, each event on the production emit path is HMAC-SHA256 signed **and hash-chained** to its predecessor (`prev_hmac`), so not only mutation but also deletion or truncation of audit rows is detectable. Auditors verify the full chain (per-event tag + linkage + gap-free sequence) via `EventLog::verify_chain`, and an authenticated high-water-mark sidecar additionally detects whole-log rollbacks to a consistent prefix across restarts.
+- **Poisoning-resistant ingest** — the admission pipeline gates every write: a **trust gate** blends provenance-derived trust (origin, evidence diversity, contradiction history) with the authoring agent's Bayesian reputation against configurable floors, and a **poisoning gate** scans candidate content with the homoglyph-resistant injection detector (audit-flag or reject; stored content is never mutated) — on top of the existing duplicate/surprise/contradiction/token-budget controllers
 - **Encryption at rest** — ⚠️ **storage-delegated only.** hirn does **not** perform application-level AES-GCM encryption today; on-disk Arrow (content, embeddings, FTS, graph, audit) is protected only by whatever the underlying store/OS provides (OS full-disk encryption, or object-store SSE when configured *outside* hirn). Field-level AEAD is on the roadmap. See [docs/encryption-at-rest.md](docs/encryption-at-rest.md).
 - **Graceful error propagation on write paths** — public mutation APIs return `Result<T, HirnError>` rather than panicking; safety-critical invariants (e.g., SIMD dimension checks) use hard `assert!`. Note: this is a design goal enforced by review, not yet by a `clippy::unwrap_used` gate.
-- **Sleep-time consolidation** — the `hirnd` daemon runs the consolidation pipeline (and, when the offline scheduler is enabled, bounded dream/reconcile jobs) automatically while idle, configured via the `[sleep]` section and aborted as soon as traffic resumes (see [Deployment](docs/deployment.md#sleep-time-consolidation))
+- **Sleep-time consolidation** — the `hirnd` daemon runs the consolidation pipeline (and, when the offline scheduler is enabled, bounded dream/reconcile/reflect jobs) automatically while idle, configured via the `[sleep]` section and aborted as soon as traffic resumes (see [Deployment](docs/deployment.md#sleep-time-consolidation))
 
 ## Deployment Modes
 
@@ -254,10 +255,10 @@ async fn main() -> HirnResult<()> {
 crates/
 ├── hirn-core      # Types, config, errors, trait definitions (leaf crate)
 ├── hirn-provider  # Embedders, LLMs, rerankers, and tokenizers with shared retry/circuit-breaker patterns
-├── hirn-storage   # Storage engine (Lance 4.0, PhysicalStore trait, DataFusion session, dataset management)
+├── hirn-storage   # Storage engine (Lance 9.0, PhysicalStore trait, DataFusion session, dataset management)
 ├── hirn-graph     # Property graph, spreading activation, PPR, Hebbian learning
 ├── hirn-query     # HirnQL parser, typed AST, plan compiler, query pipeline
-├── hirn-exec      # DataFusion operators, UDFs, optimizer rules, planner bridge
+├── hirn-exec      # DataFusion operators, optimizer rules, planner bridge
 ├── hirn-policy    # Cedar integration, audit trail, policy enforcement
 ├── hirn-engine    # Recall pipeline, consolidation, scoring, orchestration
 ├── hirn           # Public façade, AgentContext, Hirn handle
@@ -330,7 +331,13 @@ HIRN-Bench evaluates six dimensions of cognitive memory:
 | H5 — Action | Memory → action grounding (tool selection, planning) |
 | H6 — Safety | PII handling, injection resilience, adversarial robustness |
 
-External benchmark adapters for **LoCoMo**, **DMR**, and **LongMemEval** (ICLR 2025) datasets are included for direct comparison with published competitor results.
+External benchmark adapters for **LoCoMo**, **DMR**, **LongMemEval** (ICLR 2025), and
+**BEAM** (ICLR 2026, up to 10M-token conversations) are included. Retrieval-containment
+scoring is the default; an opt-in LLM reader + judge (`--reader gpt-4o --judge gpt-4o`)
+produces `official_reader_accuracy` via the official LongMemEval judge prompts, with
+exact reader-token accounting (tokens/query), blake3 dataset pinning, and seeded
+provenance for reproducible, honestly-labeled comparisons — see
+[Benchmarks](docs/benchmarks.md).
 
 ## Code Quality
 

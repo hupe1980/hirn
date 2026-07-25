@@ -263,6 +263,9 @@ async fn execute_consolidation_pipeline_inner(
         ..Default::default()
     };
     let mut episodes = db.list_episodes(&filter).await?;
+    // Number of episodes the storage layer returned *before* WHERE filtering —
+    // used to detect whether the batch limit truncated the scan (R-63a).
+    let loaded_count = episodes.len();
 
     // Apply WHERE filters.
     if !where_filters.is_empty() {
@@ -316,7 +319,18 @@ async fn execute_consolidation_pipeline_inner(
     let causal_edges_discovered = discover_causal_edges(&episodes, db).await;
 
     // 4. Form narrative threads.
-    let threads = form_narrative_threads(&segments, &patterns, config);
+    // R-64: single-linkage clustering builds an O(N²) similarity matrix — pure
+    // CPU. Run it on a blocking thread so it never stalls the async executor
+    // while the consolidation lock is held. `segments`/`patterns` are not used
+    // after this point, so they are moved into the closure.
+    let threads = {
+        let config = config.clone();
+        tokio::task::spawn_blocking(move || form_narrative_threads(&segments, &patterns, &config))
+            .await
+            .map_err(|e| {
+                HirnError::storage(format!("narrative thread clustering task failed: {e}"))
+            })?
+    };
     let threads_formed = threads.len();
 
     // 4.5. Community detection on the persistent graph.
@@ -602,8 +616,24 @@ async fn execute_consolidation_pipeline_inner(
 
     // Advance the incremental consolidation cursor to the timestamp of the
     // newest episode processed in this batch so the next run skips them.
+    //
+    // R-63a: the cursor filter is `timestamp_ms > cursor` (exclusive). If more
+    // than `consolidation_batch_size` episodes share the exact millisecond at
+    // the truncation boundary, advancing the cursor straight to `max_ts` would
+    // permanently skip the ones that fell beyond the limit. When the batch was
+    // truncated (the storage scan returned a full batch), rewind the cursor to
+    // `max_ts - 1` so the next pass re-scans the whole boundary millisecond;
+    // already-consolidated concepts are skipped idempotently, so the re-scan
+    // does no duplicate work. When the batch was not full we drained everything
+    // past the cursor and can advance to `max_ts` directly.
     if let Some(max_ts) = episodes.iter().map(|e| e.timestamp.millis()).max() {
-        db.write_runtime().advance_consolidation_cursor(max_ts);
+        let batch_truncated = loaded_count >= config.consolidation_batch_size;
+        let next_cursor = if batch_truncated {
+            max_ts.saturating_sub(1)
+        } else {
+            max_ts
+        };
+        db.write_runtime().advance_consolidation_cursor(next_cursor);
     }
 
     let execution_time_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -743,9 +773,17 @@ async fn run_rerun_repair_pass(db: &HirnDB, config: &ConsolidationConfig) -> (us
 ///
 /// Scans time-sorted episodes for pairs where A consistently precedes B
 /// within a 1-hour window. When evidence count ≥ 3, creates a `Causes`
-/// edge in the graph with strength and confidence proportional to evidence.
-/// The `consolidation_causal_window` config limits the number of episodes
-/// considered (0 = no limit). Returns the number of new edges created.
+/// edge in the graph. `strength` scales with evidence count and `confidence`
+/// is the co-occurrence *ratio* (how consistently the cause is followed by the
+/// effect), not a hardcoded constant. The `consolidation_causal_window` config
+/// limits the number of episodes considered (0 = no limit). Returns the number
+/// of new edges created.
+///
+/// R-65: co-occurrence is keyed on the episode's *entity set* (stable, id-
+/// qualified when available) instead of a 50-character content prefix, so
+/// distinct templated events are not collapsed and unrelated events that merely
+/// share a prefix are not spuriously paired. Iteration order and the
+/// representative pair are deterministic.
 async fn discover_causal_edges(episodes: &[EpisodicRecord], db: &HirnDB) -> usize {
     if episodes.len() < 2 {
         return 0;
@@ -761,15 +799,25 @@ async fn discover_causal_edges(episodes: &[EpisodicRecord], db: &HirnDB) -> usiz
     let max_gap_ms: i64 = 3_600_000;
     let min_evidence: usize = 3;
 
-    // Collect temporal co-occurrence: (content_key_a, content_key_b) → list of (id_a, id_b).
+    // Precompute a stable co-occurrence key per episode (R-65).
+    let keys: Vec<String> = episodes.iter().map(causal_content_key).collect();
+
+    // Total occurrences of each key, so confidence can be derived from the
+    // co-occurrence ratio rather than a hardcoded constant.
+    let mut key_occurrences: HashMap<&str, usize> = HashMap::new();
+    for key in &keys {
+        *key_occurrences.entry(key.as_str()).or_default() += 1;
+    }
+
+    // Collect temporal co-occurrence: (key_a, key_b) → list of (id_a, id_b).
     let mut pair_counts: HashMap<(String, String), Vec<(MemoryId, MemoryId)>> = HashMap::new();
 
     for (i, ep_b) in episodes.iter().enumerate() {
         let ts_b = ep_b.timestamp.timestamp_ms();
-        let key_b = truncate_content_key(&ep_b.content);
+        let key_b = &keys[i];
 
         // Look backward at previous episodes within the time window.
-        for ep_a in episodes[..i].iter().rev() {
+        for (j, ep_a) in episodes[..i].iter().enumerate().rev() {
             let ts_a = ep_a.timestamp.timestamp_ms();
             let gap = ts_b - ts_a;
             if gap > max_gap_ms {
@@ -778,10 +826,10 @@ async fn discover_causal_edges(episodes: &[EpisodicRecord], db: &HirnDB) -> usiz
             if gap <= 0 {
                 continue;
             }
-            let key_a = truncate_content_key(&ep_a.content);
+            let key_a = &keys[j];
             if key_a != key_b {
                 pair_counts
-                    .entry((key_a, key_b.clone()))
+                    .entry((key_a.clone(), key_b.clone()))
                     .or_default()
                     .push((ep_a.id, ep_b.id));
             }
@@ -791,7 +839,13 @@ async fn discover_causal_edges(episodes: &[EpisodicRecord], db: &HirnDB) -> usiz
     let store = db.graph_store();
     let mut edges_created = 0;
 
-    for pairs in pair_counts.values() {
+    // Deterministic iteration over discovered co-occurrences (HashMap order is
+    // otherwise randomized per run).
+    let mut keyed_pairs: Vec<(&(String, String), &Vec<(MemoryId, MemoryId)>)> =
+        pair_counts.iter().collect();
+    keyed_pairs.sort_by(|a, b| a.0.cmp(b.0));
+
+    for ((key_a, _key_b), pairs) in keyed_pairs {
         let count = pairs.len();
         if count < min_evidence {
             continue;
@@ -799,8 +853,20 @@ async fn discover_causal_edges(episodes: &[EpisodicRecord], db: &HirnDB) -> usiz
 
         let strength = (count as f32 / 10.0).min(1.0);
 
-        // Use the last observed pair as representative.
-        if let Some(&(cause_id, effect_id)) = pairs.last() {
+        // Confidence = proportion of cause occurrences that were followed by the
+        // effect within the window, clamped to (0, 1]. High when the cause is
+        // consistently followed by the effect; low when the pairing is
+        // incidental relative to how often the cause appears.
+        let cause_occ = *key_occurrences.get(key_a.as_str()).unwrap_or(&count);
+        let confidence = if cause_occ > 0 {
+            (count as f32 / cause_occ as f32).clamp(0.05, 1.0)
+        } else {
+            0.5
+        };
+
+        // Deterministic representative pair (smallest (cause, effect) id tuple)
+        // rather than the nondeterministic last-inserted one.
+        if let Some((cause_id, effect_id)) = pairs.iter().min().copied() {
             // Check if edge already exists to avoid duplicates.
             let existing = store
                 .get_edges_of_type(cause_id, EdgeRelation::Causes)
@@ -817,7 +883,7 @@ async fn discover_causal_edges(episodes: &[EpisodicRecord], db: &HirnDB) -> usiz
                     EdgeRelation::Causes,
                     strength,
                     Metadata::default(),
-                    hirn_graph::CausalEdgeData::new(strength, 0.5, count as u32)
+                    hirn_graph::CausalEdgeData::new(strength, confidence, count as u32)
                         .with_mechanism("temporal_granger"),
                 )
                 .await
@@ -842,8 +908,30 @@ async fn discover_causal_edges(episodes: &[EpisodicRecord], db: &HirnDB) -> usiz
     edges_created
 }
 
-fn truncate_content_key(content: &str) -> String {
-    content.chars().take(50).collect::<String>().to_lowercase()
+/// Build a stable co-occurrence key for an episode (R-65).
+///
+/// Keys on the episode's entity set — sorted and id-qualified when an
+/// `entity_id` is present — so repeated occurrences of the same templated event
+/// group together while distinct events stay separate. Episodes with no
+/// extracted entities fall back to a hash of the full normalized content
+/// (stable and whole-message, unlike a 50-char prefix).
+fn causal_content_key(ep: &EpisodicRecord) -> String {
+    if !ep.entities.is_empty() {
+        let mut parts: Vec<String> = ep
+            .entities
+            .iter()
+            .map(|e| match &e.entity_id {
+                Some(id) => format!("id:{id}"),
+                None => format!("name:{}", e.name.trim().to_lowercase()),
+            })
+            .collect();
+        parts.sort();
+        parts.dedup();
+        format!("entities:{}", parts.join("|"))
+    } else {
+        let normalized = ep.content.trim().to_lowercase();
+        format!("content:{}", blake3::hash(normalized.as_bytes()).to_hex())
+    }
 }
 
 #[cfg(test)]
@@ -1080,6 +1168,101 @@ mod tests {
                 "graph should contain semantic (community) nodes after consolidation"
             );
         }
+    }
+
+    fn causal_test_episode(content: &str, entities: &[(&str, &str)]) -> EpisodicRecord {
+        let mut builder = EpisodicRecord::builder()
+            .event_type(EventType::Observation)
+            .content(content)
+            .summary(content)
+            .importance(0.5)
+            .surprise(0.5)
+            .agent_id(agent())
+            .embedding(vec![1.0, 0.0, 0.0]);
+        for (name, role) in entities {
+            builder = builder.entity(*name, *role);
+        }
+        builder.build().unwrap()
+    }
+
+    #[test]
+    fn causal_key_does_not_collapse_distinct_templated_events() {
+        // R-65: two events share the same 50-char content prefix but describe
+        // different entities — they must NOT map to the same co-occurrence key.
+        let prefix = "User performed action on resource identifier number ";
+        let a = causal_test_episode(&format!("{prefix}alpha-1234"), &[("alpha", "resource")]);
+        let b = causal_test_episode(&format!("{prefix}bravo-5678"), &[("bravo", "resource")]);
+        assert_ne!(
+            causal_content_key(&a),
+            causal_content_key(&b),
+            "distinct entity sets must not collapse under a shared content prefix"
+        );
+
+        // Same entity set → same key (repeated occurrences of one templated
+        // event group together), and the function is deterministic.
+        let c = causal_test_episode("totally different text", &[("alpha", "resource")]);
+        assert_eq!(causal_content_key(&a), causal_content_key(&c));
+        assert_eq!(causal_content_key(&a), causal_content_key(&a));
+    }
+
+    #[test]
+    fn causal_key_falls_back_to_full_content_hash() {
+        // With no entities, the key hashes the FULL content, so a shared 50-char
+        // prefix no longer collapses distinct messages.
+        let prefix = "Scheduled maintenance window opened for the cluster ";
+        let a = causal_test_episode(&format!("{prefix}named east-01"), &[]);
+        let b = causal_test_episode(&format!("{prefix}named west-99"), &[]);
+        assert_ne!(causal_content_key(&a), causal_content_key(&b));
+
+        // Identical content → identical (deterministic) key.
+        let c = causal_test_episode(&format!("{prefix}named east-01"), &[]);
+        assert_eq!(causal_content_key(&a), causal_content_key(&c));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn causal_discovery_confidence_reflects_cooccurrence_ratio() {
+        // A always precedes B (3 A→B pairs, A occurs 3×) → confidence 1.0,
+        // not the old hardcoded 0.5.
+        let db = test_db().await;
+        let mut episodes = Vec::new();
+        let base = hirn_core::Timestamp::now().timestamp_ms();
+        // Space the pairs > 1h apart so only the intra-pair cause→effect
+        // ordering is within the co-occurrence window (no reverse edges).
+        for i in 0..3 {
+            let mut a = causal_test_episode("cause event", &[("cause", "actor")]);
+            a.timestamp = hirn_core::Timestamp::from_millis((base + i * 7_200_000) as u64);
+            let mut b = causal_test_episode("effect event", &[("effect", "actor")]);
+            b.timestamp = hirn_core::Timestamp::from_millis((base + i * 7_200_000 + 1000) as u64);
+            // Use the stored ids so the discovered edges land on real graph nodes.
+            a.id = db.remember_bypass_admission(a.clone()).await.unwrap();
+            b.id = db.remember_bypass_admission(b.clone()).await.unwrap();
+            episodes.push(a);
+            episodes.push(b);
+        }
+        episodes.sort_by_key(|e| e.timestamp);
+
+        let created = discover_causal_edges(&episodes, &db).await;
+        assert_eq!(created, 1, "one A→B causal edge expected");
+
+        // Inspect the edge's confidence: A→B every time A occurs → ~1.0.
+        let cause = episodes
+            .iter()
+            .find(|e| e.content == "cause event")
+            .unwrap();
+        let edges = db
+            .graph_store()
+            .get_edges_of_type(cause.id, EdgeRelation::Causes)
+            .await
+            .unwrap();
+        let causal = edges
+            .iter()
+            .find_map(|e| e.causal.as_ref())
+            .expect("causal edge should carry CausalEdgeData");
+        assert!(
+            causal.confidence > 0.9,
+            "confidence should reflect a perfect co-occurrence ratio, got {}",
+            causal.confidence
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

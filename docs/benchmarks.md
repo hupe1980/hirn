@@ -167,13 +167,15 @@ These scores use the built-in `PseudoEmbedder` (hash-based, no real embeddings) 
 
 ### Directional External References
 
-> ⚠️ **Not comparable to hirn's numbers.** These are published **LLM-generated-answer F1 / accuracy
-> with LLM judges**. hirn-bench's external adapters currently score **substring-containment of the
-> gold answer in the retrieved context** — a different, easier metric — and every vendor runs a
-> different generator/judge/config, so cross-system LoCoMo/LongMemEval scores are *not* comparable
-> even between vendors (the public Mem0↔Zep dispute is the canonical example). Use these only as
-> rough directional context, never as a hirn release gate. An answer-generation + judged-F1 stage is
-> roadmap.
+> ⚠️ **Not comparable to hirn's containment numbers.** These are published **LLM-generated-answer
+> F1 / accuracy with LLM judges**. hirn-bench's external adapters score
+> **substring-containment of the gold answer in the retrieved context** by default — a different,
+> easier metric — and every vendor runs a different generator/judge/config, so cross-system
+> LoCoMo/LongMemEval scores are *not* comparable even between vendors (the public Mem0↔Zep dispute
+> is the canonical example). Use these only as rough directional context, never as a hirn release
+> gate. For numbers that ARE comparable to the LongMemEval literature, run the opt-in
+> answer-generation + LLM-judge stage (`--reader gpt-4o --judge gpt-4o`), which reports
+> `official_reader_accuracy` — see [Reproducible external runs](#reproducible-external-runs).
 
 | System | Benchmark | Score | Metric | Source |
 |--------|-----------|-------|--------|--------|
@@ -207,10 +209,13 @@ hirn-bench includes adapters to run published external benchmarks directly:
 
 - **Paper:** Wu et al. 2024, [arXiv:2410.10813](https://arxiv.org/abs/2410.10813)
 - **Measures:** Long-term memory evaluation across diverse cognitive tasks
-- **hirn metric:** retrieval containment. Caveat: hirn-bench currently pools all questions into one
-  shared corpus rather than the published per-question haystacks, so results are not directly
-  comparable (roadmap fix). Official comparisons additionally require the official GPT-4o reader
-  for answer judging — see [Reproducible external runs](#reproducible-external-runs).
+- **hirn metrics:** retrieval containment (default), plus opt-in `official_reader_accuracy`: with
+  `--reader gpt-4o --judge gpt-4o` the harness generates answers from the retrieved context and
+  judges them with the official LongMemEval judge prompts (question-type-aware: temporal off-by-one
+  tolerance, knowledge-update, preference rubric; abstention-aware for `*_abs` question ids).
+  Caveat: hirn-bench currently pools all questions into one shared corpus rather than the published
+  per-question haystacks, so results are not directly comparable (roadmap fix) — see
+  [Reproducible external runs](#reproducible-external-runs).
 
 ### BEAM (ICLR 2026)
 
@@ -337,11 +342,15 @@ The default reproducibility envelope is `15%` max relative drift across quality,
 This section documents HOW to produce publishable external-adapter runs; it deliberately contains
 no result numbers. Every published number from these runs MUST carry, verbatim from the artifact:
 
-1. **Tokens / query** (`tokens_per_query_mean`, `tokens_per_query_p50`, `tokens_per_query_p95`)
-   plus the `token_estimator` string. Accuracy without tokens/query is not publishable — cost is
-   half the result. On the compiled surface the estimator is `tiktoken-rs/cl100k_base` (or
-   `whitespace-split` if the BPE tables fail to load); the direct-builders surface labels the THINK
-   leg separately because it uses the engine's own token counter.
+1. **Tokens / query** — now three distinct series that must never be conflated:
+   `context_tokens_per_query_*` (retrieval context only, estimator-based),
+   `tokens_per_query_*` (context + RECALL contents, estimator-based; estimator is
+   `tiktoken-rs/cl100k_base`, or `whitespace-split` if the BPE tables fail to load), and
+   `reader_prompt_tokens_per_query_*` / `reader_completion_tokens_per_query_*` (EXACT counts from
+   the reader API's `usage` field — the harness rejects responses without it). Accuracy without
+   tokens/query is not publishable — cost is half the result; **publishable cost for reader-judged
+   runs is reader prompt + completion.** The direct-builders surface labels the THINK leg
+   separately because it uses the engine's own token counter.
 2. **`oracle_assisted` flags** for every suite row. H2/H4/H6 derive namespace/temporal routing
    hints from ground-truth labels; external adapters load as H1 and are never oracle-assisted, but
    the flag must still be shown so readers can verify that.
@@ -351,6 +360,15 @@ no result numbers. Every published number from these runs MUST carry, verbatim f
    use `--full-corpus`.
 4. The run metadata already emitted with every artifact: `git_commit_sha`, `cargo_lock_blake3`,
    embedding source/model, retrieval profile, execution surface, and `--runs`/reproducibility drift.
+5. **Dataset provenance:** every artifact now records per-file blake3 checksums (`dataset_files`),
+   a combined `dataset_hash_blake3` (order-independent), the `dataset_revision` (LongMemEval
+   auto-download is pinned to a fixed HF revision; override via `HIRN_BENCH_LME_REVISION`), and the
+   `--seed` value. Publishable runs should pass `--expect-dataset-hash <hex>` so a corpus drift
+   fails fast instead of silently changing the result.
+6. **Reader/judge pins (reader-judged runs):** the reader and judge model ids are recorded in the
+   artifact (`reader_model`, `judge_model`); reader temperature defaults to 0.0 and the judge
+   always runs at 0.0. The reader answers from run 1's retrieved contexts (retrieval is
+   deterministic across `--runs`).
 
 **LongMemEval** (arXiv:2410.10813):
 
@@ -360,24 +378,29 @@ OPENAI_API_KEY=sk-... cargo run -p hirn-bench -- precompute-external \
 	--format-name longmemeval --auto-download \
 	--output embeddings/longmemeval_embeddings.json
 
-# 2. Full-corpus, multi-run, paired artifacts
-cargo run -p hirn-bench -- external \
+# 2. Full-corpus, multi-run, paired artifacts — reader-judged (publishable path)
+OPENAI_API_KEY=sk-... cargo run -p hirn-bench -- external \
 	--format-name longmemeval --auto-download \
 	--embeddings embeddings/longmemeval_embeddings.json \
 	--embedding-model-label text-embedding-3-small \
 	--runs 2 --repro-threshold-percent 15 \
 	--full-corpus \
+	--reader gpt-4o --judge gpt-4o \
+	--seed 42 \
 	--format markdown \
 	--output bench-results/longmemeval.md \
 	--json-output bench-results/longmemeval.json
 ```
 
-Be plain about what this measures: **hirn-bench scores retrieval containment, which is NOT the
-official LongMemEval metric.** The official protocol judges model-generated answers with the
-official GPT-4o reader from [xiaowu0162/LongMemEval](https://github.com/xiaowu0162/LongMemEval);
-only numbers produced through that reader are comparable to published LongMemEval scores. A
-containment score may be reported only as "retrieval containment (hirn-bench harness)", never as
-"LongMemEval accuracy". The pooled-corpus caveat above also applies.
+Be plain about what each number measures. **Containment is retrieval-only and is NOT the official
+LongMemEval metric** — it may be reported only as "retrieval containment (hirn-bench harness)",
+never as "LongMemEval accuracy". **`official_reader_accuracy`** is produced by generating answers
+with the configured reader over the retrieved context and judging them with the official
+LongMemEval judge prompts from
+[xiaowu0162/LongMemEval](https://github.com/xiaowu0162/LongMemEval) (question-type-aware,
+abstention-aware for `*_abs` ids); with `--reader gpt-4o --judge gpt-4o` this follows the official
+protocol's reader/judge pairing. The pooled-corpus caveat above still applies and must be stated
+alongside any published number.
 
 **BEAM** (arXiv:2510.27246):
 
@@ -402,13 +425,17 @@ cargo run -p hirn-bench -- external \
 	--json-output bench-results/beam-100k.json
 ```
 
-Same honesty rules: **hirn-bench scores retrieval containment of the published gold-answer text,
-NOT the official BEAM metric**, which judges generated answers against per-question rubrics with an
-LLM. Report per-tier (100K/500K/1M/10M) rather than pooling tiers, name the tier in the artifact
-path, and keep the per-dimension caveats from the adapter section (abstention and
-instruction/preference-following rows are retrieval telemetry, not ability scores). For the 10M
-tier the adapter reads each conversation's top-level `chat.json`; plan-partitioned sub-chats are
-not merged.
+Same honesty rules: **containment scores retrieval of the published gold-answer text, NOT the
+official BEAM metric**, which judges generated answers against per-question rubrics with an LLM.
+With `--reader`/`--judge` the harness additionally generates answers and judges them against the
+cited gold answer — label these **"beam-reader-judged"**: they are end-to-end QA numbers but not
+the official BEAM rubric pipeline. Report per-tier (100K/500K/1M/10M) rather than pooling tiers,
+name the tier in the artifact path, and keep the per-dimension caveats from the adapter section
+(abstention and instruction/preference-following rows are retrieval telemetry, not ability
+scores). For the 10M tier the adapter stream-parses each conversation's top-level `chat.json`
+batch-by-batch (retained memory ≈ the conversation text, ~40–60 MB at 10M tokens; ingest is
+batch-bounded), and plan-partitioned sub-chats are not merged. Full reproduction runbooks with
+cost estimation live in `crates/hirn-bench/README.md`.
 
 ### Concurrent Load Envelope
 
@@ -553,7 +580,9 @@ H3 (Graph) and H4 (Agent) scores are typically strong even with PseudoEmbedder b
 
 ## Synthetic Benchmark Baseline (Lance 4.0 / First-Class Resources)
 
-Baseline captured on the current Lance 4.0 `hirn-storage` surface with first-class resources enabled.
+Baseline captured on the Lance 4.0 `hirn-storage` surface with first-class
+resources enabled. *(Historical: this baseline predates the Lance 9.0 upgrade;
+re-capture on Lance 9.0 when publishing new numbers.)*
 
 **Configuration:** 500 records, 64 embedding dimensions, 10 queries, k=10, token budget=4096, PseudoEmbedder, 1 warmup + 3 measured runs.
 

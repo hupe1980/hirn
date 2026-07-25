@@ -3,7 +3,6 @@
 //! Groups memories by topic similarity and produces per-topic narratives.
 //! Uses greedy modularity optimization (no external dep) for topic clustering.
 
-use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
@@ -44,19 +43,19 @@ impl Default for TopicLoomConfig {
 pub struct TopicLoomExec {
     input: Arc<dyn ExecutionPlan>,
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     config: TopicLoomConfig,
 }
 
 impl TopicLoomExec {
     pub fn new(input: Arc<dyn ExecutionPlan>, config: TopicLoomConfig) -> Self {
         let schema = Self::output_schema();
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             datafusion_physical_expr::EquivalenceProperties::new(schema.clone()),
             datafusion_physical_plan::Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
         Self {
             input,
             schema,
@@ -90,15 +89,11 @@ impl ExecutionPlan for TopicLoomExec {
         "TopicLoomExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -228,10 +223,16 @@ fn cluster_by_explicit_topic(
         topic_map.entry(t).or_default().push(id.clone());
     }
 
-    topic_map
+    // Sort topic labels before assigning ids so both topic ids and iteration
+    // order are deterministic across runs — HashMap iteration order is not.
+    let mut labels: Vec<String> = topic_map.keys().cloned().collect();
+    labels.sort();
+
+    labels
         .into_iter()
         .enumerate()
-        .map(|(idx, (label, members))| {
+        .map(|(idx, label)| {
+            let members = topic_map.remove(&label).unwrap_or_default();
             let scored: Vec<(String, f32)> = members.into_iter().map(|m| (m, 1.0)).collect();
             (idx as u32, label, scored)
         })
@@ -339,5 +340,49 @@ fn jaccard_similarity(
         0.0
     } else {
         intersection as f32 / union as f32
+    }
+}
+
+// ── Tests ───────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Explicit-topic clustering must assign identical topic ids and iteration
+    /// order regardless of `HashMap` seeding: sorting the labels makes the
+    /// output a deterministic function of the input.
+    #[test]
+    fn explicit_topic_clustering_is_deterministic() {
+        let records: Vec<(String, String, Option<String>)> = vec![
+            ("m1".into(), "c1".into(), Some("zebra".into())),
+            ("m2".into(), "c2".into(), Some("alpha".into())),
+            ("m3".into(), "c3".into(), Some("mike".into())),
+            ("m4".into(), "c4".into(), Some("alpha".into())),
+            ("m5".into(), "c5".into(), None),
+        ];
+
+        // Run twice — output must be byte-for-byte identical.
+        let first = cluster_by_explicit_topic(&records);
+        let second = cluster_by_explicit_topic(&records);
+        assert_eq!(
+            first, second,
+            "clustering must be deterministic across runs"
+        );
+
+        // Topic ids follow sorted label order: alpha=0, mike=1, unknown=2, zebra=3.
+        let labels: Vec<(u32, &str)> = first
+            .iter()
+            .map(|(id, label, _)| (*id, label.as_str()))
+            .collect();
+        assert_eq!(
+            labels,
+            vec![(0, "alpha"), (1, "mike"), (2, "unknown"), (3, "zebra")],
+        );
+
+        // "alpha" groups both m2 and m4.
+        let alpha = &first[0];
+        let members: Vec<&str> = alpha.2.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(members, vec!["m2", "m4"]);
     }
 }

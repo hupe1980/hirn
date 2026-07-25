@@ -1,11 +1,18 @@
-//! Community detection using the Leiden algorithm.
+//! Community detection using a Leiden-style algorithm.
 //!
 //! The Leiden algorithm (Traag et al., 2019) detects communities in a graph by
-//! optimizing modularity. It improves on Louvain by guaranteeing well-connected
-//! communities through a refinement step.
+//! optimizing modularity, improving on Louvain by adding a refinement step.
+//!
+//! This module implements a Leiden-*inspired* pipeline: greedy modularity
+//! local-moves plus multi-level coarsening, with a lightweight relocation-based
+//! refinement pass (see [`refine_communities`]). That refinement is a practical
+//! heuristic — it does **not** implement the paper's refinement-partition step
+//! and therefore does **not** provide the formal well-connected-communities
+//! guarantee of full Leiden. Communities are typically well-connected in
+//! practice, but that property is not guaranteed here.
 //!
 //! This module implements:
-//! - Leiden community detection on the graph store
+//! - Leiden-style community detection on the graph store
 //! - Hierarchical community structure (multi-level)
 //! - Deterministic execution (fixed node ordering)
 //! - Configurable resolution parameter
@@ -280,27 +287,34 @@ pub async fn detect_communities(
     };
 
     let base_index_to_id = adj.index_to_id.clone();
-    let mut all_levels: Vec<Vec<usize>> = Vec::new();
-    let mut current_graph = adj;
 
-    for _level in 0..effective_config.max_levels {
-        if current_graph.n <= 1 {
-            break;
-        }
-        let assignments = leiden_one_level(&current_graph, &effective_config);
-        let num_communities = *assignments.iter().max().unwrap_or(&0) + 1;
-        if num_communities >= current_graph.n {
-            break;
-        }
-        all_levels.push(assignments.clone());
-        current_graph = current_graph.coarsen(&assignments, num_communities);
-    }
+    // R-64: the multi-level Leiden optimization (local moves + coarsening) and
+    // result assembly are pure CPU over owned data. Run them on a blocking
+    // thread so a large graph never stalls the async executor while the
+    // consolidation lock is held. Only the graph *load* above touches storage.
+    let result = tokio::task::spawn_blocking(move || {
+        let mut all_levels: Vec<Vec<usize>> = Vec::new();
+        let mut current_graph = adj;
 
-    Ok(build_community_result(
-        &base_index_to_id,
-        &all_levels,
-        &effective_config,
-    ))
+        for _level in 0..effective_config.max_levels {
+            if current_graph.n <= 1 {
+                break;
+            }
+            let assignments = leiden_one_level(&current_graph, &effective_config);
+            let num_communities = *assignments.iter().max().unwrap_or(&0) + 1;
+            if num_communities >= current_graph.n {
+                break;
+            }
+            all_levels.push(assignments.clone());
+            current_graph = current_graph.coarsen(&assignments, num_communities);
+        }
+
+        build_community_result(&base_index_to_id, &all_levels, &effective_config)
+    })
+    .await
+    .map_err(|e| hirn_core::HirnError::storage(format!("community detection task failed: {e}")))?;
+
+    Ok(result)
 }
 
 /// Run one level of the Leiden algorithm: local moves + refinement.
@@ -404,9 +418,13 @@ fn compact_assignments(assignments: &[usize]) -> (Vec<usize>, usize) {
     (compacted, next_id)
 }
 
-/// Leiden refinement: verify communities are well-connected.
-/// If a node has a stronger connection to another community's members than
-/// to its own community's members, it is moved.
+/// Lightweight relocation-based refinement (a heuristic, **not** the Leiden
+/// refinement-partition step, and so without its well-connectedness guarantee).
+///
+/// Runs up to three relocation passes: if a node is more strongly connected to
+/// another community's members than to its own, it is moved there. This tends to
+/// improve connectedness but does not formally guarantee well-connected
+/// communities the way the paper's refinement partition does.
 fn refine_communities(
     assignments: &[usize],
     _num_communities: usize,

@@ -51,6 +51,27 @@ pub struct EmbedCacheEntry {
     pub embedding: Vec<f32>,
 }
 
+/// Create a BTree scalar index on `content_hash` (R-24).
+///
+/// Cache lookups (`content_hash = '…'`) and the `merge_insert` dedup key both
+/// probe this column; without an index each is an O(n) full scan of the cache.
+/// Idempotent — `replace: false` is a no-op when the index already exists.
+pub async fn create_content_hash_index(
+    store: &dyn crate::store::PhysicalStore,
+) -> Result<(), HirnDbError> {
+    store
+        .create_index(
+            DATASET_NAME,
+            crate::store::IndexConfig {
+                columns: vec!["content_hash".to_string()],
+                index_type: crate::store::IndexType::BTree,
+                params: crate::store::IndexParams::default(),
+                replace: false,
+            },
+        )
+        .await
+}
+
 /// Compute the cache key for a given model + text pair.
 pub fn cache_key(model_id: &str, text: &str) -> String {
     let mut hasher = blake3::Hasher::new();

@@ -314,6 +314,97 @@ async fn lance_exists() {
     assert!(store.exists("ds").await.unwrap());
 }
 
+// ── FTS Prefilter Test (R-07) ──
+
+fn id_text_ns_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::UInt64, false),
+        Field::new("text", DataType::Utf8, false),
+        Field::new("namespace", DataType::Utf8, false),
+    ]))
+}
+
+fn id_text_ns_batch(ids: &[u64], texts: &[&str], namespaces: &[&str]) -> RecordBatch {
+    RecordBatch::try_new(
+        id_text_ns_schema(),
+        vec![
+            Arc::new(UInt64Array::from(ids.to_vec())),
+            Arc::new(StringArray::from(texts.to_vec())),
+            Arc::new(StringArray::from(namespaces.to_vec())),
+        ],
+    )
+    .unwrap()
+}
+
+/// Regression for R-07: namespaced FTS must prefilter before BM25 top-k.
+///
+/// With Lance's default post-filter, an FTS scan takes the global top-`limit`
+/// rows by BM25 score and only then drops out-of-namespace rows — so a tenant
+/// whose rows are a small share of the matches gets far fewer than `limit`
+/// results, often zero. Seeding many matching rows in namespace "b" and only a
+/// few in namespace "a", a namespace-A-scoped search must still return all of
+/// A's matches, which only holds when `scanner.prefilter(true)` is set.
+#[tokio::test(flavor = "multi_thread")]
+async fn lance_fts_prefilter_scopes_to_namespace() {
+    let (_dir, store) = setup().await;
+
+    let mut ids = Vec::new();
+    let mut texts = Vec::new();
+    let mut namespaces = Vec::new();
+    // 30 matching rows in namespace "b" (the noise that dominates a post-filter).
+    for i in 0..30u64 {
+        ids.push(i);
+        texts.push("lance vector database".to_string());
+        namespaces.push("b".to_string());
+    }
+    // 3 matching rows in namespace "a" (the tenant we scope to).
+    for i in 30..33u64 {
+        ids.push(i);
+        texts.push("lance vector database".to_string());
+        namespaces.push("a".to_string());
+    }
+    let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+    let ns_refs: Vec<&str> = namespaces.iter().map(|s| s.as_str()).collect();
+    store
+        .append("fts_ns", id_text_ns_batch(&ids, &text_refs, &ns_refs))
+        .await
+        .unwrap();
+
+    // Build the BM25 full-text index over `text`.
+    store
+        .create_index("fts_ns", IndexConfig::bm25(vec!["text".to_string()]))
+        .await
+        .unwrap();
+
+    let results = store
+        .fts_search(
+            "fts_ns",
+            FtsSearchOptions {
+                columns: vec!["text".to_string()],
+                query: "lance".to_string(),
+                limit: 10,
+                filter: Some("namespace IN ('a')".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+
+    let total: usize = results.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 3, "all 3 namespace-A matches must be returned");
+
+    for batch in &results {
+        let ns = batch
+            .column_by_name("namespace")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            assert_eq!(ns.value(i), "a", "no out-of-namespace row may leak");
+        }
+    }
+}
+
 // ── Vector Search Tests ──
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1159,5 +1250,113 @@ async fn lance_table_provider_explain_shows_lance_scan() {
     assert!(
         plan_text.contains("Lance") || plan_text.contains("lance") || plan_text.contains("Scan"),
         "EXPLAIN should show Lance scan, got:\n{plan_text}"
+    );
+}
+
+// ── R-12: open_at_version (read-only) vs rollback_to (destructive) ──
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lance_open_at_version_is_readonly_rollback_is_destructive() {
+    let (_dir, store) = setup().await;
+
+    store
+        .append("ds", id_text_batch(&[1], &["a"]))
+        .await
+        .unwrap();
+    let v1 = store.version("ds").await.unwrap();
+    store
+        .append("ds", id_text_batch(&[2], &["b"]))
+        .await
+        .unwrap();
+    assert_eq!(store.count("ds", None).await.unwrap(), 2);
+
+    // open_at_version returns the historical snapshot WITHOUT mutating live.
+    let hist = store.open_at_version("ds", v1).await.unwrap();
+    let hist_rows: usize = hist.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(hist_rows, 1, "historical view has the v1 row count");
+    assert_eq!(
+        store.count("ds", None).await.unwrap(),
+        2,
+        "open_at_version must not mutate the live dataset"
+    );
+
+    // rollback_to destructively restores the live dataset to v1.
+    store.rollback_to("ds", v1).await.unwrap();
+    assert_eq!(
+        store.count("ds", None).await.unwrap(),
+        1,
+        "rollback_to must restore the live dataset"
+    );
+}
+
+// ── R-23/R-41: concurrent maintenance (index build) + append keep all rows ──
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lance_concurrent_index_and_append_preserve_rows() {
+    let (_dir, store) = setup().await;
+    let store = Arc::new(store);
+
+    // Seed 500 rows.
+    let seed_ids: Vec<u64> = (0..500).collect();
+    let seed_texts: Vec<&str> = seed_ids.iter().map(|_| "seed").collect();
+    store
+        .append("ds", id_text_batch(&seed_ids, &seed_texts))
+        .await
+        .unwrap();
+
+    // Build a scalar index and append concurrently. With the per-dataset write
+    // lock + commit-conflict retry, neither loses rows nor errors on a
+    // retryable conflict.
+    let index_store = Arc::clone(&store);
+    let index_task = tokio::spawn(async move {
+        index_store
+            .create_index("ds", IndexConfig::btree("id"))
+            .await
+    });
+    let append_store = Arc::clone(&store);
+    let append_task = tokio::spawn(async move {
+        let ids: Vec<u64> = (500..600).collect();
+        let texts: Vec<&str> = ids.iter().map(|_| "added").collect();
+        append_store.append("ds", id_text_batch(&ids, &texts)).await
+    });
+
+    index_task.await.unwrap().unwrap();
+    append_task.await.unwrap().unwrap();
+
+    assert_eq!(
+        store.count("ds", None).await.unwrap(),
+        600,
+        "no appended rows lost to a concurrent index build"
+    );
+}
+
+// ── R-36: filtered scan pushes limit (returns exactly `limit` rows) ──
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lance_filtered_scan_pushes_limit() {
+    let (_dir, store) = setup().await;
+
+    let ids: Vec<u64> = (0..1000).collect();
+    let texts: Vec<&str> = ids.iter().map(|_| "match").collect();
+    store
+        .append("ds", id_text_batch(&ids, &texts))
+        .await
+        .unwrap();
+
+    let results = store
+        .scan(
+            "ds",
+            ScanOptions {
+                filter: Some("text = 'match'".to_string()),
+                limit: Some(10),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let total: usize = results.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total, 10,
+        "filtered scan with limit=10 must return exactly 10 rows"
     );
 }

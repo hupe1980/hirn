@@ -6,7 +6,6 @@
 //! available, which keeps CI deterministic while leaving a clean seam for
 //! future ONNX-backed inference.
 
-use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
@@ -75,7 +74,7 @@ impl NliClassifier for HeuristicNliClassifier {
 pub struct NliContradictionExec {
     input: Arc<dyn ExecutionPlan>,
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     config: NliConfig,
     classifier: Arc<dyn NliClassifier>,
 }
@@ -91,12 +90,12 @@ impl NliContradictionExec {
         classifier: Arc<dyn NliClassifier>,
     ) -> Self {
         let schema = Self::output_schema();
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             datafusion_physical_expr::EquivalenceProperties::new(schema.clone()),
             datafusion_physical_plan::Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
         Self {
             input,
             schema,
@@ -106,12 +105,25 @@ impl NliContradictionExec {
         }
     }
 
+    /// Output schema.
+    ///
+    /// The `id_a`/`id_b` and `score_a`/`score_b` columns carry the per-side
+    /// record identity and retrieval score through from the input (empty/NULL
+    /// when the feeder does not supply them). This makes the output directly
+    /// consumable by `AbaReconsolidationExec`, which keys resolution on
+    /// `id_a`/`id_b`/`score_a`/`score_b` (R-20: the two operators previously
+    /// disagreed on the column contract, so NLI→ABA silently produced zero
+    /// resolutions).
     pub fn output_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
+            Field::new("id_a", DataType::Utf8, false),
+            Field::new("id_b", DataType::Utf8, false),
             Field::new("content_a", DataType::Utf8, false),
             Field::new("content_b", DataType::Utf8, false),
             Field::new("label", DataType::Utf8, false),
             Field::new("contradiction_score", DataType::Float32, false),
+            Field::new("score_a", DataType::Float32, true),
+            Field::new("score_b", DataType::Float32, true),
         ]))
     }
 }
@@ -132,15 +144,11 @@ impl ExecutionPlan for NliContradictionExec {
         "NliContradictionExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -174,10 +182,14 @@ impl ExecutionPlan for NliContradictionExec {
         let fut = async move {
             use futures::StreamExt;
 
+            let mut id_as = Vec::new();
+            let mut id_bs = Vec::new();
             let mut content_as = Vec::new();
             let mut content_bs = Vec::new();
             let mut labels = Vec::new();
             let mut scores = Vec::new();
+            let mut score_as: Vec<Option<f32>> = Vec::new();
+            let mut score_bs: Vec<Option<f32>> = Vec::new();
             let mut total_pairs = 0usize;
 
             // Collect pairs from input batch (capped at max_batch_size).
@@ -188,6 +200,21 @@ impl ExecutionPlan for NliContradictionExec {
                     .column_by_name("content_a")
                     .or_else(|| batch.column_by_name("content"));
                 let col_b = batch.column_by_name("content_b");
+
+                // Optional per-side identity/score columns carried through so the
+                // output is consumable by `AbaReconsolidationExec` (R-20).
+                let id_a_col = batch
+                    .column_by_name("id_a")
+                    .and_then(|c| c.as_any().downcast_ref::<StringArray>().cloned());
+                let id_b_col = batch
+                    .column_by_name("id_b")
+                    .and_then(|c| c.as_any().downcast_ref::<StringArray>().cloned());
+                let score_a_col = batch
+                    .column_by_name("score_a")
+                    .and_then(|c| c.as_any().downcast_ref::<Float32Array>().cloned());
+                let score_b_col = batch
+                    .column_by_name("score_b")
+                    .and_then(|c| c.as_any().downcast_ref::<Float32Array>().cloned());
 
                 if let (Some(a), Some(b)) = (col_a, col_b) {
                     if let (Some(arr_a), Some(arr_b)) = (
@@ -202,6 +229,8 @@ impl ExecutionPlan for NliContradictionExec {
                                 let text_a = arr_a.value(i);
                                 let text_b = arr_b.value(i);
                                 let (label, score) = classifier.classify(text_a, text_b);
+                                id_as.push(carry_id(id_a_col.as_ref(), i));
+                                id_bs.push(carry_id(id_b_col.as_ref(), i));
                                 content_as.push(text_a.to_string());
                                 content_bs.push(text_b.to_string());
                                 labels.push(match label {
@@ -210,6 +239,8 @@ impl ExecutionPlan for NliContradictionExec {
                                     NliLabel::Neutral => "neutral",
                                 });
                                 scores.push(score);
+                                score_as.push(carry_score(score_a_col.as_ref(), i));
+                                score_bs.push(carry_score(score_b_col.as_ref(), i));
                                 total_pairs += 1;
                             }
                         }
@@ -218,27 +249,39 @@ impl ExecutionPlan for NliContradictionExec {
             }
 
             // Filter to pairs that are contradictions above threshold.
+            let mut final_id_as = Vec::new();
+            let mut final_id_bs = Vec::new();
             let mut final_as = Vec::new();
             let mut final_bs = Vec::new();
             let mut final_labels = Vec::new();
             let mut final_scores = Vec::new();
+            let mut final_score_as: Vec<Option<f32>> = Vec::new();
+            let mut final_score_bs: Vec<Option<f32>> = Vec::new();
 
             for i in 0..content_as.len() {
                 if labels[i] == "contradiction" && scores[i] >= threshold {
+                    final_id_as.push(id_as[i].clone());
+                    final_id_bs.push(id_bs[i].clone());
                     final_as.push(content_as[i].clone());
                     final_bs.push(content_bs[i].clone());
                     final_labels.push(labels[i].to_string());
                     final_scores.push(scores[i]);
+                    final_score_as.push(score_as[i]);
+                    final_score_bs.push(score_bs[i]);
                 }
             }
 
             let batch = RecordBatch::try_new(
                 schema,
                 vec![
+                    Arc::new(StringArray::from(final_id_as)),
+                    Arc::new(StringArray::from(final_id_bs)),
                     Arc::new(StringArray::from(final_as)),
                     Arc::new(StringArray::from(final_bs)),
                     Arc::new(StringArray::from(final_labels)),
                     Arc::new(Float32Array::from(final_scores)),
+                    Arc::new(Float32Array::from(final_score_as)),
+                    Arc::new(Float32Array::from(final_score_bs)),
                 ],
             )?;
 
@@ -250,6 +293,25 @@ impl ExecutionPlan for NliContradictionExec {
             stream_schema,
             stream,
         )))
+    }
+}
+
+/// Carry a per-side record id through from the input, defaulting to the empty
+/// string when the feeder supplies no `id_a`/`id_b` column (or a NULL value).
+fn carry_id(col: Option<&StringArray>, i: usize) -> String {
+    match col {
+        Some(arr) if !arr.is_null(i) => arr.value(i).to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Carry a per-side retrieval score through from the input, defaulting to
+/// `None` when the feeder supplies no `score_a`/`score_b` column (or a NULL
+/// value). `AbaReconsolidationExec` treats a missing score as a neutral 0.5.
+fn carry_score(col: Option<&Float32Array>, i: usize) -> Option<f32> {
+    match col {
+        Some(arr) if !arr.is_null(i) => Some(arr.value(i)),
+        _ => None,
     }
 }
 

@@ -177,8 +177,11 @@ pub async fn rollback(storage: &dyn PhysicalStore, tag: &str) -> Result<Rollback
             .await
             .map_err(|e| HirnError::storage(e))?;
 
+        // Restore is a DESTRUCTIVE rollback to the tagged version (not a
+        // read-only time-travel view), so migrate off the deprecated
+        // `checkout` to `rollback_to`.
         storage
-            .checkout(&ds.name, target.version)
+            .rollback_to(&ds.name, target.version)
             .await
             .map_err(|e| HirnError::storage(e))?;
 

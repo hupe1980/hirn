@@ -1,15 +1,45 @@
 //! Rate Limiter — sliding window rate limiting per agent.
 //!
 //! Prevents any single agent from flooding memory with writes.
+//!
+//! Accounting is reserve/commit, symmetric with [`TokenBudgetGate`]: the rate
+//! window counts *admits*, not *attempts*. `evaluate` reserves a slot (a
+//! timestamp keyed by candidate id) against `committed + reserved` — so
+//! concurrent evaluations can never jointly exceed the limit — and the
+//! reservation is turned into a committed slot by [`commit`](Self::commit) or
+//! dropped by [`release`](Self::release). The admission pipeline guarantees
+//! exactly one of the two follows every `Accept`. Without this, a candidate
+//! rejected by a *later* controller (or a failed durable write whose RAII
+//! guard calls `release`) permanently consumed a rate slot.
+//!
+//! [`TokenBudgetGate`]: crate::admission::controllers::token_budget::TokenBudgetGate
 
 use std::collections::HashMap;
 use std::time::Instant;
 
 use hirn_core::HirnResult;
+use hirn_core::id::MemoryId;
 use hirn_core::types::AgentId;
 use tokio::sync::Mutex;
 
 use crate::admission::{AdmissionController, AdmissionDecision, MemoryCandidate};
+
+/// Per-agent window: committed write timestamps + in-flight reservations.
+#[derive(Default)]
+struct AgentWindow {
+    /// Timestamps of committed (durably persisted) writes in the window.
+    committed: Vec<Instant>,
+    /// Timestamps of in-flight reservations awaiting commit/release.
+    reserved: Vec<Instant>,
+}
+
+/// All mutable state behind one lock so check-and-reserve is atomic.
+#[derive(Default)]
+struct RateState {
+    agents: HashMap<AgentId, AgentWindow>,
+    /// Candidate id → (agent, reserved timestamp) for commit/release.
+    reservations: HashMap<MemoryId, (AgentId, Instant)>,
+}
 
 /// Sliding-window rate limiter per agent.
 pub struct RateLimiter {
@@ -17,8 +47,7 @@ pub struct RateLimiter {
     max_writes: u64,
     /// Window duration in seconds.
     window_secs: u64,
-    /// Per-agent write timestamps within the current window.
-    state: Mutex<HashMap<AgentId, Vec<Instant>>>,
+    state: Mutex<RateState>,
 }
 
 impl RateLimiter {
@@ -30,7 +59,7 @@ impl RateLimiter {
         Self {
             max_writes,
             window_secs,
-            state: Mutex::new(HashMap::new()),
+            state: Mutex::new(RateState::default()),
         }
     }
 
@@ -39,7 +68,7 @@ impl RateLimiter {
         Self::new(100, 60)
     }
 
-    /// Prune timestamps older than the window for a given agent.
+    /// Prune timestamps older than the window.
     fn prune(timestamps: &mut Vec<Instant>, now: Instant, window: std::time::Duration) {
         timestamps.retain(|ts| now.duration_since(*ts) < window);
     }
@@ -56,11 +85,14 @@ impl AdmissionController for RateLimiter {
         let window = std::time::Duration::from_secs(self.window_secs);
 
         let mut state = self.state.lock().await;
-        let timestamps = state.entry(candidate.agent_id.clone()).or_default();
+        let window_entry = state.agents.entry(candidate.agent_id.clone()).or_default();
 
-        Self::prune(timestamps, now, window);
+        Self::prune(&mut window_entry.committed, now, window);
+        Self::prune(&mut window_entry.reserved, now, window);
 
-        let current_count = timestamps.len() as u64;
+        // Reserved slots count against the limit so concurrent evaluations
+        // cannot jointly exceed it before their commits/releases settle.
+        let current_count = (window_entry.committed.len() + window_entry.reserved.len()) as u64;
 
         if current_count >= self.max_writes {
             Ok(AdmissionDecision::Reject {
@@ -72,10 +104,36 @@ impl AdmissionController for RateLimiter {
                 ),
             })
         } else {
-            timestamps.push(now);
+            window_entry.reserved.push(now);
+            state
+                .reservations
+                .insert(candidate.id, (candidate.agent_id.clone(), now));
             Ok(AdmissionDecision::Accept {
                 importance_override: None,
+                flags: Vec::new(),
             })
+        }
+    }
+
+    async fn commit(&self, candidate: &MemoryCandidate) {
+        let mut state = self.state.lock().await;
+        if let Some((agent, ts)) = state.reservations.remove(&candidate.id)
+            && let Some(entry) = state.agents.get_mut(&agent)
+        {
+            if let Some(pos) = entry.reserved.iter().position(|t| *t == ts) {
+                entry.reserved.swap_remove(pos);
+            }
+            entry.committed.push(ts);
+        }
+    }
+
+    async fn release(&self, candidate: &MemoryCandidate) {
+        let mut state = self.state.lock().await;
+        if let Some((agent, ts)) = state.reservations.remove(&candidate.id)
+            && let Some(entry) = state.agents.get_mut(&agent)
+            && let Some(pos) = entry.reserved.iter().position(|t| *t == ts)
+        {
+            entry.reserved.swap_remove(pos);
         }
     }
 }
@@ -94,6 +152,7 @@ mod tests {
             entities: vec![],
             embedding: None,
             agent_id: AgentId::new(agent).unwrap(),
+            provenance: hirn_core::provenance::Provenance::direct(AgentId::new(agent).unwrap()),
             namespace: Namespace::shared(),
             importance: 0.5,
             surprise: 0.5,
@@ -149,6 +208,61 @@ mod tests {
             // All should accept since the window is 0 and old writes expire.
             assert!(result.is_accept());
         }
+    }
+
+    #[tokio::test]
+    async fn downstream_reject_releases_rate_slot() {
+        use crate::admission::AdmissionPipeline;
+
+        /// Always-reject controller placed AFTER the limiter.
+        struct RejectAll;
+        #[async_trait::async_trait]
+        impl AdmissionController for RejectAll {
+            fn name(&self) -> &str {
+                "reject_all"
+            }
+            async fn evaluate(&self, _: &MemoryCandidate) -> HirnResult<AdmissionDecision> {
+                Ok(AdmissionDecision::Reject {
+                    reason: "downstream".into(),
+                })
+            }
+        }
+
+        // One slot per window. Each attempt reserves it in the limiter, then
+        // the downstream controller rejects → the reservation is released.
+        // Without release, the second attempt would be rejected BY THE LIMITER
+        // on a leaked slot instead of by the downstream controller.
+        let pipeline = AdmissionPipeline::new()
+            .with(RateLimiter::new(1, 60))
+            .with(RejectAll);
+
+        for _ in 0..3 {
+            let result = pipeline.evaluate(&candidate("agent-a")).await.unwrap();
+            assert!(result.decision.is_reject());
+            assert_eq!(
+                result.verdicts.last().unwrap().controller,
+                "reject_all",
+                "the limiter must keep accepting — its slot was released after \
+                 each downstream reject"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn release_refunds_slot_but_commit_keeps_it() {
+        // Symmetric with the RAII token guard: a released reservation frees a
+        // slot, a committed one keeps counting.
+        let limiter = RateLimiter::new(1, 60);
+        let a = candidate("agent-a");
+        assert!(limiter.evaluate(&a).await.unwrap().is_accept());
+        // Release → slot refunded, next candidate fits.
+        limiter.release(&a).await;
+        let b = candidate("agent-a");
+        assert!(limiter.evaluate(&b).await.unwrap().is_accept());
+        // Commit b → its slot is durable, the next candidate is rejected.
+        limiter.commit(&b).await;
+        let c = candidate("agent-a");
+        assert!(limiter.evaluate(&c).await.unwrap().is_reject());
     }
 
     #[tokio::test]

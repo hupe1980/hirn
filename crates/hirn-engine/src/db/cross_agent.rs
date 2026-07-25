@@ -248,16 +248,19 @@ impl HirnDB {
         // Track quarantine event for collective corruption defense.
         let rate_limit_info = self.admission_runtime().record_quarantine(agent_id);
         if let Some(config) = rate_limit_info {
-            let _ = self
-                .append_audit(
-                    Some(agent_id.clone()),
-                    hirn_core::audit::AuditAction::AgentRateLimited {
-                        agent_id: agent_id.clone(),
-                        quarantined_count: config.max_quarantines_per_window + 1,
-                        window_seconds: config.window_seconds,
-                    },
-                )
-                .await;
+            // R-74: this is a security audit event — do NOT silently discard the
+            // durable-write Result. Propagate the failure (fail-closed) instead
+            // of dropping the audit entry, mirroring the primary Quarantine
+            // audit append above.
+            self.append_audit(
+                Some(agent_id.clone()),
+                hirn_core::audit::AuditAction::AgentRateLimited {
+                    agent_id: agent_id.clone(),
+                    quarantined_count: config.max_quarantines_per_window + 1,
+                    window_seconds: config.window_seconds,
+                },
+            )
+            .await?;
         }
 
         Err(HirnError::Quarantined(format!(
@@ -384,7 +387,19 @@ impl HirnDB {
             hirn_core::QuarantinedRecordKind::Episodic => {
                 let record: EpisodicRecord =
                     hirn_core::persist::from_versioned_bytes(&row.record_bytes)?;
-                let applied_id = self.remember(record).await?;
+                // R-62: idempotent promotion. If a previous approve crashed
+                // AFTER promoting the record but BEFORE flipping the quarantine
+                // row to Approved, the row is still Pending and a naive
+                // re-approval would promote a DUPLICATE. The promoted record
+                // keeps its original id, so an already-present node means it was
+                // already promoted — skip re-promotion and only complete the
+                // remaining state transition (row flip + audit) below.
+                let record_id = record.id;
+                let applied_id = if self.cached_graph().has_node(record_id).await? {
+                    record_id
+                } else {
+                    self.remember(record).await?
+                };
                 crate::security::QuarantineApprovalOutcome {
                     approved_entry_id: id,
                     applied_memory_ids: vec![applied_id],
@@ -445,7 +460,15 @@ impl HirnDB {
                 .await;
         }
 
-        let applied_id = self.store_semantic(record).await?;
+        // R-62: idempotent promotion (see approve_quarantine). The stored
+        // semantic record keeps its id, so an already-present node means a
+        // prior approve promoted it before crashing — skip the duplicate store.
+        let record_id = record.id;
+        let applied_id = if self.cached_graph().has_node(record_id).await? {
+            record_id
+        } else {
+            self.store_semantic(record).await?
+        };
         let mut generated_review = generated_review;
         if let Some(review) = generated_review.as_mut() {
             review.attach_rollback_receipt(GeneratedCognitionRollbackReceipt {
@@ -842,7 +865,7 @@ impl HirnDB {
     /// here; it is reused (cloned and bound) across multiple
     /// `execute_prepared` calls.
     pub(crate) fn prepare(&self, query: &str) -> HirnResult<crate::ql::PreparedStatement> {
-        crate::ql::prepare(query, None).map_err(HirnError::from)
+        crate::ql::prepare(query).map_err(HirnError::from)
     }
 
     /// Execute a prepared statement with bound parameter values.
@@ -946,7 +969,22 @@ impl HirnDB {
         // 5. Remove any quarantined entries from this agent.
         let quarantine_removed = self.purge_quarantine_for_agent(agent_id).await?;
 
-        // 6. Clear corruption defense state.
+        // 6. Erase derived per-agent data (SVO events + prospective
+        //    implications). These datasets are written on the write path
+        //    carrying the agent's namespace and content keyed by the source
+        //    record id, and stay recall-reachable after the primary records
+        //    are erased — so GDPR erasure must reach them too.
+        let derived_source_ids: Vec<MemoryId> = episodic_ids
+            .iter()
+            .chain(&semantic_ids)
+            .chain(&procedural_ids)
+            .copied()
+            .collect();
+        let derived_removed = self
+            .purge_derived_agent_data(&private_ns, &derived_source_ids)
+            .await?;
+
+        // 7. Clear corruption defense state.
         self.admission_runtime().clear_agent(agent_id);
 
         let report = PurgeReport {
@@ -957,6 +995,7 @@ impl HirnDB {
             working_deleted,
             quarantine_removed,
             edges_removed,
+            derived_removed,
         };
 
         self.append_audit(
@@ -1142,6 +1181,65 @@ impl HirnDB {
                 .delete(hirn_storage::datasets::quarantine::DATASET_NAME, &filter)
                 .await
                 .map_err(HirnError::storage)? as usize;
+        }
+
+        Ok(removed)
+    }
+
+    /// Delete every SVO event and prospective implication belonging to an
+    /// agent — rows living in the agent's private namespace, plus rows derived
+    /// from any of the agent's purged source records (keyed by
+    /// `source_memory_id`). Both datasets are written per-agent on the write
+    /// path and remain recall-reachable after the primary records are erased,
+    /// so GDPR erasure must reach them. Returns the total rows deleted across
+    /// both datasets.
+    async fn purge_derived_agent_data(
+        &self,
+        private_ns: &Namespace,
+        source_ids: &[MemoryId],
+    ) -> HirnResult<usize> {
+        let ns_literal = private_ns.as_str().replace('\'', "''");
+        let mut removed = 0usize;
+
+        for dataset in [
+            hirn_storage::datasets::svo_events::DATASET_NAME,
+            hirn_storage::datasets::prospective_implications::DATASET_NAME,
+        ] {
+            // A never-written dataset may not exist yet; nothing to erase.
+            if !self
+                .storage_runtime
+                .exists(dataset)
+                .await
+                .map_err(HirnError::storage)?
+            {
+                continue;
+            }
+
+            // Rows in the agent's private namespace.
+            let ns_filter = format!("namespace = '{ns_literal}'");
+            removed += self
+                .storage_runtime
+                .delete(dataset, &ns_filter)
+                .await
+                .map_err(HirnError::storage)? as usize;
+
+            // Rows derived from a purged source record. Chunk the IN-list to
+            // keep individual predicates bounded. A row already removed by the
+            // namespace pass is not counted again.
+            const CHUNK: usize = 256;
+            for chunk in source_ids.chunks(CHUNK) {
+                let in_list = chunk
+                    .iter()
+                    .map(|id| format!("'{}'", id.to_string().replace('\'', "''")))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let src_filter = format!("source_memory_id IN ({in_list})");
+                removed += self
+                    .storage_runtime
+                    .delete(dataset, &src_filter)
+                    .await
+                    .map_err(HirnError::storage)? as usize;
+            }
         }
 
         Ok(removed)
@@ -1443,6 +1541,294 @@ mod tests {
         assert_eq!(second.quarantine_removed, 0);
         assert_eq!(second.edges_removed, 0);
     }
+
+    async fn append_svo_event(db: &HirnDB, source_id: MemoryId, ns: &Namespace) {
+        let event = hirn_core::svo_event::SvoEvent::new_without_time("subject", "verb", "object")
+            .with_source_ids(vec![source_id]);
+        let dims = db.config().embedding_dimensions.as_usize();
+        let batch = hirn_storage::datasets::svo_events::to_batch_with_namespaces(
+            std::slice::from_ref(&event),
+            &[None],
+            &[ns.as_str()],
+            dims,
+        )
+        .unwrap();
+        db.storage_runtime
+            .append(hirn_storage::datasets::svo_events::DATASET_NAME, batch)
+            .await
+            .unwrap();
+    }
+
+    async fn append_prospective(db: &HirnDB, source_id: MemoryId, ns: &Namespace) {
+        let imp = hirn_core::prospective::ProspectiveImplication::new(
+            source_id,
+            "anticipated consequence",
+        );
+        let dims = db.config().embedding_dimensions.as_usize();
+        let batch = hirn_storage::datasets::prospective_implications::to_batch_with_namespaces(
+            std::slice::from_ref(&imp),
+            &[None],
+            &[ns.as_str()],
+            dims,
+        )
+        .unwrap();
+        db.storage_runtime
+            .append(
+                hirn_storage::datasets::prospective_implications::DATASET_NAME,
+                batch,
+            )
+            .await
+            .unwrap();
+    }
+
+    /// R-15 (GDPR): `purge_agent` must also erase the agent's derived data in
+    /// `svo_events` and `prospective_implications` — both written per-agent on
+    /// the write path and still recall-reachable after the primary records are
+    /// gone — while leaving another agent's derived rows intact.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn purge_erases_svo_and_prospective_data() {
+        let (db, _dir) = temp_db().await;
+        let agent_a = agent("agent_a");
+        let agent_b = agent("agent_b");
+        db.register_agent(&agent_a, "A").await.unwrap();
+        db.register_agent(&agent_b, "B").await.unwrap();
+
+        let private_a = Namespace::private_for(&agent_a);
+        let private_b = Namespace::private_for(&agent_b);
+
+        // agent_a's source records (one private, one authored in shared).
+        let ep_a = db
+            .remember(episode(&agent_a, private_a.clone(), "a private note"))
+            .await
+            .unwrap();
+        let sem_a = db
+            .store_semantic(semantic(&agent_a, Namespace::shared(), "concept_a"))
+            .await
+            .unwrap();
+        // agent_b's source record — its derived data must survive.
+        let ep_b = db
+            .remember(episode(&agent_b, private_b.clone(), "b private note"))
+            .await
+            .unwrap();
+
+        // Derived rows for agent_a: one keyed by a private-ns source and living
+        // in the private ns (matches on both predicates), one authored in the
+        // shared ns but derived from a purged source (matches on source_id).
+        append_svo_event(&db, ep_a, &private_a).await;
+        append_svo_event(&db, sem_a, &Namespace::shared()).await;
+        append_prospective(&db, ep_a, &private_a).await;
+
+        // Derived rows for agent_b — must survive the purge.
+        append_svo_event(&db, ep_b, &private_b).await;
+        append_prospective(&db, ep_b, &private_b).await;
+
+        let report = db.purge_agent(&agent_a).await.unwrap();
+        assert_eq!(
+            report.derived_removed, 3,
+            "all three of agent_a's derived rows must be erased"
+        );
+
+        // No svo_events / prospective_implications rows remain for agent_a.
+        let a_source_ids = [ep_a.to_string(), sem_a.to_string()];
+        let a_filter = format!(
+            "namespace = '{}' OR source_memory_id IN ('{}', '{}')",
+            private_a.as_str(),
+            a_source_ids[0],
+            a_source_ids[1],
+        );
+        let svo_a = db
+            .storage_runtime
+            .count(
+                hirn_storage::datasets::svo_events::DATASET_NAME,
+                Some(&a_filter),
+            )
+            .await
+            .unwrap();
+        let prosp_a = db
+            .storage_runtime
+            .count(
+                hirn_storage::datasets::prospective_implications::DATASET_NAME,
+                Some(&a_filter),
+            )
+            .await
+            .unwrap();
+        assert_eq!(svo_a, 0, "agent_a svo_events must be erased");
+        assert_eq!(
+            prosp_a, 0,
+            "agent_a prospective_implications must be erased"
+        );
+
+        // agent_b's derived rows are untouched.
+        let svo_total = db
+            .storage_runtime
+            .count(hirn_storage::datasets::svo_events::DATASET_NAME, None)
+            .await
+            .unwrap();
+        let prosp_total = db
+            .storage_runtime
+            .count(
+                hirn_storage::datasets::prospective_implications::DATASET_NAME,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(svo_total, 1, "agent_b's svo_event must survive");
+        assert_eq!(
+            prosp_total, 1,
+            "agent_b's prospective implication must survive"
+        );
+    }
+
+    /// R-28: `approve_quarantine` (via the `CausalView` service wrapper) is a
+    /// privileged review gate — it promotes a quarantined record into the main
+    /// store — and must require the dedicated `Review` Cedar action. An agent
+    /// lacking `Review` is denied; an agent granted `Review` succeeds; and a
+    /// `correct`-only grant does NOT satisfy the gate (distinguishability).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn approve_quarantine_requires_review_action() {
+        use crate::policy::{DEFAULT_SCHEMA, PolicyEngine};
+
+        // Policy: reviewer holds `review` (the gate) plus `remember` (needed by
+        // the promotion the approval performs); corrector holds only `correct`;
+        // plain holds nothing. `review` is enforced at the realm the enforcer
+        // targets; `remember` must cover the promoted record's namespace too,
+        // hence an unconstrained resource for the reviewer.
+        let policy = r#"
+            permit(
+                principal == Hirn::Agent::"reviewer",
+                action in [Hirn::Action::"review", Hirn::Action::"remember"],
+                resource
+            );
+            permit(
+                principal == Hirn::Agent::"corrector",
+                action == Hirn::Action::"correct",
+                resource == Hirn::Realm::"default"
+            );
+        "#;
+        let engine = PolicyEngine::new(DEFAULT_SCHEMA, &[("review.cedar", policy)]).unwrap();
+        engine.register_realm("default", "Default realm").unwrap();
+        for id in ["reviewer", "corrector", "plain"] {
+            engine
+                .register_agent(id, 100, "2025-01-01T00:00:00Z", &[])
+                .unwrap();
+        }
+
+        let (mut db, _dir) = temp_db().await;
+        db.set_policy_engine(engine);
+
+        let reviewer = agent("reviewer");
+        let corrector = agent("corrector");
+        let plain = agent("plain");
+        for a in [&reviewer, &corrector, &plain] {
+            db.register_agent(a, "reviewer/corrector/plain")
+                .await
+                .unwrap();
+        }
+
+        // Seed a pending episodic quarantine entry.
+        let seed = |content: &str| -> (MemoryId, Vec<u8>) {
+            let rec = episode(&reviewer, Namespace::shared(), content);
+            let bytes = hirn_core::persist::to_versioned_bytes(&rec).unwrap();
+            (rec.id, bytes)
+        };
+
+        // An agent lacking `Review` is denied.
+        let (id_plain, bytes_plain) = seed("quarantined-for-plain");
+        insert_quarantine_row(
+            &db,
+            &quarantine_row(
+                id_plain,
+                hirn_core::QuarantinedRecordKind::Episodic,
+                bytes_plain,
+            ),
+        )
+        .await;
+        let denied = db
+            .causal()
+            .approve_quarantine(id_plain, plain.clone())
+            .await;
+        assert!(
+            matches!(denied, Err(HirnError::AccessDenied(_))),
+            "agent without Review must be denied approve_quarantine, got: {denied:?}"
+        );
+
+        // A `correct`-only grant does NOT satisfy the review gate.
+        let corrected = db
+            .causal()
+            .approve_quarantine(id_plain, corrector.clone())
+            .await;
+        assert!(
+            matches!(corrected, Err(HirnError::AccessDenied(_))),
+            "correct right must not satisfy the review gate, got: {corrected:?}"
+        );
+
+        // The reviewer (holding `Review`) succeeds and the record is promoted.
+        let (id_ok, bytes_ok) = seed("quarantined-for-reviewer");
+        insert_quarantine_row(
+            &db,
+            &quarantine_row(id_ok, hirn_core::QuarantinedRecordKind::Episodic, bytes_ok),
+        )
+        .await;
+        let outcome = db
+            .causal()
+            .approve_quarantine(id_ok, reviewer.clone())
+            .await
+            .expect("reviewer with Review must be allowed to approve");
+        assert_eq!(outcome.approved_entry_id, id_ok);
+        assert!(
+            db.get_memory(id_ok).await.is_ok(),
+            "approved record should be promoted"
+        );
+    }
+
+    /// R-62: re-running `approve_quarantine` after a simulated mid-crash (the
+    /// record was promoted but the quarantine row never flipped to Approved)
+    /// must NOT duplicate the memory. The idempotent guard skips re-promotion
+    /// when the record's node already exists.
+    #[tokio::test]
+    async fn reapprove_after_midcrash_does_not_duplicate() {
+        let (db, _dir) = temp_db().await;
+        let author = agent("author");
+        db.register_agent(&author, "author").await.unwrap();
+
+        let record = episode(&author, Namespace::shared(), "quarantined note");
+        let id = record.id;
+        let bytes = hirn_core::persist::to_versioned_bytes(&record).unwrap();
+
+        // Pending quarantine row for the record.
+        insert_quarantine_row(
+            &db,
+            &quarantine_row(id, hirn_core::QuarantinedRecordKind::Episodic, bytes),
+        )
+        .await;
+
+        // Simulate a crash AFTER promotion but BEFORE the row flip: the record
+        // is already in the store, yet the quarantine row is still Pending.
+        db.remember(record).await.unwrap();
+        let rows_after_promote = db
+            .storage_backend()
+            .count("episodic", Some(&format!("id = '{id}'")))
+            .await
+            .unwrap();
+        assert_eq!(rows_after_promote, 1, "record promoted exactly once");
+
+        // Re-approval must complete the state transition WITHOUT re-promoting.
+        let outcome = db
+            .approve_quarantine(id, author.clone())
+            .await
+            .expect("re-approval must succeed idempotently");
+        assert_eq!(outcome.applied_memory_ids, vec![id]);
+
+        let rows_after_reapprove = db
+            .storage_backend()
+            .count("episodic", Some(&format!("id = '{id}'")))
+            .await
+            .unwrap();
+        assert_eq!(
+            rows_after_reapprove, 1,
+            "re-approval after a mid-crash must not duplicate the memory"
+        );
+    }
 }
 
 /// Result of a GDPR agent data purge.
@@ -1460,4 +1846,7 @@ pub struct PurgeReport {
     pub quarantine_removed: usize,
     /// Distinct graph edges incident to the purged records.
     pub edges_removed: usize,
+    /// Rows removed from the `svo_events` and `prospective_implications`
+    /// datasets — derived, per-agent data keyed by the purged source records.
+    pub derived_removed: usize,
 }
