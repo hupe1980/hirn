@@ -34,6 +34,13 @@ pub enum IndexType {
     BTree,
     Bitmap,
     LabelList,
+    /// Split-Block Bloom Filter scalar index (Lance 9).
+    ///
+    /// Membership-only: answers `=`, `IN (...)`, and `IS NULL` predicates. It is
+    /// inexact (AtMost) — Lance still verifies surviving rows, so there is no
+    /// correctness risk — and far smaller than a BTree. Do NOT use it for `!=`
+    /// or range predicates (it cannot answer them).
+    BloomFilter,
 }
 
 // ── Index Parameters ──

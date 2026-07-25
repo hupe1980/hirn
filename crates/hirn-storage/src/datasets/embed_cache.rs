@@ -51,10 +51,14 @@ pub struct EmbedCacheEntry {
     pub embedding: Vec<f32>,
 }
 
-/// Create a BTree scalar index on `content_hash` (R-24).
+/// Create a BloomFilter scalar index on `content_hash` (R-24; A1).
 ///
-/// Cache lookups (`content_hash = '…'`) and the `merge_insert` dedup key both
-/// probe this column; without an index each is an O(n) full scan of the cache.
+/// Cache lookups (`content_hash = '…'` / `IN (...)`) and the `merge_insert`
+/// dedup key both probe this column with exact membership tests only — never a
+/// range or `!=`. Lance 9's Split-Block Bloom Filter is the purpose-built index
+/// for that access pattern: it answers `=`/`IN`/`IS NULL`, is inexact (AtMost)
+/// so Lance still verifies surviving rows (no correctness risk), and is far
+/// smaller than a BTree. Without any index each lookup is an O(n) full scan.
 /// Idempotent — `replace: false` is a no-op when the index already exists.
 pub async fn create_content_hash_index(
     store: &dyn crate::store::PhysicalStore,
@@ -64,7 +68,7 @@ pub async fn create_content_hash_index(
             DATASET_NAME,
             crate::store::IndexConfig {
                 columns: vec!["content_hash".to_string()],
-                index_type: crate::store::IndexType::BTree,
+                index_type: crate::store::IndexType::BloomFilter,
                 params: crate::store::IndexParams::default(),
                 replace: false,
             },

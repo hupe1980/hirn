@@ -368,7 +368,7 @@ async fn find_max_similarity(
                                     for j in 0..dists.len() {
                                         if !dists.is_null(j) {
                                             let dist = dists.value(j);
-                                            let sim = dist_to_sim(metric, dist);
+                                            let sim = metric.distance_to_similarity(dist);
                                             max_sim = max_sim.max(sim);
                                         }
                                     }
@@ -390,18 +390,6 @@ async fn find_max_similarity(
         .await
         .into_iter()
         .fold(0.0_f32, f32::max)
-}
-
-/// Convert a Lance `_distance` value to a [0, 1] similarity score using the
-/// correct formula for the configured distance metric (N-M12).
-fn dist_to_sim(metric: hirn_storage::store::DistanceMetric, dist: f32) -> f32 {
-    use hirn_storage::store::DistanceMetric;
-    match metric {
-        DistanceMetric::Cosine => (1.0 - dist).clamp(0.0, 1.0),
-        // Lance dot-product distance = `1 - dot_product` for unit-normalized vectors.
-        DistanceMetric::DotProduct => (1.0 - dist).clamp(0.0, 1.0),
-        DistanceMetric::L2 => 1.0 / (1.0 + dist),
-    }
 }
 
 #[cfg(test)]

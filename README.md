@@ -21,7 +21,7 @@ LLMs are evolving from stateless chatbots into long-running autonomous agents. T
 
 - **Four-layer memory model** — episodic (events), semantic (knowledge), procedural (skills/workflows), and working memory (scratch space), mirroring human cognitive architecture (CLS theory + CoALA)
 - **Procedural execution** — `ToolExecutor` trait dispatches stored action-step sequences to external tool runtimes (MCP servers, shell, function-calling agents) with short-circuit-on-failure semantics and EMA-based success tracking
-- **Lance 9.0-powered storage** — object-storage-native lakehouse (local, S3, GCS, Azure) with built-in IVF-HNSW vector indexing, BTree, Bitmap, and LabelList indices, full-text search, and hybrid search with RRF via hirn-storage (`PhysicalStore` trait)
+- **Lance 9.0-powered storage** — object-storage-native lakehouse (local, S3, GCS, Azure) with built-in IVF-HNSW vector indexing; BTree, Bitmap, LabelList, and BloomFilter scalar indices; native full-text search (BM25 v2 posting + WAND) and hybrid search with RRF via hirn-storage (`PhysicalStore` trait)
 - **Full-text search (BM25)** — Lance built-in Tantivy-powered FTS with configurable tokenizers, stemming (30+ languages), fuzzy matching, phrase queries, boolean operators (AND/OR/NOT), and field boosting
 - **Hybrid search with RRF** — hirn-storage fuses vector search and FTS/BM25 via reciprocal rank fusion in a single query, with pluggable rerankers (Cohere, CrossEncoder, ColBERT, custom)
 - **Multivector search** — MaxSim-based late interaction search (ColBERT/ColPaLi) for token-level similarity matching via Lance

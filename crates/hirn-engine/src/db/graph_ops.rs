@@ -1101,19 +1101,9 @@ fn extend_vector_search_results(
         for i in 0..batch.num_rows() {
             let id_str = id_col.value(i);
             if let Ok(id) = hirn_core::id::MemoryId::parse(id_str) {
-                let sim = distance_to_similarity(metric, dist_col.value(i));
+                let sim = metric.distance_to_similarity(dist_col.value(i));
                 all_results.push((id.as_ulid().0, sim));
             }
         }
-    }
-}
-
-/// Convert a raw distance value to a 0..1 similarity score.
-fn distance_to_similarity(metric: hirn_storage::store::DistanceMetric, dist: f32) -> f32 {
-    match metric {
-        hirn_storage::store::DistanceMetric::Cosine => (1.0 - dist).clamp(0.0, 1.0),
-        // Lance stores dot-product distance as `1 - dot_product` (N-M11).
-        hirn_storage::store::DistanceMetric::DotProduct => (1.0 - dist).clamp(0.0, 1.0),
-        hirn_storage::store::DistanceMetric::L2 => 1.0 / (1.0 + dist),
     }
 }

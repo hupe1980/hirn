@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use arrow_array::{Array, Float32Array, RecordBatch, StringArray, UInt64Array};
+use arrow_array::{Array, Float32Array, RecordBatch, StringArray, UInt32Array, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 
@@ -150,67 +150,37 @@ fn default_merge_results(
         indices_f.extend(0..fts.num_rows());
     }
 
-    let total_rows = indices_v.len() + indices_f.len();
-
     // Build merged batch by selecting rows across both inputs.
     // Only keep fields present in both schemas to avoid length mismatches.
     let shared_schema = find_shared_schema(vector.schema(), fts.schema());
     let mut columns: Vec<arrow_array::ArrayRef> = Vec::new();
 
+    // Selected rows come from two distinct source batches (vector, fts) and each
+    // side may be missing a shared-schema field (then null-padded). Gather each
+    // side in a SINGLE `take` per column instead of a per-row `slice`, then join
+    // the two selected arrays with one `concat` of at most two arrays — dropping
+    // the O(rows) slice allocations + concat-of-N of the previous implementation.
+    let v_take = UInt32Array::from(indices_v.iter().map(|&i| i as u32).collect::<Vec<_>>());
+    let f_take = UInt32Array::from(indices_f.iter().map(|&i| i as u32).collect::<Vec<_>>());
+
     for field in shared_schema.fields() {
         let v_col = vector.column_by_name(field.name());
         let f_col = fts.column_by_name(field.name());
 
-        let mut builder_values: Vec<arrow_array::ArrayRef> = Vec::new();
+        let v_part: arrow_array::ArrayRef = match v_col {
+            Some(v) => arrow_select::take::take(v.as_ref(), &v_take, None)
+                .map_err(HirnDbError::ArrowError)?,
+            None => arrow_array::new_null_array(field.data_type(), indices_v.len()),
+        };
+        let f_part: arrow_array::ArrayRef = match f_col {
+            Some(f) => arrow_select::take::take(f.as_ref(), &f_take, None)
+                .map_err(HirnDbError::ArrowError)?,
+            None => arrow_array::new_null_array(field.data_type(), indices_f.len()),
+        };
 
-        match (v_col, f_col) {
-            (Some(v), Some(f)) => {
-                for &idx in &indices_v {
-                    builder_values.push(v.slice(idx, 1));
-                }
-                for &idx in &indices_f {
-                    builder_values.push(f.slice(idx, 1));
-                }
-            }
-            (Some(v), None) => {
-                for &idx in &indices_v {
-                    builder_values.push(v.slice(idx, 1));
-                }
-                // Pad FTS rows with nulls.
-                if !indices_f.is_empty() {
-                    builder_values.push(arrow_array::new_null_array(
-                        field.data_type(),
-                        indices_f.len(),
-                    ));
-                }
-            }
-            (None, Some(f)) => {
-                // Pad vector rows with nulls.
-                if !indices_v.is_empty() {
-                    builder_values.push(arrow_array::new_null_array(
-                        field.data_type(),
-                        indices_v.len(),
-                    ));
-                }
-                for &idx in &indices_f {
-                    builder_values.push(f.slice(idx, 1));
-                }
-            }
-            (None, None) => {
-                builder_values.push(arrow_array::new_null_array(field.data_type(), total_rows));
-            }
-        }
-
-        let refs: Vec<&dyn arrow_array::Array> =
-            builder_values.iter().map(|a| a.as_ref()).collect();
-        if refs.is_empty() {
-            let null = arrow_array::new_null_array(field.data_type(), 0);
-            columns.push(null);
-        } else {
-            let concatenated =
-                arrow_select::concat::concat(&refs).map_err(HirnDbError::ArrowError)?;
-            columns.push(concatenated);
-        }
+        let concatenated = arrow_select::concat::concat(&[v_part.as_ref(), f_part.as_ref()])
+            .map_err(HirnDbError::ArrowError)?;
+        columns.push(concatenated);
     }
 
     RecordBatch::try_new(Arc::new(shared_schema), columns).map_err(HirnDbError::ArrowError)
@@ -273,18 +243,19 @@ fn add_score_column_and_sort(
     fields.push(Field::new(RELEVANCE_SCORE_COLUMN, DataType::Float32, false));
     let new_schema = Arc::new(Schema::new(fields));
 
-    // Reorder all columns.
+    // Reorder all columns with ONE `take` per column against the shared sorted
+    // index array, instead of a per-row `slice` + concat-of-N gather.
+    let take_indices =
+        UInt32Array::from(sort_indices.iter().map(|&i| i as u32).collect::<Vec<_>>());
     let mut columns: Vec<arrow_array::ArrayRef> = Vec::new();
     for col_idx in 0..batch.num_columns() {
         let col = batch.column(col_idx);
         if batch.schema().field(col_idx).name() == RELEVANCE_SCORE_COLUMN {
             continue;
         }
-        let reordered: Vec<arrow_array::ArrayRef> =
-            sort_indices.iter().map(|&i| col.slice(i, 1)).collect();
-        let refs: Vec<&dyn arrow_array::Array> = reordered.iter().map(|a| a.as_ref()).collect();
-        let concatenated = arrow_select::concat::concat(&refs).map_err(HirnDbError::ArrowError)?;
-        columns.push(concatenated);
+        let reordered = arrow_select::take::take(col.as_ref(), &take_indices, None)
+            .map_err(HirnDbError::ArrowError)?;
+        columns.push(reordered);
     }
     columns.push(Arc::new(Float32Array::from(sorted_scores)));
 
@@ -723,26 +694,27 @@ impl ColBERTReranker {
             .collect();
 
         let num_out = retained_names.len();
-        let mut col_slices: Vec<Vec<arrow_array::ArrayRef>> = vec![Vec::new(); num_out];
-        let mut score_builder = arrow_array::builder::Float32Builder::new();
 
-        for &(row, score) in &scores_with_idx {
-            for (ci, name) in retained_names.iter().enumerate() {
-                if let Some(src) = batch.column_by_name(name) {
-                    col_slices[ci].push(src.slice(row, 1));
-                }
-            }
-            score_builder.append_value(score);
-        }
+        // Gather the re-sorted rows with ONE `take` per retained column against
+        // the shared score-order index array, instead of a per-row `slice`.
+        let take_indices = UInt32Array::from(
+            scores_with_idx
+                .iter()
+                .map(|&(row, _)| row as u32)
+                .collect::<Vec<_>>(),
+        );
+        let sorted_scores: Vec<f32> = scores_with_idx.iter().map(|&(_, score)| score).collect();
 
-        let score_array: arrow_array::ArrayRef = Arc::new(score_builder.finish());
         let mut final_arrays: Vec<arrow_array::ArrayRef> = Vec::with_capacity(num_out + 1);
-        for arrays in col_slices {
-            let refs: Vec<&dyn arrow_array::Array> = arrays.iter().map(|a| a.as_ref()).collect();
-            final_arrays
-                .push(arrow_select::concat::concat(&refs).map_err(HirnDbError::ArrowError)?);
+        for name in &retained_names {
+            if let Some(src) = batch.column_by_name(name) {
+                final_arrays.push(
+                    arrow_select::take::take(src.as_ref(), &take_indices, None)
+                        .map_err(HirnDbError::ArrowError)?,
+                );
+            }
         }
-        final_arrays.push(score_array);
+        final_arrays.push(Arc::new(Float32Array::from(sorted_scores)));
 
         RecordBatch::try_new(out_schema, final_arrays).map_err(HirnDbError::ArrowError)
     }
@@ -889,6 +861,46 @@ mod tests {
         let f = empty_batch();
         let merged = default_merge_results(&v, &f).unwrap();
         assert_eq!(merged.num_rows(), 0);
+    }
+
+    fn get_contents(batch: &RecordBatch) -> Vec<String> {
+        let arr = batch
+            .column_by_name("content")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        (0..arr.len()).map(|i| arr.value(i).to_string()).collect()
+    }
+
+    #[test]
+    fn merge_preserves_row_set_and_order_after_take_gather() {
+        // `take`/`concat` gather must produce EXACTLY the vector rows (in order)
+        // followed by the deduplicated FTS rows (in order), carrying each row's
+        // own `content` value — i.e. no cross-row scrambling.
+        let v = make_batch(&["a", "b", "c"], &["va", "vb", "vc"], &[0.9, 0.8, 0.7]);
+        let f = make_batch(&["b", "d", "e"], &["fb", "fd", "fe"], &[0.5, 0.4, 0.3]);
+
+        let merged = default_merge_results(&v, &f).unwrap();
+        // vector rows a,b,c then FTS rows d,e (b already seen → dropped).
+        assert_eq!(get_ids(&merged), vec!["a", "b", "c", "d", "e"]);
+        assert_eq!(get_contents(&merged), vec!["va", "vb", "vc", "fd", "fe"]);
+    }
+
+    #[test]
+    fn add_score_and_sort_applies_known_permutation() {
+        // Descending sort by score must permute every column consistently.
+        let batch = make_batch(
+            &["a", "b", "c", "d"],
+            &["ca", "cb", "cc", "cd"],
+            &[0.1, 0.9, 0.5, 0.7],
+        );
+        // Scores 0.1,0.9,0.5,0.7 → desc order b(0.9), d(0.7), c(0.5), a(0.1).
+        let sorted = add_score_column_and_sort(&batch, &[0.1, 0.9, 0.5, 0.7]).unwrap();
+        assert_eq!(get_ids(&sorted), vec!["b", "d", "c", "a"]);
+        assert_eq!(get_contents(&sorted), vec!["cb", "cd", "cc", "ca"]);
+        let scores = get_relevance_scores(&sorted);
+        assert_eq!(scores, vec![0.9, 0.7, 0.5, 0.1]);
     }
 
     // ── RRFReranker tests ──

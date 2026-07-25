@@ -300,9 +300,11 @@ async fn try_prospective_lookup(
         if scores.is_empty() {
             return Ok(None);
         }
-        // _distance is L2 distance — lower is better. Convert to similarity.
+        // The search runs with the default (Cosine) metric, so `_distance` is a
+        // cosine distance — convert with the canonical metric-aware formula.
+        // (Was hardcoded L2 `1/(1+d)`, wrong for cosine `_distance` — R-75.)
         let distance = scores.value(0);
-        let similarity = 1.0 / (1.0 + distance);
+        let similarity = hirn_core::DistanceMetric::default().distance_to_similarity(distance);
         if similarity < threshold {
             return Ok(None);
         }

@@ -96,6 +96,26 @@ pub enum DistanceMetric {
     L2,
 }
 
+impl DistanceMetric {
+    /// Convert a Lance `_distance` value for this metric into a `[0, 1]`
+    /// similarity score (higher = more similar).
+    ///
+    /// This is the single source of truth for distance→similarity conversion
+    /// across the retrieval, reranking, and admission paths (previously
+    /// duplicated in five places). Conventions:
+    /// - **Cosine:** Lance stores `1 - cos`, so `similarity = 1 - distance`.
+    /// - **DotProduct:** Lance stores `1 - dot` for unit-normalized vectors, so
+    ///   `similarity = 1 - distance` (N-M11; `-distance` was wrong).
+    /// - **L2:** monotone map `1 / (1 + distance)` (squared Euclidean → (0, 1]).
+    #[must_use]
+    pub fn distance_to_similarity(self, distance: f32) -> f32 {
+        match self {
+            Self::Cosine | Self::DotProduct => (1.0 - distance).clamp(0.0, 1.0),
+            Self::L2 => 1.0 / (1.0 + distance),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct EmbedderRuntimeConfig {
@@ -2046,6 +2066,35 @@ impl HirnConfigBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn distance_to_similarity_per_metric() {
+        // Canonical conversion (was duplicated across 5 call sites).
+        // Cosine / DotProduct: similarity = 1 - distance (clamped).
+        assert!((DistanceMetric::Cosine.distance_to_similarity(0.0) - 1.0).abs() < f32::EPSILON);
+        assert!((DistanceMetric::Cosine.distance_to_similarity(0.1) - 0.9).abs() < 1e-6);
+        assert_eq!(DistanceMetric::Cosine.distance_to_similarity(2.0), 0.0); // clamped
+        assert!(
+            (DistanceMetric::DotProduct.distance_to_similarity(0.0) - 1.0).abs() < f32::EPSILON
+        );
+        // L2: similarity = 1 / (1 + distance).
+        assert!((DistanceMetric::L2.distance_to_similarity(0.0) - 1.0).abs() < f32::EPSILON);
+        assert!((DistanceMetric::L2.distance_to_similarity(1.0) - 0.5).abs() < f32::EPSILON);
+        // Always in [0, 1].
+        for m in [
+            DistanceMetric::Cosine,
+            DistanceMetric::DotProduct,
+            DistanceMetric::L2,
+        ] {
+            for d in [0.0, 0.5, 1.0, 2.0, 100.0] {
+                let s = m.distance_to_similarity(d);
+                assert!(
+                    (0.0..=1.0).contains(&s),
+                    "sim {s} out of range for {m:?} d={d}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn default_is_valid() {

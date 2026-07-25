@@ -5,7 +5,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::task::{Context, Poll};
 
-use arrow_array::builder::Float32Builder;
 use arrow_array::{
     Array, ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator,
 };
@@ -822,28 +821,30 @@ impl LancePhysicalStore {
         let result_schema = Arc::new(arrow_schema::Schema::new(result_fields));
 
         let num_source_cols = schema.fields().len();
-        let mut column_slices: Vec<Vec<ArrayRef>> = vec![Vec::new(); num_source_cols];
-        let mut distances = Float32Builder::new();
 
-        for scored_row in &scored_rows {
-            let batch = &batches[scored_row.batch_idx];
-            for (col_idx, slices) in column_slices.iter_mut().enumerate() {
-                slices.push(batch.column(col_idx).slice(scored_row.row_idx, 1));
-            }
-            distances.append_value(scored_row.distance);
-        }
+        // Selected rows are scattered across multiple source batches. Gather each
+        // column with a SINGLE `interleave` pass over `(batch_idx, row_idx)`
+        // indices instead of a per-row `slice` + concat-of-N.
+        let interleave_indices: Vec<(usize, usize)> = scored_rows
+            .iter()
+            .map(|scored_row| (scored_row.batch_idx, scored_row.row_idx))
+            .collect();
+        let distances =
+            Float32Array::from(scored_rows.iter().map(|s| s.distance).collect::<Vec<f32>>());
 
         let mut final_arrays: Vec<ArrayRef> = Vec::with_capacity(num_source_cols + 1);
-        for (col_idx, slices) in column_slices.into_iter().enumerate() {
-            // Normalize all slices to the canonical field type from `schema`.
-            // This guards against mixed-nullability FixedSizeList arrays that
-            // arise when the flat-snapshot contains both Lance-scanned batches
-            // (nullable inner type) and in-memory-appended batches (non-null
-            // inner type). Arrow's `concat` rejects such mismatches.
+        for col_idx in 0..num_source_cols {
+            // Normalize each batch's column to the canonical field type from
+            // `schema` before interleaving. This guards against mixed-nullability
+            // FixedSizeList arrays that arise when the flat-snapshot contains both
+            // Lance-scanned batches (nullable inner type) and in-memory-appended
+            // batches (non-null inner type). Arrow's `interleave` (like `concat`)
+            // rejects such mismatches.
             let target_type = schema.field(col_idx).data_type();
-            let normalized: Vec<ArrayRef> = slices
+            let normalized: Vec<ArrayRef> = batches
                 .iter()
-                .map(|arr| {
+                .map(|batch| {
+                    let arr = batch.column(col_idx);
                     if arr.data_type() == target_type {
                         Arc::clone(arr)
                     } else {
@@ -853,10 +854,12 @@ impl LancePhysicalStore {
                 })
                 .collect();
             let refs: Vec<&dyn Array> = normalized.iter().map(|a| a.as_ref()).collect();
-            final_arrays
-                .push(arrow_select::concat::concat(&refs).map_err(HirnDbError::ArrowError)?);
+            final_arrays.push(
+                arrow_select::interleave::interleave(&refs, &interleave_indices)
+                    .map_err(HirnDbError::ArrowError)?,
+            );
         }
-        final_arrays.push(Arc::new(distances.finish()));
+        final_arrays.push(Arc::new(distances));
 
         let result =
             RecordBatch::try_new(result_schema, final_arrays).map_err(HirnDbError::ArrowError)?;
@@ -951,25 +954,27 @@ impl LancePhysicalStore {
             .map(|f| f.name().clone())
             .collect();
 
-        let mut column_slices: Vec<Vec<ArrayRef>> = vec![Vec::new(); orig_names.len()];
-        let mut scores = Float32Builder::new();
-        for scored_row in &scored {
-            for (ci, name) in orig_names.iter().enumerate() {
+        // Each surviving row is a distinct 1-row batch (from the streaming heap),
+        // so gather every column with a SINGLE `interleave` over `(row, 0)`
+        // indices instead of concatenating N single-row slices.
+        let interleave_indices: Vec<(usize, usize)> = (0..scored.len()).map(|i| (i, 0)).collect();
+        let scores = Float32Array::from(scored.iter().map(|s| s.score).collect::<Vec<f32>>());
+
+        let mut final_arrays: Vec<ArrayRef> = Vec::with_capacity(orig_names.len() + 1);
+        for name in &orig_names {
+            let mut cols: Vec<&dyn Array> = Vec::with_capacity(scored.len());
+            for scored_row in &scored {
                 let src = scored_row.row.column_by_name(name).ok_or_else(|| {
                     HirnDbError::InvalidArgument(format!("column `{name}` missing"))
                 })?;
-                column_slices[ci].push(Arc::clone(src));
+                cols.push(src.as_ref());
             }
-            scores.append_value(scored_row.score);
+            final_arrays.push(
+                arrow_select::interleave::interleave(&cols, &interleave_indices)
+                    .map_err(HirnDbError::ArrowError)?,
+            );
         }
-
-        let mut final_arrays: Vec<ArrayRef> = Vec::with_capacity(orig_names.len() + 1);
-        for slices in column_slices {
-            let refs: Vec<&dyn Array> = slices.iter().map(|a| a.as_ref()).collect();
-            final_arrays
-                .push(arrow_select::concat::concat(&refs).map_err(HirnDbError::ArrowError)?);
-        }
-        final_arrays.push(Arc::new(scores.finish()));
+        final_arrays.push(Arc::new(scores));
 
         let result =
             RecordBatch::try_new(result_schema, final_arrays).map_err(HirnDbError::ArrowError)?;
@@ -994,6 +999,7 @@ impl LancePhysicalStore {
             IndexType::BTree => lance_index::IndexType::BTree,
             IndexType::Bitmap => lance_index::IndexType::Bitmap,
             IndexType::LabelList => lance_index::IndexType::LabelList,
+            IndexType::BloomFilter => lance_index::IndexType::BloomFilter,
         }
     }
 
@@ -1869,7 +1875,6 @@ impl PhysicalStore for LancePhysicalStore {
         use crate::multivector::{
             extract_multivectors as extract_multivectors_from_col, maxsim_score,
         };
-        use arrow_array::Array;
         use arrow_schema::{DataType, Field, Schema};
 
         let schema = candidates[0].schema();
@@ -1914,30 +1919,32 @@ impl PhysicalStore for LancePhysicalStore {
             .map(|f| f.name().as_str())
             .collect();
 
-        let num_out_cols = orig_field_names.len();
-        let mut column_slices: Vec<Vec<arrow_array::ArrayRef>> = vec![Vec::new(); num_out_cols];
-        let mut scores = arrow_array::builder::Float32Builder::new();
+        // Selected rows are scattered across multiple candidate batches. Gather
+        // each column with a SINGLE `interleave` over `(batch_idx, row_idx)`
+        // indices instead of a per-row `slice` + concat-of-N.
+        let interleave_indices: Vec<(usize, usize)> = scored_rows
+            .iter()
+            .map(|&(batch_idx, row_idx, _)| (batch_idx, row_idx))
+            .collect();
+        let scores =
+            Float32Array::from(scored_rows.iter().map(|&(_, _, s)| s).collect::<Vec<f32>>());
 
-        for &(batch_idx, row_idx, score) in &scored_rows {
-            let batch = &candidates[batch_idx];
-            for (ci, field_name) in orig_field_names.iter().enumerate() {
+        let mut final_arrays: Vec<arrow_array::ArrayRef> =
+            Vec::with_capacity(orig_field_names.len() + 1);
+        for field_name in &orig_field_names {
+            let mut cols: Vec<&dyn arrow_array::Array> = Vec::with_capacity(candidates.len());
+            for batch in &candidates {
                 let src_col = batch.column_by_name(field_name).ok_or_else(|| {
                     HirnDbError::InvalidArgument(format!("column `{field_name}` missing"))
                 })?;
-                column_slices[ci].push(src_col.slice(row_idx, 1));
+                cols.push(src_col.as_ref());
             }
-            scores.append_value(score);
+            final_arrays.push(
+                arrow_select::interleave::interleave(&cols, &interleave_indices)
+                    .map_err(HirnDbError::ArrowError)?,
+            );
         }
-
-        let score_array: arrow_array::ArrayRef = Arc::new(scores.finish());
-        let mut final_arrays: Vec<arrow_array::ArrayRef> = Vec::with_capacity(num_out_cols + 1);
-        for col_arrays in column_slices {
-            let refs: Vec<&dyn arrow_array::Array> =
-                col_arrays.iter().map(|a| a.as_ref()).collect();
-            final_arrays
-                .push(arrow_select::concat::concat(&refs).map_err(HirnDbError::ArrowError)?);
-        }
-        final_arrays.push(score_array);
+        final_arrays.push(Arc::new(scores));
 
         let result =
             RecordBatch::try_new(result_schema, final_arrays).map_err(HirnDbError::ArrowError)?;
@@ -3093,5 +3100,80 @@ mod tests {
             "snapshot cache must be bounded, got {}",
             store.flat_vector_snapshot_cache.len()
         );
+    }
+
+    /// A1: the embed-cache `content_hash` scalar index must be a Lance 9
+    /// Split-Block Bloom Filter (`ScalarIndexParams::for_builtin(BuiltinIndexType
+    /// ::BloomFilter)`), verifiable through the `load_indices` listing API, and
+    /// exact `content_hash = '…'` membership lookups through it must still return
+    /// correct hits and misses (the index is inexact/AtMost, so Lance verifies
+    /// survivors — no false positives leak).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn embed_cache_content_hash_uses_bloom_filter_index() {
+        use crate::datasets::embed_cache;
+        use lance::index::DatasetIndexExt;
+
+        let (_tmp, store) = lance_test_store().await;
+
+        let entries = vec![
+            embed_cache::EmbedCacheEntry {
+                content_hash: embed_cache::cache_key("m", "hello"),
+                model: "m".into(),
+                dimensions: 3,
+                embedding: vec![0.1, 0.2, 0.3],
+            },
+            embed_cache::EmbedCacheEntry {
+                content_hash: embed_cache::cache_key("m", "world"),
+                model: "m".into(),
+                dimensions: 3,
+                embedding: vec![0.4, 0.5, 0.6],
+            },
+        ];
+        let batch = embed_cache::to_batch(&entries, 3).unwrap();
+        store
+            .append(embed_cache::DATASET_NAME, batch)
+            .await
+            .unwrap();
+
+        // Bootstrap the scalar lookup index (BloomFilter after A1).
+        embed_cache::create_content_hash_index(&store)
+            .await
+            .unwrap();
+
+        // Assert via the index-listing API that a BloomFilter index covers
+        // `content_hash`.
+        let ds = store.open_dataset(embed_cache::DATASET_NAME).await.unwrap();
+        let field_id = ds.schema().field_id("content_hash").unwrap();
+        let indices = ds.load_indices().await.unwrap();
+        let index = indices
+            .iter()
+            .find(|idx| idx.fields.contains(&field_id))
+            .expect("content_hash must have a scalar index");
+        let type_url = index
+            .index_details
+            .as_ref()
+            .map(|d| d.type_url.clone())
+            .unwrap_or_default();
+        assert!(
+            type_url.contains("BloomFilter"),
+            "content_hash index must be a BloomFilter, got type_url = {type_url:?}"
+        );
+
+        // Functional hit/miss through the indexed column.
+        let hit = crate::embed_cache_ops::get_cached_embedding(
+            &store,
+            &embed_cache::cache_key("m", "hello"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(hit, Some(vec![0.1, 0.2, 0.3]), "known hash must hit");
+
+        let miss = crate::embed_cache_ops::get_cached_embedding(
+            &store,
+            &embed_cache::cache_key("m", "absent"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(miss, None, "unknown hash must miss");
     }
 }

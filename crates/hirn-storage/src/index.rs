@@ -41,6 +41,19 @@ impl IndexConfig {
         }
     }
 
+    /// Create a BloomFilter scalar index config (Lance 9).
+    ///
+    /// Membership-only (`=`, `IN`, `IS NULL`) — use it for exact-lookup columns,
+    /// never for range or `!=` predicates.
+    pub fn bloom(column: impl Into<String>) -> Self {
+        Self {
+            columns: vec![column.into()],
+            index_type: IndexType::BloomFilter,
+            params: IndexParams::default(),
+            replace: true,
+        }
+    }
+
     /// Set the index type.
     pub fn with_type(mut self, index_type: IndexType) -> Self {
         self.index_type = index_type;

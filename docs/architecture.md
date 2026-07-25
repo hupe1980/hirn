@@ -41,7 +41,7 @@ Arrow `RecordBatch` streams rather than imperative async chains allocating inter
 Three architectural commitments follow from that idea, and they recur throughout this guide:
 
 - **Columnar, versioned storage.** Every memory tier is a Lance 9.0 dataset with an Arrow-native
-  schema, MVCC versioning, and pushdown-friendly indices (IVF-HNSW, FTS/BM25, BTree, Bitmap). This
+  schema, MVCC versioning, and pushdown-friendly indices (IVF-HNSW, FTS/BM25, BTree, Bitmap, BloomFilter). This
   is what lets policy predicates, temporal filters, and namespace pruning execute at near-zero cost.
 - **A two-tier graph.** A hot in-memory `petgraph` serves sub-millisecond activation and shallow
   traversal; a cold Lance-backed `PersistentGraph` serves deep, batched BFS. The engine delegates

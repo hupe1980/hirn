@@ -50,9 +50,7 @@ async fn setup_store(metric: DistanceMetric) -> (TempDir, LancePhysicalStore) {
 /// external RNG dependency. Distinct seeds yield distinct vectors.
 fn pseudo_embedding(seed: u64, dim: usize) -> Vec<f32> {
     // splitmix64 to decorrelate adjacent seeds, then a classic LCG stream.
-    let mut state = seed
-        .wrapping_add(1)
-        .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let mut state = seed.wrapping_add(1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     let mut out = Vec::with_capacity(dim);
     for _ in 0..dim {
         state = state
@@ -89,7 +87,10 @@ fn vector_batch(ids: &[u64], embeddings: &[Vec<f32>], dim: usize) -> RecordBatch
         Field::new("id", DataType::UInt64, false),
         Field::new(
             "embedding",
-            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim as i32),
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                dim as i32,
+            ),
             false,
         ),
     ]));
@@ -196,8 +197,9 @@ async fn ann_parity_cosine_recall_at_10_above_threshold() {
     let mut recall_sum = 0.0_f32;
     for q in 0..QUERIES {
         let query = pseudo_embedding(10_000_000 + q as u64, DIM);
-        let truth: std::collections::HashSet<u64> =
-            brute_force_top_k_cosine(&query, &corpus, K).into_iter().collect();
+        let truth: std::collections::HashSet<u64> = brute_force_top_k_cosine(&query, &corpus, K)
+            .into_iter()
+            .collect();
 
         let results = store
             .vector_search(
@@ -223,7 +225,9 @@ async fn ann_parity_cosine_recall_at_10_above_threshold() {
     }
 
     let recall = recall_sum / QUERIES as f32;
-    println!("ann_parity_cosine_recall_at_10_above_threshold: recall@10 = {recall:.4} over {QUERIES} queries, {ROWS} rows");
+    println!(
+        "ann_parity_cosine_recall_at_10_above_threshold: recall@10 = {recall:.4} over {QUERIES} queries, {ROWS} rows"
+    );
     assert!(
         recall >= RECALL_FLOOR,
         "recall@10 = {recall:.4} fell below the {RECALL_FLOOR} floor; the ANN index may be \
@@ -293,10 +297,7 @@ async fn ann_index_honors_metric_cosine_vs_l2() {
 
     // ── Cosine store: top-1 must be A (angle-aligned). ──
     let (_dir_c, cosine_store) = setup_store(DistanceMetric::Cosine).await;
-    cosine_store
-        .append("vecs", batch.clone())
-        .await
-        .unwrap();
+    cosine_store.append("vecs", batch.clone()).await.unwrap();
     cosine_store
         .create_index("vecs", index_cfg.clone())
         .await
@@ -428,10 +429,23 @@ async fn ann_and_flat_agree_below_threshold() {
     for q in 0..QUERIES {
         let query = pseudo_embedding(20_000_000 + q as u64, DIM);
 
-        let flat = result_ids(&flat_store.vector_search("vecs", mk_opts(query.clone())).await.unwrap());
-        let ann = result_ids(&indexed_store.vector_search("vecs", mk_opts(query.clone())).await.unwrap());
+        let flat = result_ids(
+            &flat_store
+                .vector_search("vecs", mk_opts(query.clone()))
+                .await
+                .unwrap(),
+        );
+        let ann = result_ids(
+            &indexed_store
+                .vector_search("vecs", mk_opts(query.clone()))
+                .await
+                .unwrap(),
+        );
 
-        assert!(!flat.is_empty() && !ann.is_empty(), "both paths must return results");
+        assert!(
+            !flat.is_empty() && !ann.is_empty(),
+            "both paths must return results"
+        );
         assert_eq!(
             flat.first(),
             ann.first(),
@@ -444,7 +458,9 @@ async fn ann_and_flat_agree_below_threshold() {
     }
 
     let overlap = overlap_sum / QUERIES as f32;
-    println!("ann_and_flat_agree_below_threshold: mean top-10 overlap = {overlap:.4} over {QUERIES} queries");
+    println!(
+        "ann_and_flat_agree_below_threshold: mean top-10 overlap = {overlap:.4} over {QUERIES} queries"
+    );
     assert!(
         overlap >= OVERLAP_FLOOR,
         "mean top-10 overlap {overlap:.4} fell below {OVERLAP_FLOOR}; ANN diverges from flat"

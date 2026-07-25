@@ -586,7 +586,7 @@ async fn find_max_similarities(
                                     .map(|dists| {
                                         (0..dists.len())
                                             .filter(|&j| !dists.is_null(j))
-                                            .map(|j| dist_to_sim(metric, dists.value(j)))
+                                            .map(|j| metric.distance_to_similarity(dists.value(j)))
                                             .fold(0.0_f32, f32::max)
                                     })
                                     .unwrap_or(0.0)
@@ -617,20 +617,6 @@ async fn find_max_similarities(
                 .fold(0.0_f32, f32::max)
         })
         .collect()
-}
-
-/// Convert a Lance `_distance` value to a [0, 1] similarity score.
-///
-/// The formula depends on the distance metric (must match the index build metric).
-fn dist_to_sim(metric: DistanceMetric, dist: f32) -> f32 {
-    match metric {
-        // Cosine distance = 1 - cosine_similarity, so similarity = 1 - dist.
-        DistanceMetric::Cosine => (1.0 - dist).clamp(0.0, 1.0),
-        // Dot-product distance = 1 - dot_product for unit-normalized vectors.
-        DistanceMetric::DotProduct => (1.0 - dist).clamp(0.0, 1.0),
-        // L2 distance: map to (0, 1] via 1/(1+d²) — matches RPE scoring.
-        DistanceMetric::L2 => 1.0 / (1.0 + dist),
-    }
 }
 
 #[cfg(test)]
@@ -672,21 +658,9 @@ mod tests {
         assert_eq!(flags.flag_string(), "duplicate,conflict");
     }
 
-    #[test]
-    fn dist_to_sim_l2() {
-        // Distance 0 → similarity 1.0
-        assert!((dist_to_sim(DistanceMetric::L2, 0.0) - 1.0).abs() < f32::EPSILON);
-        // Distance 1 → similarity 0.5
-        assert!((dist_to_sim(DistanceMetric::L2, 1.0) - 0.5).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn dist_to_sim_cosine() {
-        // Cosine distance 0 (identical) → similarity 1.0
-        assert!((dist_to_sim(DistanceMetric::Cosine, 0.0) - 1.0).abs() < f32::EPSILON);
-        // Cosine distance 0.1 → similarity 0.9
-        assert!((dist_to_sim(DistanceMetric::Cosine, 0.1) - 0.9).abs() < f32::EPSILON);
-    }
+    // Distance→similarity conversion is canonically tested in hirn-core
+    // (`DistanceMetric::distance_to_similarity`); the per-operator copies were
+    // consolidated to that single source of truth.
 
     #[tokio::test]
     async fn execute_empty_input() {

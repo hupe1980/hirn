@@ -227,7 +227,13 @@ pub async fn compute_rpe(
                             for j in 0..dists.len() {
                                 if !dists.is_null(j) {
                                     let dist = dists.value(j);
-                                    let sim = 1.0 / (1.0 + dist);
+                                    // The search runs with the default (Cosine)
+                                    // metric, so convert with the canonical
+                                    // metric-aware formula (was hardcoded L2
+                                    // `1/(1+d)`, wrong for cosine `_distance` —
+                                    // R-75).
+                                    let sim = hirn_core::DistanceMetric::default()
+                                        .distance_to_similarity(dist);
                                     max_sim = max_sim.max(sim);
                                 }
                             }
@@ -348,7 +354,10 @@ pub async fn batch_vector_search_max_sim(
                             {
                                 for j in 0..dists.len() {
                                     if !dists.is_null(j) {
-                                        let sim = 1.0 / (1.0 + dists.value(j));
+                                        // Default (Cosine) metric — canonical
+                                        // conversion, not hardcoded L2 (R-75).
+                                        let sim = hirn_core::DistanceMetric::default()
+                                            .distance_to_similarity(dists.value(j));
                                         max_sims[i] = max_sims[i].max(sim);
                                     }
                                 }

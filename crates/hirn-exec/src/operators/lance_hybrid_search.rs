@@ -940,25 +940,13 @@ fn score_values(
         .and_then(|column| column.as_any().downcast_ref::<Float32Array>())
     {
         return Ok((0..distances.len())
-            .map(|idx| distance_to_similarity(metric, distances.value(idx)))
+            .map(|idx| metric.distance_to_similarity(distances.value(idx)))
             .collect());
     }
 
     Err(hirn_storage::HirnDbError::InvalidArgument(
         "search batch missing `_relevance_score`, `_score`, or `_distance`".to_string(),
     ))
-}
-
-fn distance_to_similarity(metric: DistanceMetric, distance: f32) -> f32 {
-    match metric {
-        DistanceMetric::Cosine => (1.0 - distance).clamp(0.0, 1.0),
-        // Lance stores dot-product distance as `1 - dot_product` for
-        // unit-normalized vectors, so `similarity = 1 - distance`.
-        // Using `(-distance)` was wrong (produced negative values for typical
-        // distances in (0, 1)) — N-M11.
-        DistanceMetric::DotProduct => (1.0 - distance).clamp(0.0, 1.0),
-        DistanceMetric::L2 => 1.0 / (1.0 + distance),
-    }
 }
 
 #[cfg(test)]

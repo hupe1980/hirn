@@ -405,6 +405,80 @@ async fn lance_fts_prefilter_scopes_to_namespace() {
     }
 }
 
+/// D1: with the Lance 9 FTS-prefilter fix, a namespace-scoped FTS search must
+/// fill the FULL `limit` from the scoped namespace even when a different
+/// namespace holds far more matching rows.
+///
+/// This strengthens the R-07 regression to the `>limit` cross-namespace case:
+/// namespace "a" holds MORE than `limit` matches and namespace "b" holds even
+/// more noise. Under Lance's old post-filter behaviour, BM25 would take the
+/// global top-`limit` (dominated by "b") and only then drop out-of-namespace
+/// rows, returning far fewer than `limit`. Because `scanner.prefilter(true)`
+/// now restricts the BM25 candidate set to matching rows FIRST, the search must
+/// return exactly `limit` rows, all from namespace "a".
+#[tokio::test(flavor = "multi_thread")]
+async fn lance_fts_prefilter_fills_full_limit_within_namespace() {
+    let (_dir, store) = setup().await;
+
+    let mut ids = Vec::new();
+    let mut texts = Vec::new();
+    let mut namespaces = Vec::new();
+    // 50 matching rows in namespace "b" (the post-filter noise).
+    for i in 0..50u64 {
+        ids.push(i);
+        texts.push("lance vector database".to_string());
+        namespaces.push("b".to_string());
+    }
+    // 20 matching rows in namespace "a" — MORE than the limit of 10.
+    for i in 50..70u64 {
+        ids.push(i);
+        texts.push("lance vector database".to_string());
+        namespaces.push("a".to_string());
+    }
+    let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+    let ns_refs: Vec<&str> = namespaces.iter().map(|s| s.as_str()).collect();
+    store
+        .append("fts_ns_full", id_text_ns_batch(&ids, &text_refs, &ns_refs))
+        .await
+        .unwrap();
+
+    store
+        .create_index("fts_ns_full", IndexConfig::bm25(vec!["text".to_string()]))
+        .await
+        .unwrap();
+
+    let limit = 10;
+    let results = store
+        .fts_search(
+            "fts_ns_full",
+            FtsSearchOptions {
+                columns: vec!["text".to_string()],
+                query: "lance".to_string(),
+                limit,
+                filter: Some("namespace IN ('a')".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+
+    let total: usize = results.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total, limit,
+        "prefilter must fill the full limit from namespace A, not be swamped by B"
+    );
+    for batch in &results {
+        let ns = batch
+            .column_by_name("namespace")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            assert_eq!(ns.value(i), "a", "no out-of-namespace row may leak");
+        }
+    }
+}
+
 // ── Vector Search Tests ──
 
 #[tokio::test(flavor = "multi_thread")]

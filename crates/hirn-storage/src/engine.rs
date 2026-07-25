@@ -1025,9 +1025,9 @@ mod tests {
                 .iter()
                 .any(|config| {
                     config.columns == vec!["content_hash".to_string()]
-                        && config.index_type == IndexType::BTree
+                        && config.index_type == IndexType::BloomFilter
                 }),
-            "_embed_cache.content_hash must have a BTree index"
+            "_embed_cache.content_hash must have a BloomFilter index"
         );
         assert!(
             store

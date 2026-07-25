@@ -903,7 +903,7 @@ impl HirnDB {
                             Err(_) => continue,
                         };
 
-                        let sim = distance_to_similarity(metric, distance);
+                        let sim = metric.distance_to_similarity(distance);
 
                         let scores = doc_token_scores
                             .entry(uid)
@@ -1145,22 +1145,12 @@ fn extract_id_similarity_pairs(
                 // _relevance_score is already a 0..1 similarity from RRF fusion.
                 raw
             } else {
-                distance_to_similarity(metric, raw)
+                metric.distance_to_similarity(raw)
             };
             results.push((id.as_ulid().0, sim));
         }
     }
     Ok(results)
-}
-
-/// Convert a raw distance value to a 0..1 similarity score.
-fn distance_to_similarity(metric: DistanceMetric, dist: f32) -> f32 {
-    match metric {
-        DistanceMetric::Cosine => (1.0 - dist).clamp(0.0, 1.0),
-        // Lance stores dot-product distance as `1 - dot_product` (N-M11).
-        DistanceMetric::DotProduct => (1.0 - dist).clamp(0.0, 1.0),
-        DistanceMetric::L2 => 1.0 / (1.0 + dist),
-    }
 }
 
 #[cfg(test)]
