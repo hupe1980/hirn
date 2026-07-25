@@ -39,4 +39,5 @@ FINDINGS.md
 __pycache__/
 _hirn.cpython-*.so
 embeddings/locomo_embeddings.json
+embeddings/longmemeval_oracle_embeddings.json
 crates/hirn-python/dist/
