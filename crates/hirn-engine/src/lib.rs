@@ -70,12 +70,12 @@ pub use consolidation::{
     generate_community_summaries, retention_score,
 };
 pub use db::{
-    AdminView, AuditChainVerification, CausalView, CrossAgentConsolidationResult, DbStats,
-    EpisodicFilter, EpisodicView, GraphView, HirnDB, LayerCounts, MutationWriteContract,
+    AbaResolution, AdminView, AuditChainVerification, CausalView, CrossAgentConsolidationResult,
+    DbStats, EpisodicFilter, EpisodicView, GraphView, HirnDB, LayerCounts, MutationWriteContract,
     MutationWriteGuarantee, NamespaceView, PolicyView, PrefetchStats, ProceduralView, PurgeReport,
     QueryView, RecallView, SemanticFilter, SemanticMerge, SemanticMergeOutcome, SemanticOverride,
     SemanticRetraction, SemanticSupersession, SemanticUpdate, SemanticView, WorkingView,
-    mutation_write_contracts,
+    mutation_write_contracts, resolve_aba, resolve_aba_multi,
 };
 pub use diagnostics::{QueryDiagnostics, QueryId};
 pub use error::StoreError;
@@ -119,6 +119,7 @@ pub use retrieval::explanation::{
     RetrievalExplanation, RetrievalPolicyScope, RetrievalPolicySummary,
     RetrievalSuppressionSummary, RetrievedRecordExplanation, ThinkExplanation,
 };
+pub use retrieval::query_intent::{ViewKind, ViewWeights, classify_query};
 pub use scoring::{ScoreBreakdown, ScoringWeights};
 pub use security::{
     CorruptionDefense, CorruptionDefenseConfig, QuarantineApprovalOutcome, QuarantineEntry,
@@ -127,7 +128,8 @@ pub use security::{
 pub use think::ThinkBuilder;
 pub use tools::{
     IntrospectionResult, LinkRequest, MemoryAgent, MemoryToolkit, RecallOptions, RecallRecord,
-    StoreRequest, UpdateRequest,
+    RouteWeights, RoutedRecall, StoreRequest, TimelineEntryView, TimelineOptions, TimelineResult,
+    UpdateRequest,
 };
 pub use trace::{TraceBuilder, TraceResult};
 pub use watch::{WatchFilter, WatchSubscription};

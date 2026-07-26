@@ -1724,6 +1724,8 @@ mod tests {
             EdgeRelation::SimilarTo,
             EdgeRelation::Inhibits,
             EdgeRelation::ParticipatesIn,
+            EdgeRelation::Enables,
+            EdgeRelation::Prevents,
         ] {
             // Remove all edges first.
             let edge_ids: Vec<_> = pg.all_edges().iter().map(|e| e.id).collect();

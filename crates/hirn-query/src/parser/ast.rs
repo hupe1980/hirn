@@ -1290,6 +1290,8 @@ pub fn parse_edge_relation(s: &str) -> Option<EdgeRelation> {
         ("inhibits", EdgeRelation::Inhibits),
         ("participates_in", EdgeRelation::ParticipatesIn),
         ("participatesin", EdgeRelation::ParticipatesIn),
+        ("enables", EdgeRelation::Enables),
+        ("prevents", EdgeRelation::Prevents),
     ];
     TABLE
         .iter()

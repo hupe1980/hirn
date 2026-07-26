@@ -17,9 +17,6 @@ pub mod operators;
 pub mod planner;
 pub mod rules;
 
-#[cfg(test)]
-pub(crate) mod test_utils;
-
 pub use extensions::{
     ContextAssemblyRuntime, GraphActivationOutput, GraphCausalChainRow, GraphReadRuntime,
     GraphTraverseRow, HirnSessionExt, QueryReadRuntime, RegisteredContextAssemblyRuntime,

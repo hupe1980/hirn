@@ -81,6 +81,8 @@ mod tests {
             Just(EdgeRelation::SimilarTo),
             Just(EdgeRelation::Inhibits),
             Just(EdgeRelation::ParticipatesIn),
+            Just(EdgeRelation::Enables),
+            Just(EdgeRelation::Prevents),
         ]
     }
 

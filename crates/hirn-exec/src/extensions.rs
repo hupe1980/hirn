@@ -29,7 +29,6 @@ use parking_lot::RwLock;
 use crate::operators::ActivationMode;
 use crate::operators::CoRetrievalQueue;
 use crate::operators::SearchNumericFilter;
-use crate::operators::nli_contradiction::NliClassifier;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct GraphActivationOutput {
@@ -79,6 +78,8 @@ pub const fn edge_relation_query_str(relation: EdgeRelation) -> &'static str {
         EdgeRelation::SimilarTo => "similar_to",
         EdgeRelation::Inhibits => "inhibits",
         EdgeRelation::ParticipatesIn => "participates_in",
+        EdgeRelation::Enables => "enables",
+        EdgeRelation::Prevents => "prevents",
     }
 }
 
@@ -389,20 +390,6 @@ pub struct HirnSessionExt {
     /// Query-scoped recall/search bindings used by compiled search operators.
     recall_search_binding: Option<RecallSearchBinding>,
 
-    /// Shared historical RPE population statistics (Welford's online algorithm).
-    ///
-    /// Seeded from `WriteRuntime` at session setup; updated by `RpeScoreExec`
-    /// after each batch so that z-scores compare against the full historical
-    /// distribution, not just the current write batch (N-H08).
-    pub rpe_population_stats: Arc<RwLock<hirn_core::WelfordStats>>,
-
-    /// NLI classifier for `InterferenceDetectorExec` Check 3.
-    ///
-    /// `None` — operator uses its own default (`HeuristicNliClassifier`).
-    /// `Some(clf)` — operator uses the injected classifier, enabling ONNX upgrade
-    /// without recompiling or changing `InterferenceConfig`.
-    nli_classifier: Option<Arc<dyn NliClassifier>>,
-
     /// Shared co-retrieval queue drained by the engine after a recall (R-19).
     ///
     /// `HebbianBufferExec` pushes co-retrieved memory-id pairs here during plan
@@ -420,7 +407,7 @@ const _: () = {
     assert_send_sync::<HirnSessionExt>();
 };
 
-#[allow(clippy::missing_fields_in_debug)] // rpe_population_stats and recall_search_binding intentionally omitted (lock + query-scoped)
+#[allow(clippy::missing_fields_in_debug)] // recall_search_binding intentionally omitted (query-scoped)
 impl std::fmt::Debug for HirnSessionExt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HirnSessionExt")
@@ -440,16 +427,7 @@ impl std::fmt::Debug for HirnSessionExt {
                 "has_context_assembly_runtime",
                 &self.context_assembly_runtime_key.is_some(),
             )
-            .field(
-                "nli_classifier_backend",
-                &self
-                    .nli_classifier
-                    .as_ref()
-                    .map(|c| c.backend_name())
-                    .unwrap_or("default"),
-            )
-            // rpe_population_stats and recall_search_binding omitted from Debug
-            // (locking during format is undesirable; binding is query-scoped).
+            // recall_search_binding omitted from Debug (query-scoped).
             .finish_non_exhaustive()
     }
 }
@@ -474,22 +452,8 @@ impl HirnSessionExt {
             query_read_runtime_key: None,
             context_assembly_runtime_key: None,
             recall_search_binding: None,
-            rpe_population_stats: Arc::new(RwLock::new(hirn_core::WelfordStats::new())),
-            nli_classifier: None,
             co_retrieval_queue: Arc::new(crossbeam_queue::SegQueue::new()),
         }
-    }
-
-    /// Seed historical RPE population statistics (from `WriteRuntime`).
-    ///
-    /// Allows `RpeScoreExec` to z-score against the full historical
-    /// distribution instead of only the current write batch (N-H08).
-    pub fn with_rpe_population_stats(
-        mut self,
-        stats: Arc<RwLock<hirn_core::WelfordStats>>,
-    ) -> Self {
-        self.rpe_population_stats = stats;
-        self
     }
 
     /// Set the authenticated agent identity.
@@ -513,23 +477,6 @@ impl HirnSessionExt {
     /// pairs into it; the engine drains it after recall.
     pub fn co_retrieval_queue(&self) -> CoRetrievalQueue {
         Arc::clone(&self.co_retrieval_queue)
-    }
-
-    /// Inject an NLI classifier for `InterferenceDetectorExec` Check 3.
-    ///
-    /// Use this to upgrade from the default `HeuristicNliClassifier` to a
-    /// DeBERTa-MNLI ONNX model at database open time, without changing any
-    /// `InterferenceConfig` fields.
-    pub fn with_nli_classifier(mut self, clf: Arc<dyn NliClassifier>) -> Self {
-        self.nli_classifier = Some(clf);
-        self
-    }
-
-    /// Returns the injected NLI classifier, if any.
-    ///
-    /// `None` — `InterferenceDetectorExec` will use its own default.
-    pub fn nli_classifier(&self) -> Option<Arc<dyn NliClassifier>> {
-        self.nli_classifier.clone()
     }
 
     /// Set the storage backend for operators needing vector search.

@@ -1,44 +1,14 @@
-//! `SvoExtractionExec` — Subject-Verb-Object event extraction (Chronos).
+//! Subject-Verb-Object event extraction (Chronos).
 //!
-//! Extracts structured SVO events from incoming memories and indexes them
-//! by calendar time for temporal queries like "what happened in March?".
+//! Regex-based SVO extraction used by the imperative write path
+//! ([`write_path`](../../../hirn_engine/db/write_path)) to derive structured
+//! events from incoming memory content for temporal queries like
+//! "what happened in March?".
 //!
-//! Pass-through operator: input batch is emitted unchanged plus an
-//! `svo_count (Int32)` column indicating how many SVO events were extracted.
-
-use std::fmt;
-use std::sync::Arc;
-
-use arrow_array::{Array, Int32Array, RecordBatch, StringArray};
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use datafusion_common::Result;
-use datafusion_execution::{SendableRecordBatchStream, TaskContext};
-use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion_physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
-
-use crate::extensions::HirnSessionExt;
-
-/// Configuration for SVO extraction.
-#[derive(Debug, Clone)]
-pub struct SvoConfig {
-    /// Minimum confidence threshold for SVO events (default: 0.5).
-    pub confidence_threshold: f32,
-    /// Whether to use regex fallback when LLM is unavailable (default: true).
-    pub regex_fallback: bool,
-    /// Whether SVO extraction is enabled (default: true).
-    pub enabled: bool,
-}
-
-impl Default for SvoConfig {
-    fn default() -> Self {
-        Self {
-            confidence_threshold: 0.5,
-            regex_fallback: true,
-            enabled: true,
-        }
-    }
-}
+//! This was previously fronted by a `SvoExtractionExec` DataFusion operator
+//! that was never emitted into any compiled plan (R-20b). The operator was
+//! retired; the pure extraction logic (`extract_svo_regex`) lives on because
+//! the write path calls it directly.
 
 /// A single extracted SVO event.
 #[derive(Debug, Clone)]
@@ -50,187 +20,6 @@ pub struct SvoEvent {
     pub time_end: Option<String>,
     pub location: Option<String>,
     pub confidence: f32,
-}
-
-/// DataFusion operator for SVO event extraction from incoming memories.
-///
-/// Passes through input batches, appending `svo_count` column.
-/// Extracted events are written to the `svo_events` dataset via storage.
-#[derive(Debug)]
-pub struct SvoExtractionExec {
-    input: Arc<dyn ExecutionPlan>,
-    config: SvoConfig,
-    schema: SchemaRef,
-    properties: Arc<PlanProperties>,
-}
-
-impl SvoExtractionExec {
-    pub fn new(input: Arc<dyn ExecutionPlan>, config: SvoConfig) -> Self {
-        let mut fields: Vec<Arc<Field>> = input.schema().fields().iter().cloned().collect();
-        fields.push(Arc::new(Field::new("svo_count", DataType::Int32, false)));
-        let schema = Arc::new(Schema::new(fields));
-
-        let properties = Arc::new(PlanProperties::new(
-            datafusion_physical_expr::EquivalenceProperties::new(schema.clone()),
-            datafusion_physical_plan::Partitioning::UnknownPartitioning(1),
-            EmissionType::Final,
-            Boundedness::Bounded,
-        ));
-
-        Self {
-            input,
-            config,
-            schema,
-            properties,
-        }
-    }
-
-    pub fn config(&self) -> &SvoConfig {
-        &self.config
-    }
-}
-
-impl DisplayAs for SvoExtractionExec {
-    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "SvoExtractionExec: confidence_threshold={}, regex_fallback={}, enabled={}",
-            self.config.confidence_threshold, self.config.regex_fallback, self.config.enabled
-        )
-    }
-}
-
-impl ExecutionPlan for SvoExtractionExec {
-    fn name(&self) -> &str {
-        "SvoExtractionExec"
-    }
-
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
-    }
-
-    fn properties(&self) -> &Arc<PlanProperties> {
-        &self.properties
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![&self.input]
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(Self::new(
-            children[0].clone(),
-            self.config.clone(),
-        )))
-    }
-
-    fn execute(
-        &self,
-        partition: usize,
-        context: Arc<TaskContext>,
-    ) -> Result<SendableRecordBatchStream> {
-        let input_stream = self.input.execute(partition, context.clone())?;
-        let schema = self.schema.clone();
-        let config = self.config.clone();
-
-        let session_ctx = context
-            .session_config()
-            .options()
-            .extensions
-            .get::<HirnSessionExt>();
-        let storage = session_ctx.and_then(|ext| ext.storage_arc());
-
-        let stream = futures::stream::once(async move {
-            use futures::StreamExt;
-
-            let mut batches = Vec::new();
-            let mut input_stream = input_stream;
-            while let Some(batch_result) = input_stream.next().await {
-                batches.push(batch_result?);
-            }
-
-            if batches.is_empty() {
-                let columns: Vec<Arc<dyn Array>> = schema
-                    .fields()
-                    .iter()
-                    .map(|f| arrow_array::new_empty_array(f.data_type()))
-                    .collect();
-                return RecordBatch::try_new(schema, columns).map_err(Into::into);
-            }
-
-            let merged =
-                arrow_select::concat::concat_batches(&batches[0].schema(), batches.iter())?;
-            let n = merged.num_rows();
-
-            let content_col = merged.column_by_name("content");
-            let contents = content_col.and_then(|c| c.as_any().downcast_ref::<StringArray>());
-
-            let id_col = merged.column_by_name("id");
-            let ids = id_col.and_then(|c| c.as_any().downcast_ref::<StringArray>());
-
-            let mut counts = Vec::with_capacity(n);
-
-            if !config.enabled {
-                counts.resize(n, 0i32);
-            } else {
-                // Collect all SVO events across all rows for batch write.
-                let ns_col = merged.column_by_name("namespace");
-                let namespaces = ns_col.and_then(|c| c.as_any().downcast_ref::<StringArray>());
-                let mut all_events: Vec<(String, String, SvoEvent)> = Vec::new();
-
-                for i in 0..n {
-                    let content =
-                        contents.and_then(|c| if c.is_null(i) { None } else { Some(c.value(i)) });
-                    let source_id =
-                        ids.and_then(|c| if c.is_null(i) { None } else { Some(c.value(i)) });
-                    let namespace = namespaces
-                        .and_then(|c| if c.is_null(i) { None } else { Some(c.value(i)) })
-                        .unwrap_or("default");
-
-                    match (content, source_id) {
-                        (Some(text), Some(sid)) => {
-                            let events = extract_svo_regex(text, config.confidence_threshold);
-                            let count = events.len();
-                            for event in events {
-                                all_events.push((sid.to_string(), namespace.to_string(), event));
-                            }
-                            counts.push(count as i32);
-                        }
-                        (Some(_text), None) => {
-                            // No source ID → events can't be stored (no FK).
-                            // Report 0 to avoid misleading callers about stored counts.
-                            tracing::debug!(row = i, "Skipping SVO extraction: null source ID");
-                            counts.push(0);
-                        }
-                        _ => counts.push(0),
-                    }
-                }
-
-                // Batch write SVO events to storage.
-                if !all_events.is_empty() {
-                    if let Some(ref storage) = storage {
-                        if let Err(e) = write_svo_events(storage.as_ref(), &all_events).await {
-                            tracing::warn!(error = %e, events = all_events.len(), "Failed to write SVO events");
-                        }
-                    }
-                }
-            }
-
-            let count_col = Int32Array::from(counts);
-            let mut columns: Vec<Arc<dyn Array>> = merged.columns().to_vec();
-            columns.push(Arc::new(count_col));
-
-            RecordBatch::try_new(schema, columns).map_err(Into::into)
-        });
-
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            self.schema.clone(),
-            stream,
-        )))
-    }
 }
 
 /// Extract SVO events using regex patterns (fallback mode).
@@ -416,7 +205,12 @@ fn extract_temporal(text: &str) -> Option<String> {
         if lower.contains(month) {
             // Try to find "Month Day" or "Month Day, Year" pattern.
             if let Some(pos) = lower.find(month) {
-                let after = &text[pos..text.len().min(pos + month.len() + 15)];
+                // DR-H7 FIX: `pos` is a byte offset into `lower`, not `text`
+                // (`to_lowercase()` can change byte lengths, e.g. U+212A→'k'), so
+                // slicing `text` could land mid-code-point and panic on the write
+                // path. Slice `lower` at the known-good boundary `pos` and take a
+                // char-bounded window instead of a raw byte range.
+                let after: String = lower[pos..].chars().take(month.len() + 15).collect();
                 return Some(after.trim().to_string());
             }
         }
@@ -474,54 +268,9 @@ fn compute_confidence(subject: &str, verb: &str, object: &str) -> f32 {
     score.min(1.0)
 }
 
-/// Write extracted SVO events to storage in a single batch.
-async fn write_svo_events(
-    storage: &dyn hirn_storage::PhysicalStore,
-    events: &[(String, String, SvoEvent)],
-) -> std::result::Result<(), hirn_storage::HirnDbError> {
-    let mut records = Vec::with_capacity(events.len());
-    let mut namespaces = Vec::with_capacity(events.len());
-
-    for (source_id, namespace, event) in events {
-        let source_id = hirn_core::id::MemoryId::parse(source_id)
-            .map_err(|e| hirn_storage::HirnDbError::InvalidArgument(e.to_string()))?;
-        records.push(hirn_core::svo_event::SvoEvent::from_extraction(
-            event.subject.clone(),
-            event.verb.clone(),
-            event.object.clone(),
-            event.time_start.clone(),
-            event.time_end.clone(),
-            event.confidence,
-            vec![source_id],
-        ));
-        namespaces.push(namespace.as_str());
-    }
-
-    let embeddings = vec![None; records.len()];
-    let batch = hirn_storage::datasets::svo_events::to_batch_with_namespaces(
-        &records,
-        &embeddings,
-        &namespaces,
-        0,
-    )?;
-
-    storage
-        .append(hirn_storage::datasets::svo_events::DATASET_NAME, batch)
-        .await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_schema::Field;
-
-    #[test]
-    fn default_config() {
-        let config = SvoConfig::default();
-        assert!((config.confidence_threshold - 0.5).abs() < f32::EPSILON);
-        assert!(config.regex_fallback);
-        assert!(config.enabled);
-    }
 
     #[test]
     fn extract_svo_alice_deployed() {
@@ -561,7 +310,7 @@ mod tests {
             "Alice deployed the release on March 15th. Bob fixed the login bug yesterday.",
             0.5,
         );
-        assert!(events.len() >= 1);
+        assert!(!events.is_empty());
     }
 
     #[test]
@@ -582,61 +331,5 @@ mod tests {
         let t = extract_temporal("I saw this yesterday at the park.");
         assert!(t.is_some());
         assert_eq!(t.unwrap(), "yesterday");
-    }
-
-    #[tokio::test]
-    async fn execute_empty_input() {
-        use futures::StreamExt;
-
-        let empty_schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Utf8, false),
-            Field::new("content", DataType::Utf8, false),
-        ]));
-        let empty = Arc::new(datafusion_physical_plan::empty::EmptyExec::new(
-            empty_schema,
-        ));
-        let exec = SvoExtractionExec::new(empty, SvoConfig::default());
-        let ctx = Arc::new(TaskContext::default());
-        let mut stream = exec.execute(0, ctx).unwrap();
-        let batch = stream.next().await.unwrap().unwrap();
-        assert_eq!(batch.num_rows(), 0);
-        assert!(batch.schema().field_with_name("svo_count").is_ok());
-    }
-
-    #[tokio::test]
-    async fn execute_disabled_produces_zero() {
-        use crate::test_utils::MemoryBatchExec;
-        use futures::StreamExt;
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Utf8, false),
-            Field::new("content", DataType::Utf8, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(StringArray::from(vec!["id1"])),
-                Arc::new(StringArray::from(vec!["Alice deployed v2 on March 15th"])),
-            ],
-        )
-        .unwrap();
-
-        let config = SvoConfig {
-            enabled: false,
-            ..Default::default()
-        };
-        let mem = MemoryBatchExec::new(schema, vec![batch]);
-        let exec = SvoExtractionExec::new(Arc::new(mem), config);
-        let ctx = Arc::new(TaskContext::default());
-        let mut stream = exec.execute(0, ctx).unwrap();
-        let result = stream.next().await.unwrap().unwrap();
-
-        let count_col = result
-            .column_by_name("svo_count")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        assert_eq!(count_col.value(0), 0);
     }
 }

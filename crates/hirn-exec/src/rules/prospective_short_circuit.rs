@@ -414,6 +414,7 @@ mod tests {
             temporal_end_ms: None,
             temporal_expansion: false,
             temporal_boost: 1.25,
+            as_of: None,
         }
     }
 

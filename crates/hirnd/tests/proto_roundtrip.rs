@@ -1470,6 +1470,8 @@ fn roundtrip_all_edge_relations() {
         EdgeRelation::SimilarTo,
         EdgeRelation::Inhibits,
         EdgeRelation::ParticipatesIn,
+        EdgeRelation::Enables,
+        EdgeRelation::Prevents,
     ] {
         let msg = ConnectRequest {
             source: Some(sample_id("a")),

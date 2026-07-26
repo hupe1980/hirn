@@ -875,19 +875,37 @@ impl PolicyEngine {
         let authorizer = Authorizer::new();
         let response = authorizer.is_authorized(&cedar_request, &cedar.policy_set, &cedar.entities);
 
+        let errors: Vec<String> = response
+            .diagnostics()
+            .errors()
+            .map(|e| e.to_string())
+            .collect();
+
+        // DR-H1 FIX: fail CLOSED on evaluation errors. Cedar skips any policy
+        // that errors during evaluation, so an erroring `forbid` would be
+        // silently dropped and a still-matching `permit` would yield Allow — a
+        // silent authorization bypass. Any evaluation error therefore forces a
+        // deny (and is logged), regardless of the raw decision.
+        if !errors.is_empty() {
+            tracing::error!(
+                agent_id = %request.agent_id,
+                action = %request.action,
+                realm = %request.realm,
+                namespace = %request.namespace,
+                errors = ?errors,
+                "Cedar policy evaluation errors — failing closed (deny)"
+            );
+        }
+
         let mut decision = AuthzDecision {
-            allowed: response.decision() == CedarDecision::Allow,
+            allowed: response.decision() == CedarDecision::Allow && errors.is_empty(),
             policy_ids: response
                 .diagnostics()
                 .reason()
                 .map(|id| id.to_string())
                 .collect(),
             reasons: Vec::new(),
-            errors: response
-                .diagnostics()
-                .errors()
-                .map(|e| e.to_string())
-                .collect(),
+            errors,
         };
 
         if !decision.allowed {

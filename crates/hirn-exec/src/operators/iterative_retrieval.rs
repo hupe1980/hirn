@@ -384,11 +384,27 @@ fn recall_rows_from_batch(
                     }
                 },
                 namespace: namespaces.value(row).to_string(),
-                score: scores.value(row),
+                // DR-M-qry2 FIX: score/importance/access_count are nullable in
+                // `recall_schema()` (community/global-merge rows carry NULLs);
+                // read them defensively like `recall_merge.rs` rather than calling
+                // `.value()` on a NULL and feeding garbage into PRF term-weighting.
+                score: if scores.is_null(row) {
+                    0.0
+                } else {
+                    scores.value(row)
+                },
                 temporal_ms: temporal_ms.value(row),
                 created_at_ms: created_at_ms.value(row),
-                importance: importances.value(row),
-                access_count: access_counts.value(row),
+                importance: if importances.is_null(row) {
+                    0.0
+                } else {
+                    importances.value(row)
+                },
+                access_count: if access_counts.is_null(row) {
+                    0
+                } else {
+                    access_counts.value(row)
+                },
                 surprise: optional_f32_value(surprises, row),
                 evidence_count: optional_u32_value(evidence_counts, row),
                 invocation_count: optional_u64_value(invocation_counts, row),
@@ -861,6 +877,7 @@ mod tests {
                 temporal_end_ms: None,
                 temporal_expansion: false,
                 temporal_boost: 1.25,
+                as_of: None,
             },
         ));
 

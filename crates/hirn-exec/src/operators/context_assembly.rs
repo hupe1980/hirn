@@ -84,6 +84,15 @@ impl ExecutionPlan for ContextAssemblyExec {
         vec![&self.input]
     }
 
+    /// DR-H9 FIX: context assembly must see ALL candidate rows. Without a
+    /// single-partition requirement, EnforceDistribution may insert a
+    /// `RepartitionExec` below this operator and `execute(0, …)` would then see
+    /// only ~1/N of the candidates, silently dropping THINK context. Force the
+    /// planner to coalesce inputs into one partition first.
+    fn required_input_distribution(&self) -> Vec<datafusion_physical_expr::Distribution> {
+        vec![datafusion_physical_expr::Distribution::SinglePartition]
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,

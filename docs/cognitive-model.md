@@ -119,8 +119,8 @@ during retrieval.
 
 **Hirn implementation:**
 - Stored in Lance `episodic` dataset (time-series ordered by `timestamp_ms`)
-- `SVO events` extracted at write time via `SvoExtractionExec` (Chronos subsystem) — indexes who/what/when
-- `ProspectiveImplications` generated at write time via `ProspectiveIndexingExec` (Kumiho subsystem) — enables future-query short-circuiting
+- `SVO events` extracted at write time by the imperative write path (`extract_svo_regex`, Chronos subsystem) — indexes who/what/when
+- `ProspectiveImplications` generated at write time by the imperative write path (Kumiho subsystem) — enables future-query short-circuiting
 - **RPE-gated admission** (see below) — controls write enrichment depth
 - `TemporalNext` edges in the graph link episodes in namespace-local arrival order for temporal contiguity retrieval
 - Reconsolidation window: after retrieval, a labile window (default: 1 hour) re-opens the memory to correction
@@ -220,9 +220,11 @@ are discarded.
 4. **Causal discovery:** temporal co-occurrence heuristic (labelled `temporal_granger`). Note: a true lagged-predictability Granger test, LLM validation, and Bayesian accumulation are **roadmap**, not yet wired into the pipeline.
 5. **Semantic upsert + memory evolution:** Results written to the `semantic` dataset; existing records are corroborated (A-MEM evolution); superseded episodes are archived.
 
-> **NLI contradiction detection (DeBERTa-MNLI) and ABA/AGM conflict resolution** exist as HirnQL
-> query operators (`NliContradictionExec`, `AbaReconsolidationExec`), but are **not** stages of the
-> automatic consolidation pipeline. Treat them as an "implemented preview" query surface.
+> **Contradiction detection and ABA/AGM conflict resolution** run in the engine's imperative
+> paths — admission `ContradictionGate` + `Contradicts` edges on write, `detect_conflicts_for_recall`
+> for `WITH CONFLICTS`, and `hirn_engine::resolve_aba` + `CausalView::apply_aba_resolution` for
+> reconsolidation. (The former `NliContradictionExec`/`AbaReconsolidationExec` operators were never
+> emitted into a compiled plan and have been retired.)
 
 ### Semantic → Archived
 
@@ -462,10 +464,12 @@ Hirn implements the full three-rung causal hierarchy (Pearl, 2018):
 
 **Causal discovery** during consolidation currently uses a temporal co-occurrence heuristic
 (edges labelled `temporal_granger`); a true Granger lagged-predictability test, LLM validation, and
-Bayesian evidence accumulation are roadmap. The `NliContradictionExec` operator detects
-contradictions via DeBERTa-MNLI (5–15ms/pair) and `AbaReconsolidationExec` resolves them via formal
-argumentation (ABA) + AGM belief revision — both are **query operators** ("implemented preview"),
-not automatic consolidation stages.
+Bayesian evidence accumulation are roadmap. **Contradiction detection** runs imperatively (admission
+`ContradictionGate` + `Contradicts` edges on write; `detect_conflicts_for_recall` for `WITH
+CONFLICTS`), and **ABA/AGM conflict resolution** is a decide-then-apply engine capability
+(`hirn_engine::resolve_aba` → `CausalView::apply_aba_resolution`) — the former
+`NliContradictionExec`/`AbaReconsolidationExec` operators were never emitted into a plan and have
+been retired.
 
 ---
 

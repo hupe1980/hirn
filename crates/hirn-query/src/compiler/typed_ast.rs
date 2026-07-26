@@ -1024,6 +1024,8 @@ fn parse_edge_relation(s: &str) -> HirnResult<EdgeRelation> {
         "similar_to" | "similarto" => Ok(EdgeRelation::SimilarTo),
         "inhibits" => Ok(EdgeRelation::Inhibits),
         "participates_in" | "participatesin" => Ok(EdgeRelation::ParticipatesIn),
+        "enables" => Ok(EdgeRelation::Enables),
+        "prevents" => Ok(EdgeRelation::Prevents),
         other => Err(HirnError::InvalidInput(format!(
             "unknown edge relation: '{other}'"
         ))),

@@ -1,3 +1,4 @@
+mod aba;
 mod admission_runtime;
 mod cross_agent;
 mod episodic;
@@ -22,6 +23,7 @@ mod working;
 pub mod write_path;
 mod write_runtime;
 
+pub use aba::{AbaResolution, resolve_aba, resolve_aba_multi};
 pub use cross_agent::PurgeReport;
 pub use graph_runtime::PrefetchStats;
 pub use mutation_contract::{
@@ -567,8 +569,7 @@ impl HirnDB {
         self.storage_runtime.path()
     }
 
-    /// Get the DataFusion `SessionContext` with scoring UDFs and
-    /// `HirnSessionExt` pre-registered.
+    /// Get the DataFusion `SessionContext` with `HirnSessionExt` pre-registered.
     #[must_use]
     pub fn session(&self) -> &datafusion::prelude::SessionContext {
         self.query_runtime.session()
@@ -666,8 +667,8 @@ impl HirnDB {
     /// wrapped in the default multimodal router so `multi_content` and
     /// composite auto-embedding use the same configured runtime wrappers.
     /// Also updates the `HirnSessionExt` in the DataFusion `SessionContext`
-    /// so that operators (e.g. `RpeScoreExec`, `ProspectiveIndexingExec`)
-    /// can access the embedder at execution time.
+    /// so that operators (e.g. `LanceHybridSearchExec`) can access the embedder
+    /// at execution time.
     pub fn set_embedder(&self, embedder: Arc<dyn Embedder>) {
         let embedder = provider_runtime::compose_embedder(
             embedder,

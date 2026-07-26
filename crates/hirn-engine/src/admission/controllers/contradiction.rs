@@ -189,7 +189,37 @@ impl AdmissionController for ContradictionGate {
             ..Default::default()
         };
 
-        let response = self.llm.generate_text(&messages, &llm_options).await?;
+        // DR-M-eng3 FIX: bound the LLM call and degrade gracefully. Previously a
+        // hung provider hung the whole write path indefinitely and any transient
+        // error (`?`) failed the admission. Now a timeout or error accepts the
+        // write (contradiction detection is best-effort), mirroring reflection's
+        // fail-open-to-accept posture.
+        let llm_timeout = std::time::Duration::from_secs(10);
+        let response = match tokio::time::timeout(
+            llm_timeout,
+            self.llm.generate_text(&messages, &llm_options),
+        )
+        .await
+        {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "ContradictionGate LLM error — accepting write (degrade gracefully)");
+                return Ok(AdmissionDecision::Accept {
+                    importance_override: None,
+                    flags: Vec::new(),
+                });
+            }
+            Err(_) => {
+                tracing::warn!(
+                    timeout_secs = 10,
+                    "ContradictionGate LLM timed out — accepting write (degrade gracefully)"
+                );
+                return Ok(AdmissionDecision::Accept {
+                    importance_override: None,
+                    flags: Vec::new(),
+                });
+            }
+        };
         let contradiction_idx = Self::parse_response(&response);
 
         if contradiction_idx.is_some() {

@@ -141,7 +141,11 @@ const fn decay_multiplier_for_relation(relation: hirn_core::types::EdgeRelation)
     use hirn_core::types::EdgeRelation;
     match relation {
         // Causal and provenance edges are structurally important — decay very slowly.
-        EdgeRelation::Causes | EdgeRelation::CausedBy | EdgeRelation::DerivedFrom => 0.2,
+        EdgeRelation::Causes
+        | EdgeRelation::CausedBy
+        | EdgeRelation::DerivedFrom
+        | EdgeRelation::Enables
+        | EdgeRelation::Prevents => 0.2,
         // Temporal adjacency is important for episode chains — decay slowly.
         EdgeRelation::TemporalNext => 0.3,
         // Similarity edges are the backbone — moderate decay.

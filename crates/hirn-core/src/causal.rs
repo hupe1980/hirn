@@ -1,8 +1,12 @@
 //! Rich causal edge metadata.
 //!
 //! `CausalEdge` captures strength, confidence, evidence count, confounders,
-//! provenance, and mechanism for `Causes`/`CausedBy` edges in the property
-//! graph. Non-causal edges carry no `CausalEdge`.
+//! provenance, and mechanism for the causal edge family in the property graph.
+//! It applies to every relation for which
+//! [`EdgeRelation::is_causal`](crate::types::EdgeRelation::is_causal) holds —
+//! `Causes`/`CausedBy` and the facilitation/prevention pair `Enables`/`Prevents`
+//! (DR-M-core2) — so the whole causal family is uniformly scorable via
+//! [`CausalEdge::relevance_score`]. Non-causal edges carry no `CausalEdge`.
 
 use serde::{Deserialize, Serialize};
 
@@ -10,7 +14,8 @@ use crate::id::MemoryId;
 
 /// Rich metadata for a causal graph edge.
 ///
-/// Attached to `Causes` and `CausedBy` [`EdgeRelation`](crate::types::EdgeRelation) variants.
+/// Attached to the causal edge family — `Causes`/`CausedBy` and `Enables`/`Prevents`
+/// (any [`EdgeRelation`](crate::types::EdgeRelation) where `is_causal()` holds).
 /// Non-causal edges do not carry this data.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CausalEdge {

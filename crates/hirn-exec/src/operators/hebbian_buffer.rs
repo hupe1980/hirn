@@ -74,6 +74,15 @@ impl ExecutionPlan for HebbianBufferExec {
         vec![&self.input]
     }
 
+    /// DR-M-qry3 FIX: this pass-through records every co-retrieved pair, so it
+    /// must see all rows in one partition. Declaring `UnknownPartitioning(1)`
+    /// while forwarding `execute(partition, …)` would, under a multi-partition
+    /// input, run only partition 0 — dropping other partitions' rows from the
+    /// output AND from Hebbian co-retrieval learning. Require single-partition.
+    fn required_input_distribution(&self) -> Vec<datafusion_physical_expr::Distribution> {
+        vec![datafusion_physical_expr::Distribution::SinglePartition]
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,

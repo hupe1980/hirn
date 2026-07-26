@@ -79,10 +79,17 @@ impl AdmissionController for SurpriseGate {
             });
         }
 
+        // Scope the novelty search to the candidate's OWN namespace. Surprise/RPE
+        // must measure novelty against the agent's own knowledge, not the whole
+        // store: an unscoped search (a) turns admission into a cross-tenant
+        // rejection oracle (agent A's write rejected because agent B holds a
+        // near-duplicate, disclosing B's data) and (b) silently drops memories
+        // that are genuinely novel *to this agent*. Mirrors `DuplicateDetector`.
         let options = VectorSearchOptions {
             query: embedding.clone(),
             column: "embedding".into(),
             limit: 1,
+            filter: Some(super::namespace_eq_filter(&candidate.namespace)),
             ..Default::default()
         };
 
@@ -208,6 +215,7 @@ mod tests {
             .content("existing memory")
             .embedding(emb1.clone())
             .agent_id(AgentId::new("test").unwrap())
+            .namespace(Namespace::shared())
             .build()
             .unwrap();
         let batch =
@@ -231,6 +239,7 @@ mod tests {
             .content("existing memory")
             .embedding(emb.clone())
             .agent_id(AgentId::new("test").unwrap())
+            .namespace(Namespace::shared())
             .build()
             .unwrap();
         let batch =
@@ -253,6 +262,7 @@ mod tests {
             .content("existing")
             .embedding(emb.clone())
             .agent_id(AgentId::new("test").unwrap())
+            .namespace(Namespace::shared())
             .build()
             .unwrap();
         let batch =
@@ -278,6 +288,7 @@ mod tests {
             .content("existing")
             .embedding(emb.clone())
             .agent_id(AgentId::new("test").unwrap())
+            .namespace(Namespace::shared())
             .build()
             .unwrap();
         let batch =
@@ -306,6 +317,7 @@ mod tests {
             .content("existing")
             .embedding(emb.clone())
             .agent_id(AgentId::new("test").unwrap())
+            .namespace(Namespace::shared())
             .build()
             .unwrap();
         let batch =

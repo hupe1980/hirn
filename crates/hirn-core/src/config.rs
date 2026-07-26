@@ -538,11 +538,6 @@ hirn_config_fields! {
     /// Minimum confidence for SVO events. Default: 0.5.
     pub svo_confidence_threshold: f32,
 
-    /// LLM prompt template for SVO extraction. Must contain `{content}` placeholder.
-    /// When set and an LLM provider is available, SVO extraction uses the LLM instead
-    /// of regex fallback. Default: built-in prompt.
-    pub svo_extraction_prompt: String,
-
     // ── Interference-Driven Consolidation ───────────────────────────────
 
     /// Cumulative interference threshold to trigger consolidation. Default: 0.3.
@@ -600,10 +595,6 @@ hirn_config_fields! {
     /// Queries scoring below this on the 4-dimension quality metric (coverage,
     /// confidence, coherence, sufficiency) will be re-run at a higher depth.
     pub quality_gate_threshold: f32,
-
-    /// NLI contradiction probability threshold. Default: 0.7.
-    /// Pairs with contradiction score above this are flagged as contradictions.
-    pub nli_contradiction_threshold: f32,
 
     // ── Data Retention ──────────────────────────────────────────────────
 
@@ -776,7 +767,7 @@ impl Default for HirnConfig {
             db_path: PathBuf::from("brain"),
             working_memory_token_limit: 2048,
             working_memory_reserve: 0.2,
-            decay_lambda: 0.01, // ~7-day half-life
+            decay_lambda: 0.01, // ~2.9-day base half-life (ln2/0.01 ≈ 69h), shortened further by FadeMem importance/access modulation; the ~7-day figure belongs to memory_half_life_hours=168
             archive_threshold: 0.1,
             purge_threshold: 0.01,
             max_episodic_entries: 100,
@@ -840,7 +831,6 @@ impl Default for HirnConfig {
             prospective_indexing_templates: default_prospective_templates(),
             svo_extraction_enabled: false,
             svo_confidence_threshold: 0.5,
-            svo_extraction_prompt: default_svo_extraction_prompt(),
             interference_consolidation_threshold: 0.3,
             interference_consolidation_cooldown_secs: 300,
             multivector_enabled: false,
@@ -855,7 +845,6 @@ impl Default for HirnConfig {
             conflict_resolution_overrides: ConflictResolutionPolicyOverrides::default(),
             slow_query_threshold_ms: default_slow_query_threshold_ms(),
             quality_gate_threshold: 0.5,
-            nli_contradiction_threshold: 0.7,
             text_retention: TextRetention::default(),
             resource_retention_policy: ResourceRetentionPolicy::default(),
             resource_quota_policy: ResourceQuotaPolicy::default(),
@@ -1124,11 +1113,6 @@ impl HirnConfig {
                 "svo_confidence_threshold must be in [0.0, 1.0]".into(),
             ));
         }
-        if self.svo_extraction_enabled && !self.svo_extraction_prompt.contains("{content}") {
-            return Err(HirnError::InvalidInput(
-                "svo_extraction_prompt must contain {content} placeholder".into(),
-            ));
-        }
         for template in &self.prospective_indexing_templates {
             if !template.contains("{content}") {
                 return Err(invalid_config(
@@ -1148,11 +1132,6 @@ impl HirnConfig {
         if !(0.0..=1.0).contains(&self.quality_gate_threshold) {
             return Err(HirnError::InvalidInput(
                 "quality_gate_threshold must be in [0.0, 1.0]".into(),
-            ));
-        }
-        if !(0.0..=1.0).contains(&self.nli_contradiction_threshold) {
-            return Err(HirnError::InvalidInput(
-                "nli_contradiction_threshold must be in [0.0, 1.0]".into(),
             ));
         }
         if !(0.0..=1.0).contains(&self.offline_dream_quality_threshold) {
@@ -1252,6 +1231,23 @@ impl HirnConfig {
         if !self.inhibition_strength.is_finite() || self.inhibition_strength < 0.0 {
             return Err(HirnError::InvalidInput(
                 "inhibition_strength must be a finite value >= 0.0".into(),
+            ));
+        }
+        // DR-M-core1 FIX: the DataFusion `GraphActivationExec` (cold-tier) path
+        // reads these two knobs, but they previously bypassed validation entirely
+        // — unlike their in-memory-path siblings above. A NaN/0/negative epsilon
+        // makes `delta < epsilon` never true (convergence relies solely on the
+        // iteration cap), and a NaN/negative mu silently no-ops inhibition.
+        if !self.graph_activation_epsilon.is_finite() || self.graph_activation_epsilon <= 0.0 {
+            return Err(HirnError::InvalidInput(
+                "graph_activation_epsilon must be a finite value > 0.0".into(),
+            ));
+        }
+        if !self.graph_activation_inhibition_mu.is_finite()
+            || self.graph_activation_inhibition_mu < 0.0
+        {
+            return Err(HirnError::InvalidInput(
+                "graph_activation_inhibition_mu must be a finite value >= 0.0".into(),
             ));
         }
         if !(0.0..=1.0).contains(&self.similarity_edge_threshold) {
@@ -1466,21 +1462,6 @@ fn default_prospective_templates() -> Vec<String> {
         "What was the outcome of {content}?".into(),
         "Why is {content} important?".into(),
     ]
-}
-
-fn default_svo_extraction_prompt() -> String {
-    "Extract all Subject-Verb-Object events from the following text.\n\
-     For each event, provide:\n\
-     - subject: the actor or entity performing the action\n\
-     - verb: the action or relation\n\
-     - object: the target or entity affected\n\
-     - time_start: when the event started (ISO 8601 or natural language, null if unknown)\n\
-     - time_end: when the event ended (null if same as start or unknown)\n\
-     - location: where the event occurred (null if unknown)\n\
-     - confidence: your confidence in this extraction (0.0 to 1.0)\n\n\
-     Return a JSON array of objects. Only include events with confidence >= 0.5.\n\n\
-     Text: {content}"
-        .into()
 }
 
 /// Builder for [`HirnConfig`].
@@ -1863,12 +1844,6 @@ impl HirnConfigBuilder {
     }
 
     #[must_use]
-    pub const fn nli_contradiction_threshold(mut self, threshold: f32) -> Self {
-        self.0.nli_contradiction_threshold = threshold;
-        self
-    }
-
-    #[must_use]
     pub const fn text_retention(mut self, retention: TextRetention) -> Self {
         self.0.text_retention = retention;
         self
@@ -2027,12 +2002,6 @@ impl HirnConfigBuilder {
     #[must_use]
     pub const fn svo_confidence_threshold(mut self, threshold: f32) -> Self {
         self.0.svo_confidence_threshold = threshold;
-        self
-    }
-
-    #[must_use]
-    pub fn svo_extraction_prompt(mut self, prompt: impl Into<String>) -> Self {
-        self.0.svo_extraction_prompt = prompt.into();
         self
     }
 

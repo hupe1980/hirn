@@ -1,7 +1,7 @@
 //! Integration tests for `LancePhysicalStore` using real Lance datasets on tmpdir.
 //!
 //! These tests exercise the full storage stack: create datasets, append, scan,
-//! search, version, compact — all against Lance 4.0 on the local filesystem.
+//! search, version, compact — all against Lance 9.0 on the local filesystem.
 
 use std::sync::Arc;
 

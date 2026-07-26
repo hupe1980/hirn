@@ -180,6 +180,7 @@ fn bench_hybrid_search_exec(c: &mut Criterion) {
         temporal_end_ms: None,
         temporal_expansion: false,
         temporal_boost: 1.25,
+        as_of: None,
     };
 
     let n = 10_000;

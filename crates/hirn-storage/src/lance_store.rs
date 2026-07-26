@@ -83,7 +83,7 @@ struct CachedFlatSnapshot {
     batches: Arc<Vec<RecordBatch>>,
 }
 
-/// Lance 4.0 implementation of `PhysicalStore`.
+/// Lance 9.0 implementation of `PhysicalStore`.
 ///
 /// Combines a `LanceNamespace` handle (for catalog ops) with direct
 /// `Dataset` access (for I/O). An `EpochCache` avoids reopening datasets
@@ -1729,7 +1729,16 @@ impl PhysicalStore for LancePhysicalStore {
         let ds = self.open_dataset(dataset).await?;
         let mut scanner = ds.scan();
 
-        let fts_query = lance_index::scalar::FullTextSearchQuery::new(opts.query);
+        let mut fts_query = lance_index::scalar::FullTextSearchQuery::new(opts.query);
+        // DR-H6 FIX: scope the FTS to the requested text column(s). Without this,
+        // Lance searches every inverted-indexed text column, so a query intended
+        // for `content` also matches `title`/other indexed fields — a scoping
+        // (and, in multi-field datasets, cross-field leak) violation.
+        if !opts.columns.is_empty() {
+            fts_query = fts_query
+                .with_columns(&opts.columns)
+                .map_err(HirnDbError::from)?;
+        }
 
         scanner
             .full_text_search(fts_query)

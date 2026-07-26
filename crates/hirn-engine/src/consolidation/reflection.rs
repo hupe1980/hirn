@@ -12,12 +12,12 @@
 //!    belief.
 //! 2. An LLM judgment when a provider is available (strictly parsed; any
 //!    unparseable response defaults to `Unrelated`), or a heuristic fallback
-//!    otherwise: high similarity plus a negation-marker mismatch (the same
-//!    signal `graph::causal` uses for contradiction detection on insert)
-//!    classifies as `Contradicts`, high similarity without the mismatch as
-//!    `Reinforces`. The heuristic never emits `Weakens` — partial
-//!    counter-evidence that stops short of outright contradiction requires
-//!    semantic judgment beyond surface negation markers.
+//!    otherwise: a negation-marker mismatch (the same signal `graph::causal`
+//!    uses for contradiction detection on insert) classifies as `Contradicts`;
+//!    an antonym straddle from a high-precision lexicon classifies as `Weakens`
+//!    (partial counter-evidence); otherwise `Reinforces`. The graded `Weakens`
+//!    middle keeps the no-LLM path from collapsing to a binary
+//!    reinforce/contradict decision the confidence dynamics already support.
 
 use hirn_core::embed::{ChatMessage, LlmOptions, LlmProvider};
 use hirn_core::id::MemoryId;
@@ -205,28 +205,110 @@ pub(crate) fn parse_reflection_response(response: &str) -> Option<(ReflectionOut
     Some((outcome, rationale))
 }
 
+/// A small hand-curated antonym lexicon for the no-LLM `Weakens` signal.
+///
+/// Pairs are matched symmetrically as whole words. This is intentionally
+/// high-precision (common, unambiguous opposites) rather than exhaustive — a
+/// missed pair simply falls through to `Reinforces`, never a false contradiction.
+const ANTONYM_PAIRS: &[(&str, &str)] = &[
+    ("increase", "decrease"),
+    ("increased", "decreased"),
+    ("increases", "decreases"),
+    ("increasing", "decreasing"),
+    ("rise", "fall"),
+    ("rose", "fell"),
+    ("rising", "falling"),
+    ("grow", "shrink"),
+    ("growing", "shrinking"),
+    ("expand", "contract"),
+    ("up", "down"),
+    ("high", "low"),
+    ("higher", "lower"),
+    ("fast", "slow"),
+    ("faster", "slower"),
+    ("hot", "cold"),
+    ("warm", "cool"),
+    ("more", "less"),
+    ("most", "least"),
+    ("better", "worse"),
+    ("best", "worst"),
+    ("success", "failure"),
+    ("succeeded", "failed"),
+    ("win", "lose"),
+    ("won", "lost"),
+    ("gain", "loss"),
+    ("gained", "lost"),
+    ("enable", "disable"),
+    ("enabled", "disabled"),
+    ("accept", "reject"),
+    ("accepted", "rejected"),
+    ("approve", "deny"),
+    ("approved", "denied"),
+    ("true", "false"),
+    ("positive", "negative"),
+    ("improve", "worsen"),
+    ("improved", "worsened"),
+    ("always", "never"),
+    ("include", "exclude"),
+    ("add", "remove"),
+    ("start", "stop"),
+    ("started", "stopped"),
+    ("active", "inactive"),
+    ("present", "absent"),
+    ("agree", "disagree"),
+    ("safe", "dangerous"),
+    ("healthy", "sick"),
+    ("open", "closed"),
+    ("on", "off"),
+];
+
+/// Whether `belief` and `evidence` straddle a known antonym pair (one side uses
+/// a word, the other its opposite) — a signal of partial counter-evidence
+/// without an outright negation flip.
+fn has_antonym_pair(belief_lower: &str, evidence_lower: &str) -> bool {
+    let has_word = |text: &str, word: &str| {
+        text.split(|c: char| !c.is_alphanumeric())
+            .any(|tok| tok == word)
+    };
+    ANTONYM_PAIRS.iter().any(|(a, b)| {
+        (has_word(belief_lower, a) && has_word(evidence_lower, b))
+            || (has_word(belief_lower, b) && has_word(evidence_lower, a))
+    })
+}
+
 /// Heuristic classification for deployments without an LLM provider.
 ///
-/// Reuses the negation-marker signal from `graph::causal`'s insert-time
-/// contradiction detection: two texts about the same topic (the caller has
-/// already verified similarity ≥ the gate) where exactly one side carries a
-/// negation marker are treated as contradicting; otherwise the evidence is
-/// treated as corroborating.
+/// Two texts about the same topic (the caller has already verified similarity ≥
+/// the gate) are classified by two surface signals, strongest first:
+/// 1. **Negation-marker mismatch** (exactly one side negated) → `Contradicts`
+///    (the same signal `graph::causal` uses for insert-time contradiction).
+/// 2. **Antonym straddle** (one side uses a word, the other its opposite from a
+///    high-precision lexicon) → `Weakens` — partial counter-evidence that stops
+///    short of an outright polarity flip.
+/// 3. Otherwise → `Reinforces` (same topic, matching polarity).
 ///
-/// Limits: surface negation markers miss antonym contradictions ("fast" vs
-/// "slow"), cannot detect partial counter-evidence (`Weakens` is never
-/// produced), and misfire on negations that are incidental to the claim.
+/// Limits: the lexicon is not exhaustive and surface signals miss context-
+/// dependent or paraphrased contradiction — an LLM provider (when configured)
+/// supersedes this path. A missed antonym degrades to `Reinforces`, never a
+/// false contradiction.
 #[must_use]
 pub(crate) fn heuristic_reflection_outcome(
     belief_text: &str,
     evidence_text: &str,
 ) -> (ReflectionOutcome, String) {
-    let belief_negated = contains_negation(&belief_text.to_lowercase());
-    let evidence_negated = contains_negation(&evidence_text.to_lowercase());
+    let belief_lower = belief_text.to_lowercase();
+    let evidence_lower = evidence_text.to_lowercase();
+    let belief_negated = contains_negation(&belief_lower);
+    let evidence_negated = contains_negation(&evidence_lower);
     if belief_negated != evidence_negated {
         (
             ReflectionOutcome::Contradicts,
             "heuristic: same topic but opposite polarity (negation-marker mismatch)".to_string(),
+        )
+    } else if has_antonym_pair(&belief_lower, &evidence_lower) {
+        (
+            ReflectionOutcome::Weakens,
+            "heuristic: same topic with an antonym straddle (partial counter-evidence)".to_string(),
         )
     } else {
         (
@@ -403,6 +485,57 @@ mod tests {
             "the deploy pipeline passed again",
         );
         assert_eq!(outcome, ReflectionOutcome::Reinforces);
+    }
+
+    #[test]
+    fn heuristic_flags_antonym_straddle_as_weakens() {
+        // Same topic, no negation flip, but opposite-direction claim → Weakens
+        // (partial counter-evidence), not a hard Contradicts.
+        let (outcome, _) = heuristic_reflection_outcome(
+            "quarterly revenue will increase",
+            "quarterly revenue will decrease",
+        );
+        assert_eq!(outcome, ReflectionOutcome::Weakens);
+
+        let (outcome, _) = heuristic_reflection_outcome(
+            "the migration was a success",
+            "the migration was a failure",
+        );
+        assert_eq!(outcome, ReflectionOutcome::Weakens);
+    }
+
+    #[test]
+    fn heuristic_weakens_reduces_confidence_without_halving() {
+        // A Weakens outcome should nudge credence down (−15%), strictly less
+        // aggressively than Contradicts (halving) — the graded middle the
+        // no-LLM path previously lacked.
+        let weakened = apply_reflection_outcome(0.8, ReflectionOutcome::Weakens);
+        let contradicted = apply_reflection_outcome(0.8, ReflectionOutcome::Contradicts);
+        assert!((weakened - 0.68).abs() < 1e-6, "0.8 − 0.15·0.8 = 0.68");
+        assert!(
+            weakened > contradicted,
+            "Weakens is gentler than Contradicts"
+        );
+    }
+
+    #[test]
+    fn heuristic_no_antonym_is_reinforces() {
+        let (outcome, _) = heuristic_reflection_outcome(
+            "caching improves read latency",
+            "caching made reads faster in production",
+        );
+        assert_eq!(outcome, ReflectionOutcome::Reinforces);
+    }
+
+    #[test]
+    fn antonym_pair_matches_whole_words_symmetrically() {
+        assert!(has_antonym_pair("prices are high", "prices are low"));
+        assert!(has_antonym_pair("prices are low", "prices are high"));
+        // Substrings must not match (e.g. "upgrade" contains "up").
+        assert!(!has_antonym_pair(
+            "we shipped an upgrade",
+            "the downtime was brief"
+        ));
     }
 
     #[test]

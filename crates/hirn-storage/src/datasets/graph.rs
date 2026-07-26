@@ -421,6 +421,8 @@ const fn edge_relation_to_str(r: EdgeRelation) -> &'static str {
         EdgeRelation::SimilarTo => "SimilarTo",
         EdgeRelation::Inhibits => "Inhibits",
         EdgeRelation::ParticipatesIn => "ParticipatesIn",
+        EdgeRelation::Enables => "Enables",
+        EdgeRelation::Prevents => "Prevents",
     }
 }
 
@@ -438,6 +440,8 @@ fn str_to_edge_relation(s: &str) -> Result<EdgeRelation, HirnDbError> {
         "SimilarTo" => Ok(EdgeRelation::SimilarTo),
         "Inhibits" => Ok(EdgeRelation::Inhibits),
         "ParticipatesIn" => Ok(EdgeRelation::ParticipatesIn),
+        "Enables" => Ok(EdgeRelation::Enables),
+        "Prevents" => Ok(EdgeRelation::Prevents),
         _ => Err(HirnDbError::InvalidArgument(format!(
             "unknown edge relation: {s}"
         ))),
@@ -659,6 +663,8 @@ mod tests {
             EdgeRelation::SimilarTo,
             EdgeRelation::Inhibits,
             EdgeRelation::ParticipatesIn,
+            EdgeRelation::Enables,
+            EdgeRelation::Prevents,
         ];
         for rel in relations {
             let mut e = make_edge();

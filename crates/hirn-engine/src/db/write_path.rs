@@ -1207,9 +1207,6 @@ pub struct PendingEmbed {
     pub id: MemoryId,
     /// Number of retry attempts so far.
     pub attempts: u32,
-    /// When the embed failure occurred (used for backoff scheduling).
-    #[allow(dead_code)] // Public API — used by consumers for backoff decisions
-    pub enqueued_at: std::time::Instant,
 }
 
 impl Default for PendingEmbedQueue {
@@ -1232,11 +1229,7 @@ impl PendingEmbedQueue {
                 "PendingEmbedQueue capacity reached, dropping oldest entry"
             );
         }
-        self.pending.push_back(PendingEmbed {
-            id,
-            attempts: 0,
-            enqueued_at: std::time::Instant::now(),
-        });
+        self.pending.push_back(PendingEmbed { id, attempts: 0 });
     }
 
     /// Drain all pending items for processing. Returns the items and
@@ -1268,7 +1261,9 @@ impl PendingEmbedQueue {
     }
 
     /// Whether the queue is empty.
-    #[allow(dead_code)] // Public API — checked by callers to decide whether to retry
+    ///
+    /// Retained to pair with [`Self::len`] (clippy `len_without_is_empty`).
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.pending.is_empty()
     }

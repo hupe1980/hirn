@@ -146,11 +146,13 @@ All Cedar-related code lives in `hirn-policy`:
 Namespace access is pre-resolved via `PolicyEngine::allowed_namespaces_for(agent_id, action)` and
 set on `HirnSessionExt` before plan optimization.
 
-### PolicyFilterExec
+### Scan-level enforcement
 
-`PolicyFilterExec` (in `hirn-exec::operators`) handles residual Cedar predicates that
-cannot be pushed to scan level (e.g., classification-based row filtering). Pass-through
-when no residual predicate is configured.
+Namespace authorization is enforced at scan level: `PolicyPushdownRule` injects the
+Cedar-resolved namespace filter early in the plan, and `PolicyEnforcedStore` wraps the
+physical store so every scan is namespace-filtered and fails closed without a principal.
+Policy *reads* (`SHOW POLICIES`, `EXPLAIN POLICY`, `GRANT`/`REVOKE`) run through
+`PolicyQueryReadExec`.
 
 ### Pre-Mutation Enforcement
 

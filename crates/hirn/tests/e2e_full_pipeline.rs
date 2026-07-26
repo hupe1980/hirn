@@ -708,35 +708,35 @@ async fn e2e_operator_count_matches_target() {
     // We verify by counting the operator module re-exports from hirn-exec.
     // This test catches accidental operator deletions during refactoring.
 
-    // 18 operators (6 core + 8 cognitive + 4 causal). MCFA detection is no
-    // longer a plan operator: `mcfa_defense` exports the shared `detect_threat`
-    // detector, enforced (with a live `mcfa_audit_log` sink) on the engine's
-    // scored read path.
+    // Sample of live physical operators (each `HirnOp` variant that is actually
+    // emitted into a compiled plan). MCFA detection is no longer a plan operator
+    // (`mcfa_defense` exports the shared `detect_threat` detector, enforced with a
+    // live `mcfa_audit_log` sink on the engine's scored read path).
+    //
+    // Retired write-path/consolidation operators (R-20b + follow-up dead-code
+    // sweep): `NliContradictionExec`, `AbaReconsolidationExec`, `RpeScoreExec`,
+    // `ProspectiveIndexingExec`, `SvoExtractionExec`, `InterferenceDetectorExec`,
+    // `CausalDiscoveryExec`, `PolicyFilterExec`, `TopicLoomExec` were never
+    // emitted into any compiled plan (`compile()` has no REMEMBER/CONSOLIDATE
+    // arm — the write and consolidation paths are imperative). Contradiction
+    // detection + reconsolidation run in the imperative paths (admission
+    // `ContradictionGate`, `detect_conflicts_for_recall`, consolidation
+    // contradiction edges + `reconsolidation`); RPE/prospective/SVO/interference
+    // enrichment run imperatively in `db/episodic.rs`; causal discovery runs in
+    // `consolidation/pipeline.rs`; the ABA decision algorithm lives in
+    // `hirn_engine::resolve_aba` next to `CausalView::apply_aba_resolution`.
     let operator_names = [
         "LanceHybridSearchExec",
         "GraphActivationExec",
         "CausalChainExec",
         "ContextBudgetExec",
         "HebbianBufferExec",
-        "PolicyFilterExec",
-        "RpeScoreExec",
-        "ProspectiveIndexingExec",
-        "SvoExtractionExec",
         "QueryComplexityExec",
         "QualityGateExec",
         "IterativeRetrievalExec",
-        "InterferenceDetectorExec",
-        "TopicLoomExec",
         "CausalQueryReadExec",
-        "CausalDiscoveryExec",
-        "NliContradictionExec",
-        "AbaReconsolidationExec",
     ];
-    assert_eq!(
-        operator_names.len(),
-        18,
-        "Current physical operator inventory: 18 operators"
-    );
+    assert_eq!(operator_names.len(), 9, "sampled live physical operators");
 
     // Scoring UDFs were deleted: ranking runs through the single canonical
     // `hirn_core::scoring::composite_score` formula used by both the physical

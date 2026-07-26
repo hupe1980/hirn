@@ -14,6 +14,7 @@ use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use hirn_core::id::MemoryId;
+use hirn_core::revision::RecallSnapshot;
 use hirn_storage::PhysicalStore;
 use hirn_storage::store::ScanOptions;
 use hirn_storage::store::{
@@ -65,6 +66,11 @@ pub struct HybridSearchParams {
     pub numeric_filters: Vec<SearchNumericFilter>,
     pub temporal_start_ms: Option<i64>,
     pub temporal_end_ms: Option<i64>,
+    /// Bi-temporal point-in-time snapshot (`RECALL ... AS OF`). Applied as a
+    /// per-dataset **scan prefilter** (DR-H2), before top-k selection, so a
+    /// point-in-time query returns exactly the rows valid/recorded at the
+    /// snapshot instant rather than filtering the top-k after the fact.
+    pub as_of: Option<hirn_core::revision::RecallSnapshot>,
     /// When `true` and temporal bounds are set, runs a dual-pass search:
     /// a broad semantic pass (no time filter) and a temporally-focused pass
     /// (with time filter).  Temporal-pass results are boosted by `temporal_boost`.
@@ -346,6 +352,7 @@ async fn search_rows_single_pass(
             params.temporal_start_ms,
             params.temporal_end_ms,
             &params.numeric_filters,
+            params.as_of.as_ref(),
         );
 
         let batches = if params.hybrid_mode {
@@ -460,6 +467,7 @@ fn dataset_search_filter(
     temporal_start_ms: Option<i64>,
     temporal_end_ms: Option<i64>,
     numeric_filters: &[SearchNumericFilter],
+    as_of: Option<&RecallSnapshot>,
 ) -> Option<String> {
     let mut parts = Vec::new();
 
@@ -475,6 +483,13 @@ fn dataset_search_filter(
         parts.push(format!("{time_column} <= {end_ms}"));
     }
 
+    // DR-H2: bi-temporal `AS OF` snapshot as a prefilter (ANDed with everything).
+    if let Some(snapshot) = as_of {
+        if let Some(sql) = as_of_filter_for_dataset(dataset, snapshot) {
+            parts.push(sql);
+        }
+    }
+
     for filter in numeric_filters {
         if let Some(sql) = compile_dataset_numeric_filter_sql(dataset, *filter) {
             parts.push(sql);
@@ -485,6 +500,40 @@ fn dataset_search_filter(
         None
     } else {
         Some(parts.join(" AND "))
+    }
+}
+
+/// Build the per-dataset `AS OF` snapshot prefilter (DR-H2).
+///
+/// - `Observed(t)` (valid time): rows whose validity interval contains `t`
+///   (`valid_start <= t AND (valid_until_ms IS NULL OR valid_until_ms > t)`).
+///   The valid-start column is `timestamp_ms` for episodic and `valid_from_ms`
+///   for semantic; datasets without a distinct valid time (procedural) have no
+///   `valid_until_ms` and fall back to "existed by `t`" (`created_at_ms <= t`).
+/// - `Recorded(t)` (transaction time): rows recorded by `t` (`created_at_ms <= t`).
+/// - `Revision(id)`: pin to a specific revision (`revision_id = '<ulid>'`).
+fn as_of_filter_for_dataset(dataset: &str, snapshot: &RecallSnapshot) -> Option<String> {
+    use hirn_storage::datasets;
+    match snapshot {
+        RecallSnapshot::Observed(ts) => {
+            let t = ts.timestamp_ms();
+            if dataset == datasets::episodic::DATASET_NAME {
+                Some(format!(
+                    "timestamp_ms <= {t} AND (valid_until_ms IS NULL OR valid_until_ms > {t})"
+                ))
+            } else if dataset == datasets::semantic::DATASET_NAME {
+                Some(format!(
+                    "valid_from_ms <= {t} AND (valid_until_ms IS NULL OR valid_until_ms > {t})"
+                ))
+            } else {
+                // Procedural / other: no distinct valid-time axis — fall back to
+                // transaction time (the record existed by `t`).
+                Some(format!("created_at_ms <= {t}"))
+            }
+        }
+        RecallSnapshot::Recorded(ts) => Some(format!("created_at_ms <= {}", ts.timestamp_ms())),
+        // `RevisionId` is a ULID ([0-9A-Z]) — safe to interpolate directly.
+        RecallSnapshot::Revision(id) => Some(format!("revision_id = '{id}'")),
     }
 }
 
@@ -956,10 +1005,69 @@ mod tests {
     use futures::StreamExt;
     use hirn_core::config::HirnConfig;
     use hirn_core::episodic::EpisodicRecord;
+    use hirn_core::timestamp::Timestamp;
     use hirn_core::types::{AgentId, EventType};
     use hirn_storage::PhysicalStore;
     use hirn_storage::datasets::episodic;
     use hirn_storage::memory_store::MemoryStore;
+
+    // ── DR-H2: AS OF snapshot prefilter ─────────────────────────────────
+
+    #[test]
+    fn as_of_observed_uses_per_dataset_valid_time_columns() {
+        let t = Timestamp::from_millis(1_000);
+        let snap = RecallSnapshot::observed(t);
+        // Episodic valid-time = timestamp_ms; semantic = valid_from_ms; both
+        // guard the (nullable) valid_until_ms upper bound.
+        assert_eq!(
+            as_of_filter_for_dataset("episodic", &snap).unwrap(),
+            "timestamp_ms <= 1000 AND (valid_until_ms IS NULL OR valid_until_ms > 1000)"
+        );
+        assert_eq!(
+            as_of_filter_for_dataset("semantic", &snap).unwrap(),
+            "valid_from_ms <= 1000 AND (valid_until_ms IS NULL OR valid_until_ms > 1000)"
+        );
+        // Procedural has no distinct valid time → fall back to transaction time.
+        assert_eq!(
+            as_of_filter_for_dataset("procedural", &snap).unwrap(),
+            "created_at_ms <= 1000"
+        );
+    }
+
+    #[test]
+    fn as_of_recorded_and_revision() {
+        let recorded = RecallSnapshot::recorded(Timestamp::from_millis(2_000));
+        assert_eq!(
+            as_of_filter_for_dataset("episodic", &recorded).unwrap(),
+            "created_at_ms <= 2000"
+        );
+        assert_eq!(
+            as_of_filter_for_dataset("semantic", &recorded).unwrap(),
+            "created_at_ms <= 2000"
+        );
+
+        let rev = RecallSnapshot::revision(hirn_core::revision::RevisionId::new());
+        let sql = as_of_filter_for_dataset("episodic", &rev).unwrap();
+        assert!(sql.starts_with("revision_id = '") && sql.ends_with('\''));
+    }
+
+    #[test]
+    fn dataset_search_filter_ands_as_of_with_namespace() {
+        let snap = RecallSnapshot::observed(Timestamp::from_millis(500));
+        let filter = dataset_search_filter(
+            Some("namespace = 'default'"),
+            "episodic",
+            None,
+            None,
+            &[],
+            Some(&snap),
+        )
+        .unwrap();
+        assert!(filter.contains("namespace = 'default'"));
+        assert!(filter.contains("timestamp_ms <= 500"));
+        assert!(filter.contains("valid_until_ms > 500"));
+        assert!(filter.contains(" AND "));
+    }
 
     fn test_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
@@ -997,6 +1105,7 @@ mod tests {
             temporal_end_ms: None,
             temporal_expansion: false,
             temporal_boost: 1.25,
+            as_of: None,
         }
     }
 

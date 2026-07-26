@@ -1816,6 +1816,8 @@ fn edge_relation_to_str(r: EdgeRelation) -> &'static str {
         EdgeRelation::SimilarTo => "SimilarTo",
         EdgeRelation::Inhibits => "Inhibits",
         EdgeRelation::ParticipatesIn => "ParticipatesIn",
+        EdgeRelation::Enables => "Enables",
+        EdgeRelation::Prevents => "Prevents",
     }
 }
 

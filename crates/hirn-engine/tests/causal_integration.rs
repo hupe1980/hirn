@@ -849,38 +849,6 @@ mod tests {
         );
     }
 
-    // ── NLI Heuristic Contradiction Detection ──────────────────────────
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn nli_heuristic_detects_negation_contradiction() {
-        // Verify that the heuristic NLI detects contradictions via negation patterns.
-        use hirn_exec::operators::nli_contradiction::NliLabel;
-        use hirn_exec::operators::nli_contradiction::heuristic_nli;
-
-        let (label, score) = heuristic_nli(
-            "The server is running smoothly",
-            "The server is not running smoothly",
-        );
-        assert_eq!(label, NliLabel::Contradiction);
-        assert!(
-            score > 0.7,
-            "contradiction score should be > 0.7, got {score}"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn nli_heuristic_entailment_no_contradiction() {
-        use hirn_exec::operators::nli_contradiction::NliLabel;
-        use hirn_exec::operators::nli_contradiction::heuristic_nli;
-
-        let (label, _score) = heuristic_nli("The server is running", "The server handles requests");
-        assert_ne!(
-            label,
-            NliLabel::Contradiction,
-            "compatible statements should not be contradictions"
-        );
-    }
-
     // ── EXPLAIN ANALYZE Row Counts ─────────────────────────────────────
 
     #[tokio::test(flavor = "multi_thread")]
@@ -930,7 +898,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn aba_newer_evidence_wins() {
-        use hirn_exec::operators::aba_reconsolidation::resolve_aba;
+        use hirn_engine::resolve_aba;
 
         let result = resolve_aba("mem_new", 0.9, "mem_old", 0.4);
         assert_eq!(
@@ -948,7 +916,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn aba_loser_not_deleted() {
-        use hirn_exec::operators::aba_reconsolidation::resolve_aba;
+        use hirn_engine::resolve_aba;
 
         let result = resolve_aba("a", 0.8, "b", 0.6);
         // Loser confidence reduced but not zero — AGM contraction preserves some confidence.
@@ -966,7 +934,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn aba_grounded_extension_3_argument_cycle() {
-        use hirn_exec::operators::aba_reconsolidation::resolve_aba_multi;
+        use hirn_engine::resolve_aba_multi;
 
         // A(0.9) vs B(0.6) vs C(0.3): A should win, B and C are losers.
         let args = vec![("A", 0.9_f32), ("B", 0.6), ("C", 0.3)];
@@ -984,7 +952,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn aba_grounded_extension_tie() {
-        use hirn_exec::operators::aba_reconsolidation::resolve_aba_multi;
+        use hirn_engine::resolve_aba_multi;
 
         // A(0.7) vs B(0.7) vs C(0.3): A and B tie, both survive. Only C loses.
         let args = vec![("A", 0.7_f32), ("B", 0.7), ("C", 0.3)];
@@ -1003,7 +971,7 @@ mod tests {
     /// `reconsolidated_by` / `reconsolidated_at` metadata fields should be set.
     #[tokio::test(flavor = "multi_thread")]
     async fn aba_resolution_applied_sets_reconsolidated_by() {
-        use hirn_exec::operators::aba_reconsolidation::resolve_aba;
+        use hirn_engine::resolve_aba;
 
         let (db, _dir) = temp_db().await;
         let dims = db.embedding_dims();
@@ -1096,7 +1064,7 @@ mod tests {
     /// ABA audit trail: resolution is logged with tracing (verify no panic on apply).
     #[tokio::test(flavor = "multi_thread")]
     async fn aba_resolution_audit_trail_no_panic() {
-        use hirn_exec::operators::aba_reconsolidation::resolve_aba;
+        use hirn_engine::resolve_aba;
 
         let (db, _dir) = temp_db().await;
         let dims = db.embedding_dims();

@@ -78,20 +78,29 @@ impl AnthropicProvider {
     }
 
     /// Build the common HTTP request headers.
-    fn request_headers(&self) -> reqwest::header::HeaderMap {
+    ///
+    /// DR-H10 FIX: an API key with bytes not valid in an HTTP header value (a
+    /// trailing newline is extremely common from env/file sources) previously
+    /// panicked via `.expect(...)`, crashing the task on first request. Now it
+    /// returns a clear `InvalidInput` error, and the key header is marked
+    /// sensitive so it is redacted from logs/`Debug`.
+    fn request_headers(&self) -> HirnResult<reqwest::header::HeaderMap> {
         let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(
-            "x-api-key",
-            self.api_key
-                .expose_secret()
-                .parse()
-                .expect("valid api key header value"),
-        );
+        let mut key = reqwest::header::HeaderValue::from_str(self.api_key.expose_secret())
+            .map_err(|_| {
+                hirn_core::HirnError::InvalidInput(
+                    "invalid Anthropic API key: contains characters not valid in an HTTP header \
+                     value (e.g. a trailing newline)"
+                        .into(),
+                )
+            })?;
+        key.set_sensitive(true);
+        headers.insert("x-api-key", key);
         headers.insert(
             "anthropic-version",
-            API_VERSION.parse().expect("valid api version header value"),
+            reqwest::header::HeaderValue::from_static(API_VERSION),
         );
-        headers
+        Ok(headers)
     }
 
     /// Build the request body from messages and options.
@@ -473,7 +482,7 @@ impl LlmProvider for AnthropicProvider {
         let resp = self
             .client
             .post(&url)
-            .headers(self.request_headers())
+            .headers(self.request_headers()?)
             .json(&body)
             .send()
             .await
@@ -530,7 +539,7 @@ impl LlmProvider for AnthropicProvider {
         let resp = self
             .client
             .post(&url)
-            .headers(self.request_headers())
+            .headers(self.request_headers()?)
             .json(&body)
             .send()
             .await

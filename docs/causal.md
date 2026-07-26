@@ -253,7 +253,8 @@ relevance = strength × confidence × ln(1 + evidence_count)
 
 ## Causal Discovery During Consolidation
 
-During the consolidation pipeline, `CausalDiscoveryExec` proposes new causal relationships. The
+During the consolidation pipeline, the engine's `discover_causal_edges` step
+(`hirn-engine/src/consolidation/pipeline.rs`) proposes new causal relationships. The
 discovery signal in force **today** is a temporal co-occurrence heuristic — events that recur within
 a time window, where one consistently precedes the other, produce a candidate edge (labelled
 `temporal_granger`). Discovered edges are written to the graph with initial confidence based on
@@ -282,48 +283,55 @@ flowchart LR
 
 ---
 
-## NLI Contradiction Detection
+## Contradiction Detection
 
-Natural Language Inference detects contradictions between memories:
+Contradiction handling runs in the engine's **imperative** paths, not as DataFusion
+operators:
 
-- **Model**: DeBERTa-MNLI via ONNX runtime (local inference, 5-15ms per pair)
-- **Graceful degradation**: When ONNX model unavailable, falls back to heuristic detection
-- **Operator**: `NliContradictionExec` in `hirn-exec`
-- **Integration**: `WITH CONFLICTS` clause on RECALL includes contradiction annotations
-- **Write path**: New memories checked against existing ones for contradiction edges
+- **Write path (admission)**: the admission `ContradictionGate`
+  (`hirn-engine/src/admission/controllers/contradiction.rs`) checks each new memory
+  against existing ones and records `Contradicts` edges.
+- **Recall**: the `WITH CONFLICTS` clause on `RECALL` surfaces contradiction
+  annotations via the engine's `detect_conflicts_for_recall`.
+- **Consolidation**: the consolidation pipeline's contradiction pass +
+  `reconsolidation` module act on accumulated `Contradicts` edges.
+
+> Earlier revisions shipped a `NliContradictionExec` DataFusion operator (with a
+> heuristic/DeBERTa-MNLI classifier). It was never emitted into any compiled plan
+> and has been retired; the classifier had no other runtime consumer and was
+> removed with it. Contradiction detection now runs entirely on the imperative
+> paths above.
+{: .important }
 
 ---
 
 ## ABA Conflict Resolution
 
-Assumption-Based Argumentation resolves contradictions:
+Assumption-Based Argumentation resolves contradictions via a pure decision function
+plus an engine apply-step (no DataFusion operator):
 
-- **Formal argumentation**: Constructs arguments for/against each position
-- **AGM belief revision**: Updates belief state to maintain consistency
-- **Operator**: `AbaReconsolidationExec` in `hirn-exec`
-- **Trigger**: contradiction density exceeding threshold within the reconsolidation surface
+- **Decide**: `hirn_engine::resolve_aba` / `resolve_aba_multi` compute the grounded
+  extension (winner/loser) and the loser's AGM-contracted confidence (minimal
+  change: reduced, never zeroed).
+- **Apply**: `CausalView::apply_aba_resolution` reduces the loser's importance,
+  appends a successor revision, and records the reconsolidation metadata + audit.
+- **Formal argumentation**: each memory is an argument with assumptions (source,
+  recency, evidence count); AGM belief revision keeps the belief state consistent.
 
-Both `NliContradictionExec` (DeBERTa-MNLI) and `AbaReconsolidationExec` (ABA + AGM belief revision)
-are **query operators** — an "implemented preview" surface reached explicitly through HirnQL (e.g.
-`WITH CONFLICTS` on `RECALL`). They are **not** stages of the automatic episodic → semantic
-consolidation pipeline. Contradiction *edges* discovered on the write path are separate from running
-these operators.
+> The former `AbaReconsolidationExec` operator was never emitted into a compiled
+> plan and has been retired; its decision algorithm was relocated into the engine
+> next to `apply_aba_resolution`.
 {: .important }
 
 ---
 
 ## Topic Loom
 
-Per-topic timelines with branching (Membox-inspired):
+The `topic_loom` Lance table persists per-topic associations written during
+consolidation (Membox-inspired per-topic timelines with branch awareness).
 
-```sql
-RECALL "query" TOPIC "project-alpha"
-```
-
-- **Operator**: `TopicLoomExec` in `hirn-exec`
-- **Graph clustering**: weighted Louvain-style modularity optimization for community detection (a connectivity post-pass approximates Leiden fidelity — it is **not** a full Leiden refinement)
-- **Branch awareness**: Topics can fork and merge over time
-- **Dataset**: `topic_loom` Lance table for persistent topic associations
+> The `TopicLoomExec` DataFusion operator was retired (it had no `HirnOp` variant
+> and was never placed in a plan). The `topic_loom` *dataset* is retained.
 
 ---
 

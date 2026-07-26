@@ -11,5 +11,6 @@ mod types;
 pub use agent::MemoryAgent;
 pub use toolkit::MemoryToolkit;
 pub use types::{
-    IntrospectionResult, LinkRequest, RecallOptions, RecallRecord, StoreRequest, UpdateRequest,
+    IntrospectionResult, LinkRequest, RecallOptions, RecallRecord, RouteWeights, RoutedRecall,
+    StoreRequest, TimelineEntryView, TimelineOptions, TimelineResult, UpdateRequest,
 };

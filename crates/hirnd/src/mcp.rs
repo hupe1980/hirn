@@ -32,7 +32,9 @@ use axum::response::{IntoResponse, Response};
 use hirn::prelude::*;
 use hirn_engine::HirnDB;
 use hirn_engine::policy::Action;
-use hirn_engine::tools::{LinkRequest, MemoryToolkit, RecallOptions, StoreRequest, UpdateRequest};
+use hirn_engine::tools::{
+    LinkRequest, MemoryToolkit, RecallOptions, StoreRequest, TimelineOptions, UpdateRequest,
+};
 use rmcp::ErrorData as McpError;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
@@ -317,6 +319,19 @@ struct MemoryRecallParams {
     limit: Option<usize>,
     /// Target namespace (defaults to the agent's private + shared namespaces)
     namespace: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct MemoryTimelineParams {
+    /// Natural language query selecting the episodic events to place on the timeline (required)
+    query: String,
+    /// Maximum number of events on the timeline (default: 20)
+    limit: Option<usize>,
+    /// Target namespace (defaults to the agent's private + shared namespaces)
+    namespace: Option<String>,
+    /// Optional point-in-time snapshot ("as of"): a date (YYYY-MM-DD) or RFC 3339
+    /// timestamp. When set, only events valid at that instant are included.
+    as_of: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -921,6 +936,81 @@ impl HirnMcpService {
         )]))
     }
 
+    /// Build a chronologically-ordered timeline of relevant episodic events via
+    /// the agent toolkit's neuro-symbolic temporal reasoner.
+    #[tool(
+        name = "memory_timeline",
+        description = "Build a chronological timeline of episodic events matching a query, with exact ordering, Allen interval relations, inter-event gaps, total span, and an optional point-in-time (as-of) snapshot"
+    )]
+    async fn memory_timeline(
+        &self,
+        Parameters(params): Parameters<MemoryTimelineParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let caller = self.caller(&ctx).await?;
+        self.authorize(&caller, Action::Recall, &Operation::Read)
+            .await?;
+        self.check_namespace(&caller, params.namespace.as_deref())?;
+        let aid = caller.agent_id;
+
+        let ns = params
+            .namespace
+            .as_deref()
+            .map(|n| Namespace::new(n).map_err(|e| McpError::invalid_params(e.to_string(), None)))
+            .transpose()?;
+
+        let as_of = params
+            .as_of
+            .as_deref()
+            .map(|s| {
+                Timestamp::parse_date_or_rfc3339(s).ok_or_else(|| {
+                    McpError::invalid_params(
+                        format!("invalid as_of timestamp: {s:?} (want YYYY-MM-DD or RFC 3339)"),
+                        None,
+                    )
+                })
+            })
+            .transpose()?;
+
+        let toolkit = MemoryToolkit::new(Arc::clone(&caller.db));
+        let timeline = toolkit
+            .timeline(
+                aid,
+                &params.query,
+                TimelineOptions {
+                    limit: params.limit,
+                    namespace: ns,
+                    as_of,
+                },
+            )
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let entries: Vec<serde_json::Value> = timeline
+            .entries
+            .iter()
+            .map(|e| {
+                serde_json::json!({
+                    "id": e.id.to_string(),
+                    "content": e.content,
+                    "start_ms": e.start_ms,
+                    "end_ms": e.end_ms,
+                    "relation_to_prev": e.relation_to_prev,
+                    "gap_to_prev": e.gap_to_prev_human,
+                })
+            })
+            .collect();
+        let output = serde_json::json!({
+            "entries": entries,
+            "span": timeline.span_human,
+            "span_ms": timeline.span_ms,
+        });
+
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            serde_json::to_string_pretty(&output).unwrap_or_default(),
+        )]))
+    }
+
     /// Update an existing memory's content or importance via the agent toolkit.
     #[tool(
         name = "memory_update",
@@ -1168,7 +1258,7 @@ impl ServerHandler for HirnMcpService {
                     "event_types": ["conversation", "tool_call", "observation", "experiment", "error", "decision"],
                     "knowledge_types": ["propositional", "prescriptive", "taxonomic"],
                     "edge_relations": ["causes", "caused_by", "derived_from", "contradicts", "supports",
-                                       "temporal_next", "part_of", "instance_of", "similar_to", "inhibits", "participates_in", "related_to"],
+                                       "temporal_next", "part_of", "instance_of", "similar_to", "inhibits", "participates_in", "enables", "prevents", "related_to"],
                     "forget_modes": ["archive", "purge"],
                 });
                 Ok(ReadResourceResult::new(vec![ResourceContents::text(
@@ -1311,10 +1401,12 @@ fn parse_edge_relation(s: &str) -> Result<EdgeRelation, String> {
         "similar_to" | "similarto" => Ok(EdgeRelation::SimilarTo),
         "inhibits" => Ok(EdgeRelation::Inhibits),
         "participates_in" | "participatesin" => Ok(EdgeRelation::ParticipatesIn),
+        "enables" => Ok(EdgeRelation::Enables),
+        "prevents" => Ok(EdgeRelation::Prevents),
         other => Err(format!(
             "unknown relation: {other}. Valid: related_to, causes, caused_by, derived_from, \
              contradicts, supports, temporal_next, part_of, instance_of, similar_to, inhibits, \
-             participates_in"
+             participates_in, enables, prevents"
         )),
     }
 }

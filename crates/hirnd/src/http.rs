@@ -690,10 +690,20 @@ fn map_err(e: HirnError) -> (StatusCode, Json<ErrorResponse>) {
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     counter!("hirnd_errors_total", "status" => status.as_str().to_owned()).increment(1);
+    // DR-M-dae3 FIX: do not leak internal error detail to clients on 5xx —
+    // storage/backend messages can disclose paths, schema, and internals. Log
+    // the detail server-side and return a generic body, mirroring the gRPC layer.
+    // Client-actionable 4xx messages are safe to return verbatim.
+    let body = if status.is_server_error() {
+        tracing::error!(error = %e, "internal error serving HTTP request");
+        "internal error".to_string()
+    } else {
+        e.to_string()
+    };
     (
         status,
         Json(ErrorResponse::with_retryable(
-            e.to_string(),
+            body,
             status.is_server_error(),
         )),
     )
@@ -1690,7 +1700,18 @@ async fn readyz(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
     }
 }
 
-async fn brain_stats(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
+async fn brain_stats(State(state): State<Arc<HttpState>>, headers: HeaderMap) -> impl IntoResponse {
+    // DR-M-dae1 FIX: this endpoint aggregates cross-realm counts (episodes,
+    // semantic, edges, event_seq, policy_count, cluster_size) across ALL realms,
+    // so it must require Admin + rate-limiting like every sibling admin endpoint
+    // (previously any authenticated principal — even a single-realm Read token —
+    // could read daemon-wide aggregates).
+    if let Err(resp) = check_operation(&headers, &Operation::Admin) {
+        return resp.into_response();
+    }
+    if let Err(resp) = enforce_rate_limit(&state, &headers, RateLimitClass::Admin) {
+        return resp.into_response();
+    }
     let realm_names = state.realms.realms().await;
     let realm_count = realm_names.len() as u64;
 
@@ -1734,6 +1755,7 @@ async fn brain_stats(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
         cluster_size,
         sleep_last_pass_ms: crate::sleep::last_pass_unix_ms(),
     })
+    .into_response()
 }
 
 async fn cluster_status(
@@ -2690,6 +2712,8 @@ fn parse_edge_relation(s: &str) -> EdgeRelation {
         "similar_to" => EdgeRelation::SimilarTo,
         "inhibits" => EdgeRelation::Inhibits,
         "participates_in" => EdgeRelation::ParticipatesIn,
+        "enables" => EdgeRelation::Enables,
+        "prevents" => EdgeRelation::Prevents,
         _ => EdgeRelation::RelatedTo,
     }
 }

@@ -335,10 +335,26 @@ RECALL episodic ABOUT "artifact"
     LIMIT 5
 ```
 
-For semantic memory, `AS OF` resolves the revision whose validity window covers the requested
-timestamp. Snapshot recall uses revision effective time (`valid_from` / `valid_until`), so
-historical queries can surface the pre-cutover source chain before a later `CORRECT`,
+`AS OF` executes as a bi-temporal **scan prefilter** applied per layer before
+top-k selection (so a point-in-time query returns exactly the rows that were
+valid/recorded at the snapshot instant, not a filtered top-k):
+
+- `AS OF [OBSERVED] <ts>` — **valid time**: rows whose validity window contains
+  `ts`. Episodic uses `timestamp <= ts AND (valid_until IS NULL OR valid_until > ts)`;
+  semantic uses `valid_from`/`valid_until`; procedural (no distinct valid time)
+  falls back to transaction time.
+- `AS OF RECORDED <ts>` — **transaction time**: rows recorded (`created_at`) at or
+  before `ts`.
+- `AS OF REVISION <ulid>` — pin to a specific revision id.
+
+Unqualified `AS OF <ts>` defaults to `OBSERVED` (valid-time) semantics. So a
+historical query can surface the pre-cutover state before a later `CORRECT`,
 `SUPERSEDE`, or `MERGE MEMORY` change.
+
+> Note: for **semantic** `AS OF OBSERVED`, exactness depends on `valid_until`
+> being closed on supersession (Zep-style `t_invalid`); until that lands,
+> semantic-observed snapshots are best-effort. Episodic (the common temporal-QA
+> case) is exact.
 
 When `FORMAT json` or `SELECT resource_evidence` is used, each evidence entry now exposes `provenance` (`observed_resource`, `generated_artifact`, or `transformed_summary`) plus optional `artifact_id` and `artifact_kind`, so callers can distinguish the original resource from generated previews/OCR/transcripts and transformed summaries.
 

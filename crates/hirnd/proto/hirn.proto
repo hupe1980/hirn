@@ -81,6 +81,8 @@ enum EdgeRelation {
   EDGE_RELATION_SIMILAR_TO = 10;
   EDGE_RELATION_INHIBITS = 11;
   EDGE_RELATION_PARTICIPATES_IN = 12;
+  EDGE_RELATION_ENABLES = 13;
+  EDGE_RELATION_PREVENTS = 14;
 }
 
 // Strategy for spreading activation across the knowledge graph.

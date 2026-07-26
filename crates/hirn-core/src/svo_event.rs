@@ -168,10 +168,18 @@ impl SvoEvent {
         self
     }
 
-    /// Set extraction confidence.
+    /// Set extraction confidence (clamped to `[0.0, 1.0]`; NaN → 0.0).
+    ///
+    /// DR-L4: mirrors the episodic/semantic confidence clamps so an out-of-range
+    /// or non-finite confidence can't flow into the record and silently defeat
+    /// `svo_confidence_threshold` filtering.
     #[must_use]
     pub fn with_confidence(mut self, confidence: f32) -> Self {
-        self.confidence = confidence;
+        self.confidence = if confidence.is_nan() {
+            0.0
+        } else {
+            confidence.clamp(0.0, 1.0)
+        };
         self
     }
 

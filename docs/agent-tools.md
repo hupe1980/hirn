@@ -68,7 +68,7 @@ sequenceDiagram
 > authenticated connection. Either way, Cedar sees the same principal and the
 > same action.
 
-## MemoryToolkit — 6 Functions
+## MemoryToolkit — 7 Functions
 
 Every function validates input, enforces Cedar authorization via the caller's agent identity, and delegates to `HirnDB`.
 
@@ -105,6 +105,32 @@ Performs hybrid BM25 + vector search across episodic memories.
 | `with_conflicts` | `bool`      | No       | Include contradiction annotations |
 
 **Returns:** `Vec<RecallRecord>` — id, content, composite score, metadata.
+
+**Cedar action:** `recall`
+
+---
+
+### 2b. `timeline` — Neuro-symbolic temporal reasoning
+
+Retrieves the episodic events most relevant to `query` and returns them as a
+**chronologically-ordered timeline** with deterministic symbolic annotations:
+each entry carries its [Allen interval relation](https://en.wikipedia.org/wiki/Allen%27s_interval_algebra)
+to the previous event (`before`/`after`/`during`/`overlaps`/…), the human-readable
+gap since it, and the timeline reports its total span. Ordering, relations,
+durations, and the "as-of" filter are computed **exactly in Rust**
+(`hirn_core::temporal`) — the LLM never has to order or date events itself, its
+documented failure mode. This is the symbolic half of a TReMu-style
+(arXiv:2502.01630) pipeline, with **no code-execution injection surface** (unlike
+TReMu's Python-exec design).
+
+| Parameter   | Type        | Required | Description |
+|-------------|-------------|----------|-------------|
+| `query`     | `&str`      | Yes      | Natural-language query selecting events (non-empty) |
+| `limit`     | `usize`     | No       | Maximum events on the timeline (default: 20) |
+| `namespace` | `Namespace` | No       | Namespace filter (default: the agent's private + shared namespaces) |
+| `as_of`     | `Timestamp` | No       | Point-in-time snapshot — include only events valid at this instant (`occurred_at <= t < valid_until`) |
+
+**Returns:** `TimelineResult` — ordered `entries` (id, content, `start_ms`, `end_ms`, `relation_to_prev`, `gap_to_prev`) plus `span_ms` / `span_human`.
 
 **Cedar action:** `recall`
 
@@ -177,7 +203,7 @@ Returns aggregate statistics and (optionally) the graph neighborhood of a specif
 
 ## MCP Tools
 
-All 6 toolkit functions are exposed as MCP tools in `hirnd` via
+All 7 toolkit functions are exposed as MCP tools in `hirnd` via
 [rmcp](https://github.com/modelcontextprotocol/rust-sdk). Transport: MCP
 Streamable HTTP at `http://<bind>:<base+2>/mcp`, authenticated per request
 with `Authorization: Bearer` (see [Deployment — MCP
@@ -187,6 +213,7 @@ Integration](deployment.html#mcp-integration)).
 |----------------------|------------------|-------------|
 | `memory_store`       | `store`          | Store a new memory with RPE-gated admission |
 | `memory_recall`      | `recall`         | Recall memories matching a query |
+| `memory_timeline`    | `timeline`       | Chronological timeline of events with Allen relations, gaps, span, and as-of snapshot |
 | `memory_update`      | `update`         | Update content/metadata/importance |
 | `memory_delete`      | `delete`         | Soft-delete (archive) a memory |
 | `memory_link`        | `link`           | Create a graph edge between memories |

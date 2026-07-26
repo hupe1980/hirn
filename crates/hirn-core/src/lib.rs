@@ -26,6 +26,7 @@ pub mod scoring;
 pub mod semantic;
 pub mod stats;
 pub mod svo_event;
+pub mod temporal;
 pub mod text_util;
 pub mod timestamp;
 pub mod tokenizer;

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use arrow_array::builder::Float32Builder;
 use arrow_array::{Array, ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, StringArray};
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use dashmap::DashMap;
 
@@ -88,15 +88,6 @@ impl MemoryStore {
             .get(dataset)
             .map(|value| value.value().clone())
             .unwrap_or_default()
-    }
-
-    #[allow(dead_code)]
-    fn get_schema(&self, dataset: &str) -> Result<SchemaRef, HirnDbError> {
-        let batches = self.get_batches(dataset)?;
-        batches
-            .first()
-            .map(|b| b.schema())
-            .ok_or_else(|| HirnDbError::DatasetNotFound(dataset.to_string()))
     }
 }
 
@@ -1176,7 +1167,7 @@ fn chrono_timestamp() -> i64 {
 mod tests {
     use super::*;
     use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
     fn make_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![

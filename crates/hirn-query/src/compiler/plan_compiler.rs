@@ -64,6 +64,8 @@ pub enum HirnOp {
         limit: usize,
         hybrid_mode: bool,
         namespace_filter: String,
+        /// Bi-temporal `AS OF` snapshot (DR-H2), applied as a scan prefilter.
+        as_of: Option<hirn_core::revision::RecallSnapshot>,
     },
     /// Community-summary retrieval for global THINK.
     GlobalSearch {
@@ -96,20 +98,12 @@ pub enum HirnOp {
     CausalChain { depth: u32 },
     /// Hebbian co-retrieval recording (pass-through).
     HebbianBuffer,
-    /// RPE-gated admission scoring.
-    RpeScore,
-    /// Prospective indexing (future-query generation).
-    ProspectiveIndexing,
-    /// SVO event extraction.
-    SvoExtraction,
     /// Query complexity classification.
     QueryComplexity { query: String },
     /// Quality gate — confidence-based fallback.
     QualityGate { threshold: u32 }, // f32 × 1000
     /// Iterative multi-hop retrieval.
     IterativeRetrieval { max_hops: u32 },
-    /// Interference detection.
-    InterferenceDetector,
     /// Prospective search — check pre-indexed questions for recall short-circuit.
     ProspectiveSearch { query: String, namespace: String },
     /// SVO event scan — structured scan of the svo_events dataset.
@@ -172,12 +166,6 @@ pub enum HirnOp {
         depth: u32,
         namespace: Option<String>,
     },
-    /// NLI contradiction detection — DeBERTa or heuristic fallback.
-    NliContradiction,
-    /// ABA conflict resolution — formal argumentation + AGM revision.
-    AbaReconsolidation { namespace: String },
-    /// Causal discovery — Granger analysis during consolidation.
-    CausalDiscovery { namespace: String },
     /// Context assembly — Arrow-native terminal operator for THINK.
     /// Collects all scored candidate batches, invokes the registered
     /// `ContextAssemblyRuntime`, and emits a single `{ assembly_json: LargeBinary }` row.
@@ -275,13 +263,9 @@ impl UserDefinedLogicalNodeCore for HirnPlanNode {
             HirnOp::ContextBudget { .. } => "HirnContextBudget",
             HirnOp::CausalChain { .. } => "HirnCausalChain",
             HirnOp::HebbianBuffer => "HirnHebbianBuffer",
-            HirnOp::RpeScore => "HirnRpeScore",
-            HirnOp::ProspectiveIndexing => "HirnProspectiveIndexing",
-            HirnOp::SvoExtraction => "HirnSvoExtraction",
             HirnOp::QueryComplexity { .. } => "HirnQueryComplexity",
             HirnOp::QualityGate { .. } => "HirnQualityGate",
             HirnOp::IterativeRetrieval { .. } => "HirnIterativeRetrieval",
-            HirnOp::InterferenceDetector => "HirnInterferenceDetector",
             HirnOp::ProspectiveSearch { .. } => "HirnProspectiveSearch",
             HirnOp::SvoEventScan { .. } => "HirnSvoEventScan",
             HirnOp::SemanticHistoryScan { .. } => "HirnSemanticHistoryScan",
@@ -293,9 +277,6 @@ impl UserDefinedLogicalNodeCore for HirnPlanNode {
             HirnOp::ShowPoliciesScan { .. } => "HirnShowPoliciesScan",
             HirnOp::ExplainPolicyScan { .. } => "HirnExplainPolicyScan",
             HirnOp::TraverseGraph { .. } => "HirnTraverseGraph",
-            HirnOp::NliContradiction => "HirnNliContradiction",
-            HirnOp::AbaReconsolidation { .. } => "HirnAbaReconsolidation",
-            HirnOp::CausalDiscovery { .. } => "HirnCausalDiscovery",
             HirnOp::ContextAssembly => "HirnContextAssembly",
             HirnOp::ImperativeBoundary { statement } => match statement {
                 ImperativePlanLabel::Correct => "HirnDirectCorrect",
@@ -568,6 +549,7 @@ fn compile_recall(r: &TypedRecall) -> HirnResult<LogicalPlan> {
             limit: r.limit,
             hybrid_mode: r.hybrid,
             namespace_filter: ns.clone(),
+            as_of: r.as_of.clone(),
         },
         result_schema.clone(),
         match complexity {
@@ -862,6 +844,8 @@ fn local_think_source(
             limit: t.limit,
             hybrid_mode: t.hybrid,
             namespace_filter: t.namespace.as_str().to_string(),
+            // THINK does not expose an `AS OF` snapshot surface.
+            as_of: None,
         },
         result_schema.clone(),
         complexity.into_iter().collect(),

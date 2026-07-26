@@ -121,6 +121,13 @@ pub enum EdgeRelation {
     Inhibits,
     /// F-056 FIX: Participation in an N-ary fact — directed (entity → fact node).
     ParticipatesIn,
+    /// Causal enablement — A makes B possible or more likely — directed.
+    /// Part of the causal edge family (Pearl-style facilitation), alongside
+    /// `Causes`/`Prevents`.
+    Enables,
+    /// Causal prevention — A stops or blocks B — directed. The negative
+    /// counterpart of `Enables` in the causal edge family.
+    Prevents,
 }
 
 impl EdgeRelation {
@@ -128,6 +135,17 @@ impl EdgeRelation {
     #[must_use]
     pub const fn is_bidirectional(self) -> bool {
         matches!(self, Self::RelatedTo | Self::Contradicts | Self::SimilarTo)
+    }
+
+    /// Whether this relation belongs to the causal edge family
+    /// (`Causes`/`CausedBy`/`Enables`/`Prevents`). Causal edges are up-weighted
+    /// during explanatory graph traversal to favor cause→effect paths.
+    #[must_use]
+    pub const fn is_causal(self) -> bool {
+        matches!(
+            self,
+            Self::Causes | Self::CausedBy | Self::Enables | Self::Prevents
+        )
     }
 }
 
@@ -589,6 +607,8 @@ mod tests {
             EdgeRelation::SimilarTo,
             EdgeRelation::Inhibits,
             EdgeRelation::ParticipatesIn,
+            EdgeRelation::Enables,
+            EdgeRelation::Prevents,
         ] {
             let bytes = bincode::serialize(&er).unwrap();
             let back: EdgeRelation = bincode::deserialize(&bytes).unwrap();

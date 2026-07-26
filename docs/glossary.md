@@ -102,11 +102,9 @@ Related terms: [Realm](#realm), [Cedar Policy Guide](cedar-guide.md)
 
 ## NLI
 
-**NLI** stands for **Natural Language Inference**. Hirn uses NLI-style classification to decide whether two statements are entailment, neutral, or contradiction, which makes it useful for contradiction detection during recall, consolidation, and validation flows.
+**NLI** stands for **Natural Language Inference** — deciding whether two statements are entailment, neutral, or contradiction. This is the conceptual basis for contradiction detection during recall, consolidation, and validation.
 
-Operators tune NLI conservatively. A lower contradiction threshold catches more conflicts but also increases false positives. A higher threshold is safer operationally but may leave real disagreements unflagged.
-
-Related config: `nli_contradiction_threshold`
+In hirn, contradiction detection runs in the engine's imperative paths (the admission `ContradictionGate` on write, `detect_conflicts_for_recall` for `WITH CONFLICTS`), not as a standalone NLI classifier operator. A conservative decision threshold trades false positives against missed disagreements.
 
 ## PPR
 

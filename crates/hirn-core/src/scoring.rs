@@ -175,7 +175,7 @@ pub fn source_reliability_for_origin(origin: Origin) -> f32 {
 /// - `activation`: graph activation score in \[0.0, 1.0\] from spreading activation.
 /// - `causal_rel`: causal relevance score in \[0.0, 1.0\] (0.0 when FOLLOW CAUSES inactive).
 /// - `surprise`: surprise score in \[0.0, 1.0\] (Bayesian surprise from EM-LLM).
-/// - `source_rel`: source reliability score in \[0.0, 1.0\] (direct_observation=1.0, unknown=0.4).
+/// - `source_rel`: source reliability score in \[0.0, 1.0\] (see `source_reliability_for_origin`: direct observation=1.0, generated=0.8, inferred=0.6, otherwise=0.5).
 /// - `weights`: scoring weights.
 ///
 /// Call sites that lack one of the inputs pass `0.0` (or `0` for

@@ -19,15 +19,12 @@ use hirn_query::compiler::plan_compiler::{ActivationRepr, HirnOp, HirnPlanNode};
 
 use crate::extensions::HirnSessionExt;
 use crate::operators::{
-    AbaReconsolidationExec, ActivationMode, CausalChainExec, CausalDiscoveryConfig,
-    CausalDiscoveryExec, CausalQueryReadExec, CausalReadKind, ContextAssemblyExec,
+    ActivationMode, CausalChainExec, CausalQueryReadExec, CausalReadKind, ContextAssemblyExec,
     ContextBudgetExec, GlobalSearchExec, GlobalSearchParams, GraphActivationExec,
-    GraphTraverseExec, HebbianBufferExec, HybridSearchParams, InterferenceConfig,
-    InterferenceDetectorExec, IterativeConfig, IterativeRetrievalExec, LanceHybridSearchExec,
-    NliConfig, NliContradictionExec, PolicyQueryReadExec, PolicyReadKind, ProspectiveConfig,
-    ProspectiveIndexingExec, QualityGateConfig, QualityGateExec, RaptorSearchExec,
-    RaptorSearchParams, RecallMergeExec, RpeConfig, RpeScoreExec, SemanticHistoryScanExec,
-    SvoConfig, SvoEventScanExec, SvoExtractionExec, TargetedQueryReadExec, TargetedReadKind,
+    GraphTraverseExec, HebbianBufferExec, HybridSearchParams, IterativeConfig,
+    IterativeRetrievalExec, LanceHybridSearchExec, PolicyQueryReadExec, PolicyReadKind,
+    QualityGateConfig, QualityGateExec, RaptorSearchExec, RaptorSearchParams, RecallMergeExec,
+    SemanticHistoryScanExec, SvoEventScanExec, TargetedQueryReadExec, TargetedReadKind,
 };
 use crate::rules::{DEFAULT_PROSPECTIVE_THRESHOLD, ProspectiveShortCircuitExec};
 
@@ -74,7 +71,7 @@ impl ExtensionPlanner for HirnExtensionPlanner {
                 limit,
                 hybrid_mode,
                 namespace_filter,
-                ..
+                as_of,
             } => {
                 let schema = hirn_node.schema.as_ref().inner().clone();
                 let datasets = layers
@@ -113,6 +110,7 @@ impl ExtensionPlanner for HirnExtensionPlanner {
                         temporal_end_ms: None,
                         temporal_expansion: false,
                         temporal_boost: 1.25,
+                        as_of: as_of.clone(),
                     },
                 ))
             }
@@ -293,48 +291,6 @@ impl ExtensionPlanner for HirnExtensionPlanner {
                 Arc::new(IterativeRetrievalExec::new(input, config))
             }
 
-            // ── Write-path operators ──
-            HirnOp::RpeScore => {
-                let input = require_single_input(physical_inputs, "RpeScore")?;
-                Arc::new(RpeScoreExec::new(input, RpeConfig::default()))
-            }
-
-            HirnOp::ProspectiveIndexing => {
-                let input = require_single_input(physical_inputs, "ProspectiveIndexing")?;
-                Arc::new(ProspectiveIndexingExec::new(
-                    input,
-                    ProspectiveConfig::default(),
-                ))
-            }
-
-            HirnOp::SvoExtraction => {
-                let input = require_single_input(physical_inputs, "SvoExtraction")?;
-                Arc::new(SvoExtractionExec::new(input, SvoConfig::default()))
-            }
-
-            HirnOp::InterferenceDetector => {
-                let input = require_single_input(physical_inputs, "InterferenceDetector")?;
-                // Session ext may carry an injected NLI classifier (e.g. DeBERTa-MNLI ONNX).
-                // If not present, `InterferenceDetectorExec::new` picks the heuristic default.
-                let classifier = session_state
-                    .config()
-                    .options()
-                    .extensions
-                    .get::<HirnSessionExt>()
-                    .and_then(|ext| ext.nli_classifier());
-                match classifier {
-                    Some(clf) => Arc::new(InterferenceDetectorExec::with_nli_classifier(
-                        input,
-                        InterferenceConfig::default(),
-                        clf,
-                    )),
-                    None => Arc::new(InterferenceDetectorExec::new(
-                        input,
-                        InterferenceConfig::default(),
-                    )),
-                }
-            }
-
             // ── Mutation operators (pass-through at physical level) ──
             // The actual insert/delete/connect logic runs in the engine after
             // collecting the physical plan's output batches.
@@ -506,26 +462,6 @@ impl ExtensionPlanner for HirnExtensionPlanner {
                     start_id.clone(),
                     relation_filter.clone(),
                     *depth,
-                    namespace.clone(),
-                ))
-            }
-
-            // ── NLI + ABA + Causal Discovery (consolidation sub-operators) ──
-            HirnOp::NliContradiction => {
-                let input = require_single_input(physical_inputs, "NliContradiction")?;
-                Arc::new(NliContradictionExec::new(input, NliConfig::default()))
-            }
-
-            HirnOp::AbaReconsolidation { namespace } => {
-                let input = require_single_input(physical_inputs, "AbaReconsolidation")?;
-                Arc::new(AbaReconsolidationExec::new(input, namespace.clone()))
-            }
-
-            HirnOp::CausalDiscovery { namespace } => {
-                let input = require_single_input(physical_inputs, "CausalDiscovery")?;
-                Arc::new(CausalDiscoveryExec::new(
-                    input,
-                    CausalDiscoveryConfig::default(),
                     namespace.clone(),
                 ))
             }

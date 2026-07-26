@@ -17,7 +17,11 @@ use crate::persistent_graph::PersistentGraph;
 /// F-35: Relation-type-specific decay multipliers.
 fn decay_multiplier_for_relation(relation: &EdgeRelation) -> f64 {
     match relation {
-        EdgeRelation::Causes | EdgeRelation::CausedBy | EdgeRelation::DerivedFrom => 0.2,
+        EdgeRelation::Causes
+        | EdgeRelation::CausedBy
+        | EdgeRelation::DerivedFrom
+        | EdgeRelation::Enables
+        | EdgeRelation::Prevents => 0.2,
         EdgeRelation::TemporalNext => 0.3,
         EdgeRelation::SimilarTo => 0.5,
         EdgeRelation::Contradicts => 0.1,

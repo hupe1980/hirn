@@ -9,14 +9,16 @@ mod tests {
 
     use hirn_core::HirnConfig;
     use hirn_core::episodic::EpisodicRecord;
+    use hirn_core::id::MemoryId;
     use hirn_core::metadata::MetadataValue;
     use hirn_core::revision::LogicalMemoryId;
-    use hirn_core::types::{AgentId, EdgeRelation, EventType};
+    use hirn_core::timestamp::Timestamp;
+    use hirn_core::types::{AgentId, EdgeRelation, EventType, Namespace};
 
     use hirn_engine::policy::{DEFAULT_SCHEMA, PolicyEngine};
     use hirn_engine::{
         EpisodicFilter, HirnDB, LinkRequest, MemoryToolkit, RecallOptions, StoreRequest,
-        UpdateRequest,
+        TimelineOptions, UpdateRequest,
     };
     use hirn_storage::{HirnDb, HirnDbConfig, PhysicalStore, memory_store::MemoryStore};
 
@@ -1050,6 +1052,216 @@ permit(
         assert!(
             metrics.contradictions_found < 10_000,
             "contradictions count should be bounded"
+        );
+    }
+
+    // ── Temporal timeline (neuro-symbolic reasoning) ────────────────────
+
+    const DAY_MS: u64 = 86_400_000;
+    const TIMELINE_BASE_MS: u64 = 1_700_000_000_000;
+
+    fn day(n: u64) -> Timestamp {
+        Timestamp::from_millis(TIMELINE_BASE_MS + n * DAY_MS)
+    }
+
+    fn half_day(n: u64) -> Timestamp {
+        Timestamp::from_millis(TIMELINE_BASE_MS + n * DAY_MS + DAY_MS / 2)
+    }
+
+    async fn remember_event(
+        db: &HirnDB,
+        agent_id: &AgentId,
+        content: &str,
+        dims: usize,
+        ts: Timestamp,
+        valid_until: Option<Timestamp>,
+    ) -> MemoryId {
+        let mut builder = EpisodicRecord::builder()
+            .content(content)
+            .embedding(pseudo_embedding(content, dims))
+            .agent_id(agent_id.clone())
+            .namespace(Namespace::private_for(agent_id))
+            .timestamp(ts);
+        if let Some(vu) = valid_until {
+            builder = builder.valid_until(vu);
+        }
+        db.episodic()
+            .remember(builder.build().unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn timeline_orders_events_and_annotates_relations() {
+        let (db, _dir) = lance_db().await;
+        let dims = db.embedding_dims();
+        let agent_id = agent();
+
+        // Insert three "Project Alpha" events out of chronological order.
+        let c = remember_event(
+            &db,
+            &agent_id,
+            "Project Alpha launch shipped to production",
+            dims,
+            day(3),
+            None,
+        )
+        .await;
+        let a = remember_event(
+            &db,
+            &agent_id,
+            "Project Alpha kickoff meeting held",
+            dims,
+            day(0),
+            None,
+        )
+        .await;
+        let b = remember_event(
+            &db,
+            &agent_id,
+            "Project Alpha design review completed",
+            dims,
+            day(1),
+            None,
+        )
+        .await;
+
+        let toolkit = MemoryToolkit::new(Arc::new(db));
+        let tl = toolkit
+            .timeline(agent_id, "Project Alpha", TimelineOptions::default())
+            .await
+            .unwrap();
+
+        assert_eq!(tl.entries.len(), 3, "all three events on the timeline");
+        // Chronological order regardless of insertion order.
+        assert_eq!(tl.entries[0].id, a);
+        assert_eq!(tl.entries[1].id, b);
+        assert_eq!(tl.entries[2].id, c);
+
+        // First entry has no predecessor annotation.
+        assert_eq!(tl.entries[0].relation_to_prev, None);
+        assert_eq!(tl.entries[0].gap_to_prev_ms, None);
+
+        // b is after a with a one-day gap.
+        assert_eq!(tl.entries[1].relation_to_prev.as_deref(), Some("after"));
+        assert_eq!(tl.entries[1].gap_to_prev_ms, Some(DAY_MS as i64));
+        assert_eq!(tl.entries[1].gap_to_prev_human.as_deref(), Some("1 day"));
+
+        // Total span is earliest → latest = 3 days.
+        assert_eq!(tl.span_ms, Some(3 * DAY_MS as i64));
+        assert_eq!(tl.span_human, "3 days");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn timeline_as_of_snapshots_valid_events() {
+        let (db, _dir) = lance_db().await;
+        let dims = db.embedding_dims();
+        let agent_id = agent();
+
+        // A valid [day0, day2); B valid [day1, day3); C valid [day4, ongoing).
+        let a = remember_event(
+            &db,
+            &agent_id,
+            "Config Beta rollout wave one",
+            dims,
+            day(0),
+            Some(day(2)),
+        )
+        .await;
+        let b = remember_event(
+            &db,
+            &agent_id,
+            "Config Beta rollout wave two",
+            dims,
+            day(1),
+            Some(day(3)),
+        )
+        .await;
+        let _c = remember_event(
+            &db,
+            &agent_id,
+            "Config Beta rollout wave three",
+            dims,
+            day(4),
+            None,
+        )
+        .await;
+
+        let toolkit = MemoryToolkit::new(Arc::new(db));
+
+        // As of the middle of day 1: only A and B were valid.
+        let tl = toolkit
+            .timeline(
+                agent_id,
+                "Config Beta rollout",
+                TimelineOptions {
+                    as_of: Some(half_day(1)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let ids: Vec<MemoryId> = tl.entries.iter().map(|e| e.id).collect();
+        assert_eq!(ids, vec![a, b], "only events valid as of day 1.5");
+    }
+
+    // ── MAGMA query-adaptive routing ────────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn smart_recall_routes_temporal_query_to_timeline() {
+        let (db, _dir) = lance_db().await;
+        let dims = db.embedding_dims();
+        let agent_id = agent();
+
+        remember_event(
+            &db,
+            &agent_id,
+            "Project Gamma kickoff meeting",
+            dims,
+            day(0),
+            None,
+        )
+        .await;
+        remember_event(
+            &db,
+            &agent_id,
+            "Project Gamma launch shipped",
+            dims,
+            day(2),
+            None,
+        )
+        .await;
+
+        let toolkit = MemoryToolkit::new(Arc::new(db));
+
+        // A temporal-intent query routes to the timeline view.
+        let routed = toolkit
+            .smart_recall(
+                agent_id.clone(),
+                "when did Project Gamma launch and how long after kickoff",
+                RecallOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(routed.primary_view, "temporal");
+        assert!(
+            routed.timeline.is_some(),
+            "temporal query returns a timeline"
+        );
+        assert!(routed.records.is_empty());
+        assert!(routed.weights.temporal > routed.weights.semantic);
+
+        // A plain semantic query routes to hybrid recall (ranked records).
+        let routed2 = toolkit
+            .smart_recall(agent_id, "Project Gamma", RecallOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(routed2.primary_view, "semantic");
+        assert!(routed2.timeline.is_none());
+        assert!(
+            !routed2.records.is_empty(),
+            "semantic query returns records"
         );
     }
 }

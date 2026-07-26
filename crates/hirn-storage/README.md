@@ -2,7 +2,7 @@
 
 > **⚠️ Experimental:** This project is under active development. APIs, on-disk formats, and behaviour may change without notice. Not recommended for production use.
 
-Cognitive storage engine for hirn — purpose-built on **Lance 4.0** + `lance-namespace`.
+Cognitive storage engine for hirn — purpose-built on **Lance 9.0** + `lance-namespace`.
 
 ## Overview
 
@@ -18,10 +18,9 @@ single execution entry point for all query operations.
 ### Lifecycle
 
 1. **Creation** — `SessionContext` created at database open time with default configuration.
-2. **UDF Registration** — All 8 scoring UDFs from `hirn-exec` pre-registered.
-3. **Table Registration** — All Lance datasets registered as `LanceTableProvider` tables.
-4. **Extension Registration** — `HirnSessionExt` injected with graph, config, and embedder handles.
-5. **Access** — `PhysicalStore::session() -> &SessionContext` returns the shared instance.
+2. **Table Registration** — All Lance datasets registered as `LanceTableProvider` tables.
+3. **Extension Registration** — `HirnSessionExt` injected with graph, config, and embedder handles.
+4. **Access** — `PhysicalStore::session() -> &SessionContext` returns the shared instance.
 
 ### LanceTableProvider
 
@@ -54,7 +53,7 @@ let batches = df.collect().await?;
 All storage access flows through `PhysicalStore`. Never call Lance APIs from engine code.
 
 Two implementations:
-- **`LancePhysicalStore`** — production backend with `EpochCache` + Lance 4.0.
+- **`LancePhysicalStore`** — production backend with `EpochCache` + Lance 9.0.
 - **`MemoryStore`** — test backend with `DashMap` + brute-force search.
 
 ## EpochCache

@@ -13,8 +13,8 @@ use crate::graph_store::GraphStore;
 use crate::policy::Action;
 
 use super::types::{
-    EdgeInfo, IntrospectionResult, LinkRequest, RecallOptions, RecallRecord, StoreRequest,
-    UpdateRequest,
+    EdgeInfo, IntrospectionResult, LinkRequest, RecallOptions, RecallRecord, RouteWeights,
+    RoutedRecall, StoreRequest, TimelineEntryView, TimelineOptions, TimelineResult, UpdateRequest,
 };
 
 /// Agent-facing toolkit with 6 self-editing memory operations.
@@ -176,6 +176,154 @@ impl MemoryToolkit {
                 }
             })
             .collect())
+    }
+
+    // ── 2b. Timeline (neuro-symbolic temporal reasoning) ─────────────────
+
+    /// Build a chronologically-ordered **timeline** of the episodic events most
+    /// relevant to `query`, with deterministic symbolic temporal annotations:
+    /// each entry carries its Allen interval relation to the previous event, the
+    /// gap since it, and the timeline reports its total span.
+    ///
+    /// This is the retrieval-facing half of hirn's neuro-symbolic temporal layer
+    /// ([`hirn_core::temporal`]): the ordering, interval relations, durations, and
+    /// "as of" filtering are computed **exactly in Rust**, so an LLM never has to
+    /// order or date events itself (its documented failure mode). When
+    /// `options.as_of` is set, only events whose validity interval contains that
+    /// instant are included — the bi-temporal point-in-time snapshot.
+    ///
+    /// Enforces `Action::Recall`, scoped like [`recall`](Self::recall).
+    pub async fn timeline(
+        &self,
+        agent_id: AgentId,
+        query: &str,
+        options: TimelineOptions,
+    ) -> HirnResult<TimelineResult> {
+        if query.is_empty() {
+            return Err(HirnError::InvalidInput("query must not be empty".into()));
+        }
+
+        let embedding = self.db.embed_text(query).await?;
+        let limit = options.limit.unwrap_or(20);
+        let mut builder = self
+            .db
+            .recall(embedding)
+            .agent_id(agent_id.as_str())
+            .limit(limit)
+            .query_text(query)
+            .hybrid(true)
+            .episodic_only();
+
+        builder = match options.namespace {
+            Some(ns) if ns != Namespace::default() => builder.namespace(ns),
+            _ => builder
+                .allowed_namespaces(vec![Namespace::private_for(&agent_id), Namespace::shared()]),
+        };
+
+        let results = builder.execute().await?;
+
+        // Build symbolic timeline events from the episodic records' valid-time
+        // intervals (event time = `timestamp`, end = `valid_until`).
+        let mut id_map: std::collections::HashMap<String, MemoryId> =
+            std::collections::HashMap::new();
+        let mut events: Vec<hirn_core::temporal::TimelineEvent> = Vec::new();
+        for r in results {
+            if let hirn_core::record::MemoryRecord::Episodic(e) = &r.record {
+                let id_str = e.id.to_string();
+                id_map.insert(id_str.clone(), e.id);
+                events.push(hirn_core::temporal::TimelineEvent::new(
+                    id_str,
+                    e.content.clone(),
+                    e.timestamp,
+                    e.valid_until,
+                ));
+            }
+        }
+
+        let timeline = hirn_core::temporal::Timeline::build(events, options.as_of);
+
+        let entries = timeline
+            .entries
+            .into_iter()
+            .map(|e| {
+                let id = id_map.get(&e.id).copied().unwrap_or_else(MemoryId::new);
+                TimelineEntryView {
+                    id,
+                    content: e.label,
+                    start_ms: e.occurred_at.timestamp_ms(),
+                    end_ms: e.valid_until.map(|t| t.timestamp_ms()),
+                    relation_to_prev: e.relation_to_prev.map(|r| r.label().to_string()),
+                    gap_to_prev_ms: e.gap_to_prev_ms,
+                    gap_to_prev_human: e
+                        .gap_to_prev_ms
+                        .map(hirn_core::temporal::humanize_duration_ms),
+                }
+            })
+            .collect();
+
+        Ok(TimelineResult {
+            entries,
+            span_ms: timeline.span_ms,
+            span_human: timeline.span_human,
+        })
+    }
+
+    // ── 2c. Smart recall (MAGMA-style query-adaptive routing) ────────────
+
+    /// Query-adaptive recall: classify the query's intent and route it to the
+    /// matching memory view (MAGMA-style, arXiv:2601.03236).
+    ///
+    /// A "when/before/how long" query routes to the **temporal** view and returns
+    /// an exact [`timeline`](Self::timeline); "why/because/led-to", "who/which",
+    /// and everything else route to hybrid embedding [`recall`](Self::recall).
+    /// The per-view weights and the chosen `primary_view` are returned so callers
+    /// can see (and override) the routing. Enforces `Action::Recall`.
+    pub async fn smart_recall(
+        &self,
+        agent_id: AgentId,
+        query: &str,
+        options: RecallOptions,
+    ) -> HirnResult<RoutedRecall> {
+        if query.is_empty() {
+            return Err(HirnError::InvalidInput("query must not be empty".into()));
+        }
+
+        let weights = crate::retrieval::query_intent::classify_query(query);
+        let primary = weights.primary();
+        let route_weights = RouteWeights {
+            semantic: weights.semantic,
+            temporal: weights.temporal,
+            causal: weights.causal,
+            entity: weights.entity,
+        };
+
+        if primary == crate::retrieval::query_intent::ViewKind::Temporal {
+            let timeline = self
+                .timeline(
+                    agent_id,
+                    query,
+                    TimelineOptions {
+                        limit: options.limit,
+                        namespace: options.namespace,
+                        as_of: None,
+                    },
+                )
+                .await?;
+            return Ok(RoutedRecall {
+                primary_view: primary.label().to_string(),
+                weights: route_weights,
+                records: Vec::new(),
+                timeline: Some(timeline),
+            });
+        }
+
+        let records = self.recall(agent_id, query, options).await?;
+        Ok(RoutedRecall {
+            primary_view: primary.label().to_string(),
+            weights: route_weights,
+            records,
+            timeline: None,
+        })
     }
 
     // ── 3. Update ───────────────────────────────────────────────────────

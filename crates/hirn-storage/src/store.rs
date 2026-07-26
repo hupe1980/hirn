@@ -358,7 +358,7 @@ pub enum ColumnTransform {
 
 /// Physical storage operations on Lance datasets.
 ///
-/// `LancePhysicalStore` implements this directly against lance 4.0 Dataset + LanceNamespace.
+/// `LancePhysicalStore` implements this directly against lance 9.0 Dataset + LanceNamespace.
 /// `MemoryStore` implements this for tests with real Arrow data, brute-force search, etc.
 #[async_trait]
 pub trait PhysicalStore: Send + Sync {

@@ -217,6 +217,8 @@ pub fn edge_relation_to_proto(er: &EdgeRelation) -> i32 {
         EdgeRelation::SimilarTo => proto::EdgeRelation::SimilarTo as i32,
         EdgeRelation::Inhibits => proto::EdgeRelation::Inhibits as i32,
         EdgeRelation::ParticipatesIn => proto::EdgeRelation::ParticipatesIn as i32,
+        EdgeRelation::Enables => proto::EdgeRelation::Enables as i32,
+        EdgeRelation::Prevents => proto::EdgeRelation::Prevents as i32,
     }
 }
 
@@ -234,6 +236,8 @@ pub fn edge_relation_from_proto(v: i32) -> EdgeRelation {
         Ok(proto::EdgeRelation::SimilarTo) => EdgeRelation::SimilarTo,
         Ok(proto::EdgeRelation::Inhibits) => EdgeRelation::Inhibits,
         Ok(proto::EdgeRelation::ParticipatesIn) => EdgeRelation::ParticipatesIn,
+        Ok(proto::EdgeRelation::Enables) => EdgeRelation::Enables,
+        Ok(proto::EdgeRelation::Prevents) => EdgeRelation::Prevents,
         _ => EdgeRelation::RelatedTo,
     }
 }

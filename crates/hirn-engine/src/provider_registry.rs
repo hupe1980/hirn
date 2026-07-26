@@ -265,33 +265,6 @@ impl ProviderRegistry {
         reg
     }
 
-    #[allow(dead_code)]
-    fn default_embedder_is_unset_or_fallback(&self) -> bool {
-        self.defaults
-            .read()
-            .embedder
-            .as_deref()
-            .is_none_or(|name| name == "pseudo")
-    }
-
-    #[allow(dead_code)]
-    fn default_reranker_is_unset_or_fallback(&self) -> bool {
-        self.defaults
-            .read()
-            .reranker
-            .as_deref()
-            .is_none_or(|name| name == "noop")
-    }
-
-    #[allow(dead_code)]
-    fn default_llm_is_unset_or_fallback(&self) -> bool {
-        self.defaults
-            .read()
-            .llm
-            .as_deref()
-            .is_none_or(|name| name == "mock")
-    }
-
     #[allow(unused_variables)]
     fn populate_from_env(reg: &Self) {
         // Override with real providers based on env vars.
