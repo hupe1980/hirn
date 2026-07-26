@@ -219,6 +219,13 @@ Integration](deployment.html#mcp-integration)).
 | `memory_link`        | `link`           | Create a graph edge between memories |
 | `memory_introspect`  | `introspect`     | Database stats and graph neighborhood |
 
+Alongside these, `hirnd` exposes the lower-level `hirn_recall`, `hirn_think`, and
+`hirn_execute` (HirnQL) tools. Every recall/think/query MCP tool is namespace-scoped
+from the caller's credential: a token-restricted credential reads only its agent's
+accessible namespaces, while an unrestricted API-key/mTLS credential reads across its
+realm. There is no unscoped read path — an authenticated caller can never exceed its
+credential's namespace scope. See [Security — Recall is deny-by-default](security.html).
+
 ### MCP Example (JSON-RPC)
 
 ```json

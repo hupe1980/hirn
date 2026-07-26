@@ -12,6 +12,7 @@ use hirn_core::timestamp::Timestamp;
 use hirn_core::types::{AgentId, EdgeRelation, Namespace};
 use hirn_core::{HirnError, HirnResult, RecallSnapshot, RevisionId};
 
+use crate::activation::ActivationMode;
 use crate::db::{
     HirnDB, SemanticMerge, SemanticMergeOutcome, SemanticOverride, SemanticRetraction,
     SemanticSupersession, SemanticUpdate,
@@ -173,6 +174,8 @@ impl<'a> AgentContext<'a> {
             snapshot: None,
             query_text: None,
             hybrid: false,
+            activation_mode: ActivationMode::None,
+            activation_depth: None,
             view_mode: RecallViewMode::default(),
             preview_policy: RecallPreviewPolicy::from_config(self.db.config()),
         }
@@ -549,6 +552,8 @@ pub struct AgentRecallBuilder<'a> {
     snapshot: Option<RecallSnapshot>,
     query_text: Option<String>,
     hybrid: bool,
+    activation_mode: ActivationMode,
+    activation_depth: Option<usize>,
     view_mode: RecallViewMode,
     preview_policy: RecallPreviewPolicy,
 }
@@ -605,6 +610,18 @@ impl<'a> AgentRecallBuilder<'a> {
     /// Enable hybrid BM25+vector search when `query_text` is provided.
     pub fn hybrid(mut self, enable: bool) -> Self {
         self.hybrid = enable;
+        self
+    }
+
+    /// Set the graph activation mode (spreading / personalized page-rank).
+    pub fn activation(mut self, mode: ActivationMode) -> Self {
+        self.activation_mode = mode;
+        self
+    }
+
+    /// Set the graph activation traversal depth.
+    pub fn depth(mut self, depth: usize) -> Self {
+        self.activation_depth = Some(depth);
         self
     }
 
@@ -672,6 +689,10 @@ impl<'a> AgentRecallBuilder<'a> {
             if self.hybrid {
                 builder = builder.hybrid(true);
             }
+            builder = builder.activation(self.activation_mode);
+            if let Some(depth) = self.activation_depth {
+                builder = builder.depth(depth);
+            }
             if let Some(snapshot) = self.snapshot {
                 builder = builder.snapshot(snapshot);
             }
@@ -705,6 +726,10 @@ impl<'a> AgentRecallBuilder<'a> {
             );
         if self.hybrid {
             builder = builder.hybrid(true);
+        }
+        builder = builder.activation(self.activation_mode);
+        if let Some(depth) = self.activation_depth {
+            builder = builder.depth(depth);
         }
         if let Some(snapshot) = self.snapshot {
             builder = builder.snapshot(snapshot);

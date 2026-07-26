@@ -1461,10 +1461,21 @@ impl HirnDB {
 impl Drop for HirnDB {
     fn drop(&mut self) {
         let flush = async {
-            let _ = self.flush_hebbian().await;
-            let _ = self.flush_episodic_access().await;
-            let _ = self.flush_semantic_access().await;
-            let _ = self.flush_importance_accumulator().await;
+            // Log flush failures on drop — silently discarding them means
+            // buffered Hebbian weights / access counts / importance can vanish
+            // with no signal.
+            if let Err(e) = self.flush_hebbian().await {
+                tracing::error!(error = %e, "flush_hebbian failed on HirnDB drop");
+            }
+            if let Err(e) = self.flush_episodic_access().await {
+                tracing::error!(error = %e, "flush_episodic_access failed on HirnDB drop");
+            }
+            if let Err(e) = self.flush_semantic_access().await {
+                tracing::error!(error = %e, "flush_semantic_access failed on HirnDB drop");
+            }
+            if let Err(e) = self.flush_importance_accumulator().await {
+                tracing::error!(error = %e, "flush_importance_accumulator failed on HirnDB drop");
+            }
         };
 
         // Dropping inside a current-thread Tokio runtime cannot safely re-enter

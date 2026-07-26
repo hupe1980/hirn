@@ -72,19 +72,24 @@ permit(
     resource
 );
 
-// ABAC: block agents with low reputation from writing
+// ABAC: block agents with low reputation from writing.
+// Guard the optional attribute with `has` so the policy is skipped (not an
+// evaluation error) for principals without a reputation attribute — required
+// because authorization fails CLOSED on Cedar evaluation errors.
 forbid(
     principal,
     action in [Hirn::Action::"remember", Hirn::Action::"connect"],
     resource
-) when { principal.reputation < 50 };
+) when { principal has reputation && principal.reputation < 50 };
 
-// Restricted namespaces require admin
+// Restricted namespaces require admin. `has classification` guards resources
+// (e.g. realms) that carry no classification attribute, so the policy is skipped
+// rather than erroring (which would fail closed and deny legitimate access).
 forbid(
     principal,
     action,
     resource
-) when { resource.classification == "restricted" }
+) when { resource has classification && resource.classification == "restricted" }
 unless { principal in Hirn::Team::"admins" };
 "#;
 
@@ -310,6 +315,7 @@ permit(
         let result = db_finance
             .recall_view()
             .query(query.clone())
+            .unrestricted()
             .agent_id("agent-health")
             .namespace(ns("fin-default"))
             .execute()
@@ -340,6 +346,7 @@ permit(
         let result = db_finance
             .recall_view()
             .query(query)
+            .unrestricted()
             .agent_id("agent-finance")
             .namespace(ns("fin-default"))
             .execute()
@@ -498,6 +505,7 @@ permit(
         let err = db_health
             .recall_view()
             .query(query)
+            .unrestricted()
             .agent_id("agent-finance")
             .namespace(ns("health-default"))
             .execute()
@@ -537,6 +545,7 @@ permit(
         let _ = db
             .recall_view()
             .query(query)
+            .unrestricted()
             .agent_id("agent-eng")
             .namespace(ns("fin-default"))
             .execute()
@@ -745,6 +754,7 @@ permit(
         let result = db
             .recall_view()
             .query(query)
+            .unrestricted()
             .agent_id("agent-low-rep")
             .namespace(ns("fin-default"))
             .execute()
@@ -887,6 +897,7 @@ permit(
         let _ = db
             .recall_view()
             .query(query)
+            .unrestricted()
             .agent_id("agent-health")
             .namespace(ns("fin-default"))
             .execute()
@@ -978,6 +989,7 @@ permit(
         let fin_result = db_fin
             .recall_view()
             .query(rand_vec(DIM, 100))
+            .unrestricted()
             .agent_id("agent-finance")
             .namespace(ns("fin-default"))
             .limit(20)
@@ -991,6 +1003,7 @@ permit(
         let health_result = db_health
             .recall_view()
             .query(rand_vec(DIM, 200))
+            .unrestricted()
             .agent_id("agent-health")
             .namespace(ns("health-default"))
             .limit(20)
@@ -1004,6 +1017,7 @@ permit(
         let eng_result = db_eng
             .recall_view()
             .query(rand_vec(DIM, 300))
+            .unrestricted()
             .agent_id("agent-eng")
             .namespace(ns("eng-default"))
             .limit(20)
@@ -1027,6 +1041,7 @@ permit(
             let result = db
                 .recall_view()
                 .query(rand_vec(DIM, 999))
+                .unrestricted()
                 .agent_id(agent)
                 .namespace(ns(ns_id))
                 .execute()

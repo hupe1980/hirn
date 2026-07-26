@@ -626,6 +626,7 @@ mod tests {
         let result = db
             .recall_view()
             .think(emb)
+            .unrestricted()
             .budget(1024)
             .execute()
             .await
@@ -656,6 +657,7 @@ mod tests {
         let first = db
             .recall_view()
             .think(emb.clone())
+            .unrestricted()
             .budget(120)
             .execute()
             .await
@@ -665,6 +667,7 @@ mod tests {
         let second = db
             .recall_view()
             .think(emb)
+            .unrestricted()
             .budget(120)
             .execute()
             .await
@@ -698,6 +701,7 @@ mod tests {
         let result = db
             .recall_view()
             .think(emb)
+            .unrestricted()
             .budget(200)
             .limit(20)
             .execute()
@@ -733,6 +737,7 @@ mod tests {
         let result = db
             .recall_view()
             .think(emb)
+            .unrestricted()
             .context_config(config)
             .execute()
             .await
@@ -765,6 +770,7 @@ mod tests {
         let result = db
             .recall_view()
             .think(emb)
+            .unrestricted()
             .context_config(config)
             .execute()
             .await
@@ -806,6 +812,7 @@ mod tests {
         let result = db
             .recall_view()
             .think(emb)
+            .unrestricted()
             .context_config(config)
             .execute()
             .await
@@ -852,6 +859,7 @@ mod tests {
         let result = db
             .recall_view()
             .think(emb)
+            .unrestricted()
             .context_config(config)
             .budget(128)
             .execute()
@@ -874,6 +882,7 @@ mod tests {
         let result = db
             .recall_view()
             .think(emb)
+            .unrestricted()
             .budget(2048)
             .format(ContextFormat::Json)
             .execute()
@@ -938,6 +947,7 @@ mod tests {
         let result = db
             .recall_view()
             .think(emb)
+            .unrestricted()
             .semantic_only()
             .format(ContextFormat::Json)
             .budget(1024)
@@ -989,6 +999,7 @@ mod tests {
         let builder_result = db
             .recall_view()
             .think(emb)
+            .unrestricted()
             .budget(1024)
             .execute()
             .await

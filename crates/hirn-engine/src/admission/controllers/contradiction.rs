@@ -189,7 +189,7 @@ impl AdmissionController for ContradictionGate {
             ..Default::default()
         };
 
-        // DR-M-eng3 FIX: bound the LLM call and degrade gracefully. Previously a
+        // bound the LLM call and degrade gracefully. Previously a
         // hung provider hung the whole write path indefinitely and any transient
         // error (`?`) failed the admission. Now a timeout or error accepts the
         // write (contradiction detection is best-effort), mirroring reflection's

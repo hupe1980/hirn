@@ -93,6 +93,7 @@ mod tests {
         let results = db
             .recall_view()
             .query(emb)
+            .unrestricted()
             .limit(5)
             .execute()
             .await
@@ -124,6 +125,7 @@ mod tests {
         let results = db
             .recall_view()
             .query(rand_vec(105))
+            .unrestricted()
             .limit(3)
             .execute()
             .await
@@ -172,6 +174,7 @@ mod tests {
         let results = db
             .recall_view()
             .query(rand_vec(200))
+            .unrestricted()
             .query_text("quantum physics")
             .limit(5)
             .execute()
@@ -207,6 +210,7 @@ mod tests {
         let results = db
             .recall_view()
             .query(rand_vec(302))
+            .unrestricted()
             .limit(10)
             .execute()
             .await
@@ -244,6 +248,7 @@ mod tests {
         let results = db
             .recall_view()
             .query(emb)
+            .unrestricted()
             .limit(1)
             .execute()
             .await
@@ -333,6 +338,7 @@ mod tests {
         let results = db
             .recall_view()
             .query(ep_emb)
+            .unrestricted()
             .episodic_only()
             .limit(5)
             .execute()
@@ -345,6 +351,7 @@ mod tests {
         let results = db
             .recall_view()
             .query(sem_emb)
+            .unrestricted()
             .semantic_only()
             .limit(5)
             .execute()
@@ -357,6 +364,7 @@ mod tests {
         let results = db
             .recall_view()
             .query(proc_emb)
+            .unrestricted()
             .procedural_only()
             .limit(5)
             .execute()
@@ -388,6 +396,7 @@ mod tests {
         let results = db
             .recall_view()
             .query(emb.clone())
+            .unrestricted()
             .after(before_ts)
             .limit(5)
             .execute()
@@ -399,6 +408,7 @@ mod tests {
         let results = db
             .recall_view()
             .query(emb)
+            .unrestricted()
             .before(before_ts)
             .limit(5)
             .execute()
@@ -450,6 +460,7 @@ mod tests {
         let results = db
             .recall_view()
             .query(emb_a)
+            .unrestricted()
             .namespace(ns_a)
             .limit(5)
             .execute()
@@ -522,6 +533,7 @@ mod tests {
         let results = db
             .recall_view()
             .query(emb_a.clone())
+            .unrestricted()
             .query_text("quantum entanglement")
             .hybrid(true)
             .limit(5)
@@ -555,6 +567,7 @@ mod tests {
         let results = db
             .recall_view()
             .query(emb.clone())
+            .unrestricted()
             .query_text("machine learning")
             .hybrid(false)
             .limit(5)
@@ -601,6 +614,7 @@ mod tests {
         let (result, explanation) = db
             .recall_view()
             .think(rand_vec(200))
+            .unrestricted()
             .query_text("quantum physics")
             .limit(1)
             .budget(64)
@@ -681,6 +695,7 @@ mod tests {
         let results = db
             .recall_view()
             .query(rand_vec(42))
+            .unrestricted()
             .limit(5)
             .execute()
             .await
@@ -807,7 +822,12 @@ mod tests {
 
         // Build 10 recall queries, each targeting a specific record.
         let builders: Vec<_> = (0..10u128)
-            .map(|seed| db.recall_view().query(rand_vec(seed)).limit(10))
+            .map(|seed| {
+                db.recall_view()
+                    .query(rand_vec(seed))
+                    .unrestricted()
+                    .limit(10)
+            })
             .collect();
 
         let results = db.recall_view().batch(builders).await;
@@ -843,9 +863,9 @@ mod tests {
         }
 
         let builders = vec![
-            db.recall_view().query(rand_vec(5)).limit(3),
-            db.recall_view().query(rand_vec(10)).limit(7),
-            db.recall_view().query(rand_vec(15)).limit(1),
+            db.recall_view().query(rand_vec(5)).unrestricted().limit(3),
+            db.recall_view().query(rand_vec(10)).unrestricted().limit(7),
+            db.recall_view().query(rand_vec(15)).unrestricted().limit(1),
         ];
 
         let results = db.recall_view().batch(builders).await;
@@ -890,7 +910,12 @@ mod tests {
 
         // Batch approach.
         let builders: Vec<_> = (0..n as u128)
-            .map(|seed| db.recall_view().query(rand_vec(seed + 100)).limit(5))
+            .map(|seed| {
+                db.recall_view()
+                    .query(rand_vec(seed + 100))
+                    .unrestricted()
+                    .limit(5)
+            })
             .collect();
 
         let batch_start = std::time::Instant::now();
@@ -907,6 +932,7 @@ mod tests {
             let _ = db
                 .recall_view()
                 .query(rand_vec(seed + 100))
+                .unrestricted()
                 .limit(5)
                 .execute()
                 .await
@@ -973,6 +999,7 @@ mod tests {
         let results = db
             .recall_view()
             .query(emb)
+            .unrestricted()
             .limit(5)
             .execute()
             .await
@@ -1165,6 +1192,7 @@ mod tests {
         let results = db
             .recall_view()
             .query(emb)
+            .unrestricted()
             .limit(5)
             .execute()
             .await

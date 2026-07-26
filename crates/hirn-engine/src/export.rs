@@ -184,6 +184,19 @@ impl HirnDB {
         writer: &mut dyn Write,
         actor: Option<AgentId>,
     ) -> HirnResult<ExportReport> {
+        // Export dumps every record across all namespaces, so it is an admin
+        // operation. Enforce before reading anything (a no-op in open mode with
+        // no Cedar engine; fail-closed for a non-admin/anonymous actor under
+        // Cedar) — previously export performed NO authorization at all, allowing
+        // full cross-tenant exfiltration at the engine layer.
+        let agent = actor.as_ref().map_or("anonymous", AgentId::as_str);
+        self.enforce(
+            agent,
+            crate::policy::Action::Admin,
+            self.config().default_realm.as_str(),
+            "",
+        )
+        .await?;
         let report = export(self.storage_backend(), writer).await?;
         self.append_audit(
             actor,
@@ -210,6 +223,16 @@ impl HirnDB {
         reader: &mut dyn Read,
         actor: Option<AgentId>,
     ) -> HirnResult<ImportReport> {
+        // Import writes arbitrary records (with caller-supplied provenance) into
+        // any namespace — an admin operation. Enforce before writing anything.
+        let agent = actor.as_ref().map_or("anonymous", AgentId::as_str);
+        self.enforce(
+            agent,
+            crate::policy::Action::Admin,
+            self.config().default_realm.as_str(),
+            "",
+        )
+        .await?;
         let report = import(reader, self.storage_backend(), self.embedding_dims()).await?;
         self.append_audit(
             actor,

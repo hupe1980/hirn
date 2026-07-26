@@ -83,6 +83,7 @@ impl HirnDB {
         layer_filter: LayerFilter,
         namespace: Option<&Namespace>,
         allowed_namespaces: Option<&[Namespace]>,
+        unrestricted: bool,
         after: Option<&Timestamp>,
         before: Option<&Timestamp>,
         weights: Option<&ScoringWeights>,
@@ -90,7 +91,12 @@ impl HirnDB {
         activation_depth: Option<usize>,
         query_text: Option<&str>,
     ) -> HirnResult<(Vec<RecallResult>, QueryDiagnostics)> {
-        if matches!(allowed_namespaces, Some([])) {
+        let effective_namespaces =
+            effective_recall_namespaces(namespace, allowed_namespaces, unrestricted);
+        // An empty effective scope means the caller is authorized for no
+        // namespace (or provided none without opting into unrestricted reads);
+        // deny fast rather than scanning every tenant.
+        if matches!(effective_namespaces.as_deref(), Some([])) {
             return Ok((Vec::new(), QueryDiagnostics::default()));
         }
 
@@ -101,7 +107,6 @@ impl HirnDB {
         let now = Timestamp::now();
         let has_temporal_filter = after.is_some() || before.is_some();
         let mut diag = QueryDiagnostics::default();
-        let effective_namespaces = effective_recall_namespaces(namespace, allowed_namespaces);
         let effective_namespace_slice = effective_namespaces.as_deref();
 
         // ── Search via LanceDB PhysicalStore ──
@@ -1066,13 +1071,27 @@ fn build_lance_filter(
     }
 }
 
+/// Resolve the concrete namespace scope for a recall.
+///
+/// Precedence: a specifically requested namespace wins; otherwise the caller's
+/// allowed-namespace set applies. When neither is present the query is scoped to
+/// nothing — an **empty** set (`Some(vec![])`) that downstream turns into a
+/// `1 = 0` predicate — so an unscoped recall denies rather than silently reading
+/// every tenant's data. The single exception is an explicitly `unrestricted`
+/// caller (the single-tenant embedded facade / admin tooling), which opts out of
+/// filtering entirely by yielding `None`. `None` must never arise implicitly.
 fn effective_recall_namespaces(
     namespace: Option<&Namespace>,
     allowed_namespaces: Option<&[Namespace]>,
+    unrestricted: bool,
 ) -> Option<Vec<Namespace>> {
-    namespace
-        .map(|namespace| vec![*namespace])
-        .or_else(|| allowed_namespaces.map(|namespaces| namespaces.to_vec()))
+    if let Some(namespace) = namespace {
+        return Some(vec![*namespace]);
+    }
+    if let Some(namespaces) = allowed_namespaces {
+        return Some(namespaces.to_vec());
+    }
+    if unrestricted { None } else { Some(Vec::new()) }
 }
 
 fn build_namespace_filter_sql(namespaces: Option<&[Namespace]>) -> Option<String> {
@@ -1650,7 +1669,13 @@ mod tests {
         // so the buffer trips its threshold and flushes inline on the recall
         // path — no close()/drop involved.
         for _ in 0..20 {
-            let _ = db.recall(emb.clone()).limit(10).execute().await.unwrap();
+            let _ = db
+                .recall(emb.clone())
+                .unrestricted()
+                .limit(10)
+                .execute()
+                .await
+                .unwrap();
         }
 
         let final_weight = edge_weight(&db);
@@ -1943,6 +1968,7 @@ mod tests {
 
         let baseline = db
             .recall(vec![1.0, 0.0, 0.0, 0.0])
+            .unrestricted()
             .limit(2)
             .between(window_start, window_end)
             .threshold(0.3)
@@ -1959,6 +1985,7 @@ mod tests {
 
         let results = db
             .recall(vec![1.0, 0.0, 0.0, 0.0])
+            .unrestricted()
             .limit(2)
             .between(window_start, window_end)
             .threshold(0.3)
@@ -2046,6 +2073,7 @@ mod tests {
 
         let results = db
             .recall(vec![1.0, 0.0, 0.0, 0.0])
+            .unrestricted()
             .limit(3)
             .after(seed_ts)
             .threshold(0.6)
@@ -2099,6 +2127,7 @@ mod tests {
 
         let (results, diag) = db
             .recall(vec![1.0, 0.0, 0.0, 0.0])
+            .unrestricted()
             .limit(1)
             .query_text("multivector target")
             .hybrid(true)
@@ -2132,6 +2161,7 @@ mod tests {
 
         let (results, diag) = db
             .recall(vec![1.0, 0.0, 0.0, 0.0])
+            .unrestricted()
             .limit(1)
             .query_text("reranker target")
             .hybrid(true)
@@ -2167,6 +2197,7 @@ mod tests {
 
         let error = db
             .recall(vec![1.0, 0.0, 0.0, 0.0])
+            .unrestricted()
             .limit(1)
             .execute()
             .await
@@ -2207,6 +2238,7 @@ mod tests {
 
         let results = db
             .recall(vec![1.0, 0.0, 0.0, 0.0])
+            .unrestricted()
             .limit(1)
             .execute()
             .await

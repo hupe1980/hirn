@@ -115,6 +115,7 @@ fn run_explanation_quality(run_id: &str) -> Result<AdvancedResult, String> {
         let (results, explanation) = db
             .recall_view()
             .query(query)
+            .unrestricted()
             .limit(2)
             .execute_with_explanation()
             .await
@@ -125,6 +126,7 @@ fn run_explanation_quality(run_id: &str) -> Result<AdvancedResult, String> {
         let (think_result, think_explanation) = db
             .recall_view()
             .think(rand_vec(768, 4))
+            .unrestricted()
             .limit(8)
             .budget(80)
             .execute_with_explanation()

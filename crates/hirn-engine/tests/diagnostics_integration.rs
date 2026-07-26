@@ -316,6 +316,7 @@ fn test_fast_query_not_in_slow_log() {
             let _ = db
                 .recall_view()
                 .query(query)
+                .unrestricted()
                 .limit(5)
                 .query_text("fast query")
                 .execute()
@@ -359,6 +360,7 @@ fn test_slow_query_in_slow_log() {
             let _ = db
                 .recall_view()
                 .query(query)
+                .unrestricted()
                 .limit(20)
                 .query_text("slow test query")
                 .execute_with_diagnostics()
@@ -429,6 +431,7 @@ fn test_query_id_in_spans_and_logs() {
             let _ = db
                 .recall_view()
                 .query(query)
+                .unrestricted()
                 .limit(5)
                 .query_text("id-match test")
                 .execute()
@@ -569,6 +572,7 @@ fn test_execute_with_diagnostics_returns_complete_diag() {
             let (_results, diag) = db
                 .recall_view()
                 .query(query)
+                .unrestricted()
                 .limit(5)
                 .execute_with_diagnostics()
                 .await
@@ -629,6 +633,7 @@ fn test_execute_with_explanation_surfaces_score_breakdown_and_suppression() {
             let (results, explanation) = db
                 .recall_view()
                 .query(query)
+                .unrestricted()
                 .limit(2)
                 .execute_with_explanation()
                 .await
@@ -681,6 +686,7 @@ fn test_execute_with_explanation_redacts_ranking_details_when_raw_text_denied() 
             let (results, explanation) = db
                 .recall_view()
                 .query(rand_vec(768, 77))
+                .unrestricted()
                 .agent_id(restricted_agent().as_str())
                 .limit(3)
                 .execute_with_explanation()
@@ -722,6 +728,7 @@ fn test_think_execute_with_explanation_surfaces_context_budget() {
             let (result, explanation) = db
                 .recall_view()
                 .think(rand_vec(768, 4))
+                .unrestricted()
                 .limit(8)
                 .budget(80)
                 .execute_with_explanation()

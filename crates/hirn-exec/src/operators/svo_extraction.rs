@@ -205,7 +205,7 @@ fn extract_temporal(text: &str) -> Option<String> {
         if lower.contains(month) {
             // Try to find "Month Day" or "Month Day, Year" pattern.
             if let Some(pos) = lower.find(month) {
-                // DR-H7 FIX: `pos` is a byte offset into `lower`, not `text`
+                // `pos` is a byte offset into `lower`, not `text`
                 // (`to_lowercase()` can change byte lengths, e.g. U+212A→'k'), so
                 // slicing `text` could land mid-code-point and panic on the write
                 // path. Slice `lower` at the known-good boundary `pos` and take a

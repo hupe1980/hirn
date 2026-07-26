@@ -344,6 +344,7 @@ async fn golden_recall_top_result_matches_expected() {
         let results = db
             .recall_view()
             .query(query_emb)
+            .unrestricted()
             .limit(5)
             .execute()
             .await
@@ -403,6 +404,7 @@ async fn golden_recall_top_results_stable_across_repeated_queries() {
         let run1 = db
             .recall_view()
             .query(query_emb.clone())
+            .unrestricted()
             .limit(5)
             .execute()
             .await
@@ -410,6 +412,7 @@ async fn golden_recall_top_results_stable_across_repeated_queries() {
         let run2 = db
             .recall_view()
             .query(query_emb)
+            .unrestricted()
             .limit(5)
             .execute()
             .await
@@ -451,6 +454,7 @@ async fn golden_recall_result_count_stable() {
         let results = db
             .recall_view()
             .query(query_emb)
+            .unrestricted()
             .limit(10)
             .execute()
             .await
@@ -479,6 +483,7 @@ async fn golden_recall_similarity_scores_in_valid_range() {
         let results = db
             .recall_view()
             .query(query_emb)
+            .unrestricted()
             .limit(5)
             .execute()
             .await
@@ -505,6 +510,7 @@ async fn golden_recall_exact_match_highest_score() {
     let results = db
         .recall_view()
         .query(query_emb)
+        .unrestricted()
         .limit(5)
         .execute()
         .await
@@ -540,6 +546,7 @@ async fn golden_recall_with_limit_respected() {
         let results = db
             .recall_view()
             .query(query_emb)
+            .unrestricted()
             .limit(limit)
             .execute()
             .await
@@ -567,6 +574,7 @@ async fn golden_recall_all_records_findable() {
         let results = db
             .recall_view()
             .query(query_emb)
+            .unrestricted()
             .limit(3)
             .execute()
             .await
@@ -610,6 +618,7 @@ async fn golden_recall_latency_benchmark() {
             let _ = db
                 .recall_view()
                 .query(query_emb)
+                .unrestricted()
                 .limit(5)
                 .execute()
                 .await
@@ -650,6 +659,7 @@ async fn golden_recall_batch_vs_serial_performance() {
         let _ = db
             .recall_view()
             .query(q.clone())
+            .unrestricted()
             .limit(5)
             .execute()
             .await
@@ -661,7 +671,7 @@ async fn golden_recall_batch_vs_serial_performance() {
     let batch_start = std::time::Instant::now();
     let builders: Vec<_> = queries
         .iter()
-        .map(|q| db.recall_view().query(q.clone()).limit(5))
+        .map(|q| db.recall_view().query(q.clone()).unrestricted().limit(5))
         .collect();
     let _results = db.recall_view().batch(builders).await;
     let batch_elapsed = batch_start.elapsed();
@@ -697,6 +707,7 @@ async fn golden_recall_independent_dbs_produce_same_results() {
         let r1 = db1
             .recall_view()
             .query(query_emb.clone())
+            .unrestricted()
             .limit(5)
             .execute()
             .await
@@ -704,6 +715,7 @@ async fn golden_recall_independent_dbs_produce_same_results() {
         let r2 = db2
             .recall_view()
             .query(query_emb)
+            .unrestricted()
             .limit(5)
             .execute()
             .await

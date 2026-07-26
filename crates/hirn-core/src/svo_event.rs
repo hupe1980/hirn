@@ -170,7 +170,7 @@ impl SvoEvent {
 
     /// Set extraction confidence (clamped to `[0.0, 1.0]`; NaN → 0.0).
     ///
-    /// DR-L4: mirrors the episodic/semantic confidence clamps so an out-of-range
+    /// mirrors the episodic/semantic confidence clamps so an out-of-range
     /// or non-finite confidence can't flow into the record and silently defeat
     /// `svo_confidence_threshold` filtering.
     #[must_use]

@@ -31,6 +31,7 @@ pub struct ThinkBuilder<'a> {
     threshold: Option<f32>,
     layer_filter: LayerFilter,
     namespace: Option<Namespace>,
+    unrestricted: bool,
     after: Option<Timestamp>,
     before: Option<Timestamp>,
     weights: Option<ScoringWeights>,
@@ -53,6 +54,7 @@ impl<'a> ThinkBuilder<'a> {
             threshold: None,
             layer_filter: LayerFilter::All,
             namespace: None,
+            unrestricted: false,
             after: None,
             before: None,
             weights: None,
@@ -108,6 +110,17 @@ impl<'a> ThinkBuilder<'a> {
     /// Restrict to a specific namespace.
     pub fn namespace(mut self, ns: Namespace) -> Self {
         self.namespace = Some(ns);
+        self
+    }
+
+    /// Assemble context from every namespace, bypassing tenant isolation.
+    ///
+    /// For the single-tenant embedded facade ([`hirn::Memory`]) and in-process
+    /// admin tooling only. Without this opt-in, a think with no namespace scope
+    /// denies rather than reading across tenants. See
+    /// [`RecallBuilder::unrestricted`](crate::recall::RecallBuilder::unrestricted).
+    pub fn unrestricted(mut self) -> Self {
+        self.unrestricted = true;
         self
     }
 
@@ -204,6 +217,8 @@ impl<'a> ThinkBuilder<'a> {
         };
         if let Some(namespace) = self.namespace {
             recall = recall.namespace(namespace);
+        } else if self.unrestricted {
+            recall = recall.unrestricted();
         }
         if let Some(after) = self.after {
             recall = recall.after(after);

@@ -881,7 +881,7 @@ impl PolicyEngine {
             .map(|e| e.to_string())
             .collect();
 
-        // DR-H1 FIX: fail CLOSED on evaluation errors. Cedar skips any policy
+        // fail CLOSED on evaluation errors. Cedar skips any policy
         // that errors during evaluation, so an erroring `forbid` would be
         // silently dropped and a still-matching `permit` would yield Allow — a
         // silent authorization bypass. Any evaluation error therefore forces a

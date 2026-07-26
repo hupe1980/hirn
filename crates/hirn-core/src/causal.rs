@@ -5,7 +5,7 @@
 //! It applies to every relation for which
 //! [`EdgeRelation::is_causal`](crate::types::EdgeRelation::is_causal) holds —
 //! `Causes`/`CausedBy` and the facilitation/prevention pair `Enables`/`Prevents`
-//! (DR-M-core2) — so the whole causal family is uniformly scorable via
+//! — so the whole causal family is uniformly scorable via
 //! [`CausalEdge::relevance_score`]. Non-causal edges carry no `CausalEdge`.
 
 use serde::{Deserialize, Serialize};

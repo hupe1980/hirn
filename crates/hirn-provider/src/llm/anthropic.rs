@@ -17,7 +17,9 @@ const REQUEST_TIMEOUT: Duration = Duration::from_mins(5);
 /// Default connection timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-const DEFAULT_MODEL: &str = "claude-sonnet-4-20250514";
+// A current model: `claude-sonnet-4-20250514` was retired, so every
+// `AnthropicProvider::new(...)` caller without a model override 404'd.
+const DEFAULT_MODEL: &str = "claude-sonnet-5";
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const API_VERSION: &str = "2023-06-01";
 
@@ -79,7 +81,7 @@ impl AnthropicProvider {
 
     /// Build the common HTTP request headers.
     ///
-    /// DR-H10 FIX: an API key with bytes not valid in an HTTP header value (a
+    /// an API key with bytes not valid in an HTTP header value (a
     /// trailing newline is extremely common from env/file sources) previously
     /// panicked via `.expect(...)`, crashing the task on first request. Now it
     /// returns a clear `InvalidInput` error, and the key header is marked

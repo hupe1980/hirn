@@ -587,6 +587,8 @@ async fn test_brain_stats_empty() {
 
     let resp = client()
         .get(format!("{url}/debug/brain-stats"))
+        .header("X-Realm-ID", "default")
+        .header("X-Agent-ID", "test-agent")
         .send()
         .await
         .unwrap();
@@ -621,6 +623,8 @@ async fn test_brain_stats_after_remember() {
 
     let resp = client()
         .get(format!("{url}/debug/brain-stats"))
+        .header("X-Realm-ID", "default")
+        .header("X-Agent-ID", "test-agent")
         .send()
         .await
         .unwrap();

@@ -272,7 +272,14 @@ pub fn run(config: &LoadConfig, db_path: &Path, run_id: &str) -> Result<LoadResu
                             [(reader_idx + offset) % query_embeddings.len()]
                         .clone();
                         let start = Instant::now();
-                        match db.recall_view().query(query).limit(k).execute().await {
+                        match db
+                            .recall_view()
+                            .query(query)
+                            .unrestricted()
+                            .limit(k)
+                            .execute()
+                            .await
+                        {
                             Ok(_) => latencies.push(start.elapsed()),
                             Err(e) => {
                                 tracing::warn!(error = %e, "load-bench reader failure");

@@ -1233,7 +1233,7 @@ impl HirnConfig {
                 "inhibition_strength must be a finite value >= 0.0".into(),
             ));
         }
-        // DR-M-core1 FIX: the DataFusion `GraphActivationExec` (cold-tier) path
+        // the DataFusion `GraphActivationExec` (cold-tier) path
         // reads these two knobs, but they previously bypassed validation entirely
         // — unlike their in-memory-path siblings above. A NaN/0/negative epsilon
         // makes `delta < epsilon` never true (convergence relies solely on the

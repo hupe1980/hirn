@@ -436,6 +436,12 @@ impl ExecutionPlan for ContextBudgetExec {
         vec![&self.input]
     }
 
+    /// Token-budget rerank/truncation is global over all candidates, so the
+    /// operator must see every row in a single partition.
+    fn required_input_distribution(&self) -> Vec<datafusion_physical_expr::Distribution> {
+        vec![datafusion_physical_expr::Distribution::SinglePartition]
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,

@@ -194,6 +194,7 @@ permit(
         let results = db
             .recall_view()
             .query(query)
+            .unrestricted()
             .agent_id("full-access")
             .namespace(ns("ns_alpha"))
             .limit(20)
@@ -231,6 +232,7 @@ permit(
         let result = db
             .recall_view()
             .query(query)
+            .unrestricted()
             .agent_id("denied-agent")
             .namespace(ns("ns_alpha"))
             .execute()
@@ -257,6 +259,7 @@ permit(
         let result = db
             .recall_view()
             .query(query)
+            .unrestricted()
             .agent_id("reader-agent")
             .namespace(ns("ns_beta"))
             .execute()
@@ -450,6 +453,7 @@ permit(
         let results = db
             .recall_view()
             .query(query)
+            .unrestricted()
             .agent_id("full-access")
             .namespace(ns("ns_alpha"))
             .activation(hirn_engine::ActivationMode::Spreading)
@@ -516,6 +520,7 @@ permit(
         let results = db
             .recall_view()
             .query(query)
+            .unrestricted()
             .agent_id("full-access")
             .namespace(ns("ns_alpha"))
             .activation(hirn_engine::ActivationMode::PersonalizedPageRank(
@@ -738,6 +743,7 @@ permit(
         let results = db
             .recall_view()
             .query(query)
+            .unrestricted()
             .agent_id("reader-agent")
             .namespace(ns("ns_alpha"))
             .limit(20)
@@ -899,6 +905,7 @@ permit(
         let results = db
             .recall_view()
             .query(query)
+            .unrestricted()
             .agent_id("reader-agent")
             .namespace(ns("ns_alpha"))
             .limit(20)
@@ -954,6 +961,7 @@ permit(
         let results = db
             .recall_view()
             .query(query)
+            .unrestricted()
             .agent_id("full-access")
             .namespace(ns("ns_alpha"))
             .limit(20)
@@ -993,6 +1001,7 @@ permit(
         let result = db
             .recall_view()
             .query(query.clone())
+            .unrestricted()
             .agent_id("denied-agent")
             .namespace(ns("ns_alpha"))
             .execute()
@@ -1006,6 +1015,7 @@ permit(
         let result = db
             .recall_view()
             .query(query.clone())
+            .unrestricted()
             .agent_id("denied-agent")
             .namespace(ns("ns_alpha"))
             .activation(hirn_engine::ActivationMode::Spreading)
@@ -1021,6 +1031,7 @@ permit(
         let result = db
             .recall_view()
             .query(query.clone())
+            .unrestricted()
             .agent_id("denied-agent")
             .namespace(ns("ns_alpha"))
             .activation(hirn_engine::ActivationMode::PersonalizedPageRank(
@@ -1079,6 +1090,7 @@ permit(
         let alpha_results = db
             .recall_view()
             .query(query_alpha)
+            .unrestricted()
             .agent_id("full-access")
             .namespace(ns("ns_alpha"))
             .limit(50)
@@ -1100,6 +1112,7 @@ permit(
         let beta_results = db
             .recall_view()
             .query(query_beta)
+            .unrestricted()
             .agent_id("full-access")
             .namespace(ns("ns_beta"))
             .limit(50)
@@ -1303,6 +1316,7 @@ permit(
         let results = db
             .recall_view()
             .query(query)
+            .unrestricted()
             .agent_id("full-access")
             .namespace(ns("ns_alpha"))
             .activation(hirn_engine::ActivationMode::Spreading)
@@ -1327,6 +1341,7 @@ permit(
         let ppr_results = db
             .recall_view()
             .query(query)
+            .unrestricted()
             .agent_id("full-access")
             .namespace(ns("ns_alpha"))
             .activation(hirn_engine::ActivationMode::PersonalizedPageRank(

@@ -208,6 +208,10 @@ pub struct RecallBuilder<'a> {
     pub(crate) hybrid: bool,
     /// Agent ID for Cedar policy enforcement.
     pub(crate) agent_id: Option<String>,
+    /// Opt out of namespace filtering entirely (single-tenant embedded /
+    /// admin use only). When false (the default) a recall with no requested
+    /// namespace and no allowed set denies rather than reading all tenants.
+    pub(crate) unrestricted: bool,
     /// Requested result presentation order.
     pub(crate) view_mode: RecallViewMode,
     pub(crate) preview_policy: RecallPreviewPolicy,
@@ -233,6 +237,7 @@ impl<'a> RecallBuilder<'a> {
             query_text: None,
             hybrid: false,
             agent_id: None,
+            unrestricted: false,
             view_mode: RecallViewMode::default(),
             preview_policy: RecallPreviewPolicy::from_config(config),
         }
@@ -276,6 +281,19 @@ impl<'a> RecallBuilder<'a> {
 
     pub(crate) fn allowed_namespaces(mut self, namespaces: Vec<Namespace>) -> Self {
         self.allowed_namespaces = Some(namespaces);
+        self
+    }
+
+    /// Read across every namespace, bypassing tenant isolation.
+    ///
+    /// This is intended **only** for the single-tenant embedded facade
+    /// ([`hirn::Memory`]) and administrative tooling running inside a trust
+    /// boundary that owns all data. Multi-tenant surfaces (the daemon's
+    /// HTTP/gRPC/MCP handlers) must scope recall with [`namespace`](Self::namespace)
+    /// or an allowed-namespace set instead — an unscoped recall without this
+    /// opt-in denies rather than leaking across tenants.
+    pub fn unrestricted(mut self) -> Self {
+        self.unrestricted = true;
         self
     }
 
@@ -526,6 +544,7 @@ impl<'a> RecallBuilder<'a> {
                 self.layer_filter,
                 self.namespace.as_ref(),
                 self.allowed_namespaces.as_deref(),
+                self.unrestricted,
                 self.after.as_ref(),
                 self.before.as_ref(),
                 self.weights.as_ref(),

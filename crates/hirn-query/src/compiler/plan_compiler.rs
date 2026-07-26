@@ -64,7 +64,7 @@ pub enum HirnOp {
         limit: usize,
         hybrid_mode: bool,
         namespace_filter: String,
-        /// Bi-temporal `AS OF` snapshot (DR-H2), applied as a scan prefilter.
+        /// Bi-temporal `AS OF` snapshot, applied as a scan prefilter.
         as_of: Option<hirn_core::revision::RecallSnapshot>,
     },
     /// Community-summary retrieval for global THINK.

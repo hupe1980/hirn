@@ -61,6 +61,12 @@ impl ExecutionPlan for RecallMergeExec {
         self.inputs.iter().collect()
     }
 
+    /// De-dup/merge across layers must see every row of each child in one
+    /// partition, so require single-partition input from each.
+    fn required_input_distribution(&self) -> Vec<datafusion_physical_expr::Distribution> {
+        vec![datafusion_physical_expr::Distribution::SinglePartition; self.inputs.len()]
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,

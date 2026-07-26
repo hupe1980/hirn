@@ -6276,6 +6276,7 @@ mod tests {
         let results = db
             .recall_view()
             .query(emb_a)
+            .unrestricted()
             .limit(10)
             .activation(ActivationMode::Spreading)
             .depth(2)
@@ -6317,6 +6318,7 @@ mod tests {
         let result = db
             .recall_view()
             .think(query)
+            .unrestricted()
             .budget(200) // Small budget — should truncate.
             .limit(20)
             .execute()
@@ -6354,6 +6356,7 @@ mod tests {
         let small = db
             .recall_view()
             .think(query.clone())
+            .unrestricted()
             .budget(100)
             .limit(20)
             .execute()
@@ -6363,6 +6366,7 @@ mod tests {
         let large = db
             .recall_view()
             .think(query)
+            .unrestricted()
             .budget(4000)
             .limit(20)
             .execute()

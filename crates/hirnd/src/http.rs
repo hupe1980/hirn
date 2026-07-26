@@ -633,9 +633,16 @@ async fn realm_db(
 ) -> Result<Arc<HirnDB>, (StatusCode, Json<ErrorResponse>)> {
     let realm_id = extract_realm_id(headers)?;
     state.realms.get(realm_id).await.map_err(|e| {
+        // Do not leak internal error detail (filesystem paths / backend
+        // internals) to the client; log server-side, return a generic body
+        // (mirrors `map_err`).
+        tracing::error!(realm = %realm_id, error = %e, "failed to open realm DB");
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse::with_retryable(e, true)),
+            Json(ErrorResponse::with_retryable(
+                "internal error".to_string(),
+                true,
+            )),
         )
     })
 }
@@ -690,7 +697,7 @@ fn map_err(e: HirnError) -> (StatusCode, Json<ErrorResponse>) {
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     counter!("hirnd_errors_total", "status" => status.as_str().to_owned()).increment(1);
-    // DR-M-dae3 FIX: do not leak internal error detail to clients on 5xx —
+    // do not leak internal error detail to clients on 5xx —
     // storage/backend messages can disclose paths, schema, and internals. Log
     // the detail server-side and return a generic body, mirroring the gRPC layer.
     // Client-actionable 4xx messages are safe to return verbatim.
@@ -1701,7 +1708,7 @@ async fn readyz(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
 }
 
 async fn brain_stats(State(state): State<Arc<HttpState>>, headers: HeaderMap) -> impl IntoResponse {
-    // DR-M-dae1 FIX: this endpoint aggregates cross-realm counts (episodes,
+    // this endpoint aggregates cross-realm counts (episodes,
     // semantic, edges, event_seq, policy_count, cluster_size) across ALL realms,
     // so it must require Admin + rate-limiting like every sibling admin endpoint
     // (previously any authenticated principal — even a single-realm Read token —
@@ -2400,6 +2407,24 @@ async fn execute(
         if let Some(ref realms) = recall.from_realms {
             // Cross-realm requires admin access.
             check_operation(&headers, &Operation::Admin)?;
+
+            // Cross-realm dispatch reads OTHER tenants' data, so naming a realm
+            // other than the caller's own requires an *unrestricted* principal
+            // (API key / mTLS). A token is bound to a single realm (aud == realm),
+            // so a realm-bound token may only name its own realm — otherwise a
+            // realm-A admin could read realms B/C simply by naming them.
+            if parse_token_operations(&headers)?.is_some() {
+                let caller_realm = extract_realm_id(&headers)?;
+                if realms.iter().any(|r| r.as_str() != caller_realm) {
+                    return Err((
+                        StatusCode::FORBIDDEN,
+                        Json(ErrorResponse::new(
+                            "cross-realm FROM REALM across other realms requires an unrestricted \
+                             principal (API key / mTLS)",
+                        )),
+                    ));
+                }
+            }
 
             // Build a version without from_realms for per-realm execution.
             let mut single_recall = recall.clone();

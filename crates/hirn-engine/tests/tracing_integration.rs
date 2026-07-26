@@ -194,6 +194,7 @@ fn test_recall_spans_hierarchy() {
         let _ = db
             .recall_view()
             .query(query)
+            .unrestricted()
             .limit(5)
             .query_text("test query")
             .execute()
@@ -274,6 +275,7 @@ fn test_recall_span_attributes() {
         let _ = db
             .recall_view()
             .query(query)
+            .unrestricted()
             .limit(3)
             .query_text("hello world")
             .execute()
@@ -349,6 +351,7 @@ fn test_authz_deny_span() {
         let result = db
             .recall_view()
             .query(query)
+            .unrestricted()
             .agent_id("denied_agent")
             .execute()
             .await;
@@ -385,7 +388,13 @@ fn test_no_subscriber_noop() {
         let (db, _dir) = temp_db("default").await;
         db.episodic().remember(make_record(1)).await.unwrap();
         let query = rand_vec(768, 1);
-        let _ = db.recall_view().query(query).limit(5).execute().await;
+        let _ = db
+            .recall_view()
+            .query(query)
+            .unrestricted()
+            .limit(5)
+            .execute()
+            .await;
     });
     // If we reach here without panics, no-op behavior is confirmed.
 }
@@ -428,6 +437,7 @@ fn test_authz_allow_span() {
         let _ = db
             .recall_view()
             .query(query)
+            .unrestricted()
             .agent_id("good_agent")
             .execute()
             .await

@@ -84,7 +84,7 @@ impl ExecutionPlan for ContextAssemblyExec {
         vec![&self.input]
     }
 
-    /// DR-H9 FIX: context assembly must see ALL candidate rows. Without a
+    /// context assembly must see ALL candidate rows. Without a
     /// single-partition requirement, EnforceDistribution may insert a
     /// `RepartitionExec` below this operator and `execute(0, …)` would then see
     /// only ~1/N of the candidates, silently dropping THINK context. Force the

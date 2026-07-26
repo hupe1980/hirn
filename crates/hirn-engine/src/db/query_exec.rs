@@ -4500,6 +4500,7 @@ mod tests {
 
         let direct_results = db
             .recall(vec![1.0, 0.0, 0.0, 0.0])
+            .unrestricted()
             .limit(3)
             .semantic_only()
             .execute()
@@ -4599,6 +4600,7 @@ mod tests {
 
         let _direct_results = db_direct
             .recall(vec![1.0, 0.0, 0.0, 0.0])
+            .unrestricted()
             .limit(3)
             .episodic_only()
             .execute()
@@ -4622,6 +4624,7 @@ mod tests {
 
         let direct_results = db_direct
             .recall(vec![1.0, 0.0, 0.0, 0.0])
+            .unrestricted()
             .limit(3)
             .episodic_only()
             .execute()

@@ -185,6 +185,7 @@ async fn episodic_importance(db: &HirnDB, query: Vec<f32>, id: MemoryId) -> f32 
     let recalled = db
         .recall_view()
         .query(query)
+        .unrestricted()
         .limit(64)
         .execute()
         .await
@@ -280,6 +281,7 @@ async fn rpe_near_duplicate_gets_fast_path() {
     let recalled = db
         .recall_view()
         .query(emb)
+        .unrestricted()
         .limit(10)
         .execute()
         .await
@@ -325,6 +327,7 @@ async fn rpe_novel_content_gets_slow_path() {
     let recalled = db
         .recall_view()
         .query(rand_vec(999))
+        .unrestricted()
         .limit(10)
         .execute()
         .await
@@ -529,6 +532,7 @@ async fn rpe_completely_unrelated_gets_high_score() {
     let recalled = db
         .recall_view()
         .query(outlier_emb)
+        .unrestricted()
         .limit(10)
         .execute()
         .await
@@ -691,6 +695,7 @@ async fn fast_path_record_has_embedding_and_metadata() {
     let recalled = db
         .recall_view()
         .query(emb)
+        .unrestricted()
         .limit(10)
         .execute()
         .await
@@ -742,6 +747,7 @@ async fn rpe_zscore_amplifies_after_familiar_history() {
     let recalled = db
         .recall_view()
         .query(novel_emb)
+        .unrestricted()
         .limit(10)
         .execute()
         .await
@@ -774,6 +780,7 @@ async fn rpe_empty_db_novel_content_slow_path() {
     let recalled = db
         .recall_view()
         .query(rand_vec(42))
+        .unrestricted()
         .limit(10)
         .execute()
         .await
@@ -826,6 +833,7 @@ async fn rpe_mixed_writes_maintain_correct_routing() {
     let recalled = db
         .recall_view()
         .query(emb_a)
+        .unrestricted()
         .limit(10)
         .execute()
         .await
@@ -1040,6 +1048,7 @@ async fn batch_remember_rpe_routes_fast_slow_path() {
     let recalled = db
         .recall_view()
         .query(seed_emb)
+        .unrestricted()
         .limit(10)
         .execute()
         .await
@@ -1058,6 +1067,7 @@ async fn batch_remember_rpe_routes_fast_slow_path() {
     let recalled_novel = db
         .recall_view()
         .query(novel_emb)
+        .unrestricted()
         .limit(10)
         .execute()
         .await
@@ -1987,6 +1997,7 @@ async fn near_duplicate_gets_low_importance() {
     let results = db
         .recall_view()
         .query(emb)
+        .unrestricted()
         .limit(10)
         .execute()
         .await
@@ -2027,7 +2038,13 @@ async fn fast_path_completes_in_target_latency() {
     db.episodic().remember(r1).await.unwrap();
 
     // Warm up the storage to avoid first-read overhead.
-    let _ = db.recall_view().query(emb.clone()).limit(1).execute().await;
+    let _ = db
+        .recall_view()
+        .query(emb.clone())
+        .unrestricted()
+        .limit(1)
+        .execute()
+        .await;
 
     // Measure fast-path latency (near-duplicate, same embedding).
     let mut timings = Vec::new();
@@ -2291,6 +2308,7 @@ async fn prospective_indexing_timeout_still_stores_memory() {
     let results = db
         .recall_view()
         .query(rand_vec(42))
+        .unrestricted()
         .limit(5)
         .execute()
         .await
@@ -2649,6 +2667,7 @@ async fn embedder_recovery_processes_pending_embeds() {
                 .unwrap()
                 .vector,
         )
+        .unrestricted()
         .limit(5)
         .execute()
         .await

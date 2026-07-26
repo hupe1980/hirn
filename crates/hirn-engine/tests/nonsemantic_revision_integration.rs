@@ -157,6 +157,7 @@ mod tests {
         let recall = db
             .recall_view()
             .query(procedural_embedding())
+            .unrestricted()
             .procedural_only()
             .limit(10)
             .execute()
@@ -224,6 +225,7 @@ mod tests {
         let recall = db
             .recall_view()
             .query(procedural_embedding())
+            .unrestricted()
             .procedural_only()
             .limit(10)
             .at_revision(RevisionId::from_memory_id(id))

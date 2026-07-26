@@ -492,11 +492,15 @@ fn recall_activation_schema(_input_schema: SchemaRef) -> SchemaRef {
         Field::new("full_content", DataType::Utf8, false),
         Field::new("layer", DataType::Utf8, false),
         Field::new("namespace", DataType::Utf8, false),
-        Field::new("score", DataType::Float32, false),
+        // score/importance/access_count are nullable in the canonical
+        // `recall_schema()`; declaring them non-nullable here is a physical-vs-
+        // logical drift that DataFusion's schema check can reject (the arrays are
+        // always non-null in practice, but the field nullability must match).
+        Field::new("score", DataType::Float32, true),
         Field::new("temporal_ms", DataType::Int64, false),
         Field::new("created_at_ms", DataType::Int64, false),
-        Field::new("importance", DataType::Float32, false),
-        Field::new("access_count", DataType::UInt32, false),
+        Field::new("importance", DataType::Float32, true),
+        Field::new("access_count", DataType::UInt32, true),
         Field::new("surprise", DataType::Float32, true),
         Field::new("evidence_count", DataType::UInt32, true),
         Field::new("invocation_count", DataType::UInt64, true),

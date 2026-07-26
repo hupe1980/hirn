@@ -67,7 +67,7 @@ pub struct HybridSearchParams {
     pub temporal_start_ms: Option<i64>,
     pub temporal_end_ms: Option<i64>,
     /// Bi-temporal point-in-time snapshot (`RECALL ... AS OF`). Applied as a
-    /// per-dataset **scan prefilter** (DR-H2), before top-k selection, so a
+    /// per-dataset **scan prefilter**, before top-k selection, so a
     /// point-in-time query returns exactly the rows valid/recorded at the
     /// snapshot instant rather than filtering the top-k after the fact.
     pub as_of: Option<hirn_core::revision::RecallSnapshot>,
@@ -483,7 +483,7 @@ fn dataset_search_filter(
         parts.push(format!("{time_column} <= {end_ms}"));
     }
 
-    // DR-H2: bi-temporal `AS OF` snapshot as a prefilter (ANDed with everything).
+    // bi-temporal `AS OF` snapshot as a prefilter (ANDed with everything).
     if let Some(snapshot) = as_of {
         if let Some(sql) = as_of_filter_for_dataset(dataset, snapshot) {
             parts.push(sql);
@@ -503,7 +503,7 @@ fn dataset_search_filter(
     }
 }
 
-/// Build the per-dataset `AS OF` snapshot prefilter (DR-H2).
+/// Build the per-dataset `AS OF` snapshot prefilter.
 ///
 /// - `Observed(t)` (valid time): rows whose validity interval contains `t`
 ///   (`valid_start <= t AND (valid_until_ms IS NULL OR valid_until_ms > t)`).
@@ -1011,7 +1011,7 @@ mod tests {
     use hirn_storage::datasets::episodic;
     use hirn_storage::memory_store::MemoryStore;
 
-    // ── DR-H2: AS OF snapshot prefilter ─────────────────────────────────
+    // ── AS OF snapshot prefilter ─────────────────────────────────
 
     #[test]
     fn as_of_observed_uses_per_dataset_valid_time_columns() {

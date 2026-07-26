@@ -2578,6 +2578,7 @@ mod tests {
         let results = db
             .recall_view()
             .query(emb)
+            .unrestricted()
             .limit(5)
             .execute()
             .await
@@ -2599,6 +2600,7 @@ mod tests {
         let results = db
             .recall_view()
             .query(rand_vec(1))
+            .unrestricted()
             .limit(5)
             .execute()
             .await
@@ -2638,6 +2640,7 @@ mod tests {
         let results = db
             .recall_view()
             .query(emb)
+            .unrestricted()
             .limit(5)
             .execute()
             .await
@@ -2662,6 +2665,7 @@ mod tests {
         let results = db
             .recall_view()
             .query(emb.clone())
+            .unrestricted()
             .limit(5)
             .execute()
             .await
@@ -2675,6 +2679,7 @@ mod tests {
         let results = db
             .recall_view()
             .query(emb)
+            .unrestricted()
             .limit(5)
             .execute()
             .await
@@ -2704,6 +2709,7 @@ mod tests {
         let results = db
             .recall_view()
             .query(embs[3].clone())
+            .unrestricted()
             .limit(5)
             .weights(ScoringWeights::PURE_SIMILARITY)
             .execute()
@@ -2734,6 +2740,7 @@ mod tests {
         let results = db
             .recall_view()
             .query(rand_vec(999))
+            .unrestricted()
             .limit(3)
             .execute()
             .await
@@ -2838,6 +2845,7 @@ mod tests {
         let warmed = db
             .recall_view()
             .query(emb.clone())
+            .unrestricted()
             .limit(10)
             .execute()
             .await
@@ -2866,6 +2874,7 @@ mod tests {
         let recalled = db
             .recall_view()
             .query(emb)
+            .unrestricted()
             .limit(10)
             .execute()
             .await
@@ -2903,6 +2912,7 @@ mod tests {
         let warmed = db
             .recall_view()
             .query(emb.clone())
+            .unrestricted()
             .limit(10)
             .execute()
             .await
@@ -2923,6 +2933,7 @@ mod tests {
         let recalled = db
             .recall_view()
             .query(emb)
+            .unrestricted()
             .limit(10)
             .execute()
             .await
@@ -2968,6 +2979,7 @@ mod tests {
         let warmed = db
             .recall_view()
             .query(source_emb.clone())
+            .unrestricted()
             .limit(10)
             .execute()
             .await
@@ -2994,6 +3006,7 @@ mod tests {
         let recalled = db
             .recall_view()
             .query(source_emb)
+            .unrestricted()
             .limit(10)
             .execute()
             .await
@@ -3487,6 +3500,7 @@ mod tests {
         let results = db
             .recall_view()
             .query(far)
+            .unrestricted()
             .threshold(0.8)
             .execute()
             .await
@@ -3520,6 +3534,7 @@ mod tests {
         let results = db
             .recall_view()
             .query(emb)
+            .unrestricted()
             .episodic_only()
             .execute()
             .await
@@ -3536,7 +3551,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn recall_empty_database() {
         let (db, _dir) = temp_db_with_vectors().await;
-        let results = db.recall_view().query(rand_vec(1)).execute().await.unwrap();
+        let results = db
+            .recall_view()
+            .query(rand_vec(1))
+            .unrestricted()
+            .execute()
+            .await
+            .unwrap();
         assert!(results.is_empty());
     }
 
@@ -3555,6 +3576,7 @@ mod tests {
         let results = db
             .recall_view()
             .query(emb)
+            .unrestricted()
             .weights(ScoringWeights::PURE_SIMILARITY)
             .execute()
             .await
@@ -3598,6 +3620,7 @@ mod tests {
         let results = db
             .recall_view()
             .query(emb)
+            .unrestricted()
             .weights(w)
             .execute()
             .await
@@ -3630,6 +3653,7 @@ mod tests {
         let results = db
             .recall_view()
             .query(target)
+            .unrestricted()
             .weights(ScoringWeights::PURE_SIMILARITY)
             .execute()
             .await
@@ -3668,6 +3692,7 @@ mod tests {
         let results = db
             .recall_view()
             .query(rand_vec(1005))
+            .unrestricted()
             .execute()
             .await
             .unwrap();
@@ -3709,6 +3734,7 @@ mod tests {
         let results = db
             .recall_view()
             .query(rand_vec(1100))
+            .unrestricted()
             .after(five_days_ago)
             .execute()
             .await
@@ -3740,6 +3766,7 @@ mod tests {
         let results = db
             .recall_view()
             .query(rand_vec(1205))
+            .unrestricted()
             .between(day3, day7)
             .execute()
             .await
@@ -3771,6 +3798,7 @@ mod tests {
         let results = db
             .recall_view()
             .query(rand_vec(1300))
+            .unrestricted()
             .after(one_hour_ago)
             .execute()
             .await
@@ -3811,6 +3839,7 @@ mod tests {
             let results = db
                 .recall_view()
                 .query(query.clone())
+                .unrestricted()
                 .limit(5)
                 .weights(ScoringWeights::PURE_SIMILARITY)
                 .execute()
@@ -3832,6 +3861,7 @@ mod tests {
         let results = db
             .recall_view()
             .query(query)
+            .unrestricted()
             .limit(5)
             .weights(ScoringWeights::PURE_SIMILARITY)
             .execute()
@@ -3887,7 +3917,13 @@ mod tests {
             .await
             .unwrap();
 
-        let results = db.recall_view().query(emb).execute().await.unwrap();
+        let results = db
+            .recall_view()
+            .query(emb)
+            .unrestricted()
+            .execute()
+            .await
+            .unwrap();
         for r in &results {
             assert_ne!(r.record.id(), id, "deleted record reappeared after reopen");
         }
@@ -3956,7 +3992,13 @@ mod tests {
         db.semantic().store(sem).await.unwrap();
 
         // Search both layers.
-        let results = db.recall_view().query(emb).execute().await.unwrap();
+        let results = db
+            .recall_view()
+            .query(emb)
+            .unrestricted()
+            .execute()
+            .await
+            .unwrap();
         assert_eq!(results.len(), 2);
 
         let layers: std::collections::HashSet<Layer> =
@@ -4009,6 +4051,7 @@ mod tests {
         let results = db
             .recall_view()
             .query(cluster_a)
+            .unrestricted()
             .limit(10)
             .weights(ScoringWeights::PURE_SIMILARITY)
             .execute()
@@ -4064,6 +4107,7 @@ mod tests {
         let results = db
             .recall_view()
             .query(emb)
+            .unrestricted()
             .weights(w)
             .execute()
             .await
@@ -4101,6 +4145,7 @@ mod tests {
             let r = db
                 .recall_view()
                 .query(query.clone())
+                .unrestricted()
                 .limit(5)
                 .weights(ScoringWeights::PURE_SIMILARITY)
                 .execute()
@@ -4121,6 +4166,7 @@ mod tests {
         let r = db
             .recall_view()
             .query(query)
+            .unrestricted()
             .limit(5)
             .weights(ScoringWeights::PURE_SIMILARITY)
             .execute()
@@ -4418,6 +4464,7 @@ mod tests {
         let results_none = db
             .recall_view()
             .query(query.clone())
+            .unrestricted()
             .limit(5)
             .activation(hirn_engine::ActivationMode::None)
             .weights(ScoringWeights::PURE_SIMILARITY)
@@ -4427,6 +4474,7 @@ mod tests {
         let results_default = db
             .recall_view()
             .query(query)
+            .unrestricted()
             .limit(5)
             .weights(ScoringWeights::PURE_SIMILARITY)
             .execute()
@@ -4499,6 +4547,7 @@ mod tests {
         let results = db
             .recall_view()
             .query(main_emb)
+            .unrestricted()
             .limit(10)
             .activation(hirn_engine::ActivationMode::Spreading)
             .depth(2)
@@ -4570,6 +4619,7 @@ mod tests {
         let results = db
             .recall_view()
             .query(emb)
+            .unrestricted()
             .limit(10)
             .activation(hirn_engine::ActivationMode::Static)
             .weights(w)
@@ -4626,6 +4676,7 @@ mod tests {
         let results = db
             .recall_view()
             .query(emb)
+            .unrestricted()
             .limit(10)
             .activation(hirn_engine::ActivationMode::Spreading)
             .depth(2)
@@ -4987,6 +5038,7 @@ mod tests {
             let _ = db
                 .recall_view()
                 .query(emb.clone())
+                .unrestricted()
                 .limit(10)
                 .activation(hirn_engine::ActivationMode::None)
                 .execute()
@@ -5074,6 +5126,7 @@ mod tests {
                 let _ = db
                     .recall_view()
                     .query(emb.clone())
+                    .unrestricted()
                     .limit(10)
                     .execute()
                     .await
@@ -5385,6 +5438,7 @@ mod tests {
         let results = db
             .recall_view()
             .query(query_emb.clone())
+            .unrestricted()
             .limit(15)
             .activation(hirn_engine::ActivationMode::Spreading)
             .depth(3)
@@ -5417,6 +5471,7 @@ mod tests {
             let _ = db
                 .recall_view()
                 .query(query_emb.clone())
+                .unrestricted()
                 .limit(10)
                 .execute()
                 .await
@@ -5532,6 +5587,7 @@ mod tests {
         let results = db
             .recall_view()
             .query(query)
+            .unrestricted()
             .limit(10)
             .activation(hirn_engine::ActivationMode::Spreading)
             .depth(2)
@@ -5602,6 +5658,7 @@ mod tests {
             let _ = db
                 .recall_view()
                 .query(query_emb.clone())
+                .unrestricted()
                 .limit(5)
                 .execute()
                 .await
@@ -5690,6 +5747,7 @@ mod tests {
             let _ = db
                 .recall_view()
                 .query(query_emb.clone())
+                .unrestricted()
                 .limit(5)
                 .execute()
                 .await
@@ -5766,6 +5824,7 @@ mod tests {
         let results = db
             .recall_view()
             .query(emb)
+            .unrestricted()
             .weights(w)
             .limit(10)
             .execute()
@@ -5896,6 +5955,7 @@ mod tests {
         let results = db
             .recall_view()
             .query(query_emb)
+            .unrestricted()
             .limit(10)
             .execute()
             .await
@@ -5974,6 +6034,7 @@ mod tests {
         let no_prov = db
             .recall_view()
             .query(rand_vec(7_011))
+            .unrestricted()
             .limit(10)
             .execute()
             .await

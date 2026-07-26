@@ -74,7 +74,7 @@ impl ExecutionPlan for HebbianBufferExec {
         vec![&self.input]
     }
 
-    /// DR-M-qry3 FIX: this pass-through records every co-retrieved pair, so it
+    /// this pass-through records every co-retrieved pair, so it
     /// must see all rows in one partition. Declaring `UnknownPartitioning(1)`
     /// while forwarding `execute(partition, …)` would, under a multi-partition
     /// input, run only partition 0 — dropping other partitions' rows from the

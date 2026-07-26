@@ -384,7 +384,7 @@ fn recall_rows_from_batch(
                     }
                 },
                 namespace: namespaces.value(row).to_string(),
-                // DR-M-qry2 FIX: score/importance/access_count are nullable in
+                // score/importance/access_count are nullable in
                 // `recall_schema()` (community/global-merge rows carry NULLs);
                 // read them defensively like `recall_merge.rs` rather than calling
                 // `.value()` on a NULL and feeding garbage into PRF term-weighting.

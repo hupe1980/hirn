@@ -232,6 +232,7 @@ forbid(
                 let deny_recall = db
                     .recall_view()
                     .query(query.clone())
+                    .unrestricted()
                     .agent_id("intruder")
                     .limit(5)
                     .execute()
@@ -339,6 +340,7 @@ forbid(
                 let recall_results = db
                     .recall_view()
                     .query(query_topic0)
+                    .unrestricted()
                     .agent_id("writer-bot")
                     .limit(10)
                     .execute()
@@ -354,6 +356,7 @@ forbid(
                 let global_results = db
                     .recall_view()
                     .query(query_topic1)
+                    .unrestricted()
                     .agent_id("writer-bot")
                     .limit(20)
                     .execute()
@@ -412,6 +415,7 @@ forbid(
                 let intruder_recall = db
                     .recall_view()
                     .query(rand_vec(DIM, 555))
+                    .unrestricted()
                     .agent_id("intruder")
                     .limit(5)
                     .execute()
@@ -533,6 +537,7 @@ forbid(
             let results = db
                 .recall_view()
                 .query(rand_vec(DIM, 500))
+                .unrestricted()
                 .agent_id("writer-bot")
                 .limit(5)
                 .execute()
@@ -602,6 +607,7 @@ forbid(
                     let _ = db
                         .recall_view()
                         .query(rand_vec(DIM, 2000 + i as u128))
+                        .unrestricted()
                         .agent_id("writer-bot")
                         .limit(5)
                         .execute()
@@ -613,6 +619,7 @@ forbid(
                     let result = db
                         .recall_view()
                         .query(rand_vec(DIM, 777))
+                        .unrestricted()
                         .agent_id("intruder")
                         .limit(5)
                         .execute()

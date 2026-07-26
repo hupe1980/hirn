@@ -208,6 +208,45 @@ impl HirnMcpService {
         }
         Ok(())
     }
+
+    /// Execute a HirnQL statement under the caller's authority.
+    ///
+    /// Token-restricted identities run scoped to their agent's accessible
+    /// namespaces (mirroring the HTTP/gRPC query surfaces); unrestricted
+    /// API-key/mTLS identities — which own every namespace in their realm — run
+    /// with full scope. This replaces the previously-shared unscoped `db.ql()`
+    /// path, through which any authenticated MCP caller could read across
+    /// tenants regardless of its credential's namespace allowlist.
+    async fn execute_ql_for_caller(
+        &self,
+        caller: &Caller,
+        query: &str,
+    ) -> Result<QueryResult, McpError> {
+        match &caller.identity.namespaces {
+            Some(_) => {
+                caller
+                    .db
+                    .ensure_agent(&caller.agent_id)
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                let agent_ctx = caller
+                    .db
+                    .as_agent(&caller.agent_id)
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                agent_ctx
+                    .execute_ql(query)
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))
+            }
+            None => caller
+                .db
+                .ql()
+                .execute(query)
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None)),
+        }
+    }
 }
 
 /// Map an operation to the same rate-limit class the HTTP layer uses.
@@ -446,22 +485,15 @@ impl HirnMcpService {
         // exactly like `hirn_execute`: without this, a Read-scoped credential
         // could run write/admin HirnQL (CORRECT/RETRACT/SUPERSEDE/MERGE/GRANT/
         // REVOKE/SET TIER_POLICY/DROP REALM) through the recall tool. Execution
-        // uses `db.ql()` to match `hirn_execute` (some MCP principals — e.g. the
-        // daemon `system` identity — are not registered agents, so `as_agent`
-        // cannot be required here; the shared unscoped-`db.ql()` residual is
-        // tracked as R-72 and applies to both HirnQL tools consistently).
+        // is scoped to the caller's authority (see `execute_ql_for_caller`) so a
+        // token-restricted credential cannot read across tenants via HirnQL.
         if let Some(ref query) = params.query {
             let stmt = hirn_engine::ql::parser::parse(query)
                 .map_err(|e| McpError::invalid_params(format!("invalid HirnQL: {e}"), None))?;
             let operation = crate::http::execute_statement_operation(&stmt);
             self.authorize(&caller, Action::Execute, &operation).await?;
 
-            let result = caller
-                .db
-                .ql()
-                .execute(query)
-                .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            let result = self.execute_ql_for_caller(&caller, query).await?;
             return match result {
                 QueryResult::Records(r) => {
                     let output = serde_json::json!({
@@ -503,19 +535,52 @@ impl HirnMcpService {
             ));
         }
 
-        let mut builder = caller.db.recall_view().query(embedding);
-
-        if let Some(limit) = params.limit {
-            builder = builder.limit(limit as usize);
-        }
-        if let Some(ref mode) = params.activation_mode {
-            builder = builder.activation(parse_activation_mode(mode));
-        }
-
-        let results = builder
-            .execute()
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        // Scope the recall to the caller's authority, mirroring the HTTP/gRPC
+        // recall surfaces (and the QL/watch tools above). A token-restricted
+        // credential reads only its agent's accessible namespaces (private +
+        // shared, plus grants) via an agent-scoped context; an unrestricted
+        // API-key/mTLS identity — which owns every namespace in its realm —
+        // reads across all of them. Previously this went straight through the
+        // unscoped `recall_view()`, exposing every tenant's memories to any
+        // authenticated caller regardless of its credential's scope.
+        let results = match &caller.identity.namespaces {
+            Some(_) => {
+                caller
+                    .db
+                    .ensure_agent(&caller.agent_id)
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                let agent_ctx = caller
+                    .db
+                    .as_agent(&caller.agent_id)
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                let mut builder = agent_ctx.recall(embedding);
+                if let Some(limit) = params.limit {
+                    builder = builder.limit(limit as usize);
+                }
+                if let Some(ref mode) = params.activation_mode {
+                    builder = builder.activation(parse_activation_mode(mode));
+                }
+                builder
+                    .execute()
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?
+            }
+            None => {
+                let mut builder = caller.db.recall_view().query(embedding).unrestricted();
+                if let Some(limit) = params.limit {
+                    builder = builder.limit(limit as usize);
+                }
+                if let Some(ref mode) = params.activation_mode {
+                    builder = builder.activation(parse_activation_mode(mode));
+                }
+                builder
+                    .execute()
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?
+            }
+        };
 
         let output: Vec<serde_json::Value> = results
             .iter()
@@ -560,19 +625,48 @@ impl HirnMcpService {
             ));
         }
 
-        let mut builder = caller.db.recall_view().think(embedding);
-
-        if let Some(budget) = params.budget {
-            builder = builder.budget(budget as usize);
-        }
-        if let Some(limit) = params.limit {
-            builder = builder.limit(limit as usize);
-        }
-
-        let result = builder
-            .execute()
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        // Scope think to the caller's authority, credential-aware (see
+        // `hirn_recall`): token-restricted identities are confined to their
+        // accessible namespaces; unrestricted API-key/mTLS identities read
+        // across every namespace in their realm.
+        let result = match &caller.identity.namespaces {
+            Some(_) => {
+                caller
+                    .db
+                    .ensure_agent(&caller.agent_id)
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                let agent_ctx = caller
+                    .db
+                    .as_agent(&caller.agent_id)
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                let mut builder = agent_ctx.think(embedding);
+                if let Some(budget) = params.budget {
+                    builder = builder.budget(budget as usize);
+                }
+                if let Some(limit) = params.limit {
+                    builder = builder.limit(limit as usize);
+                }
+                builder
+                    .execute()
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?
+            }
+            None => {
+                let mut builder = caller.db.recall_view().think(embedding).unrestricted();
+                if let Some(budget) = params.budget {
+                    builder = builder.budget(budget as usize);
+                }
+                if let Some(limit) = params.limit {
+                    builder = builder.limit(limit as usize);
+                }
+                builder
+                    .execute()
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?
+            }
+        };
 
         let output = serde_json::json!({
             "context": result.context,
@@ -733,12 +827,7 @@ impl HirnMcpService {
         let operation = crate::http::execute_statement_operation(&stmt);
         self.authorize(&caller, Action::Execute, &operation).await?;
 
-        let result = caller
-            .db
-            .ql()
-            .execute(&params.query)
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let result = self.execute_ql_for_caller(&caller, &params.query).await?;
 
         let output = crate::convert::query_result_to_json(&result);
         Ok(CallToolResult::success(vec![ContentBlock::text(

@@ -1570,15 +1570,10 @@ impl PhysicalStore for LancePhysicalStore {
         let lock = self.write_lock(dataset);
         let _guard = lock.lock().await;
         // Commit-conflict retry (R-41): rebuild the update against the latest
-        // version on a retryable conflict. Capture the version before the update
-        // so we can re-key any cached flat-vector snapshots to the new version
-        // afterwards.  Embedding columns are untouched by importance-boost
-        // updates, so the snapshot data is still valid — only the version key
-        // changes.
+        // version on a retryable conflict.
         let mut attempt = 0u32;
-        let (new_dataset, rows_updated, old_version) = loop {
+        let (new_dataset, rows_updated) = loop {
             let ds = self.open_dataset(dataset).await?;
-            let old_version = ds.version().version;
             let mut builder = UpdateBuilder::new(ds);
             builder = builder.update_where(filter).map_err(HirnDbError::from)?;
             for &(col, expr) in updates {
@@ -1589,33 +1584,24 @@ impl PhysicalStore for LancePhysicalStore {
                 Ok(UpdateResult {
                     new_dataset,
                     rows_updated,
-                }) => break (new_dataset, rows_updated, old_version),
+                }) => break (new_dataset, rows_updated),
                 Err(err)
                     if is_retryable_commit_conflict(&err)
                         && self.backoff_or_giveup(dataset, &mut attempt).await => {}
                 Err(err) => return Err(HirnDbError::from(err)),
             }
         };
-        let new_version = new_dataset.version().version;
-
-        // Preserve flat-vector snapshots by re-keying to the new version.
-        // Collect entries BEFORE invalidating so we can re-insert them.
-        let preserved: Vec<(FlatVectorSnapshotKey, Arc<Vec<RecordBatch>>)> = self
-            .flat_vector_snapshot_cache
-            .iter()
-            .filter(|e| e.key().dataset == dataset && e.key().version == old_version)
-            .map(|e| (e.key().clone(), Arc::clone(&e.value().batches)))
-            .collect();
 
         // Use put() so the EpochCache stays warm (no cold manifest re-read).
         self.datasets.put(dataset.to_string(), new_dataset);
+        // Drop (do NOT re-key) the flat-vector snapshot: it is a full-column
+        // scan, so it carries importance/confidence/access_count/valid_until/…,
+        // and `update_where` is a generic `SET col = expr` that mutates exactly
+        // those columns. Re-keying the pre-update snapshot to the new version
+        // would serve stale column values (and, for a re-embedding update, stale
+        // vectors) on the flat path. Invalidation forces the next flat search to
+        // rebuild from the committed version.
         self.invalidate_dataset_caches(dataset);
-
-        // Re-insert snapshots under the new version key.
-        for (mut key, snapshot) in preserved {
-            key.version = new_version;
-            self.insert_flat_snapshot(key, snapshot);
-        }
 
         Ok(rows_updated)
     }
@@ -1730,7 +1716,7 @@ impl PhysicalStore for LancePhysicalStore {
         let mut scanner = ds.scan();
 
         let mut fts_query = lance_index::scalar::FullTextSearchQuery::new(opts.query);
-        // DR-H6 FIX: scope the FTS to the requested text column(s). Without this,
+        // scope the FTS to the requested text column(s). Without this,
         // Lance searches every inverted-indexed text column, so a query intended
         // for `content` also matches `title`/other indexed fields — a scoping
         // (and, in multi-field datasets, cross-field leak) violation.

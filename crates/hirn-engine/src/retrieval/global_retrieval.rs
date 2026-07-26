@@ -343,6 +343,17 @@ pub async fn raptor_recall(
             continue; // Skip other RAPTOR summaries — only want leaf nodes.
         }
         if let Ok(record) = db.get_memory(*member_id).await {
+            // A summary in an allowed namespace can reference leaf episodes in
+            // other namespaces; enforce the same namespace scope on drilled-down
+            // leaves that the community fan-out applies, so the tree traversal
+            // cannot surface cross-tenant records.
+            if !namespace_allowed(
+                record.effective_namespace(),
+                config.namespace,
+                config.allowed_namespaces.as_deref(),
+            ) {
+                continue;
+            }
             let resource_evidence = db
                 .resource_evidence_summaries_for_record(&record, config.actor_id.as_str())
                 .await

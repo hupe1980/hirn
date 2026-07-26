@@ -82,6 +82,7 @@ mod event_sourcing {
         let results = db
             .recall_view()
             .query(emb)
+            .unrestricted()
             .limit(5)
             .execute()
             .await
@@ -127,6 +128,7 @@ mod event_sourcing {
         let results = db
             .recall_view()
             .query(rand_vec(7))
+            .unrestricted()
             .limit(10)
             .execute()
             .await
@@ -304,6 +306,7 @@ mod event_sourcing {
         let _ = db
             .recall_view()
             .query(rand_vec(0))
+            .unrestricted()
             .limit(5)
             .execute()
             .await
@@ -499,6 +502,7 @@ mod persistent_graph {
         let results = db
             .recall_view()
             .query(base_emb)
+            .unrestricted()
             .limit(10)
             .execute()
             .await
@@ -574,6 +578,7 @@ mod provider_engine {
         let results = db
             .recall_view()
             .query(emb)
+            .unrestricted()
             .limit(5)
             .execute()
             .await
@@ -1215,6 +1220,7 @@ mod admission_consolidation {
         let results = db
             .recall_view()
             .query(base_emb.clone())
+            .unrestricted()
             .limit(5)
             .execute()
             .await
@@ -1243,6 +1249,7 @@ mod admission_consolidation {
         let results_after = db
             .recall_view()
             .query(base_emb)
+            .unrestricted()
             .limit(10)
             .execute()
             .await
@@ -1975,6 +1982,7 @@ mod multimodal_embedding {
         let results = db
             .recall_view()
             .query(query_emb)
+            .unrestricted()
             .agent_id(agent().as_str())
             .limit(5)
             .execute()
@@ -2017,6 +2025,7 @@ mod multimodal_embedding {
         let results = db
             .recall_view()
             .query(query_emb)
+            .unrestricted()
             .agent_id(agent().as_str())
             .limit(5)
             .execute()
@@ -2055,6 +2064,7 @@ mod multimodal_embedding {
         let recalled = db
             .recall_view()
             .query(query_emb)
+            .unrestricted()
             .limit(1)
             .agent_id(agent().as_str())
             .execute()
@@ -2120,6 +2130,7 @@ mod multimodal_embedding {
         let results = db
             .recall_view()
             .query(query_emb)
+            .unrestricted()
             .agent_id(agent().as_str())
             .limit(5)
             .execute()
@@ -2188,6 +2199,7 @@ mod multimodal_embedding {
         let results = db
             .recall_view()
             .query(query_emb)
+            .unrestricted()
             .limit(5)
             .execute()
             .await
@@ -2226,6 +2238,7 @@ mod multimodal_embedding {
         let results = db
             .recall_view()
             .query(query_emb)
+            .unrestricted()
             .limit(5)
             .execute()
             .await
@@ -2274,6 +2287,7 @@ mod multimodal_embedding {
         let results = db
             .recall_view()
             .query(query_emb)
+            .unrestricted()
             .limit(5)
             .execute()
             .await
@@ -2322,6 +2336,7 @@ mod multimodal_embedding {
         let results = db
             .recall_view()
             .query(query_emb)
+            .unrestricted()
             .limit(5)
             .execute()
             .await
@@ -2505,6 +2520,7 @@ mod multimodal_embedding {
         let results = db
             .recall_view()
             .query(query_emb)
+            .unrestricted()
             .limit(5)
             .execute()
             .await
@@ -2563,6 +2579,7 @@ mod multimodal_embedding {
         let results = db
             .recall_view()
             .query(query_emb)
+            .unrestricted()
             .limit(5)
             .execute()
             .await
@@ -3396,6 +3413,7 @@ mod storage_optimization {
         let restricted_results = db
             .recall_view()
             .query(rand_vec(88))
+            .unrestricted()
             .episodic_only()
             .limit(1)
             .query_text("evidence-rich image")
@@ -3451,6 +3469,7 @@ mod storage_optimization {
         let allowed_results = db
             .recall_view()
             .query(rand_vec(88))
+            .unrestricted()
             .episodic_only()
             .limit(1)
             .query_text("evidence-rich image")
@@ -3483,6 +3502,7 @@ mod storage_optimization {
         let restricted_results = db
             .recall_view()
             .query(rand_vec(91))
+            .unrestricted()
             .episodic_only()
             .limit(1)
             .query_text("generated caption text")
@@ -3527,6 +3547,7 @@ mod storage_optimization {
         let restricted_results = db
             .recall_view()
             .query(rand_vec(92))
+            .unrestricted()
             .episodic_only()
             .limit(1)
             .query_text("image whose caption generation failed")
@@ -3605,6 +3626,7 @@ mod storage_optimization {
         let restricted_results = db
             .recall_view()
             .query(shared_embedding)
+            .unrestricted()
             .episodic_only()
             .limit(1)
             .query_text("redaction-sensitive image")
@@ -3750,6 +3772,7 @@ mod storage_optimization {
         let baseline_results = db
             .recall_view()
             .query(query_embedding.clone())
+            .unrestricted()
             .episodic_only()
             .limit(2)
             .query_text("blueprint valves pressure")
@@ -3762,6 +3785,7 @@ mod storage_optimization {
         let reranked_results = db
             .recall_view()
             .query(query_embedding)
+            .unrestricted()
             .episodic_only()
             .limit(2)
             .query_text("blueprint valves pressure")
@@ -3916,6 +3940,7 @@ mod storage_optimization {
         let results = db
             .recall_view()
             .query(shared_embedding)
+            .unrestricted()
             .episodic_only()
             .limit(2)
             .query_text("blueprint valves pressure")
@@ -3967,6 +3992,7 @@ mod storage_optimization {
         let summary_first = db
             .recall_view()
             .query(rand_vec(90))
+            .unrestricted()
             .episodic_only()
             .limit(1)
             .query_text("detailed walkthrough content")
@@ -3995,6 +4021,7 @@ mod storage_optimization {
         let evidence_first = db
             .recall_view()
             .query(rand_vec(90))
+            .unrestricted()
             .episodic_only()
             .limit(1)
             .query_text("detailed walkthrough content")
@@ -4022,6 +4049,7 @@ mod storage_optimization {
         let mixed = db
             .recall_view()
             .query(rand_vec(90))
+            .unrestricted()
             .episodic_only()
             .limit(1)
             .query_text("detailed walkthrough content")
@@ -4046,6 +4074,7 @@ mod storage_optimization {
         let restricted = db
             .recall_view()
             .query(rand_vec(90))
+            .unrestricted()
             .episodic_only()
             .limit(1)
             .query_text("detailed walkthrough content")
@@ -5026,6 +5055,7 @@ mod storage_optimization {
         let results = db
             .recall_view()
             .query(rand_vec(5))
+            .unrestricted()
             .episodic_only()
             .limit(10)
             .query_text("recall metadata test")
@@ -5101,6 +5131,7 @@ mod storage_optimization {
             let results = db
                 .recall_view()
                 .query(rand_vec(100 + i))
+                .unrestricted()
                 .episodic_only()
                 .limit(1)
                 .execute()
@@ -5226,6 +5257,7 @@ mod multivector_search {
         let results = db
             .recall_view()
             .query(rand_vec(0))
+            .unrestricted()
             .episodic_only()
             .limit(5)
             .query_text("document testing")
@@ -5271,6 +5303,7 @@ mod multivector_search {
         let results_mv = db_mv
             .recall_view()
             .query(q.clone())
+            .unrestricted()
             .episodic_only()
             .limit(1)
             .query_text(content)
@@ -5281,6 +5314,7 @@ mod multivector_search {
         let results_no_mv = db_no_mv
             .recall_view()
             .query(q)
+            .unrestricted()
             .episodic_only()
             .limit(1)
             .query_text(content)
@@ -5317,6 +5351,7 @@ mod multivector_search {
         let results = db
             .recall_view()
             .query(rand_vec(10))
+            .unrestricted()
             .episodic_only()
             .limit(5)
             .query_text("standard search")
@@ -5505,6 +5540,7 @@ mod predictive_prefetch {
         let results = db
             .recall_view()
             .query(rand_vec(1))
+            .unrestricted()
             .limit(2)
             .execute()
             .await
@@ -5530,6 +5566,7 @@ mod predictive_prefetch {
         let _ = db
             .recall_view()
             .query(rand_vec(1))
+            .unrestricted()
             .limit(2)
             .execute()
             .await
@@ -5554,6 +5591,7 @@ mod predictive_prefetch {
         let _ = db
             .recall_view()
             .query(rand_vec(1))
+            .unrestricted()
             .limit(2)
             .execute()
             .await
@@ -5566,6 +5604,7 @@ mod predictive_prefetch {
         let _ = db
             .recall_view()
             .query(rand_vec(1))
+            .unrestricted()
             .limit(2)
             .execute()
             .await
@@ -5612,6 +5651,7 @@ mod predictive_prefetch {
         let _ = db
             .recall_view()
             .query(rand_vec(1))
+            .unrestricted()
             .limit(1)
             .execute()
             .await
@@ -5639,6 +5679,7 @@ mod predictive_prefetch {
         let _ = db
             .recall_view()
             .query(rand_vec(1))
+            .unrestricted()
             .limit(10)
             .execute()
             .await
@@ -5661,6 +5702,7 @@ mod predictive_prefetch {
         let results = db
             .recall_view()
             .query(rand_vec(1))
+            .unrestricted()
             .limit(2)
             .execute()
             .await
@@ -5819,7 +5861,13 @@ mod index_advisor {
 
         // Issue 20 recall queries (each searches 3 datasets: episodic, semantic, procedural).
         for i in 0..20u128 {
-            let _ = db.recall_view().query(rand_vec(i)).limit(5).execute().await;
+            let _ = db
+                .recall_view()
+                .query(rand_vec(i))
+                .unrestricted()
+                .limit(5)
+                .execute()
+                .await;
         }
 
         // The index advisor should have tracked queries per dataset.
@@ -5857,7 +5905,13 @@ mod index_advisor {
 
         // Issue recalls to populate advisor.
         for i in 0..5u128 {
-            let _ = db.recall_view().query(rand_vec(i)).limit(5).execute().await;
+            let _ = db
+                .recall_view()
+                .query(rand_vec(i))
+                .unrestricted()
+                .limit(5)
+                .execute()
+                .await;
         }
 
         // Get recommendation (should be KeepCurrent or similar given few queries).
@@ -5872,6 +5926,7 @@ mod index_advisor {
         let results = db
             .recall_view()
             .query(rand_vec(0))
+            .unrestricted()
             .limit(5)
             .execute()
             .await

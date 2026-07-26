@@ -238,6 +238,13 @@ impl ExecutionPlan for QualityGateExec {
         vec![&self.input]
     }
 
+    /// The gate buffers all input batches to make one global escalation decision,
+    /// so it must see every row in a single partition (defense-in-depth against a
+    /// repartition being inserted below it).
+    fn required_input_distribution(&self) -> Vec<datafusion_physical_expr::Distribution> {
+        vec![datafusion_physical_expr::Distribution::SinglePartition]
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,

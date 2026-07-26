@@ -309,7 +309,13 @@ fn test_recall_5_times_histogram() {
 
             for _ in 0..5 {
                 let query = rand_vec(DIM, 99);
-                let _ = db.recall_view().query(query).limit(5).execute().await;
+                let _ = db
+                    .recall_view()
+                    .query(query)
+                    .unrestricted()
+                    .limit(5)
+                    .execute()
+                    .await;
             }
         });
     });

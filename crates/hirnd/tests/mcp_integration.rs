@@ -152,9 +152,10 @@ async fn test_mcp_list_tools() {
         "hirn_consolidate",
         "hirn_execute",
         "hirn_watch",
-        // MemoryToolkit tools (6 additional)
+        // MemoryToolkit tools (7 additional)
         "memory_store",
         "memory_recall",
+        "memory_timeline",
         "memory_update",
         "memory_delete",
         "memory_link",
@@ -165,7 +166,7 @@ async fn test_mcp_list_tools() {
             "missing {expected}: {tool_names:?}"
         );
     }
-    assert_eq!(tools.len(), 14);
+    assert_eq!(tools.len(), 15);
 
     // Verify every tool has a non-empty description and input schema
     for tool in &tools {

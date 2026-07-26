@@ -228,6 +228,7 @@ fn bench_recall(
             let results = db
                 .recall_view()
                 .query(q.embedding.clone())
+                .unrestricted()
                 .limit(config.k)
                 .execute();
             let results = block_on(results).expect("recall");

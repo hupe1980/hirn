@@ -87,6 +87,15 @@ flowchart TD
 > policy set fails safe rather than opening access. This is why authorization is
 > a **plan property** (below) rather than an optional runtime check that could be
 > skipped on an error path.
+>
+> **A Cedar *evaluation error* also fails closed** (the request is denied and the
+> error logged) rather than being silently skipped. This means a policy that
+> references an attribute a given entity may not carry (e.g. `resource.classification`
+> on a realm, `principal.reputation` on an unregistered agent) must guard it with
+> `has` — otherwise the policy errors and denies. Write
+> `when { resource has classification && resource.classification == "restricted" }`,
+> not `when { resource.classification == "restricted" }`. All shipped example
+> policies follow this rule.
 
 ## Authorization: Plan-Rewrite Model
 
@@ -153,6 +162,32 @@ Cedar-resolved namespace filter early in the plan, and `PolicyEnforcedStore` wra
 physical store so every scan is namespace-filtered and fails closed without a principal.
 Policy *reads* (`SHOW POLICIES`, `EXPLAIN POLICY`, `GRANT`/`REVOKE`) run through
 `PolicyQueryReadExec`.
+
+### Recall is deny-by-default
+
+The engine recall primitive treats an *unscoped* query — no requested namespace and
+no allowed-namespace set — as **deny**, not "all tenants". Internally this resolves
+to an empty namespace scope (`namespace IN ()` → `1 = 0`), so a recall that fails to
+carry a scope returns nothing rather than leaking across tenants. Reading across
+every namespace is possible only through an explicit `RecallBuilder::unrestricted()`
+(and `ThinkBuilder::unrestricted()`) opt-in, which is reserved for the single-tenant
+embedded [`hirn::Memory`](../README.md) facade and in-process admin tooling that own
+all data within their trust boundary.
+
+Multi-tenant surfaces never rely on the raw primitive: the HTTP, gRPC, and MCP
+recall/think/query tools resolve the caller's scope from its credential. A
+token-restricted identity is confined to its agent's accessible namespaces (via
+`db.as_agent(...)`); an unrestricted API-key/mTLS identity — which owns every
+namespace in its realm — reads realm-wide. The same credential-aware rule governs
+the MCP HirnQL and watch tools, so no authenticated caller can exceed its
+credential's namespace scope.
+
+### Bulk export / import require admin
+
+`export_to` dumps every record across all namespaces and `import_from` writes
+arbitrary records with caller-supplied provenance, so both enforce the `admin`
+Cedar action before touching data (a no-op in open mode with no policy engine;
+fail-closed for a non-admin or anonymous actor under Cedar).
 
 ### Pre-Mutation Enforcement
 

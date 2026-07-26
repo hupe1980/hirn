@@ -179,10 +179,14 @@ impl HirnMemory {
             )));
         }
         let embedding = self.db.embed_text(query).await?;
+        // The embedded facade is single-tenant: it owns all data in-process, so
+        // it reads across every namespace. Multi-tenant daemon surfaces never
+        // take this path — they scope by agent identity instead.
         self.db
             .recall_view()
             .think(embedding)
             .budget(budget)
+            .unrestricted()
             .execute()
             .await
     }
@@ -194,6 +198,7 @@ impl HirnMemory {
             .recall_view()
             .query(embedding)
             .limit(limit)
+            .unrestricted()
             .execute()
             .await
     }
@@ -395,6 +400,8 @@ impl<'a> MemoryRecallBuilder<'a> {
         }
         if let Some(ns) = self.namespace {
             builder = builder.namespace(ns);
+        } else {
+            builder = builder.unrestricted();
         }
         if let Some(ts) = self.after {
             builder = builder.after(ts);
@@ -559,6 +566,8 @@ impl<'a> MemoryThinkBuilder<'a> {
         }
         if let Some(ns) = self.namespace {
             builder = builder.namespace(ns);
+        } else {
+            builder = builder.unrestricted();
         }
         if let Some(ts) = self.after {
             builder = builder.after(ts);

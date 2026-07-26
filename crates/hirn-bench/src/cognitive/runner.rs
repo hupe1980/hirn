@@ -1432,6 +1432,7 @@ fn execute_direct_query(
     let mut think = db
         .recall_view()
         .think(query_embedding.clone())
+        .unrestricted()
         .budget(config.token_budget);
     if config.effective_query_text_hybrid() {
         think = think.query_text(query.question.clone());
@@ -1445,7 +1446,11 @@ fn execute_direct_query(
     );
     require_query_clean_diagnostics(&query.id, "THINK", &think_explanation.retrieval.diagnostics);
 
-    let mut recall = db.recall_view().query(query_embedding).limit(config.k);
+    let mut recall = db
+        .recall_view()
+        .query(query_embedding)
+        .unrestricted()
+        .limit(config.k);
     if config.effective_query_text_hybrid() {
         recall = recall.query_text(query.question.clone());
     }
