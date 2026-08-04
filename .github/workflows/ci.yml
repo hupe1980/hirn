@@ -39,7 +39,7 @@ jobs:
       - name: Check markdown links
         run: |
           python3 scripts/check_markdown_links.py \
-            README.md CONTRIBUTING.md FINDINGS.md \
+            README.md CONTRIBUTING.md \
             site bench-results crates .github
 
       # Heading anchors inside the site are left to Zola, which slugifies them

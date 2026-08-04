@@ -93,7 +93,7 @@ links: links-markdown links-site
 # Cross-file markdown links (fails loudly on a path that does not exist).
 links-markdown:
     python3 scripts/check_markdown_links.py \
-        README.md CONTRIBUTING.md FINDINGS.md \
+        README.md CONTRIBUTING.md \
         site bench-results crates .github
 
 # Site links and heading anchors, slugified exactly as the renderer does.

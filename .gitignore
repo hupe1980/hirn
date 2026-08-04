@@ -31,10 +31,6 @@ benchmarks_report.md
 
 # Custom
 .venv
-_prompts
-BACKLOG*.md
-CONCEPT.md
-FINDINGS.md
 .pytest_cache/
 __pycache__/
 _hirn.cpython-*.so
