@@ -196,10 +196,15 @@ mod tests {
         let config = HirnConfig::builder()
             .db_path(&db_path)
             .working_memory_token_limit(2000)
+            // Isolate the causal term: every other weight is zeroed so the
+            // ranking under test is purely causal. All weights must sum to
+            // 1.0, so the temporal-relevance term has to be zeroed explicitly
+            // too — it defaults to 0.10.
             .scoring_weights(0.0, 0.0, 0.0, 0.0)
             .scoring_causal_relevance_weight(1.0)
             .scoring_surprise_weight(0.0)
             .scoring_source_reliability_weight(0.0)
+            .scoring_temporal_relevance_weight(0.0)
             .build()
             .unwrap();
         let db = HirnDB::open_with_config(config, backend).await.unwrap();

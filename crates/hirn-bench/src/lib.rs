@@ -6,6 +6,7 @@ pub mod compare;
 pub mod dataset;
 pub mod load;
 pub mod metrics;
+pub mod nlu_eval;
 pub mod output;
 pub mod provenance;
 pub mod runner;

@@ -186,7 +186,7 @@ pub async fn personalized_pagerank(
         return Ok(HashMap::new());
     }
 
-    let all_nodes = collect_reachable_nodes(graph, seeds, allowed_namespaces).await?;
+    let all_nodes = collect_reachable_nodes(graph, seeds, config, allowed_namespaces).await?;
     if all_nodes.is_empty() {
         return Ok(HashMap::new());
     }
@@ -214,6 +214,7 @@ pub async fn personalized_pagerank(
 async fn collect_reachable_nodes(
     graph: &PersistentGraph,
     seeds: &[MemoryId],
+    config: &hirn_graph::activation::PprConfig,
     allowed_namespaces: Option<&[Namespace]>,
 ) -> HirnResult<Vec<MemoryId>> {
     let mut visited = HashSet::new();
@@ -233,10 +234,17 @@ async fn collect_reachable_nodes(
         if visited.insert(seed) {
             frontier.push(seed);
             reachable.push(seed);
+            if reachable.len() >= config.max_nodes {
+                return Ok(reachable);
+            }
         }
     }
+    frontier.truncate(config.max_frontier_size);
 
-    while !frontier.is_empty() {
+    for _depth in 0..config.max_depth {
+        if frontier.is_empty() {
+            break;
+        }
         // Two batched scans per level: forward neighbors are edge targets,
         // backward neighbors are edge sources. Both scans push the namespace
         // filter into the scan predicate.
@@ -247,13 +255,21 @@ async fn collect_reachable_nodes(
             .batch_incoming_adjacency_read_scoped(&frontier, allowed_namespaces)
             .await?;
 
-        let mut next_frontier = Vec::new();
+        let remaining_capacity = config.max_nodes.saturating_sub(reachable.len());
+        let next_limit = config.max_frontier_size.min(remaining_capacity);
+        if next_limit == 0 {
+            break;
+        }
+        let mut next_frontier = Vec::with_capacity(next_limit);
         let forward = outgoing.iter().map(|edge| edge.target);
         let backward = incoming.iter().map(|edge| edge.source);
         for neighbor in forward.chain(backward) {
             if visited.insert(neighbor) {
                 next_frontier.push(neighbor);
                 reachable.push(neighbor);
+                if next_frontier.len() >= next_limit {
+                    break;
+                }
             }
         }
         frontier = next_frontier;
@@ -502,7 +518,14 @@ mod tests {
 
         // Backward direction: the incoming-adjacency read pulls the upstream
         // cause into the PPR subgraph.
-        let reachable = collect_reachable_nodes(&pg, &[seed], None).await.unwrap();
+        let reachable = collect_reachable_nodes(
+            &pg,
+            &[seed],
+            &hirn_graph::activation::PprConfig::default(),
+            None,
+        )
+        .await
+        .unwrap();
         assert!(
             reachable.contains(&upstream),
             "backward reachability must pull upstream causes into the PPR subgraph"

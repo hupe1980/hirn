@@ -269,7 +269,8 @@ message ScoringWeights {
   float activation = 4;        // Weight for graph activation spread.
   float causal_relevance = 5;  // Weight for causal-chain relevance.
   float source_reliability = 6; // Weight for source reliability (provenance).
-  reserved 7 to 10;
+  float temporal_relevance = 7; // Weight for Allen-interval temporal relevance.
+  reserved 8 to 10;
 }
 
 // Per-signal breakdown of a record's composite score.
@@ -281,7 +282,8 @@ message ScoreBreakdown {
   float causal_relevance = 5;
   float surprise = 6;
   float source_reliability = 7;
-  reserved 8 to 10;
+  float temporal_relevance = 8; // Allen-interval match of validity vs query time frame.
+  reserved 9 to 10;
 }
 
 // A memory record paired with its relevance scores.

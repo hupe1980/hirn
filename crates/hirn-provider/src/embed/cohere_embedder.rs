@@ -192,16 +192,19 @@ impl Embedder for CohereEmbedder {
                 .get("retry-after")
                 .and_then(|v| v.to_str().ok())
                 .and_then(parse_retry_after);
-            let body_text = resp.text().await.unwrap_or_default();
+            let body_text = crate::transport::read_error_response(resp).await;
             return Err(
                 EmbedError::from_status(&self.model, status_code, body_text, retry_after).into(),
             );
         }
 
-        let parsed: EmbedResponse = resp.json().await.map_err(|e| EmbedError::InvalidResponse {
-            provider: self.model.clone(),
-            details: format!("Cohere embed parse error: {e}"),
-        })?;
+        let parsed: EmbedResponse =
+            crate::transport::decode_json_response(resp)
+                .await
+                .map_err(|details| EmbedError::InvalidResponse {
+                    provider: self.model.clone(),
+                    details,
+                })?;
 
         debug!(
             model = %self.model,

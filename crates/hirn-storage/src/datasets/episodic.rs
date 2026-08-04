@@ -17,7 +17,7 @@ use hirn_core::metadata::Metadata;
 use hirn_core::provenance::Provenance;
 use hirn_core::revision::{LogicalMemoryId, RevisionId, RevisionOperation};
 use hirn_core::timestamp::Timestamp;
-use hirn_core::types::{EventType, Namespace};
+use hirn_core::types::{EventType, MemoryType, Namespace};
 
 use crate::HirnDbError;
 
@@ -62,6 +62,11 @@ pub const RECALL_HYDRATION_COLUMNS: &[&str] = &[
     "valence",
     "expires_at_ms",
     "valid_until_ms",
+    "functional_role",
+    "pinned",
+    "event_time_ms",
+    "time_precision",
+    "temporal_state",
 ];
 
 /// Create scalar indices used by revision-head lookups.
@@ -158,6 +163,14 @@ pub fn schema(embedding_dims: usize) -> SchemaRef {
         Field::new("valence", DataType::Float32, true),
         Field::new("expires_at_ms", DataType::Int64, true),
         Field::new("valid_until_ms", DataType::Int64, true),
+        Field::new("functional_role", DataType::Utf8, true),
+        Field::new("pinned", DataType::Boolean, true),
+        // Write-time temporal envelope. Nullable: a record ingested without
+        // temporal extraction carries no envelope and must rank exactly as it
+        // did before the columns existed.
+        Field::new("event_time_ms", DataType::Int64, true),
+        Field::new("time_precision", DataType::Utf8, true),
+        Field::new("temporal_state", DataType::Utf8, true),
     ]))
 }
 
@@ -201,6 +214,11 @@ pub fn to_batch(
     let mut valence_values: Vec<Option<f32>> = Vec::with_capacity(len);
     let mut expires_at_values: Vec<Option<i64>> = Vec::with_capacity(len);
     let mut valid_until_values: Vec<Option<i64>> = Vec::with_capacity(len);
+    let mut functional_roles: Vec<&str> = Vec::with_capacity(len);
+    let mut event_times: Vec<Option<i64>> = Vec::with_capacity(len);
+    let mut time_precisions: Vec<&str> = Vec::with_capacity(len);
+    let mut temporal_states: Vec<&str> = Vec::with_capacity(len);
+    let mut pinned_values: Vec<Option<bool>> = Vec::with_capacity(len);
 
     for r in records {
         ids.push(r.id.to_string());
@@ -254,6 +272,11 @@ pub fn to_batch(
         valence_values.push(r.valence);
         expires_at_values.push(r.expires_at.map(|t| t.timestamp_ms()));
         valid_until_values.push(r.valid_until.map(|t| t.timestamp_ms()));
+        functional_roles.push(functional_role_to_str(r.functional_role));
+        event_times.push(r.temporal.event_time.map(|t| t.timestamp_ms()));
+        time_precisions.push(r.temporal.precision.as_str());
+        temporal_states.push(r.temporal.state.as_str());
+        pinned_values.push(Some(r.pinned));
         multi_content_values.push(
             r.multi_content
                 .as_ref()
@@ -322,6 +345,11 @@ pub fn to_batch(
             Arc::new(Float32Array::from(valence_values)),
             Arc::new(Int64Array::from(expires_at_values)),
             Arc::new(Int64Array::from(valid_until_values)),
+            Arc::new(StringArray::from(functional_roles)),
+            Arc::new(BooleanArray::from(pinned_values)),
+            Arc::new(Int64Array::from(event_times)),
+            Arc::new(StringArray::from(time_precisions)),
+            Arc::new(StringArray::from(temporal_states)),
         ],
     )
     .map_err(|e| HirnDbError::InvalidArgument(e.to_string()))
@@ -383,6 +411,29 @@ pub fn from_batch(batch: &RecordBatch) -> Result<Vec<EpisodicRecord>, HirnDbErro
     let valid_until_col = batch
         .column_by_name("valid_until_ms")
         .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
+
+    // functional_role may be absent in older datasets (nullable column).
+    let functional_role_col = batch
+        .column_by_name("functional_role")
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+
+    // pinned may be absent in older datasets (nullable column); default to false.
+    let pinned_col = batch
+        .column_by_name("pinned")
+        .and_then(|c| c.as_any().downcast_ref::<BooleanArray>());
+
+    // Temporal envelope columns. All three may be absent (projection or a
+    // dataset written before they existed); the record then carries
+    // `TemporalEnvelope::unknown()`, which ranks as it always did.
+    let event_time_col = batch
+        .column_by_name("event_time_ms")
+        .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
+    let time_precision_col = batch
+        .column_by_name("time_precision")
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+    let temporal_state_col = batch
+        .column_by_name("temporal_state")
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>());
 
     // embedding may be absent when using recall-hydration column projection;
     // the vector is not needed for context assembly or post-plan scoring.
@@ -474,6 +525,23 @@ pub fn from_batch(batch: &RecordBatch) -> Result<Vec<EpisodicRecord>, HirnDbErro
             metadata,
             namespace,
             archived: arch_col.value(i),
+            temporal: hirn_core::temporal::TemporalEnvelope {
+                event_time: event_time_col
+                    .filter(|c| !c.is_null(i))
+                    .and_then(|c| u64::try_from(c.value(i)).ok())
+                    .map(Timestamp::from_millis),
+                // An unparseable label decodes as `Unknown` rather than
+                // failing the batch: a corrupt enum must not make an otherwise
+                // readable record unreadable.
+                precision: time_precision_col
+                    .filter(|c| !c.is_null(i))
+                    .and_then(|c| hirn_core::temporal::TimePrecision::parse(c.value(i)))
+                    .unwrap_or_default(),
+                state: temporal_state_col
+                    .filter(|c| !c.is_null(i))
+                    .and_then(|c| hirn_core::temporal::TemporalState::parse(c.value(i)))
+                    .unwrap_or_default(),
+            },
             expires_at: expires_at_col.and_then(|col| {
                 if col.is_null(i) {
                     None
@@ -517,6 +585,11 @@ pub fn from_batch(batch: &RecordBatch) -> Result<Vec<EpisodicRecord>, HirnDbErro
                     }
                 }
             }),
+            functional_role: match functional_role_col {
+                Some(col) if !col.is_null(i) => str_to_memory_type(col.value(i)),
+                _ => MemoryType::default(),
+            },
+            pinned: pinned_col.map(|c| c.value(i)).unwrap_or(false),
         });
     }
 
@@ -604,6 +677,25 @@ fn str_to_event_type(s: &str) -> Result<EventType, HirnDbError> {
         other => Err(HirnDbError::InvalidArgument(format!(
             "unknown event type: {other}"
         ))),
+    }
+}
+
+const fn functional_role_to_str(role: MemoryType) -> &'static str {
+    match role {
+        MemoryType::StableFact => "stable_fact",
+        MemoryType::EpisodicEvent => "episodic_event",
+        MemoryType::BehavioralRule => "behavioral_rule",
+        MemoryType::Preference => "preference",
+    }
+}
+
+fn str_to_memory_type(s: &str) -> MemoryType {
+    match s {
+        "stable_fact" => MemoryType::StableFact,
+        "episodic_event" => MemoryType::EpisodicEvent,
+        "behavioral_rule" => MemoryType::BehavioralRule,
+        "preference" => MemoryType::Preference,
+        _ => MemoryType::default(),
     }
 }
 
@@ -718,6 +810,7 @@ mod tests {
         let now = Timestamp::now();
         let id = MemoryId::new();
         EpisodicRecord {
+            temporal: hirn_core::temporal::TemporalEnvelope::unknown(),
             id,
             logical_memory_id: LogicalMemoryId::from_memory_id(id),
             revision_id: RevisionId::from_memory_id(id),
@@ -757,14 +850,22 @@ mod tests {
             valid_until: None,
             multi_content: None,
             valence: None,
+            functional_role: MemoryType::EpisodicEvent,
+            pinned: false,
         }
     }
 
     #[test]
     fn schema_has_correct_fields() {
         let s = schema(128);
-        assert_eq!(s.fields().len(), 32);
+        assert_eq!(s.fields().len(), 37);
         assert!(s.field_with_name("agent_id").is_ok());
+        // Write-time temporal envelope.
+        assert!(s.field_with_name("event_time_ms").is_ok());
+        assert!(s.field_with_name("time_precision").is_ok());
+        assert!(s.field_with_name("temporal_state").is_ok());
+        assert!(s.field_with_name("functional_role").is_ok());
+        assert!(s.field_with_name("pinned").is_ok());
         assert!(s.field_with_name("valence").is_ok());
         assert!(s.field_with_name("valid_until_ms").is_ok());
         assert!(s.field_with_name("id").is_ok());
@@ -1078,5 +1179,59 @@ mod tests {
             .collect();
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].content, "content-img1");
+    }
+
+    #[test]
+    fn temporal_envelope_survives_the_round_trip() {
+        use hirn_core::temporal::{TemporalEnvelope, TemporalState, TimePrecision};
+
+        let mut record = make_record("temporal", true);
+        record.temporal = TemporalEnvelope {
+            event_time: Some(Timestamp::from_millis(1_700_000_000_000)),
+            precision: TimePrecision::Month,
+            state: TemporalState::Ongoing,
+        };
+
+        let batch = to_batch(std::slice::from_ref(&record), 4).unwrap();
+        let decoded = from_batch(&batch).unwrap();
+        assert_eq!(decoded[0].temporal, record.temporal);
+        // The state must survive, because it is what exempts the record from
+        // recency decay downstream.
+        assert!(!decoded[0].temporal.state.decays_with_age());
+    }
+
+    #[test]
+    fn a_record_without_an_envelope_decodes_as_unknown() {
+        use hirn_core::temporal::TemporalEnvelope;
+
+        let record = make_record("temporal", true);
+        assert_eq!(record.temporal, TemporalEnvelope::unknown());
+        let batch = to_batch(std::slice::from_ref(&record), 4).unwrap();
+        let decoded = from_batch(&batch).unwrap();
+        assert_eq!(decoded[0].temporal, TemporalEnvelope::unknown());
+        assert!(
+            !decoded[0].temporal.is_rankable(),
+            "an absent envelope must never be treated as temporal evidence"
+        );
+    }
+
+    #[test]
+    fn a_corrupt_enum_label_decodes_as_unknown_rather_than_failing() {
+        // A bad enum value must not make an otherwise readable record
+        // unreadable — the rest of the row is still valid data.
+        use arrow_array::StringArray;
+        use hirn_core::temporal::TemporalEnvelope;
+
+        let record = make_record("temporal", true);
+        let batch = to_batch(std::slice::from_ref(&record), 4).unwrap();
+
+        let schema = batch.schema();
+        let idx = schema.index_of("temporal_state").unwrap();
+        let mut columns: Vec<arrow_array::ArrayRef> = batch.columns().to_vec();
+        columns[idx] = Arc::new(StringArray::from(vec![Some("not_a_state")]));
+        let corrupted = RecordBatch::try_new(schema, columns).unwrap();
+
+        let decoded = from_batch(&corrupted).unwrap();
+        assert_eq!(decoded[0].temporal, TemporalEnvelope::unknown());
     }
 }

@@ -110,6 +110,33 @@ pub trait GraphReadRuntime: Send + Sync {
         allowed_namespaces: Option<&[Namespace]>,
     ) -> HirnResult<GraphActivationOutput>;
 
+    /// Activation with memory embeddings available for lateral inhibition.
+    async fn activate_graph_with_embeddings(
+        &self,
+        seeds: &[MemoryId],
+        mode: ActivationMode,
+        ppr_config: Option<&PprConfig>,
+        max_depth: u32,
+        epsilon: f32,
+        inhibition_mu: f32,
+        embeddings: Option<&HashMap<MemoryId, Vec<f32>>>,
+        delegation_threshold: usize,
+        allowed_namespaces: Option<&[Namespace]>,
+    ) -> HirnResult<GraphActivationOutput> {
+        let _ = embeddings;
+        self.activate_graph(
+            seeds,
+            mode,
+            ppr_config,
+            max_depth,
+            epsilon,
+            inhibition_mu,
+            delegation_threshold,
+            allowed_namespaces,
+        )
+        .await
+    }
+
     /// Activation with an edge-weight cutoff (EXPAND … MIN_WEIGHT).
     ///
     /// The default implementation refuses a requested cutoff rather than
@@ -139,6 +166,39 @@ pub trait GraphReadRuntime: Send + Sync {
             max_depth,
             epsilon,
             inhibition_mu,
+            delegation_threshold,
+            allowed_namespaces,
+        )
+        .await
+    }
+
+    /// Embedding-aware activation with an edge-weight cutoff.
+    async fn activate_graph_min_weight_with_embeddings(
+        &self,
+        seeds: &[MemoryId],
+        mode: ActivationMode,
+        ppr_config: Option<&PprConfig>,
+        max_depth: u32,
+        epsilon: f32,
+        inhibition_mu: f32,
+        min_weight: Option<f32>,
+        embeddings: Option<&HashMap<MemoryId, Vec<f32>>>,
+        delegation_threshold: usize,
+        allowed_namespaces: Option<&[Namespace]>,
+    ) -> HirnResult<GraphActivationOutput> {
+        if min_weight.is_some_and(|weight| weight > 0.0) {
+            return Err(hirn_core::HirnError::InvalidInput(
+                "this graph runtime does not support MIN_WEIGHT activation cutoffs".into(),
+            ));
+        }
+        self.activate_graph_with_embeddings(
+            seeds,
+            mode,
+            ppr_config,
+            max_depth,
+            epsilon,
+            inhibition_mu,
+            embeddings,
             delegation_threshold,
             allowed_namespaces,
         )

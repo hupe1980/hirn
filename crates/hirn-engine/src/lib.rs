@@ -119,7 +119,29 @@ pub use retrieval::explanation::{
     RetrievalExplanation, RetrievalPolicyScope, RetrievalPolicySummary,
     RetrievalSuppressionSummary, RetrievedRecordExplanation, ThinkExplanation,
 };
-pub use retrieval::query_intent::{ViewKind, ViewWeights, classify_query};
+pub use retrieval::query_intent::{
+    QUERY_INTENT_TASK, QueryRoute, ViewKind, ViewWeights, classify_query_heuristic, route_query,
+};
+
+/// Every natural-language decision surface hirn ships.
+///
+/// One registry rather than a task per module, for three reasons: a new task
+/// added without its own well-formedness test would otherwise ship unchecked;
+/// calibration is fitted *per task*, so the workflow needs something to iterate
+/// over; and `hirn_nlu_*` metric labels come from `task.name`, which has to be
+/// unique across the whole system for a dashboard to mean anything.
+///
+/// See [`hirn_core::nlu`] for the contract these implement.
+#[must_use]
+pub fn nlu_tasks() -> Vec<&'static hirn_core::nlu::ClassificationTask> {
+    vec![
+        &QUERY_INTENT_TASK,
+        &consolidation::REFLECTION_TASK,
+        &consolidation::KNOWLEDGE_TYPE_TASK,
+        &adaptive::QUERY_COMPLEXITY_TASK,
+        &hirn_provider::nlu::NLI_TASK,
+    ]
+}
 pub use scoring::{ScoreBreakdown, ScoringWeights};
 pub use security::{
     CorruptionDefense, CorruptionDefenseConfig, QuarantineApprovalOutcome, QuarantineEntry,

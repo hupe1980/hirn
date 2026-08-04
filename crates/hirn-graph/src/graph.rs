@@ -327,6 +327,12 @@ pub struct PropertyGraph {
     /// Tracks nodes whose `access_count` has changed since the last cold-tier flush.
     /// Drained by `drain_dirty_access_counts()` and reset to 0 after flush.
     dirty_access_counts: HashMap<MemoryId, u64>,
+    /// Set once a node has been evicted for capacity (the hard `max_node_count`
+    /// cap), meaning the hot tier is no longer a complete view of the graph.
+    /// A write-through cache layer consults this to route reads/traversals to the
+    /// authoritative cold tier so evicted nodes are still reachable. Explicit
+    /// deletions do NOT set it (they remove the node from both tiers).
+    node_evicted: bool,
 }
 
 impl Default for PropertyGraph {
@@ -346,6 +352,7 @@ impl PropertyGraph {
             max_node_count: 500_000,
             eviction_heap: BinaryHeap::new(),
             dirty_access_counts: HashMap::new(),
+            node_evicted: false,
         }
     }
 
@@ -359,6 +366,7 @@ impl PropertyGraph {
             max_node_count,
             eviction_heap: BinaryHeap::new(),
             dirty_access_counts: HashMap::new(),
+            node_evicted: false,
         }
     }
 
@@ -507,6 +515,9 @@ impl PropertyGraph {
                     "evicting least-accessed node from hot tier (max_node_count reached)"
                 );
                 self.remove_node(evict_id);
+                // The hot tier is now a partial view; a cache layer must consult
+                // cold on a miss so the evicted node stays reachable.
+                self.node_evicted = true;
             } else {
                 tracing::error!(
                     nodes = node_count,
@@ -586,6 +597,15 @@ impl PropertyGraph {
     /// Whether a node exists.
     pub fn has_node(&self, id: MemoryId) -> bool {
         self.id_to_node.contains_key(&id)
+    }
+
+    /// Whether any node has been evicted for capacity since construction.
+    ///
+    /// Once true, the hot tier is no longer a complete view of the graph, so a
+    /// write-through cache layer must fall back to the authoritative cold tier on
+    /// reads and traversals to avoid silently dropping evicted nodes.
+    pub fn has_evicted(&self) -> bool {
+        self.node_evicted
     }
 
     /// Record an access to a node (bumps the access counter for LRU eviction).

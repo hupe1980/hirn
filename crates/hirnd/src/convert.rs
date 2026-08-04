@@ -552,6 +552,7 @@ pub fn score_breakdown_to_proto(sb: &ScoreBreakdown) -> proto::ScoreBreakdown {
         causal_relevance: sb.causal_relevance,
         surprise: sb.surprise,
         source_reliability: sb.source_reliability,
+        temporal_relevance: sb.temporal_relevance,
     }
 }
 

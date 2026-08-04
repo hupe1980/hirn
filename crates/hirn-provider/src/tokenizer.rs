@@ -142,13 +142,20 @@ impl Tokenizer for TiktokenTokenizer {
 pub fn default_tokenizer() -> Arc<dyn Tokenizer> {
     #[cfg(feature = "tiktoken")]
     {
-        TiktokenTokenizer::new(TokenizerModel::Cl100kBase)
-            .map(|tokenizer| Arc::new(tokenizer) as Arc<dyn Tokenizer>)
-            .unwrap_or_else(|_| Arc::new(EstimatingTokenizer))
+        match TiktokenTokenizer::new(TokenizerModel::Cl100kBase) {
+            Ok(tokenizer) => Arc::new(tokenizer) as Arc<dyn Tokenizer>,
+            Err(error) => {
+                tracing::warn!(%error, "tiktoken initialization failed; using heuristic token estimator");
+                Arc::new(EstimatingTokenizer)
+            }
+        }
     }
 
     #[cfg(not(feature = "tiktoken"))]
     {
+        tracing::warn!(
+            "tiktoken feature is disabled; using heuristic token estimator for context budgets"
+        );
         Arc::new(EstimatingTokenizer)
     }
 }

@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="{{ lang | default(value=config.default_language) }}" data-theme="dark" data-mermaid="{{ config.extra.mermaid_version }}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+{#- Resolve per-page SEO values once, then reuse. A section and a page expose
+    different variables, so both are normalised here rather than in five
+    separate places below. -#}
+{%- set_global is_home = false -%}
+{%- if page -%}
+  {%- set_global title = page.title -%}
+  {%- set_global description = page.description | default(value=config.description) -%}
+  {%- set_global permalink = page.permalink -%}
+  {%- set_global og_type = "article" -%}
+{%- elif section -%}
+  {%- set_global title = section.title | default(value=config.title) -%}
+  {%- set_global description = section.description | default(value=config.description) -%}
+  {%- set_global permalink = section.permalink -%}
+  {%- set_global og_type = "website" -%}
+  {%- if section.relative_path == "_index.md" %}{% set_global is_home = true %}{% endif -%}
+{%- else -%}
+  {%- set_global title = config.title -%}
+  {%- set_global description = config.description -%}
+  {%- set_global permalink = config.base_url ~ "/" -%}
+  {%- set_global og_type = "website" -%}
+{%- endif -%}
+
+{#- The landing page leads with the tagline; every other page is
+    "<page> · hirn" so a search result reads unambiguously. -#}
+{%- if is_home -%}
+  {%- set_global full_title = config.title ~ " — " ~ config.extra.tagline -%}
+{%- else -%}
+  {%- set_global full_title = title ~ " · " ~ config.title -%}
+{%- endif -%}
+
+<title>{{ full_title }}</title>
+<meta name="description" content="{{ description }}">
+<link rel="canonical" href="{{ permalink | safe }}">
+<meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1">
+
+<meta property="og:site_name" content="{{ config.title }}">
+<meta property="og:type" content="{{ og_type }}">
+<meta property="og:title" content="{{ full_title }}">
+<meta property="og:description" content="{{ description }}">
+<meta property="og:url" content="{{ permalink | safe }}">
+<meta property="og:locale" content="en_US">
+<meta property="og:image" content="{{ get_url(path=config.extra.og_image, trailing_slash=false) }}">
+{#- Dimensions let a scraper reserve the card's space before the image loads;
+    without them some platforms fall back to a small thumbnail. -#}
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:type" content="image/png">
+<meta property="og:image:alt" content="hirn — {{ config.extra.tagline }}">
+
+<meta name="twitter:card" content="{{ config.extra.twitter_card }}">
+<meta name="twitter:title" content="{{ full_title }}">
+<meta name="twitter:description" content="{{ description }}">
+<meta name="twitter:image" content="{{ get_url(path=config.extra.og_image, trailing_slash=false) }}">
+
+<meta name="theme-color" content="#0d0e14" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<link rel="icon" type="image/svg+xml" href="{{ get_url(path='favicon.svg', trailing_slash=false) }}">
+
+{#- Code blocks carry their own inline palette from the highlighter, so they
+    stay dark in both themes. That is deliberate: a single code palette keeps
+    long reference pages visually stable when the theme is toggled. -#}
+<link rel="stylesheet" href="{{ get_url(path='main.css', trailing_slash=false) }}">
+
+{#- Structured data. WebSite on the landing page (enables a sitelinks search
+    box), TechArticle plus a breadcrumb trail on docs pages. -#}
+{%- if is_home %}
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "hirn",
+  "description": {{ config.description | json_encode | safe }},
+  "url": "{{ config.base_url }}/",
+  "applicationCategory": "DeveloperApplication",
+  "operatingSystem": "Linux, macOS, Windows",
+  "programmingLanguage": "Rust",
+  "license": "https://www.apache.org/licenses/LICENSE-2.0",
+  "codeRepository": "{{ config.extra.repo }}",
+  "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" }
+}
+</script>
+{%- elif page %}
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "TechArticle",
+  "headline": {{ page.title | json_encode | safe }},
+  "description": {{ description | json_encode | safe }},
+  "url": "{{ page.permalink | safe }}",
+  "isPartOf": { "@type": "WebSite", "name": "hirn", "url": "{{ config.base_url }}/" },
+  "inLanguage": "en"
+}
+</script>
+{#- A breadcrumb trail lets a result show "hirn › Concepts › Architecture"
+    instead of a bare URL. Built from the page's own ancestors so it cannot
+    drift from the navigation. -#}
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  {#- `page.ancestors` already begins at the site root, so the trail is built
+      entirely from it; adding a hand-written root entry duplicates it. -#}
+  "itemListElement": [
+    {%- set_global position = 0 -%}
+    {%- for ancestor in page.ancestors -%}
+      {%- set crumb = get_section(path=ancestor) -%}
+      {%- if crumb.title -%}
+        {%- set_global position = position + 1 -%}
+        {%- if position > 1 %},{% endif %}
+    { "@type": "ListItem", "position": {{ position }}, "name": {{ crumb.title | json_encode | safe }}, "item": "{{ crumb.permalink | safe }}" }
+      {%- endif -%}
+    {%- endfor %},
+    { "@type": "ListItem", "position": {{ position + 1 }}, "name": {{ page.title | json_encode | safe }}, "item": "{{ page.permalink | safe }}" }
+  ]
+}
+</script>
+{%- if page.lower %}<link rel="prev" href="{{ page.lower.permalink | safe }}">{% endif %}
+{%- if page.higher %}<link rel="next" href="{{ page.higher.permalink | safe }}">{% endif %}
+{%- endif %}
+
+{% block head %}{% endblock head %}
+</head>
+<body class="{% block body_class %}{% endblock body_class %}">
+
+<a class="skip-link" href="#main">Skip to content</a>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="{{ get_url(path='@/_index.md') }}" aria-label="hirn home">
+      <img src="{{ get_url(path='logo.svg', trailing_slash=false) }}" alt="" width="86" height="23" decoding="async">
+    </a>
+    <nav class="topnav" aria-label="Primary">
+      <a href="{{ get_url(path='@/docs/_index.md') }}">Docs</a>
+      <a href="{{ get_url(path='@/docs/getting-started.md') }}">Get started</a>
+      <a href="{{ get_url(path='@/docs/hirnql-reference.md') }}">HirnQL</a>
+      <a href="{{ get_url(path='@/docs/benchmarks.md') }}">Benchmarks</a>
+      <a href="{{ config.extra.repo }}" rel="noopener">GitHub</a>
+    </nav>
+    <div class="topbar-actions">
+      <button class="icon-btn" id="theme-toggle" type="button" aria-label="Toggle colour theme" title="Toggle colour theme">
+        <span aria-hidden="true" data-theme-icon>◐</span>
+      </button>
+      <button class="icon-btn nav-toggle" id="nav-toggle" type="button" aria-label="Toggle navigation" aria-expanded="false">
+        <span aria-hidden="true">☰</span>
+      </button>
+    </div>
+  </div>
+</header>
+
+{% block content %}{% endblock content %}
+
+<footer class="site-footer">
+  <div class="footer-inner">
+    <div>
+      <img src="{{ get_url(path='logo.svg', trailing_slash=false) }}" alt="hirn" width="72" height="19" decoding="async">
+      <p>{{ config.extra.status_banner }}</p>
+    </div>
+    <nav aria-label="Footer">
+      <a href="{{ get_url(path='@/docs/_index.md') }}">Documentation</a>
+      <a href="{{ get_url(path='@/docs/concepts/_index.md') }}">Concepts</a>
+      <a href="{{ get_url(path='@/docs/glossary.md') }}">Glossary</a>
+      <a href="{{ config.extra.repo }}" rel="noopener">Source</a>
+    </nav>
+  </div>
+  <p class="footer-legal">
+    Licensed under {{ config.extra.license }}. Built with
+    <a href="https://lancedb.github.io/lance/" rel="noopener">Lance</a>,
+    <a href="https://datafusion.apache.org/" rel="noopener">DataFusion</a>,
+    <a href="https://www.cedarpolicy.com/" rel="noopener">Cedar</a>, and
+    <a href="https://docs.rs/petgraph/" rel="noopener">petgraph</a>.
+  </p>
+</footer>
+
+{#- Only the initial theme is inline, because it must run before first paint.
+    Everything else is deferred and cached as one file. -#}
+<script>
+(function () {
+  var stored = null;
+  try { stored = localStorage.getItem('hirn-theme'); } catch (e) { /* private mode */ }
+  var light = window.matchMedia('(prefers-color-scheme: light)').matches;
+  document.documentElement.setAttribute('data-theme', stored || (light ? 'light' : 'dark'));
+})();
+</script>
+<script src="{{ get_url(path='site.js', trailing_slash=false) }}" defer></script>
+
+{% block scripts %}{% endblock scripts %}
+</body>
+</html>

@@ -513,38 +513,76 @@ pub async fn store_prospective_implications(
     }
 }
 
-/// Extract SVO events from content and store them.
+/// Extract SVO events from content and build the storage batch.
 ///
-/// Returns the number of SVO events stored, or 0 on failure.
-pub fn prepare_svo_events_batch(
+/// Extraction is typed when an [`EventExtractor`] is configured
+/// (`nlu.typed_event_extraction`) and regex-based otherwise. The typed path
+/// resolves passive voice to the real actor and marks negated assertions;
+/// the regex path cannot do either, so it is the fallback, not the default
+/// when a model is available.
+///
+/// A typed extractor that returns nothing — timeout, malformed output, or a
+/// genuinely event-free record — falls through to the regex extractor rather
+/// than silently dropping the record's events.
+pub async fn prepare_svo_events_batch(
+    extractor: Option<&dyn hirn_core::nlu::EventExtractor>,
+    budget: &hirn_core::nlu::NluBudget,
     source_id: MemoryId,
     content: &str,
     confidence_threshold: f32,
     namespace: &str,
     embedding_dims: usize,
 ) -> Option<RecordBatch> {
-    // Reuse the regex extraction from hirn-exec.
-    let events = hirn_exec::operators::extract_svo_regex(content, confidence_threshold);
+    let typed = match extractor {
+        Some(extractor) => match extractor.extract_events(content, budget).await {
+            Ok(events) => events,
+            Err(error) => {
+                tracing::debug!(%error, "typed event extraction failed; using regex extraction");
+                Vec::new()
+            }
+        },
+        None => Vec::new(),
+    };
 
-    if events.is_empty() {
+    let records: Vec<SvoEvent> = if typed.is_empty() {
+        hirn_exec::operators::extract_svo_regex(content, confidence_threshold)
+            .into_iter()
+            .map(|event| {
+                SvoEvent::from_extraction(
+                    event.subject,
+                    event.verb,
+                    event.object,
+                    event.time_start,
+                    event.time_end,
+                    event.confidence,
+                    vec![source_id],
+                )
+            })
+            .collect()
+    } else {
+        typed
+            .into_iter()
+            .filter(|event| event.confidence >= confidence_threshold)
+            .map(|event| {
+                SvoEvent::from_extraction(
+                    event.subject,
+                    event.verb,
+                    event.object,
+                    event.time_start,
+                    event.time_end,
+                    event.confidence,
+                    vec![source_id],
+                )
+                .with_negated(event.negated)
+            })
+            .collect()
+    };
+
+    if records.is_empty() {
         return None;
     }
 
-    let count = events.len();
-    let records: Vec<SvoEvent> = events
-        .into_iter()
-        .map(|event| {
-            SvoEvent::from_extraction(
-                event.subject,
-                event.verb,
-                event.object,
-                event.time_start,
-                event.time_end,
-                event.confidence,
-                vec![source_id],
-            )
-        })
-        .collect();
+    let count = records.len();
     let embeddings = vec![None; count];
     let namespaces: Vec<&str> = std::iter::repeat_n(namespace, count).collect();
 
@@ -562,8 +600,11 @@ pub fn prepare_svo_events_batch(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn extract_and_store_svo_events(
     storage: &dyn PhysicalStore,
+    extractor: Option<&dyn hirn_core::nlu::EventExtractor>,
+    budget: &hirn_core::nlu::NluBudget,
     source_id: MemoryId,
     content: &str,
     confidence_threshold: f32,
@@ -571,12 +612,16 @@ pub async fn extract_and_store_svo_events(
     embedding_dims: usize,
 ) -> usize {
     let Some(batch) = prepare_svo_events_batch(
+        extractor,
+        budget,
         source_id,
         content,
         confidence_threshold,
         namespace,
         embedding_dims,
-    ) else {
+    )
+    .await
+    else {
         return 0;
     };
 

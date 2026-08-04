@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+{% block body_class %}docs{% endblock body_class %}
+
+{#- Shared chrome for every documentation page and section: sidebar tree,
+    breadcrumbs, in-page contents, and prev/next. Concrete templates fill
+    `doc_title`, `doc_body`, and optionally `doc_toc`. -#}
+
+{% macro nav_tree(section, current) %}
+  {%- set sec = get_section(path=section) -%}
+  <ul>
+    {%- for p in sec.pages %}
+      <li><a href="{{ p.permalink }}"{% if p.permalink == current %} aria-current="page"{% endif %}>{{ p.title }}</a></li>
+    {%- endfor %}
+    {%- for sp in sec.subsections %}
+      {%- set sub = get_section(path=sp) %}
+      <li class="nav-group">
+        <a class="nav-group-title" href="{{ sub.permalink }}"{% if sub.permalink == current %} aria-current="page"{% endif %}>{{ sub.title }}</a>
+        <ul>
+          {%- for p in sub.pages %}
+            <li><a href="{{ p.permalink }}"{% if p.permalink == current %} aria-current="page"{% endif %}>{{ p.title }}</a></li>
+          {%- endfor %}
+        </ul>
+      </li>
+    {%- endfor %}
+  </ul>
+{% endmacro nav_tree %}
+
+{% block content %}
+{#- The active link is highlighted by permalink match, which works for both a
+    leaf page and a section index without a second code path. -#}
+{%- if page %}{% set_global current = page.permalink %}
+{%- else %}{% set_global current = section.permalink %}{% endif -%}
+<div class="docs-shell">
+
+  <aside class="sidebar" id="sidebar">
+    <div class="search">
+      <label class="visually-hidden" for="search-input">Search documentation</label>
+      <input type="search" id="search-input" placeholder="Search docs…" autocomplete="off" spellcheck="false"
+             data-index="{{ get_url(path='search_index.en.json', trailing_slash=false) }}"
+             data-lib="{{ get_url(path='elasticlunr.min.js', trailing_slash=false) }}">
+      <div id="search-results" role="listbox" aria-label="Search results" hidden></div>
+    </div>
+    <nav class="sidebar-nav" aria-label="Documentation">
+      {{ self::nav_tree(section="docs/_index.md", current=current) }}
+    </nav>
+  </aside>
+
+  <main class="doc" id="main">
+    <nav class="breadcrumbs" aria-label="Breadcrumb">
+      <a href="{{ get_url(path='@/docs/_index.md') }}">Docs</a>
+      {%- block breadcrumb %}{% endblock breadcrumb %}
+    </nav>
+
+    {#- Rendered from config rather than repeated in every page's Markdown.
+        Thirteen hand-copied versions of this notice were drifting apart; one
+        source means the wording can be changed in a single place. -#}
+    <p class="status-banner" role="note">
+      <strong>Experimental</strong> — {{ config.extra.status_banner | replace(from="hirn is experimental. ", to="") }}
+    </p>
+
+    <article class="prose">
+      {% block doc_body %}{% endblock doc_body %}
+    </article>
+
+    {% block doc_footer %}{% endblock doc_footer %}
+  </main>
+
+  <aside class="toc-rail">
+    {% block doc_toc %}{% endblock doc_toc %}
+  </aside>
+</div>
+{% endblock content %}

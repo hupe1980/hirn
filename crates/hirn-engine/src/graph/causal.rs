@@ -7,9 +7,10 @@
 //! - Trustworthiness scoring engine
 //! - Automatic contradiction detection on insertion
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use hirn_core::id::MemoryId;
+use hirn_core::nlu::{DecisionSource, NliLabel, NliModel, NluBudget};
 use hirn_core::provenance::Provenance;
 use hirn_core::record::MemoryRecord;
 use hirn_core::types::{EdgeRelation, Namespace, Origin};
@@ -320,6 +321,154 @@ async fn extract_causal_chains(
     })
 }
 
+// ── Causal Intervention (do-operator approximation) ─────────────────────
+
+/// Deterministic ceiling on the number of causal edges a single intervention
+/// pass may traverse. Shares the enumeration discipline of
+/// [`MAX_CAUSAL_CHAINS`]: bounds total work so a deep, high-fan-out causal
+/// neighbourhood cannot allocate or spin unbounded.
+const MAX_INTERVENTION_EDGES: usize = MAX_CAUSAL_CHAINS;
+
+/// Edges whose confidence falls below this floor are ignored: they carry too
+/// little causal certainty to move a candidate's ranking, and traversing them
+/// would only add noise. Legacy / non-causal edges report no confidence and
+/// fall back to the 0.5 convention, which always clears this floor.
+const INTERVENTION_CONFIDENCE_FLOOR: f32 = 0.1;
+
+/// Approximate `P(candidate | do(seeds))` with a signed causal-reachability
+/// score for every candidate reachable from the recall `seeds` along the
+/// causal edge family.
+///
+/// This is a deterministic, native-Rust stand-in for a true interventional
+/// query — no sampling, no LLM. From each seed we walk two directions:
+///
+/// - **Downstream** (cause → effect): outgoing [`EdgeRelation::Causes`] and
+///   [`EdgeRelation::Enables`] edges contribute a POSITIVE step, and outgoing
+///   [`EdgeRelation::Prevents`] edges contribute a NEGATIVE step (a prevented
+///   effect should be *less* relevant, not more).
+/// - **Upstream** (effect → cause): outgoing [`EdgeRelation::CausedBy`] edges
+///   contribute a POSITIVE step.
+///
+/// Each edge's magnitude is `w(e) = strength.unwrap_or(weight) *
+/// confidence.unwrap_or(0.5)` clamped to `[0, 1]`. A path's score is the
+/// product of `polarity(e) * w(e)` over its edges, so magnitude is
+/// self-discounting with depth (each factor ≤ 1) and the sign is the product
+/// of polarities — an odd number of `Prevents` hops yields a negative score.
+///
+/// Per candidate we keep the reach of **maximum absolute magnitude** across all
+/// seeds and both directions, preserving its sign (mirroring the "max, not
+/// mean" rule in [`causal_relevance`]). The returned score lies roughly in
+/// `[-1, 1]`.
+///
+/// Traversal is cycle-safe via a per-path `visited` set (identical discipline
+/// to [`extract_causal_chains`]), capped at `max_depth` hops and at
+/// [`MAX_INTERVENTION_EDGES`] total explored edges. Namespace scoping, when
+/// provided, is applied to both the seed and every traversed target.
+pub(crate) async fn causal_intervention_scores(
+    store: &dyn GraphStore,
+    seeds: &[MemoryId],
+    max_depth: usize,
+    allowed_namespaces: Option<&[Namespace]>,
+) -> HirnResult<HashMap<MemoryId, f32>> {
+    let mut scores: HashMap<MemoryId, f32> = HashMap::new();
+    if max_depth == 0 || seeds.is_empty() {
+        return Ok(scores);
+    }
+
+    // Fixed iteration order keeps the traversal deterministic. Each entry pairs
+    // a causal relation with the polarity its edges contribute to a path.
+    const CAUSAL_FAMILY: [(EdgeRelation, f32); 4] = [
+        (EdgeRelation::Causes, 1.0),
+        (EdgeRelation::Enables, 1.0),
+        (EdgeRelation::Prevents, -1.0),
+        (EdgeRelation::CausedBy, 1.0),
+    ];
+
+    let mut edges_explored = 0usize;
+
+    for &seed in seeds {
+        if edges_explored >= MAX_INTERVENTION_EDGES {
+            break;
+        }
+
+        // Scope the seed itself: an out-of-scope seed contributes nothing.
+        if let Some(allowed) = allowed_namespaces {
+            match store.node_namespace(seed).await? {
+                Some(namespace) if allowed.contains(&namespace) => {}
+                _ => continue,
+            }
+        }
+        if !store.has_node(seed).await? {
+            continue;
+        }
+
+        // Iterative DFS with a per-path visited set (cycle-safe). Each stack
+        // frame carries the running product of `polarity * w` and the depth in
+        // hops from the seed.
+        let mut stack: Vec<(MemoryId, f32, HashSet<MemoryId>, usize)> = Vec::new();
+        let mut initial_visited = HashSet::new();
+        initial_visited.insert(seed);
+        stack.push((seed, 1.0, initial_visited, 0usize));
+
+        while let Some((current, running, visited, depth)) = stack.pop() {
+            if depth >= max_depth || edges_explored >= MAX_INTERVENTION_EDGES {
+                continue;
+            }
+
+            for &(relation, polarity) in &CAUSAL_FAMILY {
+                let edges = store.get_edges_of_type(current, relation).await?;
+                for edge in &edges {
+                    // Only follow edges *out of* `current` so each relation is
+                    // traversed in its intended causal direction.
+                    if edge.source != current {
+                        continue;
+                    }
+                    if edges_explored >= MAX_INTERVENTION_EDGES {
+                        break;
+                    }
+                    edges_explored += 1;
+
+                    let confidence = edge.confidence().unwrap_or(0.5);
+                    if confidence < INTERVENTION_CONFIDENCE_FLOOR {
+                        continue;
+                    }
+
+                    let target = edge.target;
+                    if visited.contains(&target) {
+                        continue; // cycle on this path
+                    }
+
+                    if let Some(allowed) = allowed_namespaces {
+                        match store.node_namespace(target).await? {
+                            Some(namespace) if allowed.contains(&namespace) => {}
+                            _ => continue,
+                        }
+                    }
+
+                    let w = (edge.strength().unwrap_or(edge.weight) * confidence).clamp(0.0, 1.0);
+                    let new_score = running * polarity * w;
+
+                    // Keep the reach of maximum absolute magnitude, sign intact.
+                    scores
+                        .entry(target)
+                        .and_modify(|existing| {
+                            if new_score.abs() > existing.abs() {
+                                *existing = new_score;
+                            }
+                        })
+                        .or_insert(new_score);
+
+                    let mut new_visited = visited.clone();
+                    new_visited.insert(target);
+                    stack.push((target, new_score, new_visited, depth + 1));
+                }
+            }
+        }
+    }
+
+    Ok(scores)
+}
+
 // ── Counterfactual Detection ───────────────────────────────────────────
 
 /// A counterfactual constraint: if memory A is true, memory B is under tension.
@@ -414,12 +563,66 @@ fn count_mutations_without_evidence(provenance: &Provenance) -> usize {
 // ── Contradiction Detection (for insertion) ────────────────────────────
 
 /// Result of contradiction detection during insertion.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ContradictionDetection {
-    /// IDs of records that contradict the new record.
-    pub contradicting_ids: Vec<MemoryId>,
-    /// Whether any contradictions were found.
-    pub has_contradictions: bool,
+    /// Records that contradict the new record, with how each was established.
+    pub contradictions: Vec<ConfirmedContradiction>,
+}
+
+impl ContradictionDetection {
+    /// Whether any contradictions were confirmed.
+    #[must_use]
+    pub fn has_contradictions(&self) -> bool {
+        !self.contradictions.is_empty()
+    }
+
+    /// The contradicting record IDs.
+    pub fn contradicting_ids(&self) -> impl Iterator<Item = MemoryId> + '_ {
+        self.contradictions.iter().map(|c| c.id)
+    }
+}
+
+/// One confirmed contradiction and its provenance.
+#[derive(Debug, Clone)]
+pub struct ConfirmedContradiction {
+    pub id: MemoryId,
+    /// Which deterministic signal nominated the pair.
+    pub signal: CandidateSignal,
+    /// Which backend confirmed it. `Heuristic` means no entailment model was
+    /// available and the deterministic signal stands unreviewed — recorded on
+    /// the edge so downstream consumers can weigh it accordingly.
+    pub decided_by: DecisionSource,
+    /// Confidence in the contradiction. `1.0` for unreviewed heuristic edges,
+    /// which is a statement about the signal firing, not about correctness.
+    pub confidence: f32,
+}
+
+/// Why a pair was nominated for a semantic contradiction check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateSignal {
+    /// Same topic, but exactly one side carries a negation cue.
+    NegationMismatch,
+    /// Shared entities with divergent content or conflicting numeric values.
+    EntityValueConflict,
+}
+
+impl CandidateSignal {
+    /// Stable machine-readable label (recorded in edge metadata).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NegationMismatch => "negation_mismatch",
+            Self::EntityValueConflict => "entity_value_conflict",
+        }
+    }
+}
+
+/// A pair worth an entailment check.
+#[derive(Debug, Clone)]
+pub struct ContradictionCandidate {
+    pub id: MemoryId,
+    pub signal: CandidateSignal,
+    pub similarity: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -431,22 +634,25 @@ pub struct InsertionCandidateRecord<'a> {
     pub similarity: f32,
 }
 
-/// Check if a new record (represented by its content and embedding)
-/// contradicts any existing records.
+/// Nominate existing records that *might* contradict a new one.
 ///
-/// Detection signals:
-/// 1. High embedding similarity (same topic) with conflicting content
-/// 2. Entity-value conflicts (same entity, different claims)
-/// 3. Negation patterns
-pub fn detect_contradictions_on_insert(
+/// This is deliberately cheap and deliberately over-inclusive: it runs on every
+/// write against every similar record, so it uses only surface signals —
+/// embedding similarity, negation-cue mismatch, shared entities, and numeric
+/// divergence. None of those establishes a contradiction on its own
+/// (see [`has_negation_cue`] for why); they establish that a pair is worth
+/// asking a model about.
+///
+/// Pass the result to [`confirm_contradictions`] for the semantic decision.
+pub fn contradiction_candidates(
     content: &str,
     entities: &[String],
     similar_records: &[InsertionCandidateRecord<'_>],
     similarity_threshold: f32,
-) -> ContradictionDetection {
-    let mut contradicting_ids = Vec::new();
+) -> Vec<ContradictionCandidate> {
+    let mut candidates = Vec::new();
     let content_lower = content.to_lowercase();
-    let new_has_negation = contains_negation(&content_lower);
+    let new_has_negation = has_negation_cue(&content_lower);
 
     for candidate in similar_records {
         if candidate.similarity < similarity_threshold {
@@ -456,35 +662,117 @@ pub fn detect_contradictions_on_insert(
         let existing_content = candidate.content_lower;
         let existing_has_negation = candidate.has_negation;
 
-        // Signal 1: Same topic (high cosine sim) + one has negation, the other doesn't.
+        // Signal 1: same topic (high cosine sim) + exactly one side negated.
         let negation_conflict = new_has_negation != existing_has_negation
             && content_similarity_simple(&content_lower, existing_content) > 0.3;
 
-        // Signal 2: Entity-value conflicts — same entities but different values.
-        let entity_conflict = if !entities.is_empty() {
-            let shared_entities: Vec<&String> = entities
+        // Signal 2: shared entities with divergent content or values.
+        let entity_conflict = if entities.is_empty() {
+            false
+        } else {
+            let shares_entity = entities
                 .iter()
-                .filter(|e| candidate.entities.iter().any(|ee| ee == *e))
-                .collect();
-            // If they share entities but have different content, likely a conflict.
-            !shared_entities.is_empty()
+                .any(|e| candidate.entities.iter().any(|ee| ee == e));
+            shares_entity
                 && content_similarity_simple(&content_lower, existing_content) < 0.8
                 && (new_has_negation
                     || existing_has_negation
                     || value_conflict(&content_lower, existing_content))
-        } else {
-            false
         };
 
-        if negation_conflict || entity_conflict {
-            contradicting_ids.push(candidate.id);
+        let signal = if negation_conflict {
+            CandidateSignal::NegationMismatch
+        } else if entity_conflict {
+            CandidateSignal::EntityValueConflict
+        } else {
+            continue;
+        };
+
+        candidates.push(ContradictionCandidate {
+            id: candidate.id,
+            signal,
+            similarity: candidate.similarity,
+        });
+    }
+
+    candidates
+}
+
+/// Decide which nominated candidates are genuine contradictions.
+///
+/// With an entailment model configured, each candidate's text is judged against
+/// the new record's; only a `Contradiction` verdict at or above
+/// `min_confidence` survives. This is what stops "the pipeline is not
+/// unstable" from being filed as a conflict with "the pipeline is stable".
+///
+/// With **no** model available every candidate is kept, tagged
+/// [`DecisionSource::Heuristic`], so contradiction detection still works
+/// offline — but the edge records that no model reviewed it, and consumers can
+/// filter on that rather than being silently told a surface signal was a
+/// semantic judgment.
+///
+/// Judgment direction is new-record-as-premise: the question is whether what
+/// just arrived rules out what is already stored.
+pub async fn confirm_contradictions(
+    nli: Option<&dyn NliModel>,
+    content: &str,
+    candidates: &[(ContradictionCandidate, String)],
+    min_confidence: f32,
+) -> ContradictionDetection {
+    let Some(nli) = nli else {
+        return ContradictionDetection {
+            contradictions: candidates
+                .iter()
+                .map(|(candidate, _)| ConfirmedContradiction {
+                    id: candidate.id,
+                    signal: candidate.signal,
+                    decided_by: DecisionSource::Heuristic,
+                    confidence: 1.0,
+                })
+                .collect(),
+        };
+    };
+
+    let budget = NluBudget::default();
+    let mut contradictions = Vec::new();
+    for (candidate, existing_content) in candidates {
+        match nli.judge(content, existing_content, &budget).await {
+            Ok(Some(judgment))
+                if judgment.label == NliLabel::Contradiction
+                    && judgment.accepted(min_confidence) =>
+            {
+                contradictions.push(ConfirmedContradiction {
+                    id: candidate.id,
+                    signal: candidate.signal,
+                    decided_by: judgment.source,
+                    confidence: judgment.confidence,
+                });
+            }
+            // Entailment or neutral: the surface signal was a false positive.
+            Ok(Some(_)) => {}
+            // The model abstained or failed. The candidate is dropped rather
+            // than admitted unreviewed: with a model configured, an unreviewed
+            // edge would be indistinguishable from a reviewed one, and a
+            // missing contradiction edge is recoverable while a wrong one
+            // propagates into conflict resolution.
+            Ok(None) => {
+                tracing::debug!(
+                    candidate = %candidate.id,
+                    signal = candidate.signal.as_str(),
+                    "entailment model abstained; not recording a contradiction"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    candidate = %candidate.id,
+                    "entailment review failed; not recording a contradiction"
+                );
+            }
         }
     }
 
-    ContradictionDetection {
-        has_contradictions: !contradicting_ids.is_empty(),
-        contradicting_ids,
-    }
+    ContradictionDetection { contradictions }
 }
 
 // ── TRACE / Provenance Lineage ─────────────────────────────────────────
@@ -606,15 +894,23 @@ pub fn record_content_str(record: &MemoryRecord) -> &str {
     }
 }
 
-/// Simple negation detection: checks for common negation patterns.
+/// Whether `text` carries a surface negation cue.
 ///
-/// **Limitation (F-48):** This is surface-level pattern matching, not semantic
-/// entailment. For example, "the project succeeded" vs "the project failed" won't
-/// be caught unless negation markers are present. Full semantic contradiction
-/// detection would require an LLM or NLI (Natural Language Inference) model.
-/// The current approach works well for explicit negations and numerical conflicts
-/// but misses implicit contradictions via paraphrase.
-pub(crate) fn contains_negation(text: &str) -> bool {
+/// **This is a candidate generator, not a polarity decision.** Cue presence is
+/// cheap to compute over every stored record, which makes it a good filter for
+/// *which pairs are worth a semantic check* — and a bad basis for asserting
+/// that two records conflict:
+///
+/// - It fires on agreement: "the pipeline is **not** unstable" and "the
+///   pipeline is stable" say the same thing with mismatched cues.
+/// - It stays silent on conflict: "the migration succeeded" versus "the
+///   migration was rolled back" carries no cue at all.
+/// - It has no scope: a cue inside a subordinate clause negates that clause,
+///   not the sentence.
+///
+/// The decision itself belongs to an entailment model — see
+/// [`confirm_contradictions`], which reviews the candidates this generates.
+pub(crate) fn has_negation_cue(text: &str) -> bool {
     let negation_patterns = [
         "not ",
         "n't ",
@@ -815,11 +1111,151 @@ mod tests {
     // ── Contradiction Detection Tests ──────────────────────────────────
 
     #[test]
-    fn negation_detection() {
-        assert!(contains_negation("hnsw is not faster"));
-        assert!(contains_negation("it doesn't work"));
-        assert!(contains_negation("system never recovered"));
-        assert!(!contains_negation("system is fast"));
+    fn negation_cue_detection() {
+        assert!(has_negation_cue("hnsw is not faster"));
+        assert!(has_negation_cue("it doesn't work"));
+        assert!(has_negation_cue("system never recovered"));
+        assert!(!has_negation_cue("system is fast"));
+    }
+
+    #[test]
+    fn negation_cue_is_not_polarity() {
+        // Documents why this signal only nominates candidates. Both of these
+        // are wrong as polarity judgments and correct as "worth checking".
+        //
+        // A double negative agrees, yet the cue fires on one side only.
+        assert!(has_negation_cue("the pipeline is not unstable"));
+        assert!(!has_negation_cue("the pipeline is stable"));
+        // A genuine conflict with no cue on either side.
+        assert!(!has_negation_cue("the migration succeeded"));
+        assert!(!has_negation_cue("the migration was rolled back"));
+    }
+
+    #[tokio::test]
+    async fn candidates_without_a_model_are_kept_but_marked_unreviewed() {
+        let existing = MemoryId::new();
+        let candidates = vec![(
+            ContradictionCandidate {
+                id: existing,
+                signal: CandidateSignal::NegationMismatch,
+                similarity: 0.9,
+            },
+            "the pipeline is stable".to_string(),
+        )];
+
+        let detection =
+            confirm_contradictions(None, "the pipeline is not unstable", &candidates, 0.7).await;
+        assert!(detection.has_contradictions());
+        assert_eq!(
+            detection.contradictions[0].decided_by,
+            DecisionSource::Heuristic,
+            "an unreviewed surface signal must be labelled as such"
+        );
+    }
+
+    #[tokio::test]
+    async fn entailment_model_filters_false_positive_candidates() {
+        struct ScriptedNli(NliLabel);
+
+        #[async_trait::async_trait]
+        impl NliModel for ScriptedNli {
+            async fn judge(
+                &self,
+                _premise: &str,
+                _hypothesis: &str,
+                _budget: &NluBudget,
+            ) -> HirnResult<Option<hirn_core::nlu::NliJudgment>> {
+                Ok(Some(hirn_core::nlu::NliJudgment::point(
+                    self.0,
+                    0.95,
+                    DecisionSource::LocalModel,
+                )))
+            }
+
+            fn model_id(&self) -> &str {
+                "scripted-nli"
+            }
+        }
+
+        let candidates = vec![(
+            ContradictionCandidate {
+                id: MemoryId::new(),
+                signal: CandidateSignal::NegationMismatch,
+                similarity: 0.9,
+            },
+            "the pipeline is stable".to_string(),
+        )];
+
+        // The double negative agrees: the candidate must be dropped.
+        let entailed = ScriptedNli(NliLabel::Entailment);
+        let detection = confirm_contradictions(
+            Some(&entailed),
+            "the pipeline is not unstable",
+            &candidates,
+            0.7,
+        )
+        .await;
+        assert!(
+            !detection.has_contradictions(),
+            "entailment must veto a negation-cue false positive"
+        );
+
+        // A genuine conflict survives and is attributed to the model.
+        let contradicted = ScriptedNli(NliLabel::Contradiction);
+        let detection = confirm_contradictions(
+            Some(&contradicted),
+            "the pipeline collapsed under load",
+            &candidates,
+            0.7,
+        )
+        .await;
+        assert!(detection.has_contradictions());
+        assert_eq!(
+            detection.contradictions[0].decided_by,
+            DecisionSource::LocalModel
+        );
+    }
+
+    #[tokio::test]
+    async fn low_confidence_entailment_does_not_assert_a_contradiction() {
+        struct WeakNli;
+
+        #[async_trait::async_trait]
+        impl NliModel for WeakNli {
+            async fn judge(
+                &self,
+                _premise: &str,
+                _hypothesis: &str,
+                _budget: &NluBudget,
+            ) -> HirnResult<Option<hirn_core::nlu::NliJudgment>> {
+                Ok(Some(hirn_core::nlu::NliJudgment::point(
+                    NliLabel::Contradiction,
+                    0.4,
+                    DecisionSource::LocalModel,
+                )))
+            }
+
+            fn model_id(&self) -> &str {
+                "weak-nli"
+            }
+        }
+
+        let candidates = vec![(
+            ContradictionCandidate {
+                id: MemoryId::new(),
+                signal: CandidateSignal::EntityValueConflict,
+                similarity: 0.9,
+            },
+            "the cluster has 10gb of ram".to_string(),
+        )];
+        let detection = confirm_contradictions(
+            Some(&WeakNli),
+            "the cluster has 5gb of ram",
+            &candidates,
+            0.7,
+        )
+        .await;
+        assert!(!detection.has_contradictions());
     }
 
     #[test]

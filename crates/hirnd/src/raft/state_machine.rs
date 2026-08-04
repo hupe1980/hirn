@@ -13,12 +13,36 @@ use openraft::{
     BasicNode, Entry, EntryPayload, LogId, RaftSnapshotBuilder, Snapshot, SnapshotMeta,
     StorageError, StorageIOError, StoredMembership,
 };
+use parking_lot::Mutex;
+use redb::{Database, TableDefinition};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use super::lease::ConsolidationLease;
 use super::types::*;
+
+// ── redb tables owned by the state machine ─────────────────────────────────
+//
+// These live in the same redb database as the Raft log store (vote/log/meta),
+// shared via `DurableLogStore::database()`. Persisting the applied state here is
+// what makes committed cluster metadata (realm ownership, node registry, leases,
+// and the monotonic lease fence) survive a snapshot-driven log purge + restart —
+// without it the state machine was in-memory only and reset to empty on restart.
+
+/// Serialized `StateMachineData` (single row, key = `SM_STATE_KEY`).
+const SM_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("sm");
+/// The most recent snapshot: metadata + payload bytes.
+const SNAP_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("snapshot");
+
+const SM_STATE_KEY: &[u8] = b"state";
+const SNAP_META_KEY: &[u8] = b"meta";
+const SNAP_DATA_KEY: &[u8] = b"data";
+
+fn sm_io_err<E: std::fmt::Display>(e: E, ctx: &'static str) -> StorageError<NodeId> {
+    let io_err = std::io::Error::new(std::io::ErrorKind::Other, format!("{ctx}: {e}"));
+    StorageIOError::read_state_machine(openraft::AnyError::new(&io_err)).into()
+}
 
 /// Persistent snapshot data for the state machine.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -47,12 +71,20 @@ struct StoredSnapshot {
     data: Vec<u8>,
 }
 
-/// In-memory Raft state machine for hirnd cluster metadata.
+/// Raft state machine for hirnd cluster metadata.
+///
+/// When constructed via [`Self::open`] it is backed by redb and persists every
+/// applied entry and snapshot durably; via [`Self::new`]/[`Self::default`] it is
+/// purely in-memory (dev/test, mirroring `DevMemLogStore`).
 #[derive(Debug)]
 pub struct HirnStateMachine {
     data: RwLock<StateMachineData>,
     snapshot_idx: AtomicU64,
     current_snapshot: RwLock<Option<StoredSnapshot>>,
+    /// Durable backing store. `None` = volatile (dev/test).
+    db: Option<Arc<Database>>,
+    /// Shared write-serialization mutex (same one the log store uses).
+    write_lock: Option<Arc<Mutex<()>>>,
 }
 
 impl Default for HirnStateMachine {
@@ -61,13 +93,157 @@ impl Default for HirnStateMachine {
             data: RwLock::new(StateMachineData::default()),
             snapshot_idx: AtomicU64::new(0),
             current_snapshot: RwLock::new(None),
+            db: None,
+            write_lock: None,
         }
     }
 }
 
 impl HirnStateMachine {
+    /// Create a volatile (in-memory) state machine. For dev/test only — applied
+    /// state is lost on restart. Production must use [`Self::open`].
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Open a durable state machine backed by the shared redb database.
+    ///
+    /// Creates the state-machine tables if absent, then reloads the last applied
+    /// `StateMachineData` and snapshot from disk so committed cluster metadata
+    /// survives a snapshot-driven log purge + restart.
+    pub fn open(
+        db: Arc<Database>,
+        write_lock: Arc<Mutex<()>>,
+    ) -> Result<Self, StorageError<NodeId>> {
+        // Ensure the tables exist (idempotent).
+        {
+            let _guard = write_lock.lock();
+            let wtxn = db
+                .begin_write()
+                .map_err(|e| sm_io_err(e, "sm begin_write"))?;
+            wtxn.open_table(SM_TABLE)
+                .map_err(|e| sm_io_err(e, "open sm table"))?;
+            wtxn.open_table(SNAP_TABLE)
+                .map_err(|e| sm_io_err(e, "open snapshot table"))?;
+            wtxn.commit().map_err(|e| sm_io_err(e, "sm init commit"))?;
+        }
+
+        // Reload applied state.
+        let data: StateMachineData = {
+            let rtxn = db.begin_read().map_err(|e| sm_io_err(e, "sm begin_read"))?;
+            let table = rtxn
+                .open_table(SM_TABLE)
+                .map_err(|e| sm_io_err(e, "open sm table (read)"))?;
+            match table
+                .get(SM_STATE_KEY)
+                .map_err(|e| sm_io_err(e, "sm get"))?
+            {
+                Some(v) => {
+                    bincode::deserialize(v.value()).map_err(|e| sm_io_err(e, "sm state decode"))?
+                }
+                None => StateMachineData::default(),
+            }
+        };
+
+        // Reload the most recent snapshot, if any.
+        let current_snapshot: Option<StoredSnapshot> = {
+            let rtxn = db
+                .begin_read()
+                .map_err(|e| sm_io_err(e, "snap begin_read"))?;
+            let table = rtxn
+                .open_table(SNAP_TABLE)
+                .map_err(|e| sm_io_err(e, "open snapshot table (read)"))?;
+            let meta = table
+                .get(SNAP_META_KEY)
+                .map_err(|e| sm_io_err(e, "snap meta get"))?;
+            let payload = table
+                .get(SNAP_DATA_KEY)
+                .map_err(|e| sm_io_err(e, "snap data get"))?;
+            match (meta, payload) {
+                (Some(m), Some(d)) => {
+                    let meta: SnapshotMeta<NodeId, BasicNode> = bincode::deserialize(m.value())
+                        .map_err(|e| sm_io_err(e, "snap meta decode"))?;
+                    Some(StoredSnapshot {
+                        meta,
+                        data: d.value().to_vec(),
+                    })
+                }
+                _ => None,
+            }
+        };
+
+        if data.last_applied_log.is_some() || current_snapshot.is_some() {
+            info!(
+                last_applied = ?data.last_applied_log,
+                realms = data.realm_owners.len(),
+                nodes = data.nodes.len(),
+                leases = data.leases.len(),
+                fence = data.lease_fence_counter,
+                "reloaded durable Raft state machine from disk"
+            );
+        }
+
+        Ok(Self {
+            data: RwLock::new(data),
+            snapshot_idx: AtomicU64::new(0),
+            current_snapshot: RwLock::new(current_snapshot),
+            db: Some(db),
+            write_lock: Some(write_lock),
+        })
+    }
+
+    /// Persist the current applied state to redb. No-op when volatile.
+    ///
+    /// Called inside `apply()` before returning, so openraft only observes an
+    /// entry as applied once it is durable — matching its storage contract.
+    fn persist_state(&self, data: &StateMachineData) -> Result<(), StorageError<NodeId>> {
+        let (Some(db), Some(write_lock)) = (self.db.as_ref(), self.write_lock.as_ref()) else {
+            return Ok(());
+        };
+        let bytes = bincode::serialize(data).map_err(|e| sm_io_err(e, "sm state encode"))?;
+        let _guard = write_lock.lock();
+        let wtxn = db
+            .begin_write()
+            .map_err(|e| sm_io_err(e, "sm begin_write"))?;
+        {
+            let mut table = wtxn
+                .open_table(SM_TABLE)
+                .map_err(|e| sm_io_err(e, "open sm table"))?;
+            table
+                .insert(SM_STATE_KEY, bytes.as_slice())
+                .map_err(|e| sm_io_err(e, "sm insert"))?;
+        }
+        wtxn.commit().map_err(|e| sm_io_err(e, "sm commit"))?;
+        Ok(())
+    }
+
+    /// Persist a snapshot (metadata + payload) to redb. No-op when volatile.
+    fn persist_snapshot(
+        &self,
+        meta: &SnapshotMeta<NodeId, BasicNode>,
+        payload: &[u8],
+    ) -> Result<(), StorageError<NodeId>> {
+        let (Some(db), Some(write_lock)) = (self.db.as_ref(), self.write_lock.as_ref()) else {
+            return Ok(());
+        };
+        let meta_bytes = bincode::serialize(meta).map_err(|e| sm_io_err(e, "snap meta encode"))?;
+        let _guard = write_lock.lock();
+        let wtxn = db
+            .begin_write()
+            .map_err(|e| sm_io_err(e, "snap begin_write"))?;
+        {
+            let mut table = wtxn
+                .open_table(SNAP_TABLE)
+                .map_err(|e| sm_io_err(e, "open snapshot table"))?;
+            table
+                .insert(SNAP_META_KEY, meta_bytes.as_slice())
+                .map_err(|e| sm_io_err(e, "snap meta insert"))?;
+            table
+                .insert(SNAP_DATA_KEY, payload)
+                .map_err(|e| sm_io_err(e, "snap data insert"))?;
+        }
+        wtxn.commit().map_err(|e| sm_io_err(e, "snap commit"))?;
+        Ok(())
     }
 
     /// Get the current owner of a realm (if assigned).
@@ -249,6 +425,10 @@ impl RaftSnapshotBuilder<TypeConfig> for Arc<HirnStateMachine> {
             data: data.clone(),
         };
 
+        // Persist the snapshot durably so it survives restart and can seed the
+        // state machine after the covered log is purged.
+        self.persist_snapshot(&meta, &data)?;
+
         *self.current_snapshot.write().await = Some(stored);
 
         Ok(Snapshot {
@@ -292,6 +472,12 @@ impl RaftStateMachine<TypeConfig> for Arc<HirnStateMachine> {
                 }
             }
         }
+        // Persist the applied state (including last_applied_log/membership and
+        // the lease fence) BEFORE returning: openraft treats a returned response
+        // as durably applied, and the log covering these entries may later be
+        // purged after a snapshot. Persisting here is what lets committed
+        // metadata survive a restart. No-op for a volatile (dev) state machine.
+        self.persist_state(&sm)?;
         Ok(responses)
     }
 
@@ -310,8 +496,15 @@ impl RaftStateMachine<TypeConfig> for Arc<HirnStateMachine> {
         meta: &SnapshotMeta<NodeId, BasicNode>,
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<NodeId>> {
-        let new_data: StateMachineData = serde_json::from_slice(snapshot.get_ref())
+        let payload = snapshot.into_inner();
+        let new_data: StateMachineData = serde_json::from_slice(&payload)
             .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &e))?;
+
+        // Persist the installed state + snapshot durably before swapping the
+        // in-memory view, so a crash mid-install can't leave the on-disk state
+        // and snapshot divergent. Installing a snapshot replaces state wholesale.
+        self.persist_state(&new_data)?;
+        self.persist_snapshot(meta, &payload)?;
 
         {
             let mut sm = self.data.write().await;
@@ -320,7 +513,7 @@ impl RaftStateMachine<TypeConfig> for Arc<HirnStateMachine> {
 
         *self.current_snapshot.write().await = Some(StoredSnapshot {
             meta: meta.clone(),
-            data: snapshot.into_inner(),
+            data: payload,
         });
 
         Ok(())

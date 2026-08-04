@@ -288,6 +288,18 @@ fn collapse_semantic_heads(
     heads
 }
 
+/// Stable string form of a functional role, matching the semantic dataset's
+/// `functional_role` encoding so the poisoning gate reads it back consistently.
+fn functional_role_str(role: hirn_core::types::MemoryType) -> &'static str {
+    use hirn_core::types::MemoryType;
+    match role {
+        MemoryType::StableFact => "stable_fact",
+        MemoryType::EpisodicEvent => "episodic_event",
+        MemoryType::BehavioralRule => "behavioral_rule",
+        MemoryType::Preference => "preference",
+    }
+}
+
 fn semantic_record_is_live(record: &SemanticRecord) -> bool {
     record.is_live()
 }
@@ -376,9 +388,17 @@ fn semantic_snapshot_head_as_of(
     history: &[SemanticRecord],
     cutoff: Timestamp,
 ) -> Option<SemanticRecord> {
+    // Interval-exact bi-temporal `AS OF OBSERVED`: keep only revisions whose
+    // observed-time validity interval `[valid_from, valid_until)` contains the
+    // cutoff. Once supersession closes a predecessor's `valid_until` this
+    // selects the single fact that was true at `cutoff`. For chains written
+    // before validity intervals were closed (all `valid_until = None`),
+    // `is_valid_at` reduces to `valid_from <= cutoff`, preserving the prior
+    // max-version-wins fallback. Ties (overlapping still-live revisions such as
+    // a correction that preserves `valid_from`) break by max version.
     history
         .iter()
-        .filter(|record| record.valid_from <= cutoff)
+        .filter(|record| record.is_valid_at(cutoff))
         .max_by(|left, right| {
             left.version
                 .cmp(&right.version)
@@ -386,6 +406,21 @@ fn semantic_snapshot_head_as_of(
                 .then_with(|| left.revision_id.cmp(&right.revision_id))
         })
         .cloned()
+}
+
+/// Whether appending a successor with this operation should close the
+/// predecessor's observed-time validity interval (`valid_until`, Zep-style
+/// `t_invalid`). `Supersede`/`Override` install a new observed truth, so the
+/// predecessor's interval ends where the successor's begins. `Correct` (and the
+/// contradiction-metadata successor) preserve `valid_from`, so closing would
+/// collapse the predecessor to an empty interval and is therefore skipped. This
+/// mirrors the `preserve_valid_from` flag on the live write path so the live
+/// and crash-recovery replay paths agree on which predecessors get closed.
+fn successor_closes_predecessor_interval(operation: RevisionOperation) -> bool {
+    matches!(
+        operation,
+        RevisionOperation::Supersede | RevisionOperation::Override
+    )
 }
 
 fn semantic_snapshot_head_recorded_at_snapshot(
@@ -519,6 +554,77 @@ impl ResolvedRecallSnapshot {
 impl HirnDB {
     // ── Semantic Memory ─────────────────────────────────────────────────
 
+    /// Score a semantic candidate with the write-path poisoning gate and, when
+    /// enabled, route a poisoned write to quarantine-for-review.
+    ///
+    /// - Poisoning action other than `Quarantine`, or a clean/low-score write →
+    ///   `Ok(())` (the store proceeds normally).
+    /// - `poisoning_quarantine_recommended:` → the record is quarantined as
+    ///   `Semantic` and `Err(Quarantined)` is returned.
+    /// - `poisoning_detected:` (hard) → `Err(InvalidInput)`, mirroring the
+    ///   episodic hard-reject posture.
+    async fn evaluate_semantic_poisoning(&self, record: &SemanticRecord) -> HirnResult<()> {
+        use crate::admission::AdmissionController;
+        use crate::admission::controllers::poisoning::{
+            PoisoningGate, REASON_POISONING, REASON_POISONING_QUARANTINE,
+        };
+        use hirn_core::config::AdmissionPoisoningAction;
+
+        if self.config.admission_poisoning_action != AdmissionPoisoningAction::Quarantine {
+            return Ok(());
+        }
+
+        // The candidate authority rides in metadata so the gate can compare it
+        // against the nearest trusted record's authority.
+        let mut metadata = hirn_core::metadata::Metadata::new();
+        metadata.insert(
+            "functional_role".to_string(),
+            hirn_core::metadata::MetadataValue::String(
+                functional_role_str(record.functional_role).to_string(),
+            ),
+        );
+        let candidate = crate::admission::MemoryCandidate {
+            id: record.id,
+            content: record.description.clone(),
+            entities: Vec::new(),
+            embedding: record.embedding.clone(),
+            agent_id: record.provenance.created_by,
+            provenance: record.provenance.clone(),
+            namespace: record.namespace,
+            importance: record.confidence,
+            surprise: 0.0,
+            timestamp: record.created_at,
+            metadata,
+        };
+
+        let gate = PoisoningGate::with_scoring(
+            self.storage_arc(),
+            hirn_storage::datasets::semantic::DATASET_NAME,
+            self.config.metric,
+            self.config.admission_poisoning_quarantine_threshold,
+            self.config.admission_poisoning_reject_threshold,
+        );
+
+        if let crate::admission::AdmissionDecision::Reject { reason } =
+            gate.evaluate(&candidate).await?
+        {
+            let agent_id = record.provenance.created_by;
+            if reason.starts_with(REASON_POISONING_QUARANTINE) {
+                let score = super::episodic::poison_score_from_reason(&reason).unwrap_or(0.5);
+                return self
+                    .quarantine_semantic_record(record, score, &agent_id, reason)
+                    .await
+                    .map(|_| ());
+            }
+            if reason.starts_with(REASON_POISONING) {
+                return Err(HirnError::InvalidInput(format!(
+                    "admission rejected: {reason}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Store a semantic record. Enforces concept name uniqueness within namespace.
     ///
     /// Also adds a node in the property graph and detects auto-edges.
@@ -531,6 +637,13 @@ impl HirnDB {
             record.namespace.as_str(),
         )
         .await?;
+
+        // ── Write-path poisoning defense ──
+        // Semantic writes are scored by the same deterministic gate as the
+        // episodic path (run BEFORE text-retention truncation so the scan sees
+        // the original description). Poisoned writes are quarantined-for-review
+        // as `Semantic` rather than silently stored.
+        self.evaluate_semantic_poisoning(&record).await?;
 
         // ── Text retention ──
         match self.config.text_retention {
@@ -851,31 +964,57 @@ impl HirnDB {
                     filter: Some(filter),
                     ..Default::default()
                 };
-                let mut batches = self
-                    .storage_runtime
-                    .scan_stream(hirn_storage::datasets::semantic::DATASET_NAME, opts)
-                    .await
-                    .ok();
-
-                // Build a set of existing (namespace, concept, agent) triples.
-                let mut existing: HashSet<(String, String)> = HashSet::new();
-                if let Some(batches) = batches.as_mut() {
-                    let mut heads = HashMap::new();
-                    while let Ok(Some(batch)) = batches.try_next().await {
-                        if let Ok(recs) = hirn_storage::datasets::semantic::from_batch(&batch) {
-                            for rec in recs {
+                // Build the set of existing (namespace, concept) heads for this
+                // agent. A scan or decode failure here must NOT be swallowed:
+                // silently treating it as "nothing exists" would disable the
+                // uniqueness check and admit duplicate concepts. On failure, fail
+                // every still-unresolved record in the batch instead.
+                let existing: HashSet<(String, String)> = {
+                    let scanned = async {
+                        let mut batches = self
+                            .storage_runtime
+                            .scan_stream(hirn_storage::datasets::semantic::DATASET_NAME, opts)
+                            .await?;
+                        let mut heads = HashMap::new();
+                        while let Some(batch) = batches.try_next().await? {
+                            for rec in hirn_storage::datasets::semantic::from_batch(&batch)? {
                                 upsert_semantic_head(&mut heads, rec);
                             }
                         }
+                        let mut existing: HashSet<(String, String)> = HashSet::new();
+                        for r in heads.into_values() {
+                            if r.provenance.created_by.as_str() == agent_id.as_str()
+                                && semantic_record_is_live(&r)
+                            {
+                                existing.insert((r.namespace.to_string(), r.concept.clone()));
+                            }
+                        }
+                        Ok::<_, HirnError>(existing)
                     }
-                    for r in heads.into_values() {
-                        if r.provenance.created_by.as_str() == agent_id.as_str()
-                            && semantic_record_is_live(&r)
-                        {
-                            existing.insert((r.namespace.to_string(), r.concept.clone()));
+                    .await;
+
+                    match scanned {
+                        Ok(existing) => existing,
+                        Err(error) => {
+                            let message = error.to_string();
+                            for slot in &mut results {
+                                if slot.is_none() {
+                                    *slot = Some(Err(HirnError::storage(format!(
+                                        "semantic uniqueness check failed: {message}"
+                                    ))));
+                                }
+                            }
+                            return results
+                                .into_iter()
+                                .map(|r| {
+                                    r.unwrap_or_else(|| {
+                                        Err(HirnError::InvalidInput("unreachable".into()))
+                                    })
+                                })
+                                .collect();
                         }
                     }
-                }
+                };
 
                 // Also track concepts within the batch itself (intra-batch dedup).
                 let mut batch_seen: HashSet<(String, String)> = HashSet::new();
@@ -1229,7 +1368,7 @@ impl HirnDB {
         let dims = self.config.embedding_dimensions.as_usize();
         let exact_filter =
             hirn_storage::store::ExactMatchFilter::utf8_value("id", record.id.to_string());
-        self.storage_runtime
+        self.storage_backend()
             .delete_exact(
                 hirn_storage::datasets::semantic::DATASET_NAME,
                 &exact_filter,
@@ -1238,7 +1377,7 @@ impl HirnDB {
             .map_err(|e| HirnError::storage(e))?;
         let batch = hirn_storage::datasets::semantic::to_batch(std::slice::from_ref(record), dims)
             .map_err(|e| HirnError::storage(e))?;
-        self.storage_runtime
+        self.storage_backend()
             .append(hirn_storage::datasets::semantic::DATASET_NAME, batch)
             .await
             .map_err(|e| HirnError::storage(e))?;
@@ -1246,11 +1385,38 @@ impl HirnDB {
         Ok(())
     }
 
+    /// Close a stored predecessor's observed-time validity interval by
+    /// rewriting its row with `valid_until = Some(t_close)` (Zep-style
+    /// `t_invalid`). Callers pass `t_close` already clamped to at least the
+    /// record's `valid_from` (typically `max(successor.valid_from,
+    /// record.valid_from)`) so a backdated `observed_at` can never produce an
+    /// inverted interval. Idempotent: a row already closed at or before
+    /// `t_close` is left untouched, so the crash-recovery replay paths can call
+    /// this after the live path already did without narrowing the interval or
+    /// thrashing storage. Both the live write paths and the reconcile replay
+    /// paths route through here so they cannot diverge.
+    async fn close_predecessor_valid_until(
+        &self,
+        record: &SemanticRecord,
+        t_close: Timestamp,
+    ) -> HirnResult<()> {
+        let t_close = storage_precision_timestamp(t_close);
+        if let Some(existing) = record.valid_until {
+            if storage_precision_timestamp(existing).timestamp_ms() <= t_close.timestamp_ms() {
+                return Ok(());
+            }
+        }
+        let mut closed = record.clone();
+        closed.valid_until = Some(t_close);
+        normalize_semantic_record_timestamps(&mut closed);
+        self.overwrite_semantic_record(&closed).await
+    }
+
     async fn append_semantic_record(&self, record: &SemanticRecord) -> HirnResult<()> {
         let dims = self.config.embedding_dimensions.as_usize();
         let batch = hirn_storage::datasets::semantic::to_batch(std::slice::from_ref(record), dims)
             .map_err(HirnError::storage)?;
-        self.storage_runtime
+        self.storage_backend()
             .append(hirn_storage::datasets::semantic::DATASET_NAME, batch)
             .await
             .map_err(HirnError::storage)?;
@@ -1265,7 +1431,7 @@ impl HirnDB {
         let dims = self.config.embedding_dimensions.as_usize();
         let batch = hirn_storage::datasets::semantic::to_batch(records, dims)
             .map_err(HirnError::storage)?;
-        self.storage_runtime
+        self.storage_backend()
             .append(hirn_storage::datasets::semantic::DATASET_NAME, batch)
             .await
             .map_err(HirnError::storage)?;
@@ -2895,6 +3061,48 @@ impl HirnDB {
             return Err(error);
         }
 
+        // The successor head is now durable. Only after that do we close the
+        // predecessor's observed-time validity interval, so a crash between the
+        // two never loses the head; the reconcile replay path re-closes the
+        // predecessor idempotently. Correction successors preserve `valid_from`
+        // (`preserve_valid_from`), so closing them would collapse the interval —
+        // those are skipped and treated as already closed for the finalize gate.
+        let predecessor_interval_closed = if preserve_valid_from {
+            true
+        } else {
+            let t_close = std::cmp::max(next.valid_from, current.valid_from);
+            match self.close_predecessor_valid_until(current, t_close).await {
+                Ok(()) => {
+                    let detector = match operation {
+                        RevisionOperation::Override => "override",
+                        _ => "supersede",
+                    };
+                    self.append_audit(
+                        Some(next.provenance.created_by.clone()),
+                        hirn_core::audit::AuditAction::ContradictionResolved {
+                            winner_revision_id: next.revision_id,
+                            loser_revision_id: current.revision_id,
+                            relation: hirn_core::types::ContradictionRelation::Supersedes,
+                            detector: detector.to_string(),
+                            valid_until_closed_ms: Some(t_close.timestamp_ms()),
+                            namespace: next.namespace.as_str().to_string(),
+                            rationale: reason.clone(),
+                        },
+                    )
+                    .await?;
+                    true
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        id = %current.id,
+                        error = %error,
+                        "failed to close superseded semantic predecessor validity interval; recovery will retry"
+                    );
+                    false
+                }
+            }
+        };
+
         self.cache_semantic_head(&next);
 
         let predecessor_removed = match self.cached_graph().has_node(current.id).await {
@@ -2912,7 +3120,7 @@ impl HirnDB {
             }
         };
 
-        if predecessor_removed {
+        if predecessor_removed && predecessor_interval_closed {
             if let Err(error) = hirn_storage::update_mutation_envelope_state(
                 self.storage_backend(),
                 &envelope.id,
@@ -3339,6 +3547,45 @@ impl HirnDB {
             return Err(error);
         }
 
+        // The merged heads are now durable. Close the observed-time validity
+        // interval of the target predecessor and every merged-away source head
+        // at the merge's observed time (clamped to each row's own `valid_from`
+        // so a backdated merge cannot invert an interval). A crash before this
+        // completes leaves the envelope pending; the reconcile replay path
+        // re-closes the same predecessors idempotently.
+        let mut predecessors_interval_closed = true;
+        for predecessor in std::iter::once(&current).chain(source_heads.iter()) {
+            let t_close = std::cmp::max(observed_at, predecessor.valid_from);
+            match self
+                .close_predecessor_valid_until(predecessor, t_close)
+                .await
+            {
+                Ok(()) => {
+                    self.append_audit(
+                        Some(target.provenance.created_by.clone()),
+                        hirn_core::audit::AuditAction::ContradictionResolved {
+                            winner_revision_id: target.revision_id,
+                            loser_revision_id: predecessor.revision_id,
+                            relation: hirn_core::types::ContradictionRelation::Supersedes,
+                            detector: "merge".to_string(),
+                            valid_until_closed_ms: Some(t_close.timestamp_ms()),
+                            namespace: target.namespace.as_str().to_string(),
+                            rationale: reason.clone(),
+                        },
+                    )
+                    .await?;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        id = %predecessor.id,
+                        error = %error,
+                        "failed to close merged semantic predecessor validity interval; recovery will retry"
+                    );
+                    predecessors_interval_closed = false;
+                }
+            }
+        }
+
         self.cache_semantic_head(&target);
         for merged_source in &merged_sources {
             self.cache_semantic_head(merged_source);
@@ -3376,7 +3623,7 @@ impl HirnDB {
             }
         }
 
-        if predecessors_removed {
+        if predecessors_removed && predecessors_interval_closed {
             if let Err(error) = hirn_storage::update_mutation_envelope_state(
                 self.storage_backend(),
                 &envelope.id,
@@ -3464,6 +3711,28 @@ impl HirnDB {
 
         self.append_semantic_record(&tombstone).await?;
 
+        // The tombstone head is durable; close the retracted predecessor's
+        // observed-time validity interval so storage self-describes the moment
+        // the fact stopped being valid (recall already drops retracted chains
+        // via `is_live`). Clamped to the predecessor's own `valid_from` to guard
+        // a backdated retraction `observed_at`. A crash before this leaves the
+        // envelope pending and the reconcile replay path re-closes it.
+        let t_close = std::cmp::max(tombstone.valid_from, rec.valid_from);
+        let predecessor_interval_closed = match self
+            .close_predecessor_valid_until(&rec, t_close)
+            .await
+        {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(
+                    id = %rec.id,
+                    error = %error,
+                    "failed to close retracted semantic predecessor validity interval; recovery will retry"
+                );
+                false
+            }
+        };
+
         self.cache_semantic_head(&tombstone);
 
         let node_removed = match self.cached_graph().remove_node(rec.id).await {
@@ -3486,7 +3755,7 @@ impl HirnDB {
         )
         .await;
 
-        if node_removed {
+        if node_removed && predecessor_interval_closed {
             if let Err(error) = hirn_storage::update_mutation_envelope_state(
                 self.storage_backend(),
                 &envelope.id,
@@ -3770,7 +4039,7 @@ impl HirnDB {
         logical_memory_id: LogicalMemoryId,
     ) -> HirnResult<()> {
         let exact_filter = Self::semantic_logical_exact_filter(logical_memory_id);
-        self.storage_runtime
+        self.storage_backend()
             .delete_exact(
                 hirn_storage::datasets::semantic::DATASET_NAME,
                 &exact_filter,
@@ -3810,6 +4079,23 @@ impl HirnDB {
                     self.cached_graph()
                         .remove_node(payload.prior_record_id)
                         .await?;
+                }
+                // Mirror the live write path: supersede/override successors close
+                // the predecessor's observed-time validity interval. The
+                // operation on the recovered successor row selects which
+                // predecessors to close, so live and recovery paths agree; the
+                // close is idempotent when the live path already ran.
+                if successor_closes_predecessor_interval(successor.revision_operation) {
+                    match self.read_semantic_record(payload.prior_record_id).await {
+                        Ok(predecessor) => {
+                            let t_close =
+                                std::cmp::max(successor.valid_from, predecessor.valid_from);
+                            self.close_predecessor_valid_until(&predecessor, t_close)
+                                .await?;
+                        }
+                        Err(HirnError::NotFound(_)) => {}
+                        Err(error) => return Err(error),
+                    }
                 }
                 hirn_storage::update_mutation_envelope_state(
                     self.storage_backend(),
@@ -3934,6 +4220,23 @@ impl HirnDB {
         self.remove_semantic_graph_nodes_if_present(&predecessor_ids)
             .await?;
 
+        // Mirror the live merge path: close the observed-time validity interval
+        // of the target predecessor and every merged-away source head at the
+        // merge's observed time (the merged target's `valid_from`), clamped to
+        // each predecessor's own `valid_from`. Idempotent when the live path
+        // already closed them.
+        for predecessor_id in &predecessor_ids {
+            match self.read_semantic_record(*predecessor_id).await {
+                Ok(predecessor) => {
+                    let t_close = std::cmp::max(target.valid_from, predecessor.valid_from);
+                    self.close_predecessor_valid_until(&predecessor, t_close)
+                        .await?;
+                }
+                Err(HirnError::NotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+
         hirn_storage::update_mutation_envelope_state(
             self.storage_backend(),
             &envelope.id,
@@ -4044,6 +4347,19 @@ impl HirnDB {
                     self.cached_graph()
                         .remove_node(payload.prior_record_id)
                         .await?;
+                }
+                // Mirror the live retract path: close the retracted
+                // predecessor's observed-time validity interval at the
+                // tombstone's observed time, clamped to the predecessor's own
+                // `valid_from`. Idempotent when the live path already closed it.
+                match self.read_semantic_record(payload.prior_record_id).await {
+                    Ok(predecessor) => {
+                        let t_close = std::cmp::max(tombstone.valid_from, predecessor.valid_from);
+                        self.close_predecessor_valid_until(&predecessor, t_close)
+                            .await?;
+                    }
+                    Err(HirnError::NotFound(_)) => {}
+                    Err(error) => return Err(error),
                 }
                 hirn_storage::update_mutation_envelope_state(
                     self.storage_backend(),
@@ -4688,11 +5004,14 @@ impl HirnDB {
     ///
     /// `actor_override` names the executing agent for Cedar enforcement and
     /// revision authorship; without it the evidence author acts.
+    /// `classifier_override` substitutes a specific classification chain for
+    /// the database's configured one — used to reflect a batch against a
+    /// particular model without reconfiguring the instance.
     pub(crate) async fn reflect_semantic(
         &self,
         evidence_id: MemoryId,
         actor_override: Option<AgentId>,
-        llm: Option<&dyn hirn_core::embed::LlmProvider>,
+        classifier_override: Option<&hirn_provider::HybridClassifier>,
     ) -> HirnResult<Vec<crate::consolidation::ReflectionUpdate>> {
         use crate::consolidation::{
             ReflectionOutcome, ReflectionUpdate, apply_reflection_outcome, classify_reflection,
@@ -4787,20 +5106,31 @@ impl HirnDB {
         ranked.truncate(self.config.reflection_top_k.max(1));
 
         let similarity_threshold = self.config.reflection_similarity_threshold;
-        // Matches ConsolidationConfig::default().llm_timeout.
-        let llm_timeout = std::time::Duration::from_secs(10);
+        let owned_classifier;
+        let classifier = match classifier_override {
+            Some(classifier) => classifier,
+            None => {
+                owned_classifier = self.nlu_classifier();
+                owned_classifier.as_ref()
+            }
+        };
+        let nli = self.nli_model();
+        let contradiction_min_confidence = self.config.nlu.contradiction_min_confidence;
 
         let mut updates = Vec::with_capacity(ranked.len());
         for (belief, similarity) in ranked {
-            let (outcome, rationale) = classify_reflection(
-                llm,
+            let decision = classify_reflection(
+                classifier,
+                nli.as_deref(),
                 &belief,
                 &evidence_text,
                 similarity,
                 similarity_threshold,
-                llm_timeout,
+                contradiction_min_confidence,
             )
             .await;
+            let outcome = decision.outcome;
+            let rationale = decision.rationale;
 
             let prior_confidence = belief.confidence;
             if outcome == ReflectionOutcome::Unrelated {
@@ -4811,6 +5141,8 @@ impl HirnDB {
                     new_confidence: prior_confidence,
                     evidence_id,
                     rationale,
+                    confidence: decision.confidence,
+                    decided_by: decision.source,
                 });
                 continue;
             }
@@ -4834,9 +5166,22 @@ impl HirnDB {
 
             if outcome == ReflectionOutcome::Contradicts {
                 // Record the epistemic conflict explicitly: Contradicts graph
-                // edge plus a contradiction_ids entry on the belief chain.
-                self.connect_contradiction(next.id, evidence_id, 1.0, Metadata::default())
-                    .await?;
+                // edge plus a contradiction_ids entry on the belief chain. The
+                // edge carries which backend judged it and how confidently, so
+                // it reads the same way as an insert-time contradiction edge.
+                let mut edge_metadata = Metadata::default();
+                edge_metadata.insert(
+                    "contradiction_decided_by".to_string(),
+                    decision.source.as_str().into(),
+                );
+                edge_metadata.insert("contradiction_source".to_string(), "reflection".into());
+                self.connect_contradiction(
+                    next.id,
+                    evidence_id,
+                    decision.confidence,
+                    edge_metadata,
+                )
+                .await?;
             }
 
             updates.push(ReflectionUpdate {
@@ -4846,6 +5191,8 @@ impl HirnDB {
                 new_confidence,
                 evidence_id,
                 rationale,
+                confidence: decision.confidence,
+                decided_by: decision.source,
             });
         }
 
@@ -4953,6 +5300,7 @@ mod tests {
                 causal_relevance: 0.0,
                 surprise: 0.0,
                 source_reliability: 1.0,
+                temporal_relevance: 0.0,
             },
             revision: None,
             resource_evidence: Vec::new(),
@@ -6466,6 +6814,28 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn reflection_contradict_halves_confidence_and_records_conflict() {
         use crate::consolidation::ReflectionOutcome;
+        use hirn_core::embed::{ChatMessage, LlmOptions, LlmProvider};
+
+        // Contradiction halves credence irreversibly, so it now requires a
+        // model verdict: the deterministic floor caps out at Weakens.
+        struct ContradictLlm;
+
+        #[async_trait::async_trait]
+        impl LlmProvider for ContradictLlm {
+            async fn generate_text(
+                &self,
+                _messages: &[ChatMessage],
+                _options: &LlmOptions,
+            ) -> hirn_core::HirnResult<String> {
+                Ok(r#"{"label":"contradicts","confidence":0.95,
+                       "rationale":"the evidence denies the belief outright"}"#
+                    .to_string())
+            }
+
+            fn model_id(&self) -> &str {
+                "contradict-mock"
+            }
+        }
 
         let db = temp_db().await;
         let ns = hirn_core::types::Namespace::default_ns();
@@ -6474,7 +6844,13 @@ mod tests {
         let evidence_id =
             store_reflection_evidence(&db, "the deploy is not safe anymore", 0, ns).await;
 
-        let updates = db.reflect_semantic(evidence_id, None, None).await.unwrap();
+        let chain = hirn_provider::HybridClassifier::new().with_backend(std::sync::Arc::new(
+            hirn_provider::LlmTextClassifier::new(std::sync::Arc::new(ContradictLlm)),
+        ));
+        let updates = db
+            .reflect_semantic(evidence_id, None, Some(&chain))
+            .await
+            .unwrap();
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].outcome, ReflectionOutcome::Contradicts);
         assert!((updates[0].new_confidence - 0.4).abs() < 1e-6);
@@ -6498,10 +6874,33 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn reflection_without_a_model_weakens_rather_than_contradicting() {
+        use crate::consolidation::ReflectionOutcome;
+
+        let db = temp_db().await;
+        let ns = hirn_core::types::Namespace::default_ns();
+        store_reflection_belief(&db, "deploys-safe", "deploys are safe", 0.8, 0, ns).await;
+        let evidence_id =
+            store_reflection_evidence(&db, "the deploy is not safe anymore", 0, ns).await;
+
+        // No classifier backend is configured: a negation-cue mismatch is not
+        // entailment, so it may nudge credence but must not halve it.
+        let updates = db.reflect_semantic(evidence_id, None, None).await.unwrap();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].outcome, ReflectionOutcome::Weakens);
+        assert!(
+            (updates[0].new_confidence - 0.68).abs() < 1e-6,
+            "0.8 - 0.15*0.8, not 0.8/2"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn reflection_weaken_lowers_confidence_toward_floor_with_llm() {
         use crate::consolidation::{REFLECTION_CONFIDENCE_FLOOR, ReflectionOutcome};
         use hirn_core::embed::{ChatMessage, LlmOptions, LlmProvider};
 
+        // A provider that answers the reflection task's JSON schema — the
+        // classifier chain rejects anything else.
         struct WeakenLlm;
 
         #[async_trait::async_trait]
@@ -6511,13 +6910,20 @@ mod tests {
                 _messages: &[ChatMessage],
                 _options: &LlmOptions,
             ) -> hirn_core::HirnResult<String> {
-                Ok("WEAKENS: the metric dropped but the claim may still hold".to_string())
+                Ok(r#"{"label":"weakens","confidence":0.9,
+                       "rationale":"the metric dropped but the claim may still hold"}"#
+                    .to_string())
             }
 
             fn model_id(&self) -> &str {
                 "weaken-mock"
             }
         }
+
+        let weaken_chain =
+            hirn_provider::HybridClassifier::new().with_backend(std::sync::Arc::new(
+                hirn_provider::LlmTextClassifier::new(std::sync::Arc::new(WeakenLlm)),
+            ));
 
         let db = temp_db().await;
         let ns = hirn_core::types::Namespace::default_ns();
@@ -6530,7 +6936,7 @@ mod tests {
                 store_reflection_evidence(&db, &format!("latency metric sample {round}"), 0, ns)
                     .await;
             let updates = db
-                .reflect_semantic(evidence_id, None, Some(&WeakenLlm))
+                .reflect_semantic(evidence_id, None, Some(&weaken_chain))
                 .await
                 .unwrap();
             assert_eq!(updates.len(), 1);

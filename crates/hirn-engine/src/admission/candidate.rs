@@ -4,6 +4,7 @@ use hirn_core::episodic::{EntityRef, EpisodicRecord};
 use hirn_core::id::MemoryId;
 use hirn_core::metadata::Metadata;
 use hirn_core::provenance::Provenance;
+use hirn_core::timestamp::Timestamp;
 use hirn_core::types::{AgentId, Namespace};
 
 /// A candidate memory to be evaluated by the admission pipeline.
@@ -30,6 +31,10 @@ pub struct MemoryCandidate {
     pub importance: f32,
     /// Surprise score assigned by the caller.
     pub surprise: f32,
+    /// Event timestamp of the record. Feeds the write-path poisoning defense's
+    /// future-timestamp anomaly signal (a record dated in the future is a
+    /// classic tampering marker).
+    pub timestamp: Timestamp,
     /// Arbitrary metadata.
     pub metadata: Metadata,
 }
@@ -47,6 +52,7 @@ impl MemoryCandidate {
             namespace: record.namespace.clone(),
             importance: record.importance,
             surprise: record.surprise,
+            timestamp: record.timestamp,
             metadata: record.metadata.clone(),
         }
     }

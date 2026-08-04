@@ -401,7 +401,12 @@ async fn test_mcp_semantic_inspect_and_execute_trace_include_revision_and_confli
     let (client, server) = start_mcp_client().await;
     let db = server.default_db().await;
 
-    let agent = AgentId::new("semantic-mcp-agent").unwrap();
+    // The MCP credential authenticates as `system`, so the fixture must be
+    // written by that same identity: records land in the author's *private*
+    // namespace, and cross-agent private reads are correctly denied. Writing as
+    // a different agent here would be testing the isolation boundary, not the
+    // inspect surface.
+    let agent = AgentId::new("system").unwrap();
     db.register_agent(&agent, "Semantic MCP Agent")
         .await
         .unwrap();

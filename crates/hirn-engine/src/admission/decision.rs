@@ -39,10 +39,10 @@ pub enum AdmissionDecision {
     ///   candidate to quarantine review rather than dropping it silently
     /// - `poisoning_detected:` — ingest-time injection scan hit in `reject` mode
     Reject { reason: String },
-    /// Defer the candidate — hold it without materializing.
+    /// Defer the candidate to quarantine for explicit manual review.
     Defer {
-        /// Wall-clock microsecond timestamp after which to retry.
-        until: i64,
+        /// Wall-clock millisecond timestamp before which review is forbidden.
+        review_not_before: i64,
     },
     /// Merge the candidate into an existing memory record.
     Merge { target: MemoryId },

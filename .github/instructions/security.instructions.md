@@ -22,7 +22,7 @@ Authorization is a **plan property**, not a runtime gate. Cedar policies are enf
 - **`NamespacePartitionPruneRule`** (in `hirn-exec::rules`): simplifies single-element `IN` predicates to equality for more efficient Lance scan pushdown. Runs after `PolicyPushdownRule`.
 - **`PolicyFilterExec`** (in `hirn-exec::operators`): residual Cedar predicates that can't be pushed to scan (e.g., classification-based row filtering). Pass-through when no residual predicate.
 - **Pre-mutation enforcement:** for write operations (`REMEMBER`), Cedar authorization is checked before plan execution — deny happens before any data write.
-- **`hirn-policy` crate**: extracted Cedar engine, entity management, audit HMAC. Depends on `cedar-policy` 4.9+
+- **`hirn-policy` crate**: extracted Cedar engine, entity management, audit HMAC. Depends on `cedar-policy` 4.11+
 - **Entity model:** Agent ∈ Team ∈ Organization; Namespace ∈ Realm; MemoryLayer; Operation; Tool
 - **13 actions:** remember, recall, think, forget, consolidate, watch, connect, execute, admin, recall_raw_text, read, write, delete
 - **Open mode** (`PolicyEngine::open_mode()`) permits all — only for development/testing

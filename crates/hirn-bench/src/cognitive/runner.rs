@@ -88,7 +88,7 @@ use super::{
     ActiveRetrievalSurfaces, BaselineStrategy, Benchmark, BenchmarkExecutionSurface,
     BenchmarkRetrievalProfile, CategoryScore, CognitiveConfig, CognitiveDataset, CognitiveResult,
     CompiledPhaseTimingSummary, EmbedderPolicy, MetricDrift, QueryEmbeddingSource, QueryScore,
-    ReproducibilitySummary, TokenCostEstimate, render_turn_content,
+    ReproducibilitySummary, RetrievalCorpus, TokenCostEstimate, render_turn_content,
 };
 
 const HIRN_STRATEGY: &str = "hirn";
@@ -102,6 +102,14 @@ const BENCH_SOURCE_ID_META_KEY: &str = "hirn_bench_source_id";
 const BENCH_THINK_CANDIDATE_LIMIT: usize = 50;
 const BENCHMARK_CACHE_EMBEDDER_MODEL_ID: &str = "benchmark-cache";
 const BENCHMARK_PROVIDER_EMBED_BATCH_SIZE: usize = 100;
+
+fn benchmark_session_namespace(session_id: &str) -> Namespace {
+    Namespace::new(format!(
+        "bench_session_{}",
+        blake3::hash(session_id.as_bytes()).to_hex()
+    ))
+    .expect("BLAKE3-derived benchmark namespace is valid")
+}
 
 fn ingest_batch_size(total_records: usize) -> usize {
     if total_records >= 250_000 {
@@ -299,6 +307,12 @@ struct CompiledPhaseSample {
 #[derive(Debug, Clone)]
 struct QueryExecution {
     context: String,
+    /// THINK candidates behind `context`, each with the time it was recorded.
+    ///
+    /// The assembled context is a flat string, so the per-record times are lost
+    /// once it is rendered. They are kept alongside it so the temporal ledger
+    /// can anchor each excerpt to its own moment.
+    context_candidates: Vec<RetrievedCandidate>,
     ranked_results: Vec<RetrievedCandidate>,
     context_tokens: usize,
     /// Tokens returned to the reader for this query (THINK context + RECALL contents).
@@ -498,11 +512,22 @@ pub fn prepare_benchmark_embedding_runtime(
         )));
     }
 
-    // No cache — check if a live provider is reachable.
+    // No cache — check if a live provider is reachable. Only adopt it when its
+    // dimension matches the profile's configured dims: enabling a provider for
+    // *other* purposes (e.g. an ambient LLM for query decomposition) must not
+    // silently swap the retrieval embedder and change the experiment. A
+    // dimension mismatch falls through to the configured policy instead.
     let registry = ProviderRegistry::from_env_strict();
     if let Some(embedder) = registry.embedder() {
-        return provider_backed_benchmark_runtime(dataset, config.embedding_dims, embedder)
-            .map(Some);
+        if embedder.dimensions() == config.embedding_dims {
+            return provider_backed_benchmark_runtime(dataset, config.embedding_dims, embedder)
+                .map(Some);
+        }
+        tracing::warn!(
+            embedder_dims = embedder.dimensions(),
+            config_dims = config.embedding_dims,
+            "provider embedder dimension differs from profile; keeping profile embedder"
+        );
     }
 
     // No real embedder available — apply the configured policy.
@@ -534,6 +559,13 @@ struct ContextDocument {
 struct RetrievedCandidate {
     content: String,
     source_id: Option<String>,
+    /// When this memory was recorded, in epoch milliseconds.
+    ///
+    /// Carried because a relative expression inside the text ("today", "last
+    /// Tuesday") only resolves against *this record's* own time. Resolving the
+    /// whole retrieved set against one reference makes excerpts written weeks
+    /// apart land on the same day.
+    timestamp_ms: Option<u64>,
 }
 
 /// Run a single cognitive benchmark and return scored results.
@@ -563,6 +595,14 @@ fn benchmark_hirn_config(config: &CognitiveConfig, db_path: &Path) -> HirnConfig
         builder = builder.multivector_enabled(true).multivector_weight(0.3);
     }
 
+    // The M-06 A/B arm: everything else held fixed, `enabled = false` pins
+    // every meaning-dependent decision to its deterministic fallback.
+    builder = builder.nlu(hirn_core::NluConfig {
+        enabled: config.nlu_enabled,
+        typed_temporal_extraction: config.typed_temporal_extraction,
+        ..Default::default()
+    });
+
     builder.build().expect("valid HirnConfig")
 }
 
@@ -590,6 +630,25 @@ fn configure_benchmark_retrieval(
     };
     let mut query_embedding_source = embedding_runtime.query_embedding_source();
     let mut query_embedding_model_label = embedding_runtime.query_embedding_model_label();
+
+    surfaces.notes.push(format!(
+        "typed_temporal_extraction={} ({})",
+        config.typed_temporal_extraction,
+        if config.typed_temporal_extraction {
+            "write-time event time / precision / state; state-aware recency active"
+        } else {
+            "no temporal envelope — every record ages uniformly (H-01 control arm)"
+        }
+    ));
+    surfaces.notes.push(format!(
+        "nlu_enabled={} ({})",
+        config.nlu_enabled,
+        if config.nlu_enabled {
+            "model-backed routing/relation decisions with deterministic fallback"
+        } else {
+            "deterministic cue fallback only — the M-06 control arm"
+        }
+    ));
 
     match config.execution_surface {
         BenchmarkExecutionSurface::DirectBuilders => surfaces.notes.push(
@@ -633,6 +692,18 @@ fn configure_benchmark_retrieval(
         surfaces.notes.push(warn.to_string());
     }
 
+    let registry = ProviderRegistry::from_env_strict();
+
+    // Ambient LLM for query decomposition — a query-planning step orthogonal to
+    // the reranker/multivector "extras", so it is enabled in every profile
+    // (including minimal) when a provider is discovered from the environment.
+    if let Some(llm) = registry.llm() {
+        db.set_llm_provider(llm);
+        surfaces
+            .notes
+            .push("ambient LLM enabled for query decomposition".to_string());
+    }
+
     if matches!(config.retrieval_profile, BenchmarkRetrievalProfile::Minimal) {
         surfaces
             .notes
@@ -643,8 +714,6 @@ fn configure_benchmark_retrieval(
             query_embedding_model_label,
         };
     }
-
-    let registry = ProviderRegistry::from_env_strict();
 
     if let Some(tokenizer) = registry.tokenizer() {
         db.set_tokenizer(tokenizer);
@@ -770,7 +839,14 @@ pub fn run_with_prepared_embeddings(
 
     let hirn_config = benchmark_hirn_config(config, db_path);
     let db = block_on(HirnDB::open_with_config(hirn_config, backend)).expect("open HirnDB");
-    let retrieval_setup = configure_benchmark_retrieval(&db, config, embedding_runtime);
+    let mut retrieval_setup = configure_benchmark_retrieval(&db, config, embedding_runtime);
+    if dataset.retrieval_corpus == RetrievalCorpus::PerQueryHaystack {
+        retrieval_setup.active_retrieval_surfaces.per_query_haystack = true;
+        retrieval_setup.active_retrieval_surfaces.notes.push(
+            "retrieval and THINK context are isolated to each query's official haystack"
+                .to_string(),
+        );
+    }
 
     // Phase 1: Ingest all sessions as episodic records.
     let ingest_start = Instant::now();
@@ -1188,6 +1264,7 @@ fn lexical_overlap_score(query_terms: &BTreeSet<String>, doc_terms: &BTreeSet<St
 #[derive(Debug, Clone)]
 struct QueryRoutingProfile {
     namespace: Option<Namespace>,
+    allowed_namespaces: Option<Vec<Namespace>>,
     after: Option<Timestamp>,
     activation: Option<ActivationProfile>,
 }
@@ -1201,12 +1278,23 @@ impl QueryRoutingProfile {
     fn for_query(dataset: &CognitiveDataset, query: &super::QAQuery) -> Self {
         let mut profile = Self {
             namespace: None,
+            allowed_namespaces: None,
             after: None,
             activation: None,
         };
 
         if query_uses_graph_reasoning(dataset, query) {
             profile.activation = Some(ActivationProfile { depth: 3 });
+        }
+
+        if dataset.retrieval_corpus == RetrievalCorpus::PerQueryHaystack {
+            profile.allowed_namespaces = Some(
+                query
+                    .relevant_session_ids
+                    .iter()
+                    .map(|session_id| benchmark_session_namespace(session_id))
+                    .collect(),
+            );
         }
 
         if dataset.benchmark == Benchmark::H5Action {
@@ -1263,6 +1351,8 @@ fn apply_routing_to_think<'a>(
 ) -> ThinkBuilder<'a> {
     if let Some(namespace) = profile.namespace {
         builder = builder.namespace(namespace);
+    } else if let Some(ref allowed_namespaces) = profile.allowed_namespaces {
+        builder = builder.namespaces(allowed_namespaces.iter().copied());
     }
     if let Some(after) = profile.after {
         builder = builder.after(after);
@@ -1281,6 +1371,8 @@ fn apply_routing_to_recall<'a>(
 ) -> RecallBuilder<'a> {
     if let Some(namespace) = profile.namespace {
         builder = builder.namespace(namespace);
+    } else if let Some(ref allowed_namespaces) = profile.allowed_namespaces {
+        builder = builder.namespaces(allowed_namespaces.iter().copied());
     }
     if let Some(after) = profile.after {
         builder = builder.after(after);
@@ -1298,18 +1390,22 @@ fn retrieved_candidate_from_record(record: &hirn::record::MemoryRecord) -> Retri
         hirn::record::MemoryRecord::Episodic(record) => RetrievedCandidate {
             content: record.content.clone(),
             source_id: metadata_source_id(&record.metadata),
+            timestamp_ms: Some(record.timestamp.millis()),
         },
         hirn::record::MemoryRecord::Semantic(record) => RetrievedCandidate {
             content: record.description.clone(),
             source_id: None,
+            timestamp_ms: None,
         },
         hirn::record::MemoryRecord::Working(record) => RetrievedCandidate {
             content: record.content.clone(),
             source_id: None,
+            timestamp_ms: None,
         },
         hirn::record::MemoryRecord::Procedural(record) => RetrievedCandidate {
             content: record.description.clone(),
             source_id: None,
+            timestamp_ms: None,
         },
     }
 }
@@ -1433,10 +1529,9 @@ fn execute_direct_query(
         .recall_view()
         .think(query_embedding.clone())
         .unrestricted()
-        .budget(config.token_budget);
-    if config.effective_query_text_hybrid() {
-        think = think.query_text(query.question.clone());
-    }
+        .budget(config.token_budget)
+        .query_text(query.question.clone())
+        .hybrid(config.effective_query_text_hybrid());
     think = apply_routing_to_think(think, routing_profile);
 
     let (think_result, think_explanation) = require_query_stage(
@@ -1450,10 +1545,9 @@ fn execute_direct_query(
         .recall_view()
         .query(query_embedding)
         .unrestricted()
-        .limit(config.k);
-    if config.effective_query_text_hybrid() {
-        recall = recall.query_text(query.question.clone());
-    }
+        .limit(config.k)
+        .query_text(query.question.clone())
+        .hybrid(config.effective_query_text_hybrid());
     recall = apply_routing_to_recall(recall, routing_profile);
 
     let (recall_results, recall_explanation) = require_query_stage(
@@ -1475,6 +1569,10 @@ fn execute_direct_query(
 
     QueryExecution {
         context,
+        // The direct THINK surface reports only record ids for the assembled
+        // context, so per-excerpt times are not available on this path; the
+        // ledger falls back to question-date anchoring.
+        context_candidates: Vec::new(),
         ranked_results,
         context_tokens,
         returned_tokens,
@@ -1489,13 +1587,18 @@ fn execute_compiled_query(
     config: &CognitiveConfig,
 ) -> QueryExecution {
     let think_query = build_compiled_think_query(query, profile, config);
-    let (think_result, think_diagnostics) = require_query_stage(
-        &query.id,
-        "THINK",
-        block_on(db.ql().execute_with_diagnostics(&think_query)),
-    );
+    let think_execution = match profile.allowed_namespaces.as_deref() {
+        Some(allowed_namespaces) => block_on(
+            db.ql()
+                .execute_scoped_with_diagnostics(&think_query, allowed_namespaces),
+        ),
+        None => block_on(db.ql().execute_with_diagnostics(&think_query)),
+    };
+    let (think_result, think_diagnostics) =
+        require_query_stage(&query.id, "THINK", think_execution);
     let think_diagnostics = require_compiled_diagnostics(&query.id, "THINK", think_diagnostics);
-    let (context, _) = unpack_compiled_records(&query.id, "THINK", think_result);
+    let (context, context_candidates) =
+        unpack_compiled_records(&query.id, "THINK", think_result);
     let context = context.unwrap_or_else(|| {
         panic!(
             "benchmark THINK omitted assembled context for query `{}`",
@@ -1504,11 +1607,15 @@ fn execute_compiled_query(
     });
 
     let recall_query = build_compiled_recall_query(query, profile, config);
-    let (recall_result, recall_diagnostics) = require_query_stage(
-        &query.id,
-        "RECALL",
-        block_on(db.ql().execute_with_diagnostics(&recall_query)),
-    );
+    let recall_execution = match profile.allowed_namespaces.as_deref() {
+        Some(allowed_namespaces) => block_on(
+            db.ql()
+                .execute_scoped_with_diagnostics(&recall_query, allowed_namespaces),
+        ),
+        None => block_on(db.ql().execute_with_diagnostics(&recall_query)),
+    };
+    let (recall_result, recall_diagnostics) =
+        require_query_stage(&query.id, "RECALL", recall_execution);
     let recall_diagnostics = require_compiled_diagnostics(&query.id, "RECALL", recall_diagnostics);
     let (_, ranked_results) = unpack_compiled_records(&query.id, "RECALL", recall_result);
 
@@ -1517,6 +1624,7 @@ fn execute_compiled_query(
         context_tokens,
         returned_tokens: context_tokens + ranked_results_token_count(&ranked_results),
         context,
+        context_candidates,
         ranked_results,
         compiled_phase_sample: compiled_phase_sample(&think_diagnostics, &recall_diagnostics),
     }
@@ -1803,6 +1911,8 @@ fn execute_full_context_baseline(
         selected.push(RetrievedCandidate {
             content: doc.content.clone(),
             source_id: doc.source_id.clone(),
+            // Baseline surfaces score raw documents, which carry no record time.
+            timestamp_ms: None,
         });
         used_tokens += doc.token_count;
     }
@@ -1814,6 +1924,7 @@ fn execute_full_context_baseline(
             .map(|candidate| candidate.content.as_str())
             .collect::<Vec<_>>()
             .join("\n"),
+        context_candidates: selected.clone(),
         ranked_results: selected,
         context_tokens: used_tokens,
         returned_tokens,
@@ -1903,6 +2014,7 @@ fn execute_iterative_baseline(
         .map(|(idx, _)| RetrievedCandidate {
             content: documents[idx].content.clone(),
             source_id: documents[idx].source_id.clone(),
+            timestamp_ms: None,
         })
         .collect();
     let context = selected_indices
@@ -1914,6 +2026,7 @@ fn execute_iterative_baseline(
     let returned_tokens = used_tokens + ranked_results_token_count(&ranked_contents);
     QueryExecution {
         context,
+        context_candidates: ranked_contents.clone(),
         ranked_results: ranked_contents,
         context_tokens: used_tokens,
         returned_tokens,
@@ -1992,6 +2105,7 @@ fn ingest_sessions(
 ) -> HashMap<(String, usize), MemoryId> {
     let is_h4 = dataset.benchmark == Benchmark::H4Agent;
     let is_h6 = dataset.benchmark == Benchmark::H6Safety;
+    let isolate_query_haystacks = dataset.retrieval_corpus == RetrievalCorpus::PerQueryHaystack;
     let ingest_start = Instant::now();
     let total_records: usize = dataset
         .sessions
@@ -2016,7 +2130,9 @@ fn ingest_sessions(
         } else {
             agent_id("bench")
         };
-        let ns = if is_h4 {
+        let ns = if isolate_query_haystacks {
+            Some(benchmark_session_namespace(&session.id))
+        } else if is_h4 {
             Some(Namespace::private_for(&aid))
         } else if is_h6 && session.id == "h6-pii" {
             Some(Namespace::private_for(&aid))
@@ -2633,6 +2749,20 @@ fn evaluate_queries(
             expected_answers: q.expected_answers.clone(),
             category: q.category.clone(),
             negative: q.negative,
+            reference_time: q
+                .question_date_ms
+                .and_then(|ms| u64::try_from(ms).ok())
+                .map_or_else(hirn_core::Timestamp::now, hirn_core::Timestamp::from_millis),
+            dated_excerpts: execution
+                .context_candidates
+                .iter()
+                .filter_map(|candidate| {
+                    Some(super::reader::DatedExcerpt {
+                        text: candidate.content.clone(),
+                        recorded_at: hirn_core::Timestamp::from_millis(candidate.timestamp_ms?),
+                    })
+                })
+                .collect(),
         });
 
         let completed = query_index + 1;
@@ -2852,6 +2982,7 @@ mod tests {
             execution_surface,
             query_text_hybrid,
             embedder_policy: Default::default(),
+            ..Default::default()
         }
     }
 
@@ -2882,6 +3013,77 @@ mod tests {
 
     fn run_benchmark(benchmark: Benchmark) -> CognitiveResult {
         run_benchmark_with_config(benchmark, BenchmarkRetrievalProfile::Minimal, false)
+    }
+
+    #[test]
+    fn per_query_haystack_isolates_direct_and_compiled_context() {
+        let dataset = crate::cognitive::CognitiveDataset {
+            name: "LongMemEval isolation fixture".to_string(),
+            benchmark: Benchmark::H1Retrieval,
+            retrieval_corpus: RetrievalCorpus::PerQueryHaystack,
+            sessions: vec![
+                crate::cognitive::Session {
+                    id: "official-haystack".to_string(),
+                    turns: vec![crate::cognitive::Turn {
+                        speaker: "user".to_string(),
+                        content: "The launch code is ALPHA.".to_string(),
+                        timestamp: None,
+                        timestamp_text: None,
+                        source_id: Some("gold-turn".to_string()),
+                    }],
+                },
+                crate::cognitive::Session {
+                    id: "foreign-distractor".to_string(),
+                    turns: vec![crate::cognitive::Turn {
+                        speaker: "user".to_string(),
+                        content: "The launch code is OMEGA.".to_string(),
+                        timestamp: None,
+                        timestamp_text: None,
+                        source_id: Some("distractor-turn".to_string()),
+                    }],
+                },
+            ],
+            queries: vec![crate::cognitive::QAQuery {
+                question_date_ms: None,
+                id: "lme-isolation".to_string(),
+                question: "What is the launch code?".to_string(),
+                expected_answers: vec!["ALPHA".to_string()],
+                category: "single-session-user".to_string(),
+                relevant_session_ids: vec!["official-haystack".to_string()],
+                evidence_ids: Vec::new(),
+                evidence_snippets: Vec::new(),
+                negative: false,
+            }],
+            truncated: None,
+        };
+
+        for surface in [
+            BenchmarkExecutionSurface::DirectBuilders,
+            BenchmarkExecutionSurface::CompiledHirnql,
+        ] {
+            let dir = TempDir::new().unwrap();
+            let config =
+                benchmark_config_with_surface(BenchmarkRetrievalProfile::Minimal, surface, false);
+            let report = run_with_embeddings(
+                &dataset,
+                &config,
+                &dir.path().join("db"),
+                "haystack-isolation",
+                None,
+            )
+            .expect("pseudo fallback should execute the isolation fixture");
+            let context = &report.reader_inputs[0].context;
+
+            assert!(
+                context.contains("ALPHA"),
+                "{surface}: official-haystack evidence missing from context: {context}"
+            );
+            assert!(
+                !context.contains("OMEGA"),
+                "{surface}: foreign distractor leaked into context: {context}"
+            );
+            assert!(report.active_retrieval_surfaces.per_query_haystack);
+        }
     }
 
     #[test]
@@ -3010,6 +3212,7 @@ mod tests {
         crate::cognitive::CognitiveDataset {
             name: "finalize-fixture".to_string(),
             benchmark,
+            retrieval_corpus: RetrievalCorpus::Shared,
             sessions: Vec::new(),
             queries: Vec::new(),
             truncated,
@@ -3163,6 +3366,7 @@ mod tests {
     #[test]
     fn matched_target_key_falls_back_to_evidence_snippet_when_source_id_is_missing() {
         let query = crate::cognitive::QAQuery {
+            question_date_ms: None,
             id: "locomo-q1".to_string(),
             question: "Where did Alice move?".to_string(),
             expected_answers: vec!["Seattle".to_string()],
@@ -3175,6 +3379,7 @@ mod tests {
         let candidate = RetrievedCandidate {
             content: "[sample-1::session_1] Alice: I moved to Seattle in 2022.".to_string(),
             source_id: None,
+            timestamp_ms: None,
         };
 
         assert_eq!(
@@ -3188,11 +3393,13 @@ mod tests {
         let dataset = crate::cognitive::CognitiveDataset {
             name: "External fixture".to_string(),
             benchmark: Benchmark::H1Retrieval,
+            retrieval_corpus: RetrievalCorpus::Shared,
             sessions: Vec::new(),
             queries: Vec::new(),
             truncated: None,
         };
         let query = crate::cognitive::QAQuery {
+            question_date_ms: None,
             id: "locomo-q2".to_string(),
             question: "What fields would Caroline be likely to pursue in her education?"
                 .to_string(),
@@ -3215,11 +3422,13 @@ mod tests {
         let dataset = crate::cognitive::CognitiveDataset {
             name: "External fixture".to_string(),
             benchmark: Benchmark::H1Retrieval,
+            retrieval_corpus: RetrievalCorpus::Shared,
             sessions: Vec::new(),
             queries: Vec::new(),
             truncated: None,
         };
         let query = crate::cognitive::QAQuery {
+            question_date_ms: None,
             id: "q-routing".to_string(),
             question: "What fields would Caroline be likely to pursue in her education?"
                 .to_string(),
@@ -3527,11 +3736,13 @@ mod tests {
         let dataset = crate::cognitive::CognitiveDataset {
             name: "provider-runtime".to_string(),
             benchmark: Benchmark::H1Retrieval,
+            retrieval_corpus: RetrievalCorpus::Shared,
             sessions: vec![crate::cognitive::Session {
                 id: "session-a".to_string(),
                 turns: vec![sample_turn("user")],
             }],
             queries: vec![crate::cognitive::QAQuery {
+                question_date_ms: None,
                 id: "query-a".to_string(),
                 question: "query".to_string(),
                 expected_answers: vec!["answer".to_string()],
@@ -3603,6 +3814,7 @@ mod tests {
     #[test]
     fn compiled_think_query_emits_hybrid_clause_when_profile_enables_it() {
         let query = crate::cognitive::QAQuery {
+            question_date_ms: None,
             id: "hybrid-think".to_string(),
             question: "release readiness".to_string(),
             expected_answers: vec!["go".to_string()],

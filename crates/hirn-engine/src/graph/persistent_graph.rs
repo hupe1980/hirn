@@ -304,6 +304,25 @@ impl PersistentGraph {
         Ok(nodes)
     }
 
+    /// Stream all persisted graph nodes in one scan.
+    ///
+    /// Startup hot-tier hydration uses this instead of fetching every ID with
+    /// a separate point lookup.
+    pub async fn all_nodes(&self) -> HirnResult<Vec<GraphNodeData>> {
+        if !self.storage.exists(DATASET_NODES_NAME).await? {
+            return Ok(Vec::new());
+        }
+        self.scan_nodes(ScanOptions {
+            columns: None,
+            filter: None,
+            exact_filter: None,
+            order_by: None,
+            limit: None,
+            offset: None,
+        })
+        .await
+    }
+
     async fn scan_edges(&self, options: ScanOptions) -> HirnResult<Vec<GraphEdge>> {
         let mut stream = self
             .storage

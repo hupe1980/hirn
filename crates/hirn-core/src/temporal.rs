@@ -18,6 +18,8 @@
 //! An interval with `end = None` is *open-ended* (ongoing / still valid), treated
 //! as extending to `+∞` for every relation.
 
+use serde::{Deserialize, Serialize};
+
 use crate::timestamp::Timestamp;
 
 /// Sentinel for an open-ended interval end (`+∞`) in millisecond comparisons.
@@ -731,5 +733,411 @@ mod tests {
         assert_eq!(tl.relation_between("b", "a"), Some(AllenRelation::After));
         assert_eq!(tl.duration_between("a", "b"), Some(5 * DAY));
         assert_eq!(tl.relation_between("a", "missing"), None);
+    }
+
+    // ── Write-time temporal envelope ─────────────────────────────────────
+
+    #[test]
+    fn precision_labels_round_trip() {
+        for p in [
+            TimePrecision::Instant,
+            TimePrecision::Day,
+            TimePrecision::Month,
+            TimePrecision::Year,
+            TimePrecision::Unknown,
+        ] {
+            assert_eq!(TimePrecision::parse(p.as_str()), Some(p));
+        }
+        assert_eq!(TimePrecision::parse("decade"), None);
+    }
+
+    #[test]
+    fn state_labels_round_trip() {
+        for s in [
+            TemporalState::Ongoing,
+            TemporalState::Completed,
+            TemporalState::Planned,
+            TemporalState::Timeless,
+            TemporalState::Unknown,
+        ] {
+            assert_eq!(TemporalState::parse(s.as_str()), Some(s));
+        }
+        assert_eq!(TemporalState::parse("maybe"), None);
+    }
+
+    #[test]
+    fn defaults_assert_nothing() {
+        // An unextracted memory must not claim a precise time or a state, or
+        // ranking would act on evidence that was never present.
+        let envelope = TemporalEnvelope::default();
+        assert_eq!(envelope.precision, TimePrecision::Unknown);
+        assert_eq!(envelope.state, TemporalState::Unknown);
+        assert!(!envelope.is_rankable());
+        assert_eq!(envelope, TemporalEnvelope::unknown());
+    }
+
+    #[test]
+    fn timeless_and_ongoing_facts_do_not_decay() {
+        // The highest-value consequence of tracking state: an address stated
+        // two years ago is exactly as true today.
+        assert!(!TemporalState::Timeless.decays_with_age());
+        assert!(!TemporalState::Ongoing.decays_with_age());
+        // Finished and planned events legitimately age.
+        assert!(TemporalState::Completed.decays_with_age());
+        assert!(TemporalState::Planned.decays_with_age());
+        // Unknown keeps the pre-existing behaviour rather than silently
+        // exempting unclassified memories from decay.
+        assert!(TemporalState::Unknown.decays_with_age());
+    }
+
+    #[test]
+    fn current_state_predicate() {
+        assert!(TemporalState::Ongoing.is_current());
+        assert!(TemporalState::Timeless.is_current());
+        assert!(!TemporalState::Completed.is_current());
+        assert!(!TemporalState::Planned.is_current());
+        assert!(!TemporalState::Unknown.is_current());
+    }
+
+    #[test]
+    fn unknown_precision_is_never_rankable() {
+        // An event time with unknown precision is a guess; ranking on it would
+        // treat a fabricated instant as evidence.
+        let envelope = TemporalEnvelope {
+            event_time: Some(Timestamp::from_millis(1_000_000)),
+            precision: TimePrecision::Unknown,
+            state: TemporalState::Completed,
+        };
+        assert!(!envelope.is_rankable());
+        assert_eq!(
+            envelope.proximity_to(Timestamp::from_millis(1_000_000), 86_400_000),
+            None
+        );
+    }
+
+    #[test]
+    fn proximity_is_flat_inside_the_precision_window() {
+        // A memory dated "March" is exactly as close to 3 March as to 20 March.
+        let march = Timestamp::from_millis(1_000_000_000);
+        let envelope = TemporalEnvelope {
+            event_time: Some(march),
+            precision: TimePrecision::Month,
+            state: TemporalState::Completed,
+        };
+        let half_month = TimePrecision::Month.window_ms() / 2;
+        for offset in [0, half_month / 4, half_month - 1] {
+            let q = Timestamp::from_millis((march.timestamp_ms() + offset) as u64);
+            assert_eq!(
+                envelope.proximity_to(q, 86_400_000),
+                Some(1.0),
+                "offset {offset} should be inside the month window"
+            );
+        }
+    }
+
+    #[test]
+    fn proximity_decays_outside_the_window() {
+        let event = Timestamp::from_millis(10_000_000_000);
+        let envelope = TemporalEnvelope {
+            event_time: Some(event),
+            precision: TimePrecision::Day,
+            state: TemporalState::Completed,
+        };
+        let half_life = 86_400_000i64; // one day
+        let slack = TimePrecision::Day.window_ms() / 2;
+
+        // Exactly one half-life past the window edge → ~0.5.
+        let q = Timestamp::from_millis((event.timestamp_ms() as i64 + slack + half_life) as u64);
+        let p = envelope.proximity_to(q, half_life).unwrap();
+        assert!((p - 0.5).abs() < 0.01, "expected ~0.5, got {p}");
+
+        // Further away is strictly worse, and never negative.
+        let far =
+            Timestamp::from_millis((event.timestamp_ms() as i64 + slack + 10 * half_life) as u64);
+        let far_p = envelope.proximity_to(far, half_life).unwrap();
+        assert!(far_p < p && far_p >= 0.0);
+    }
+
+    #[test]
+    fn a_coarser_precision_is_more_forgiving() {
+        // The point of tracking precision: a month-granular memory must not be
+        // punished for not naming a second.
+        let event = Timestamp::from_millis(10_000_000_000);
+        let query = Timestamp::from_millis(10_000_000_000 + 5 * 86_400_000);
+        let half_life = 86_400_000;
+
+        let day = TemporalEnvelope {
+            event_time: Some(event),
+            precision: TimePrecision::Day,
+            state: TemporalState::Completed,
+        };
+        let month = TemporalEnvelope {
+            precision: TimePrecision::Month,
+            ..day
+        };
+        assert!(
+            month.proximity_to(query, half_life) > day.proximity_to(query, half_life),
+            "coarser precision must not score lower for the same distance"
+        );
+    }
+
+    #[test]
+    fn proximity_is_symmetric_and_guards_degenerate_half_life() {
+        let event = Timestamp::from_millis(5_000_000_000);
+        let envelope = TemporalEnvelope {
+            event_time: Some(event),
+            precision: TimePrecision::Instant,
+            state: TemporalState::Completed,
+        };
+        let before = Timestamp::from_millis(5_000_000_000 - 3_600_000);
+        let after = Timestamp::from_millis(5_000_000_000 + 3_600_000);
+        assert_eq!(
+            envelope.proximity_to(before, 3_600_000),
+            envelope.proximity_to(after, 3_600_000),
+            "proximity must not depend on direction"
+        );
+        // A non-positive half-life would divide by zero.
+        assert_eq!(envelope.proximity_to(after, 0), None);
+    }
+
+    #[test]
+    fn envelope_round_trips_through_serde() {
+        let envelope = TemporalEnvelope {
+            event_time: Some(Timestamp::from_millis(1_700_000_000_000)),
+            precision: TimePrecision::Month,
+            state: TemporalState::Ongoing,
+        };
+        let json = serde_json::to_string(&envelope).unwrap();
+        assert!(json.contains("\"month\""));
+        assert!(json.contains("\"ongoing\""));
+        assert_eq!(
+            serde_json::from_str::<TemporalEnvelope>(&json).unwrap(),
+            envelope
+        );
+    }
+}
+
+// ── Write-time temporal envelope ─────────────────────────────────────────
+
+/// How precisely a memory's event time is known.
+///
+/// Extraction rarely yields an instant. "on 2026-03-14 at 09:15" is an instant;
+/// "in March" is a month; "last year" is a year. Collapsing all of them onto a
+/// single `Timestamp` invents precision that was never in the source, and a
+/// proximity ranking then treats a month-granular memory as if it named a
+/// specific second — which is how a correct memory loses to a wrong one that
+/// happens to carry an exact timestamp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimePrecision {
+    /// A specific moment.
+    Instant,
+    /// Resolved to a calendar day.
+    Day,
+    /// Resolved to a calendar month.
+    Month,
+    /// Resolved to a calendar year.
+    Year,
+    /// No usable time expression was found. The default: absence of evidence
+    /// is not a precise timestamp.
+    #[default]
+    Unknown,
+}
+
+impl TimePrecision {
+    /// Stable machine-readable label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Instant => "instant",
+            Self::Day => "day",
+            Self::Month => "month",
+            Self::Year => "year",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Parse a canonical label.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "instant" => Some(Self::Instant),
+            "day" => Some(Self::Day),
+            "month" => Some(Self::Month),
+            "year" => Some(Self::Year),
+            "unknown" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
+
+    /// The window this precision actually pins the event to, in milliseconds.
+    ///
+    /// Used to grade temporal proximity: a memory dated "March" should score
+    /// full proximity for any query instant inside March, not decay away from
+    /// an arbitrary point inside it.
+    #[must_use]
+    pub const fn window_ms(self) -> i64 {
+        match self {
+            Self::Instant => 0,
+            Self::Day => 86_400_000,
+            Self::Month => 2_678_400_000, // 31 days
+            Self::Year => 31_622_400_000, // 366 days
+            // An unknown time pins nothing; callers must not rank on it.
+            Self::Unknown => i64::MAX,
+        }
+    }
+
+    /// Whether this precision supports temporal ranking at all.
+    #[must_use]
+    pub const fn is_usable(self) -> bool {
+        !matches!(self, Self::Unknown)
+    }
+}
+
+/// What temporal state a memory asserts.
+///
+/// Orthogonal to [`crate::types::MemoryType`], which encodes *authority*
+/// (stable fact vs. preference vs. rule). This axis encodes *time-validity*,
+/// and retrieval needs both: "where do I live" must prefer an `Ongoing` fact
+/// over a `Completed` one, while "what did I plan for the trip" wants
+/// `Planned`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TemporalState {
+    /// True now and still holding ("I live in Berlin").
+    Ongoing,
+    /// Happened and finished ("I moved to Berlin in March").
+    Completed,
+    /// Intended or scheduled, not yet true ("I'm moving in June").
+    Planned,
+    /// True independent of time ("my birthday is 14 March"). Must never be
+    /// discounted for age — a timeless fact does not become less true.
+    Timeless,
+    /// Not established. The conservative default: an unclassified memory is
+    /// ranked as it was before this axis existed.
+    #[default]
+    Unknown,
+}
+
+impl TemporalState {
+    /// Stable machine-readable label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ongoing => "ongoing",
+            Self::Completed => "completed",
+            Self::Planned => "planned",
+            Self::Timeless => "timeless",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Parse a canonical label.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "ongoing" => Some(Self::Ongoing),
+            "completed" => Some(Self::Completed),
+            "planned" => Some(Self::Planned),
+            "timeless" => Some(Self::Timeless),
+            "unknown" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
+
+    /// Whether recency decay should apply to a memory in this state.
+    ///
+    /// `Timeless` and `Ongoing` facts are exempt: an address stated two years
+    /// ago is exactly as true today, and decaying it lets a stale contradiction
+    /// or an unrelated recent note outrank it. This is the single highest-value
+    /// consequence of tracking state.
+    #[must_use]
+    pub const fn decays_with_age(self) -> bool {
+        match self {
+            Self::Timeless | Self::Ongoing => false,
+            Self::Completed | Self::Planned | Self::Unknown => true,
+        }
+    }
+
+    /// Whether this state answers a question about the present.
+    #[must_use]
+    pub const fn is_current(self) -> bool {
+        matches!(self, Self::Ongoing | Self::Timeless)
+    }
+}
+
+/// When a memory's event happened, how precisely that is known, and what
+/// temporal state it asserts.
+///
+/// Distinct from the record's `timestamp` (ingestion) and from
+/// `valid_from`/`valid_until` (the belief-validity interval). Those answer
+/// "when did we learn this" and "when did we consider this true"; this answers
+/// "when did the thing happen, how sure are we, and is it still the case" —
+/// which is what temporal-reasoning questions actually ask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct TemporalEnvelope {
+    /// When the event occurred, as opposed to when it was recorded.
+    pub event_time: Option<Timestamp>,
+    pub precision: TimePrecision,
+    pub state: TemporalState,
+}
+
+impl TemporalEnvelope {
+    /// An envelope asserting nothing — the pre-extraction default.
+    #[must_use]
+    pub const fn unknown() -> Self {
+        Self {
+            event_time: None,
+            precision: TimePrecision::Unknown,
+            state: TemporalState::Unknown,
+        }
+    }
+
+    /// An envelope for a fact that holds regardless of time.
+    #[must_use]
+    pub const fn timeless() -> Self {
+        Self {
+            event_time: None,
+            precision: TimePrecision::Unknown,
+            state: TemporalState::Timeless,
+        }
+    }
+
+    /// Whether this envelope can support temporal ranking.
+    ///
+    /// Requires both an event time and a usable precision: an event time
+    /// carrying `Unknown` precision is a guess the ranker must not treat as
+    /// evidence.
+    #[must_use]
+    pub const fn is_rankable(&self) -> bool {
+        self.event_time.is_some() && self.precision.is_usable()
+    }
+
+    /// Temporal proximity of this memory to `query_time`, in `[0, 1]`.
+    ///
+    /// Returns `None` when the envelope cannot support ranking, so callers
+    /// fall back to their existing behaviour rather than ranking on a
+    /// fabricated zero.
+    ///
+    /// Inside the precision window proximity is 1.0 — a memory dated "March"
+    /// is exactly as close to 3 March as to 20 March. Outside it, proximity
+    /// falls off over `half_life_ms` beyond the window edge.
+    #[must_use]
+    pub fn proximity_to(&self, query_time: Timestamp, half_life_ms: i64) -> Option<f32> {
+        if !self.is_rankable() || half_life_ms <= 0 {
+            return None;
+        }
+        let event = self.event_time?;
+        let distance = (query_time.timestamp_ms() - event.timestamp_ms()).abs();
+        let window = self.precision.window_ms();
+        // Half the window either side: a month-precise event sits at the
+        // month's midpoint, so anything within ±½ month is inside it.
+        let slack = window / 2;
+        if distance <= slack {
+            return Some(1.0);
+        }
+        let excess = (distance - slack) as f64;
+        let decay = 0.5f64.powf(excess / half_life_ms as f64);
+        Some(decay as f32)
     }
 }

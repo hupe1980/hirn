@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Cognitive storage engine for hirn — lance 4.0 + lance-namespace"
+description = "Cognitive storage engine for hirn — Lance 9.0 + lance-namespace"
 
 [dependencies]
 hirn-core = { workspace = true }

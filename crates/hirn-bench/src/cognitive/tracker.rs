@@ -317,7 +317,10 @@ mod tests {
 
     fn reader_report(accuracy: f64) -> crate::cognitive::reader::ReaderJudgeReport {
         crate::cognitive::reader::ReaderJudgeReport {
+            judge_failures: Vec::new(),
+            per_query_verdicts: Vec::new(),
             reader_model: "gpt-4o".into(),
+            reader_prompt_strategy: "evidence-notes-v1".into(),
             judge_model: Some("gpt-4o".into()),
             judge_protocol: Some("longmemeval-official".into()),
             reader_temperature: 0.0,

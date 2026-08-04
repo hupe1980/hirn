@@ -152,6 +152,17 @@ impl std::fmt::Display for BaselineStrategy {
 
 // ─── Dataset Types ───────────────────────────────────────────
 
+/// Corpus visibility protocol used while executing benchmark queries.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RetrievalCorpus {
+    /// Every query searches the complete ingested corpus.
+    #[default]
+    Shared,
+    /// Every query searches only the sessions listed in its official haystack.
+    PerQueryHaystack,
+}
+
 /// A conversation session with timestamped turns.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -197,6 +208,13 @@ pub struct QAQuery {
     /// A true positive for a negative query means nothing relevant was found.
     #[serde(default)]
     pub negative: bool,
+    /// When the question was asked, in epoch milliseconds.
+    ///
+    /// Anchors year-less and relative date expressions in the retrieved
+    /// context. Without it a bare "January 10th" from a 2023 conversation
+    /// resolves into the current year and every computed interval is wrong.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question_date_ms: Option<i64>,
 }
 
 /// Counts of items dropped from a dataset by load limits or safety limits.
@@ -231,6 +249,9 @@ impl TruncationSummary {
 pub struct CognitiveDataset {
     pub name: String,
     pub benchmark: Benchmark,
+    /// Defines whether retrieval uses a shared corpus or official per-query haystacks.
+    #[serde(default)]
+    pub retrieval_corpus: RetrievalCorpus,
     pub sessions: Vec<Session>,
     pub queries: Vec<QAQuery>,
     /// Set when load limits dropped sessions/records/queries from the source
@@ -410,6 +431,9 @@ impl std::fmt::Display for EmbedderPolicy {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct ActiveRetrievalSurfaces {
+    /// Queries are isolated to their dataset-provided haystack before retrieval.
+    #[serde(default)]
+    pub per_query_haystack: bool,
     #[serde(default)]
     pub query_text_hybrid: bool,
     #[serde(default)]
@@ -434,6 +458,9 @@ impl ActiveRetrievalSurfaces {
     pub fn enabled_labels(&self) -> Vec<&'static str> {
         let mut labels = Vec::new();
 
+        if self.per_query_haystack {
+            labels.push("per-query-haystack");
+        }
         if self.query_text_hybrid {
             labels.push("hybrid");
         }
@@ -465,6 +492,9 @@ impl ActiveRetrievalSurfaces {
     pub fn disabled_labels(&self) -> Vec<&'static str> {
         let mut labels = Vec::new();
 
+        if !self.per_query_haystack {
+            labels.push("per-query-haystack");
+        }
         if !self.query_text_hybrid {
             labels.push("hybrid");
         }
@@ -509,6 +539,21 @@ pub struct CognitiveConfig {
     /// Defaults to `PseudoFallback` for backward compatibility.
     #[serde(default)]
     pub embedder_policy: EmbedderPolicy,
+    /// Whether model-backed natural-language understanding participates
+    /// (`HirnConfig::nlu.enabled`).
+    ///
+    /// This is the A/B arm for M-06: run the same dataset, protocol, reader,
+    /// and seed twice, flipping only this, and the difference is attributable
+    /// to model-backed decisions rather than to the deterministic cue floor.
+    /// Defaults to `true` (via [`Default`]), matching the shipped `NluConfig`,
+    /// so an ordinary run measures the shipped configuration.
+    pub nlu_enabled: bool,
+    /// Extract the write-time temporal envelope during ingest.
+    ///
+    /// The H-01 arm: with this off every record carries
+    /// `TemporalState::Unknown` and ages uniformly, which is the pre-envelope
+    /// behaviour. Defaults to `false`, matching the shipped `NluConfig`.
+    pub typed_temporal_extraction: bool,
 }
 
 impl CognitiveConfig {
@@ -531,6 +576,8 @@ impl Default for CognitiveConfig {
             execution_surface: BenchmarkExecutionSurface::CompiledHirnql,
             query_text_hybrid: false,
             embedder_policy: EmbedderPolicy::PseudoFallback,
+            nlu_enabled: true,
+            typed_temporal_extraction: false,
         }
     }
 }
@@ -822,6 +869,9 @@ pub struct CognitiveSuiteResult {
     pub geometric_mean: f64,
     /// Lowest individual suite score.
     pub min_suite_score: f64,
+    /// Whether every result has a configured competitive containment gate.
+    #[serde(default)]
+    pub competitive_gates_evaluated: bool,
     /// Whether all suites meet their competitive threshold.
     pub all_competitive: bool,
 }
@@ -874,15 +924,27 @@ pub fn compute_min_suite_score(results: &[CognitiveResult]) -> f64 {
         .min(1.0) // Guard against empty
 }
 
+/// Return whether every result has a configured competitive threshold.
+pub fn competitive_gates_evaluated(results: &[CognitiveResult]) -> bool {
+    !results.is_empty()
+        && results
+            .iter()
+            .all(|result| result.benchmark.parse::<Benchmark>().is_ok())
+}
+
 /// Check whether all suites meet their competitive threshold.
+///
+/// Unknown external benchmark names have no configured containment target and
+/// therefore cannot produce a positive competitive claim.
 pub fn all_suites_competitive(results: &[CognitiveResult]) -> bool {
-    results.iter().all(|r| {
-        if let Ok(bench) = r.benchmark.parse::<Benchmark>() {
-            baselines::is_competitive(bench, r.overall_containment)
-        } else {
-            true
-        }
-    })
+    competitive_gates_evaluated(results)
+        && results.iter().all(|result| {
+            let benchmark = result
+                .benchmark
+                .parse::<Benchmark>()
+                .expect("competitive gate evaluation validated every benchmark name");
+            baselines::is_competitive(benchmark, result.overall_containment)
+        })
 }
 
 #[cfg(test)]
@@ -902,6 +964,7 @@ mod tests {
         let dataset = CognitiveDataset {
             name: "test".to_string(),
             benchmark: Benchmark::H1Retrieval,
+            retrieval_corpus: RetrievalCorpus::Shared,
             truncated: None,
             sessions: vec![Session {
                 id: "session-1".to_string(),
@@ -914,6 +977,7 @@ mod tests {
                 }],
             }],
             queries: vec![QAQuery {
+                question_date_ms: None,
                 id: "q1".to_string(),
                 question: "Where did Alice move?".to_string(),
                 expected_answers: vec!["Seattle".to_string()],

@@ -497,17 +497,19 @@ impl LlmProvider for AnthropicProvider {
                 .get("retry-after")
                 .and_then(|v| v.to_str().ok())
                 .and_then(parse_retry_after);
-            let text = resp.text().await.unwrap_or_default();
+            let text = crate::transport::read_error_response(resp).await;
             return Err(
                 LlmError::from_status(&self.model, status.as_u16(), text, retry_after).into(),
             );
         }
 
         let parsed: MessagesResponse =
-            resp.json().await.map_err(|e| LlmError::InvalidResponse {
-                provider: self.model.clone(),
-                details: format!("failed to parse Anthropic response: {e}"),
-            })?;
+            crate::transport::decode_json_response(resp)
+                .await
+                .map_err(|details| LlmError::InvalidResponse {
+                    provider: self.model.clone(),
+                    details,
+                })?;
 
         let content = parsed
             .content
@@ -554,7 +556,7 @@ impl LlmProvider for AnthropicProvider {
                 .get("retry-after")
                 .and_then(|v| v.to_str().ok())
                 .and_then(parse_retry_after);
-            let text = resp.text().await.unwrap_or_default();
+            let text = crate::transport::read_error_response(resp).await;
             return Err(
                 LlmError::from_status(&self.model, status.as_u16(), text, retry_after).into(),
             );

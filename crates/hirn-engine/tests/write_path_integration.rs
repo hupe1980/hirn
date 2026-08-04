@@ -1931,10 +1931,19 @@ async fn fast_path_no_embedder_calls_for_prospective() {
     );
 }
 
-// ── Low-Novelty Fast-Path Timing ────────────────────────────────────
+// ── Low-Novelty Fast-Path Skips Enrichment ──────────────────────────
 
+/// A low-novelty write must take the fast path and skip the enrichment stages.
+///
+/// This replaced a wall-clock assertion (`elapsed < 500ms`). That assertion
+/// measured the machine rather than the code: it passed on an idle box and
+/// failed at 3.2s when the suite ran alongside a saturating benchmark, so it
+/// reported load as a code regression while never checking *why* the path is
+/// fast. The explanation exposes the decision directly, which is both
+/// machine-independent and a stronger claim. Fast-path latency itself is a
+/// throughput property, measured with percentiles in `hirn-bench`.
 #[tokio::test(flavor = "multi_thread")]
-async fn fast_path_stores_in_under_100ms() {
+async fn fast_path_skips_enrichment_stages() {
     let (db, _dir) = rpe_db().await;
     let emb = rand_vec(42);
 
@@ -1955,14 +1964,23 @@ async fn fast_path_stores_in_under_100ms() {
         .build()
         .unwrap();
 
-    let start = std::time::Instant::now();
-    db.episodic().remember(r2).await.unwrap();
-    let elapsed = start.elapsed();
+    let (_id, explanation) = db.episodic().remember_with_explanation(r2).await.unwrap();
 
+    let rpe = explanation.rpe.expect("RPE is enabled in this fixture");
     assert!(
-        elapsed.as_millis() < 500,
-        "Fast-path store should complete quickly, took {}ms",
-        elapsed.as_millis()
+        rpe.is_fast_path,
+        "near-duplicate should take the fast path (score {:?} vs threshold {})",
+        rpe.score, rpe.threshold
+    );
+    assert_eq!(
+        explanation.prospective_indexing.status,
+        hirn_engine::WritePathOperationStatus::SkippedFastPath,
+        "fast path must skip prospective indexing"
+    );
+    assert_eq!(
+        explanation.svo_extraction.status,
+        hirn_engine::WritePathOperationStatus::SkippedFastPath,
+        "fast path must skip SVO extraction"
     );
 }
 

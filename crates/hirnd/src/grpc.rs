@@ -10,7 +10,7 @@ use tonic::{Request, Response, Status};
 
 use crate::auth::{
     AuthState, Operation, ResolvedIdentity, TokenError, token_allows_namespace,
-    token_allows_operation,
+    token_allows_operation, token_namespace_scope,
 };
 use crate::convert;
 use crate::proto;
@@ -359,9 +359,19 @@ fn map_err(e: HirnError) -> Status {
 async fn agent_context<'a>(
     db: &'a HirnDB,
     agent_id: &AgentId,
+    metadata: &MetadataMap,
 ) -> Result<hirn_engine::AgentContext<'a>, Status> {
     db.ensure_agent(agent_id).await.map_err(map_err)?;
-    db.as_agent(agent_id).await.map_err(map_err)
+    match parse_token_namespaces(metadata)? {
+        Some(namespaces) => {
+            let namespaces =
+                token_namespace_scope(agent_id, &namespaces).map_err(Status::permission_denied)?;
+            db.as_agent_with_namespaces(agent_id, &namespaces)
+                .await
+                .map_err(map_err)
+        }
+        None => db.as_agent(agent_id).await.map_err(map_err),
+    }
 }
 
 fn parse_namespace_arg(namespace: Option<&str>) -> Result<Option<Namespace>, Status> {
@@ -406,7 +416,7 @@ impl HirnService for HirnGrpcService {
         check_operation(&metadata, &Operation::Write)?;
         enforce_rate_limit(&self.rate_limiter, &metadata, RateLimitClass::Write)?;
         let db = self.get_db(&metadata).await?;
-        let ctx = agent_context(&db, &agent).await?;
+        let ctx = agent_context(&db, &agent, &metadata).await?;
         let inner = request.into_inner();
 
         let (id, layer, watch_entities, watch_importance, watch_namespace) = match inner.record {
@@ -558,7 +568,7 @@ impl HirnService for HirnGrpcService {
         check_operation(&metadata, &Operation::Read)?;
         enforce_rate_limit(&self.rate_limiter, &metadata, RateLimitClass::Read)?;
         let db = self.get_db(&metadata).await?;
-        let ctx = agent_context(&db, &agent).await?;
+        let ctx = agent_context(&db, &agent, &metadata).await?;
         let inner = request.into_inner();
         check_namespace(&metadata, &agent, inner.namespace.as_deref())?;
 
@@ -595,7 +605,7 @@ impl HirnService for HirnGrpcService {
         check_operation(&metadata, &Operation::Read)?;
         enforce_rate_limit(&self.rate_limiter, &metadata, RateLimitClass::Read)?;
         let db = self.get_db(&metadata).await?;
-        let ctx = agent_context(&db, &agent).await?;
+        let ctx = agent_context(&db, &agent, &metadata).await?;
         let inner = request.into_inner();
         check_namespace(&metadata, &agent, inner.namespace.as_deref())?;
 
@@ -627,7 +637,7 @@ impl HirnService for HirnGrpcService {
         check_operation(&metadata, &Operation::Read)?;
         enforce_rate_limit(&self.rate_limiter, &metadata, RateLimitClass::Read)?;
         let db = self.get_db(&metadata).await?;
-        let ctx = agent_context(&db, &agent).await?;
+        let ctx = agent_context(&db, &agent, &metadata).await?;
         let inner = request.into_inner();
         check_namespace(&metadata, &agent, inner.namespace.as_deref())?;
 
@@ -693,7 +703,7 @@ impl HirnService for HirnGrpcService {
             RateLimitClass::Write,
         )?;
         let db = self.get_db(request.metadata()).await?;
-        let ctx = agent_context(&db, &agent).await?;
+        let ctx = agent_context(&db, &agent, request.metadata()).await?;
         let inner = request.into_inner();
 
         let id = inner
@@ -796,7 +806,7 @@ impl HirnService for HirnGrpcService {
         let agent = extract_agent_id(request.metadata())?;
         check_operation(request.metadata(), &Operation::Write)?;
         let db = self.get_db(request.metadata()).await?;
-        let ctx = agent_context(&db, &agent).await?;
+        let ctx = agent_context(&db, &agent, request.metadata()).await?;
         let inner = request.into_inner();
 
         let source = inner
@@ -839,7 +849,7 @@ impl HirnService for HirnGrpcService {
         check_operation(request.metadata(), &Operation::Read)?;
         enforce_rate_limit(&self.rate_limiter, request.metadata(), RateLimitClass::Read)?;
         let db = self.get_db(request.metadata()).await?;
-        let ctx = agent_context(&db, &agent).await?;
+        let ctx = agent_context(&db, &agent, request.metadata()).await?;
         let inner = request.into_inner();
 
         let id = inner
@@ -899,7 +909,7 @@ impl HirnService for HirnGrpcService {
         check_operation(request.metadata(), &Operation::Read)?;
         enforce_rate_limit(&self.rate_limiter, request.metadata(), RateLimitClass::Read)?;
         let db = self.get_db(request.metadata()).await?;
-        let ctx = agent_context(&db, &agent).await?;
+        let ctx = agent_context(&db, &agent, request.metadata()).await?;
         let inner = request.into_inner();
 
         let id = inner
@@ -969,7 +979,7 @@ impl HirnService for HirnGrpcService {
         }
 
         let db = self.get_db(&metadata).await?;
-        let ctx = agent_context(&db, &agent).await?;
+        let ctx = agent_context(&db, &agent, &metadata).await?;
 
         let result = ctx.execute_ql(&inner.query).await.map_err(map_err)?;
 
@@ -1070,6 +1080,7 @@ impl HirnService for HirnGrpcService {
         &self,
         request: Request<proto::ShareMemoryRequest>,
     ) -> Result<Response<proto::ShareMemoryResponse>, Status> {
+        let metadata = request.metadata().clone();
         let agent = extract_agent_id(request.metadata())?;
         check_operation(request.metadata(), &Operation::Write)?;
         enforce_rate_limit(
@@ -1094,7 +1105,7 @@ impl HirnService for HirnGrpcService {
         let target_ns = Namespace::new(&inner.target_namespace)
             .map_err(|e| Status::invalid_argument(format!("invalid target_namespace: {e}")))?;
 
-        let ctx = agent_context(&db, &agent_id).await?;
+        let ctx = agent_context(&db, &agent_id, &metadata).await?;
         let new_id = ctx
             .share_memory(memory_id, &target_ns)
             .await

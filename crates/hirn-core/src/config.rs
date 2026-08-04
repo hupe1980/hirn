@@ -186,6 +186,160 @@ impl Default for EmbedderPersistentCacheRuntimeConfig {
     }
 }
 
+/// Policy for the natural-language-understanding decision layer
+/// ([`crate::nlu`]).
+///
+/// Meaning-dependent decisions — query-view routing, belief/evidence relation,
+/// knowledge typing, contradiction, entity and event extraction — run through
+/// an ordered backend chain: structured LLM, then embedding exemplar routing,
+/// then the deterministic per-decision fallback. This struct decides which
+/// backends participate and under what budget.
+///
+/// Defaults enable both model-backed backends *if providers are configured*;
+/// with no provider registered the chain is empty and every decision uses its
+/// deterministic fallback, so an offline deployment works unchanged.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+// Each flag is an independent, orthogonal policy switch that maps 1:1 onto a
+// TOML key; folding them into enums would obscure the config surface for no
+// behavioural gain.
+#[allow(clippy::struct_excessive_bools)]
+pub struct NluConfig {
+    /// Master switch for model-backed understanding. `false` pins every
+    /// decision to its deterministic fallback regardless of configured
+    /// providers. Default: `true`.
+    pub enabled: bool,
+
+    /// Use the ambient LLM provider as the primary classifier. Default: `true`.
+    pub llm_primary: bool,
+
+    /// Use the embedding exemplar router as the secondary classifier.
+    /// Default: `true`.
+    pub embedding_router: bool,
+
+    /// Per-decision time, token, input, and confidence budget.
+    pub budget: crate::nlu::NluBudget,
+
+    /// Calibration applied to LLM self-reported confidence. Self-reported
+    /// confidence is systematically over-confident; fit `scale`/`floor`
+    /// against a labeled sample before tightening
+    /// [`NluBudget::min_confidence`](crate::nlu::NluBudget::min_confidence).
+    pub llm_calibration: crate::nlu::Calibration,
+
+    /// Calibration for the embedding exemplar router, including the softmax
+    /// temperature applied to cosine similarities.
+    pub embedding_calibration: crate::nlu::Calibration,
+
+    /// Use typed LLM event extraction on the write path instead of the regex
+    /// SVO extractor. Correct on passive voice and negation, but adds a
+    /// provider call per ingested record — off by default because the write
+    /// path is latency-sensitive. Default: `false`.
+    pub typed_event_extraction: bool,
+
+    /// Maximum concurrent write-path extraction calls during batch ingest.
+    ///
+    /// Typed extraction is one provider round-trip per record. Issued
+    /// sequentially, a 10k-record batch spends over an hour in provider
+    /// latency for work that is embarrassingly parallel. Bounded so a large
+    /// batch cannot open an unbounded number of connections or trip provider
+    /// rate limits. Default: 8.
+    pub extraction_concurrency: usize,
+
+    /// Extract the write-time temporal envelope (event time, precision, and
+    /// ongoing/completed/planned/timeless state) on the write path.
+    ///
+    /// This is what makes recency decay state-aware: without it every record
+    /// carries `TemporalState::Unknown` and ages uniformly, so a timeless fact
+    /// ("my birthday is 14 March") loses ground to a recent irrelevant note.
+    /// Costs one provider call per ingested record, so it is opt-in like the
+    /// other typed extractors. Default: `false`.
+    pub typed_temporal_extraction: bool,
+
+    /// Use typed LLM preference extraction on the write path instead of the
+    /// first-person cue matcher. Reads indirect and non-English phrasing the
+    /// cue list cannot, and can answer "no preference here" — but adds a
+    /// provider call per ingested message. Default: `false`.
+    pub typed_preference_extraction: bool,
+
+    /// Minimum calibrated confidence an entailment judgment needs before it is
+    /// allowed to assert a contradiction. Contradiction edges are destructive
+    /// (they halve belief credence and surface as conflicts), so this gate is
+    /// deliberately stricter than the general decision gate. Default: 0.70.
+    pub contradiction_min_confidence: f32,
+
+    /// Cosine similarity above which two thread summaries are treated as
+    /// duplicates during concept description assembly. Default: 0.95.
+    pub summary_dedup_threshold: f32,
+}
+
+impl Default for NluConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            llm_primary: true,
+            embedding_router: true,
+            budget: crate::nlu::NluBudget::default(),
+            llm_calibration: crate::nlu::Calibration::default(),
+            embedding_calibration: crate::nlu::Calibration {
+                temperature: 0.07,
+                scale: 1.0,
+                floor: 0.0,
+            },
+            typed_event_extraction: false,
+            typed_preference_extraction: false,
+            typed_temporal_extraction: false,
+            extraction_concurrency: 8,
+            contradiction_min_confidence: 0.70,
+            summary_dedup_threshold: 0.95,
+        }
+    }
+}
+
+impl NluConfig {
+    /// Validate the NLU policy's invariants.
+    ///
+    /// # Errors
+    /// Returns [`HirnError::InvalidInput`] when the budget is degenerate, a
+    /// calibration temperature is non-positive, or a threshold falls outside
+    /// `[0.0, 1.0]`.
+    pub fn validate(&self) -> Result<(), HirnError> {
+        self.budget.validate()?;
+        for (name, calibration) in [
+            ("llm_calibration", &self.llm_calibration),
+            ("embedding_calibration", &self.embedding_calibration),
+        ] {
+            if !(calibration.temperature.is_finite() && calibration.temperature > 0.0) {
+                return Err(HirnError::InvalidInput(format!(
+                    "nlu.{name}.temperature must be finite and > 0.0"
+                )));
+            }
+            if !(0.0..=1.0).contains(&calibration.scale)
+                || !(0.0..=1.0).contains(&calibration.floor)
+            {
+                return Err(HirnError::InvalidInput(format!(
+                    "nlu.{name} scale and floor must be in [0.0, 1.0]"
+                )));
+            }
+        }
+        if self.extraction_concurrency == 0 {
+            return Err(HirnError::InvalidInput(
+                "nlu.extraction_concurrency must be non-zero".into(),
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.contradiction_min_confidence) {
+            return Err(HirnError::InvalidInput(
+                "nlu.contradiction_min_confidence must be in [0.0, 1.0]".into(),
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.summary_dedup_threshold) {
+            return Err(HirnError::InvalidInput(
+                "nlu.summary_dedup_threshold must be in [0.0, 1.0]".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Action the poisoning admission controller takes when an ingest-time
 /// content scan detects prompt-injection patterns in a memory candidate.
 ///
@@ -202,6 +356,10 @@ pub enum AdmissionPoisoningAction {
     Audit,
     /// Reject the candidate with a machine-readable `poisoning_detected:` reason.
     Reject,
+    /// Score the candidate with the combined write-path poisoning defense and
+    /// route suspect writes to quarantine-for-review (deferred trust) instead of
+    /// rejecting outright; only a score above the reject threshold is rejected.
+    Quarantine,
 }
 
 /// Action the duplicate admission controller takes when an incoming candidate
@@ -304,6 +462,26 @@ hirn_config_fields! {
     /// Importance threshold below which archived records are purged.
     pub purge_threshold: f32,
 
+    /// Retention floor: a record whose intrinsic `importance` is at or above this
+    /// value is never **hard-purged** by the automated forgetting pass (it may
+    /// still be archived). Guards salient memories from silent data loss when
+    /// retention decays. Range 0.0..=1.0. Default: 0.2.
+    pub retention_floor: f32,
+
+    /// Whether a `pinned` record is also exempt from TTL (`expires_at`) purge, in
+    /// addition to decay-driven archival/purge. Default: true.
+    pub pin_overrides_ttl: bool,
+
+    /// Enable causal-intervention retrieval: score recall candidates by their
+    /// directed causal effect from the query seeds (do-calculus-style), feeding
+    /// the `causal_relevance` term. Default: true. When false, the imperative
+    /// recall path leaves `causal_relevance` at 0.0 (prior behavior).
+    pub causal_intervention_enabled: bool,
+
+    /// Maximum causal traversal depth for causal-intervention retrieval scoring.
+    /// Kept small so per-query cost stays negligible. Default: 3.
+    pub causal_intervention_max_depth: usize,
+
     /// Maximum number of episodic entries to retrieve in a single query.
     pub max_episodic_entries: u32,
 
@@ -378,6 +556,13 @@ hirn_config_fields! {
 
     /// Weight for source reliability in composite scoring (η).
     pub scoring_source_reliability_weight: f32,
+
+    /// Weight for temporal relevance in composite scoring (θ). Allen-interval
+    /// match of a record's validity interval to the query's time frame; only
+    /// contributes when the query expresses a time context (otherwise the term
+    /// is 0.0 for every candidate). The MAGMA router raises the effective weight
+    /// per-query when it detects temporal intent.
+    pub scoring_temporal_relevance_weight: f32,
 
     // ── Graph / Activation ──────────────────────────────────────────────
     /// Spreading activation depth decay factor d (default 0.7).
@@ -498,6 +683,17 @@ hirn_config_fields! {
     /// Ingest-time poisoning scan action: `off` (default), `audit`
     /// (admit + flag + audit event), or `reject`. Content is never rewritten.
     pub admission_poisoning_action: AdmissionPoisoningAction,
+
+    /// Write-path poisoning defense (A-MemGuard): a candidate whose combined
+    /// deterministic poison score is at or above this threshold (and below the
+    /// reject threshold) is routed to quarantine-for-review when
+    /// `admission_poisoning_action = Quarantine`. Range 0.0..=1.0. Default: 0.5.
+    pub admission_poisoning_quarantine_threshold: f32,
+
+    /// Poisoning score at or above which a candidate is rejected outright
+    /// (`poisoning_detected:`) rather than quarantined. Range 0.0..=1.0. Must be
+    /// >= the quarantine threshold. Default: 0.85.
+    pub admission_poisoning_reject_threshold: f32,
 
     // ── RPE-Gated Admission ─────────────────────────────────────────────
 
@@ -626,6 +822,14 @@ hirn_config_fields! {
 
     /// Minimum quality score required before planning agendas can be promoted.
     pub offline_plan_quality_threshold: f32,
+
+    // ── Natural-Language Understanding ───────────────────────────────────
+
+    /// Which backends decide meaning-dependent questions (query routing,
+    /// belief relation, knowledge typing, contradiction, extraction) and under
+    /// what budget. Every such decision keeps a deterministic fallback, so an
+    /// offline deployment works with this disabled.
+    pub nlu: NluConfig,
 
     // ── Reflection (Belief Revision) ─────────────────────────────────────
 
@@ -770,6 +974,10 @@ impl Default for HirnConfig {
             decay_lambda: 0.01, // ~2.9-day base half-life (ln2/0.01 ≈ 69h), shortened further by FadeMem importance/access modulation; the ~7-day figure belongs to memory_half_life_hours=168
             archive_threshold: 0.1,
             purge_threshold: 0.01,
+            retention_floor: 0.2,
+            pin_overrides_ttl: true,
+            causal_intervention_enabled: true,
+            causal_intervention_max_depth: 3,
             max_episodic_entries: 100,
             hebbian_learning_rate: 0.1,
             hebbian_decay_rate: 0.05,
@@ -788,12 +996,13 @@ impl Default for HirnConfig {
             embedder_runtime: EmbedderRuntimeConfig::default(),
             metric: DistanceMetric::Cosine,
             scoring_similarity_weight: 0.30,
-            scoring_importance_weight: 0.20,
-            scoring_recency_weight: 0.20,
+            scoring_importance_weight: 0.15,
+            scoring_recency_weight: 0.15,
             scoring_activation_weight: 0.10,
             scoring_causal_relevance_weight: 0.05,
             scoring_surprise_weight: 0.10,
             scoring_source_reliability_weight: 0.05,
+            scoring_temporal_relevance_weight: 0.10,
             activation_decay_factor: 0.7,
             activation_max_depth: 3,
             activation_convergence_threshold: 0.01,
@@ -822,6 +1031,8 @@ impl Default for HirnConfig {
             admission_min_trust: 0.0,
             admission_trust_quarantine_below: None,
             admission_poisoning_action: AdmissionPoisoningAction::Off,
+            admission_poisoning_quarantine_threshold: 0.5,
+            admission_poisoning_reject_threshold: 0.85,
             rpe_enabled: false,
             rpe_fast_path_threshold: 0.3,
             rpe_similarity_search_limit: 5,
@@ -854,6 +1065,7 @@ impl Default for HirnConfig {
             offline_dream_quality_threshold: 0.55,
             offline_reconcile_quality_threshold: 0.6,
             offline_plan_quality_threshold: 0.45,
+            nlu: NluConfig::default(),
             reflection_similarity_threshold: 0.75,
             reflection_top_k: 5,
             evolution_mode: EvolutionMode::None,
@@ -903,6 +1115,34 @@ impl HirnConfig {
         if self.archive_threshold <= self.purge_threshold {
             return Err(HirnError::InvalidInput(
                 "archive_threshold must be strictly greater than purge_threshold".into(),
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.retention_floor) {
+            return Err(HirnError::InvalidInput(
+                "retention_floor must be in [0.0, 1.0]".into(),
+            ));
+        }
+        for (name, w) in [
+            (
+                "admission_poisoning_quarantine_threshold",
+                self.admission_poisoning_quarantine_threshold,
+            ),
+            (
+                "admission_poisoning_reject_threshold",
+                self.admission_poisoning_reject_threshold,
+            ),
+        ] {
+            if !(0.0..=1.0).contains(&w) {
+                return Err(HirnError::InvalidInput(format!(
+                    "{name} must be in [0.0, 1.0], got {w}"
+                )));
+            }
+        }
+        if self.admission_poisoning_reject_threshold < self.admission_poisoning_quarantine_threshold
+        {
+            return Err(HirnError::InvalidInput(
+                "admission_poisoning_reject_threshold must be >= admission_poisoning_quarantine_threshold"
+                    .into(),
             ));
         }
         if !self.decay_lambda.is_finite() || self.decay_lambda <= 0.0 {
@@ -1034,7 +1274,8 @@ impl HirnConfig {
             + self.scoring_activation_weight
             + self.scoring_causal_relevance_weight
             + self.scoring_surprise_weight
-            + self.scoring_source_reliability_weight;
+            + self.scoring_source_reliability_weight
+            + self.scoring_temporal_relevance_weight;
         if (weight_sum - 1.0).abs() > 1e-4 {
             return Err(HirnError::InvalidInput(format!(
                 "scoring weights must sum to 1.0, got {weight_sum}"
@@ -1054,6 +1295,10 @@ impl HirnConfig {
             (
                 "scoring_source_reliability_weight",
                 self.scoring_source_reliability_weight,
+            ),
+            (
+                "scoring_temporal_relevance_weight",
+                self.scoring_temporal_relevance_weight,
             ),
         ] {
             if !(0.0..=1.0).contains(&w) {
@@ -1149,6 +1394,7 @@ impl HirnConfig {
                 "offline_plan_quality_threshold must be in [0.0, 1.0]".into(),
             ));
         }
+        self.nlu.validate()?;
         if !(0.0..=1.0).contains(&self.reflection_similarity_threshold) {
             return Err(HirnError::InvalidInput(
                 "reflection_similarity_threshold must be in [0.0, 1.0]".into(),
@@ -1702,6 +1948,12 @@ impl HirnConfigBuilder {
     }
 
     #[must_use]
+    pub const fn scoring_temporal_relevance_weight(mut self, weight: f32) -> Self {
+        self.0.scoring_temporal_relevance_weight = weight;
+        self
+    }
+
+    #[must_use]
     pub const fn similarity_edge_threshold(mut self, threshold: f32) -> Self {
         self.0.similarity_edge_threshold = threshold;
         self
@@ -1826,6 +2078,14 @@ impl HirnConfigBuilder {
     #[must_use]
     pub const fn offline_plan_quality_threshold(mut self, threshold: f32) -> Self {
         self.0.offline_plan_quality_threshold = threshold;
+        self
+    }
+
+    /// Set the natural-language-understanding policy: which backends decide
+    /// meaning-dependent questions, and under what budget and calibration.
+    #[must_use]
+    pub fn nlu(mut self, nlu: NluConfig) -> Self {
+        self.0.nlu = nlu;
         self
     }
 
@@ -2035,6 +2295,80 @@ impl HirnConfigBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nlu_section_loads_from_toml_as_documented() {
+        // Exactly the shape documented in docs/language-understanding.md.
+        let config: HirnConfig = toml::from_str(
+            r#"
+            [nlu]
+            enabled = true
+            llm_primary = true
+            embedding_router = true
+            typed_event_extraction = true
+            contradiction_min_confidence = 0.8
+            summary_dedup_threshold = 0.9
+
+            [nlu.budget]
+            timeout = 1500
+            max_tokens = 128
+            min_confidence = 0.6
+            max_input_chars = 512
+
+            [nlu.llm_calibration]
+            temperature = 1.0
+            scale = 0.8
+            floor = 0.05
+
+            [nlu.embedding_calibration]
+            temperature = 0.07
+            scale = 1.0
+            floor = 0.0
+            "#,
+        )
+        .expect("documented nlu section must parse");
+
+        assert!(config.nlu.enabled);
+        assert!(config.nlu.typed_event_extraction);
+        assert_eq!(
+            config.nlu.budget.timeout,
+            std::time::Duration::from_millis(1_500)
+        );
+        assert!((config.nlu.budget.min_confidence - 0.6).abs() < 1e-6);
+        assert!((config.nlu.llm_calibration.scale - 0.8).abs() < 1e-6);
+        assert!((config.nlu.contradiction_min_confidence - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn nlu_defaults_apply_when_the_section_is_absent() {
+        let config: HirnConfig = toml::from_str("").expect("empty config is valid");
+        assert_eq!(config.nlu, NluConfig::default());
+        assert!(
+            config.nlu.enabled,
+            "model-backed understanding is on by default; it is inert without providers"
+        );
+        assert!(
+            !config.nlu.typed_event_extraction,
+            "typed write-path extraction is opt-in — it adds a provider call per record"
+        );
+    }
+
+    #[test]
+    fn invalid_nlu_config_is_rejected_at_load() {
+        // A zero timeout would let a hung provider stall a write.
+        assert!(toml::from_str::<HirnConfig>("[nlu.budget]\ntimeout = 0\n").is_err());
+        // A non-positive softmax temperature produces NaN probabilities.
+        assert!(
+            toml::from_str::<HirnConfig>("[nlu.embedding_calibration]\ntemperature = 0.0\n")
+                .is_err()
+        );
+        // Out-of-range gates.
+        assert!(
+            toml::from_str::<HirnConfig>("[nlu]\ncontradiction_min_confidence = 1.5\n").is_err()
+        );
+        assert!(toml::from_str::<HirnConfig>("[nlu]\nsummary_dedup_threshold = -0.1\n").is_err());
+        assert!(toml::from_str::<HirnConfig>("[nlu.budget]\nmin_confidence = 2.0\n").is_err());
+    }
 
     #[test]
     fn distance_to_similarity_per_metric() {

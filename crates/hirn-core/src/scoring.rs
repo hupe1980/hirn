@@ -14,6 +14,7 @@ use std::fmt;
 use crate::HirnError;
 use crate::config::HirnConfig;
 use crate::record::MemoryRecord;
+use crate::temporal::TemporalState;
 use crate::types::Origin;
 
 /// Scoring weights for the composite formula:
@@ -38,6 +39,10 @@ pub struct ScoringWeights {
     pub surprise: f32,
     /// η — source reliability weight. Direct observation ranked higher than inferred.
     pub source_reliability: f32,
+    /// θ — temporal relevance weight. Allen-interval match of the record's
+    /// validity interval against the query's time frame (0.0 for queries that
+    /// express no time context, so it only ranks when time actually matters).
+    pub temporal_relevance: f32,
 }
 
 impl ScoringWeights {
@@ -56,6 +61,7 @@ impl ScoringWeights {
             causal_relevance: config.scoring_causal_relevance_weight,
             surprise: config.scoring_surprise_weight,
             source_reliability: config.scoring_source_reliability_weight,
+            temporal_relevance: config.scoring_temporal_relevance_weight,
         }
     }
 
@@ -69,6 +75,7 @@ impl ScoringWeights {
             ("causal_relevance", self.causal_relevance),
             ("surprise", self.surprise),
             ("source_reliability", self.source_reliability),
+            ("temporal_relevance", self.temporal_relevance),
         ] {
             if !(0.0..=1.0).contains(&w) {
                 return Err(HirnError::InvalidInput(format!(
@@ -82,7 +89,8 @@ impl ScoringWeights {
             + self.activation
             + self.causal_relevance
             + self.surprise
-            + self.source_reliability;
+            + self.source_reliability
+            + self.temporal_relevance;
         if (sum - 1.0).abs() > 1e-4 {
             return Err(HirnError::InvalidInput(format!(
                 "scoring weights must sum to 1.0, got {sum}"
@@ -99,6 +107,7 @@ impl ScoringWeights {
         causal_relevance: 0.0,
         surprise: 0.0,
         source_reliability: 0.0,
+        temporal_relevance: 0.0,
     };
 }
 
@@ -123,13 +132,14 @@ pub struct ScoreBreakdown {
     pub causal_relevance: f32,
     pub surprise: f32,
     pub source_reliability: f32,
+    pub temporal_relevance: f32,
 }
 
 impl fmt::Display for ScoreBreakdown {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "sim={:.3} imp={:.3} rec={:.3} act={:.3} caus={:.3} sur={:.3} src={:.3}",
+            "sim={:.3} imp={:.3} rec={:.3} act={:.3} caus={:.3} sur={:.3} src={:.3} tmp={:.3}",
             self.similarity,
             self.importance,
             self.recency,
@@ -137,6 +147,7 @@ impl fmt::Display for ScoreBreakdown {
             self.causal_relevance,
             self.surprise,
             self.source_reliability,
+            self.temporal_relevance,
         )
     }
 }
@@ -152,6 +163,36 @@ pub fn source_reliability_for_record(record: &MemoryRecord) -> f32 {
     };
 
     source_reliability_for_origin(*origin)
+}
+
+/// The functional role ([`MemoryType`]) of a record, for type-aware composition
+/// (MemGuard). Episodic/semantic records carry it explicitly; working entries are
+/// transient episodic evidence and procedural records are actionable rules.
+#[must_use]
+pub fn functional_role_for_record(record: &MemoryRecord) -> crate::types::MemoryType {
+    use crate::types::MemoryType;
+    match record {
+        MemoryRecord::Episodic(e) => e.functional_role,
+        MemoryRecord::Semantic(s) => s.functional_role,
+        MemoryRecord::Working(_) => MemoryType::EpisodicEvent,
+        MemoryRecord::Procedural(_) => MemoryType::BehavioralRule,
+    }
+}
+
+/// The temporal state a record asserts, for state-aware recency.
+///
+/// Only episodic records carry an extracted envelope today. Semantic records
+/// are consolidated knowledge whose validity is already tracked by the revision
+/// chain, and working entries are transient by construction — both report
+/// `Unknown`, which preserves their existing decay behaviour exactly.
+#[must_use]
+pub fn temporal_state_for_record(record: &MemoryRecord) -> TemporalState {
+    match record {
+        MemoryRecord::Episodic(e) => e.temporal.state,
+        MemoryRecord::Semantic(_) | MemoryRecord::Working(_) | MemoryRecord::Procedural(_) => {
+            TemporalState::Unknown
+        }
+    }
 }
 
 /// Map a provenance origin to the canonical source-reliability score.
@@ -176,6 +217,7 @@ pub fn source_reliability_for_origin(origin: Origin) -> f32 {
 /// - `causal_rel`: causal relevance score in \[0.0, 1.0\] (0.0 when FOLLOW CAUSES inactive).
 /// - `surprise`: surprise score in \[0.0, 1.0\] (Bayesian surprise from EM-LLM).
 /// - `source_rel`: source reliability score in \[0.0, 1.0\] (see `source_reliability_for_origin`: direct observation=1.0, generated=0.8, inferred=0.6, otherwise=0.5).
+/// - `temporal_rel`: temporal relevance in \[0.0, 1.0\] — Allen-interval match of the record's validity interval to the query time frame (0.0 when the query has no time context).
 /// - `weights`: scoring weights.
 ///
 /// Call sites that lack one of the inputs pass `0.0` (or `0` for
@@ -194,9 +236,48 @@ pub fn composite_score(
     causal_rel: f32,
     surprise: f32,
     source_rel: f32,
+    temporal_rel: f32,
     weights: &ScoringWeights,
 ) -> f32 {
-    let recency = fade_mem_recency(importance, age_hours, decay_lambda, access_freq);
+    composite_score_for_state(
+        similarity,
+        importance,
+        age_hours,
+        decay_lambda,
+        access_freq,
+        activation,
+        causal_rel,
+        surprise,
+        source_rel,
+        temporal_rel,
+        TemporalState::Unknown,
+        weights,
+    )
+}
+
+/// [`composite_score`] with the memory's temporal state, so facts that do not
+/// age are not discounted for age.
+///
+/// `TemporalState::Unknown` reproduces [`composite_score`] exactly, which is
+/// what an unextracted corpus yields.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn composite_score_for_state(
+    similarity: f32,
+    importance: f32,
+    age_hours: f64,
+    decay_lambda: f64,
+    access_freq: u64,
+    activation: f32,
+    causal_rel: f32,
+    surprise: f32,
+    source_rel: f32,
+    temporal_rel: f32,
+    state: TemporalState,
+    weights: &ScoringWeights,
+) -> f32 {
+    let recency =
+        fade_mem_recency_for_state(importance, age_hours, decay_lambda, access_freq, state);
 
     // Sanitize every term to [0.0, 1.0]. `f32::clamp` returns NaN for a NaN
     // input, so a single corrupt term (e.g. a NaN `similarity` from a
@@ -209,7 +290,8 @@ pub fn composite_score(
         + weights.activation * sane01(activation)
         + weights.causal_relevance * sane01(causal_rel)
         + weights.surprise * sane01(surprise)
-        + weights.source_reliability * sane01(source_rel);
+        + weights.source_reliability * sane01(source_rel)
+        + weights.temporal_relevance * sane01(temporal_rel);
 
     // Final guard: even if a weight were non-finite, never return NaN/inf.
     if score.is_finite() {
@@ -230,8 +312,39 @@ fn sane01(x: f32) -> f32 {
     }
 }
 
+/// FadeMem adaptive recency, respecting the memory's temporal state.
+///
+/// A memory that asserts a *timeless* or *ongoing* fact does not become less
+/// true with age: "my birthday is 14 March" and "I live in Berlin" are exactly
+/// as valid two years after they were recorded. Decaying them lets a recent but
+/// less relevant memory outrank the correct answer, which is a direct
+/// correctness failure on "where do I live"-style questions rather than a
+/// ranking nicety.
+///
+/// States that legitimately age — completed events, plans, and anything not yet
+/// classified — decay exactly as before, so an unextracted corpus behaves
+/// identically to the pre-`TemporalState` engine.
+#[must_use]
+pub fn fade_mem_recency_for_state(
+    importance: f32,
+    age_hours: f64,
+    decay_lambda: f64,
+    access_freq: u64,
+    state: TemporalState,
+) -> f32 {
+    if state.decays_with_age() {
+        fade_mem_recency(importance, age_hours, decay_lambda, access_freq)
+    } else {
+        1.0
+    }
+}
+
 /// FadeMem adaptive recency: exponential decay slowed by importance and
 /// access frequency.
+///
+/// Prefer [`fade_mem_recency_for_state`] where the memory's
+/// [`TemporalState`] is known — this variant decays every memory, including
+/// facts that do not age.
 #[must_use]
 pub fn fade_mem_recency(
     importance: f32,
@@ -303,6 +416,7 @@ mod tests {
             0.0,
             0.0,
             0.0,
+            0.0,
             &ScoringWeights::PURE_SIMILARITY,
         );
         assert!((score - 0.9).abs() < 1e-4);
@@ -318,9 +432,10 @@ mod tests {
             causal_relevance: 0.0,
             surprise: 0.0,
             source_reliability: 0.0,
+            temporal_relevance: 0.0,
         };
-        let low = composite_score(0.8, 0.2, 0.0, 0.01, 0, 0.0, 0.0, 0.0, 0.0, &w);
-        let high = composite_score(0.8, 0.9, 0.0, 0.01, 0, 0.0, 0.0, 0.0, 0.0, &w);
+        let low = composite_score(0.8, 0.2, 0.0, 0.01, 0, 0.0, 0.0, 0.0, 0.0, 0.0, &w);
+        let high = composite_score(0.8, 0.9, 0.0, 0.01, 0, 0.0, 0.0, 0.0, 0.0, 0.0, &w);
         assert!(high > low);
     }
 
@@ -334,9 +449,10 @@ mod tests {
             causal_relevance: 0.0,
             surprise: 0.0,
             source_reliability: 0.0,
+            temporal_relevance: 0.0,
         };
-        let old = composite_score(0.8, 0.5, 720.0, 0.01, 0, 0.0, 0.0, 0.0, 0.0, &w); // 30 days
-        let recent = composite_score(0.8, 0.5, 1.0, 0.01, 0, 0.0, 0.0, 0.0, 0.0, &w); // 1 hour
+        let old = composite_score(0.8, 0.5, 720.0, 0.01, 0, 0.0, 0.0, 0.0, 0.0, 0.0, &w); // 30 days
+        let recent = composite_score(0.8, 0.5, 1.0, 0.01, 0, 0.0, 0.0, 0.0, 0.0, 0.0, &w); // 1 hour
         assert!(recent > old);
     }
 
@@ -344,8 +460,8 @@ mod tests {
     fn recency_decay() {
         let w = ScoringWeights::PURE_SIMILARITY;
         // With pure similarity, recency doesn't matter.
-        let s1 = composite_score(0.9, 0.5, 1.0, 0.01, 0, 0.0, 0.0, 0.0, 0.0, &w);
-        let s2 = composite_score(0.9, 0.5, 720.0, 0.01, 0, 0.0, 0.0, 0.0, 0.0, &w);
+        let s1 = composite_score(0.9, 0.5, 1.0, 0.01, 0, 0.0, 0.0, 0.0, 0.0, 0.0, &w);
+        let s2 = composite_score(0.9, 0.5, 720.0, 0.01, 0, 0.0, 0.0, 0.0, 0.0, 0.0, &w);
         assert!((s1 - s2).abs() < 1e-4);
     }
 
@@ -355,7 +471,7 @@ mod tests {
         for sim in [0.0, 0.1, 0.5, 0.9, 1.0] {
             for imp in [0.0, 0.5, 1.0] {
                 for age in [0.0, 1.0, 24.0, 720.0] {
-                    let s = composite_score(sim, imp, age, 0.01, 0, 0.0, 0.0, 0.0, 0.0, &w);
+                    let s = composite_score(sim, imp, age, 0.01, 0, 0.0, 0.0, 0.0, 0.0, 0.0, &w);
                     assert!(
                         (0.0..=1.0).contains(&s),
                         "score {s} out of range for sim={sim}, imp={imp}, age={age}"
@@ -381,6 +497,7 @@ mod tests {
             f32::NEG_INFINITY,
             f32::NAN,
             0.5,
+            f32::NAN,
             &w,
         );
         assert!(
@@ -410,6 +527,7 @@ mod tests {
             causal_relevance: 0.0,
             surprise: 0.0,
             source_reliability: 0.0,
+            temporal_relevance: 0.0,
         };
         assert!(w.validate().is_err());
     }
@@ -418,5 +536,113 @@ mod tests {
     fn valid_weights() {
         ScoringWeights::default().validate().unwrap();
         ScoringWeights::PURE_SIMILARITY.validate().unwrap();
+    }
+
+    // ── State-aware recency ──────────────────────────────────────────────
+
+    #[test]
+    fn timeless_and_ongoing_facts_keep_full_recency() {
+        // "my birthday is 14 March" recorded two years ago is exactly as true
+        // today. Decaying it lets a recent irrelevant note outrank the answer.
+        let two_years = 24.0 * 365.0 * 2.0;
+        for state in [TemporalState::Timeless, TemporalState::Ongoing] {
+            let r = fade_mem_recency_for_state(0.5, two_years, 0.05, 0, state);
+            assert!(
+                (r - 1.0).abs() < f32::EPSILON,
+                "{state:?} must not decay, got {r}"
+            );
+        }
+    }
+
+    #[test]
+    fn aging_states_decay_exactly_as_before() {
+        let age = 500.0;
+        let baseline = fade_mem_recency(0.5, age, 0.05, 3);
+        for state in [
+            TemporalState::Completed,
+            TemporalState::Planned,
+            TemporalState::Unknown,
+        ] {
+            let r = fade_mem_recency_for_state(0.5, age, 0.05, 3, state);
+            assert!(
+                (r - baseline).abs() < f32::EPSILON,
+                "{state:?} must decay identically to the stateless path"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_state_reproduces_the_stateless_score_exactly() {
+        // An unextracted corpus must rank bit-identically to the previous
+        // engine, or this change would be an unmeasured behaviour shift.
+        let w = ScoringWeights::default();
+        for (sim, imp, age, freq) in [
+            (0.9f32, 0.5f32, 10.0f64, 0u64),
+            (0.2, 0.9, 5_000.0, 42),
+            (0.5, 0.1, 0.0, 1),
+        ] {
+            let stateless = composite_score(sim, imp, age, 0.05, freq, 0.1, 0.2, 0.0, 0.5, 0.3, &w);
+            let stateful = composite_score_for_state(
+                sim,
+                imp,
+                age,
+                0.05,
+                freq,
+                0.1,
+                0.2,
+                0.0,
+                0.5,
+                0.3,
+                TemporalState::Unknown,
+                &w,
+            );
+            assert_eq!(stateless, stateful);
+        }
+    }
+
+    #[test]
+    fn a_timeless_fact_outranks_a_fresher_completed_one() {
+        // The behaviour the change exists for, stated as an ordering.
+        let w = ScoringWeights::default();
+        let old_timeless = composite_score_for_state(
+            0.8,
+            0.5,
+            24.0 * 365.0,
+            0.05,
+            0,
+            0.0,
+            0.0,
+            0.0,
+            0.5,
+            0.0,
+            TemporalState::Timeless,
+            &w,
+        );
+        let fresh_completed = composite_score_for_state(
+            0.8,
+            0.5,
+            1.0,
+            0.05,
+            0,
+            0.0,
+            0.0,
+            0.0,
+            0.5,
+            0.0,
+            TemporalState::Completed,
+            &w,
+        );
+        assert!(
+            old_timeless >= fresh_completed,
+            "a year-old timeless fact ({old_timeless}) must not lose to an \
+             hour-old completed event ({fresh_completed}) at equal similarity"
+        );
+    }
+
+    #[test]
+    fn state_aware_recency_still_guards_clock_skew() {
+        // A future-stamped record must not produce an inflated score.
+        let r = fade_mem_recency_for_state(0.5, -1_000.0, 0.05, 0, TemporalState::Completed);
+        assert!(r.is_finite() && (0.0..=1.0).contains(&r));
     }
 }

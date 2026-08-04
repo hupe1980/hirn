@@ -126,14 +126,24 @@ impl HirnMemory {
         if let Some(tokenizer) = registry.tokenizer() {
             db.set_tokenizer(tokenizer);
         }
+        let llm = registry.llm();
+        if let Some(llm) = llm.clone() {
+            db.set_llm_provider(llm);
+        }
         db.setup_default_admission_pipeline();
 
         let agent_id = AgentId::new("hirn_memory")?;
         db.register_agent(&agent_id, "HirnMemory default agent")
             .await?;
 
-        let entity_extractor: Arc<dyn EntityExtractor> =
-            Arc::new(hirn_provider::RegexEntityExtractor::new());
+        // Typed extraction when a provider is configured; the regex extractor
+        // otherwise. `LlmEntityExtractor` keeps the regex path internally as
+        // its own fallback, so a provider that times out still yields entities
+        // rather than none.
+        let entity_extractor: Arc<dyn EntityExtractor> = match llm {
+            Some(llm) => Arc::new(hirn_provider::LlmEntityExtractor::new(llm)),
+            None => Arc::new(hirn_provider::RegexEntityExtractor::new()),
+        };
 
         Ok(Self {
             db,

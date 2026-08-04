@@ -526,6 +526,19 @@ impl PolicyEngine {
     /// Returns an [`AuthzDecision`] indicating whether the request is allowed
     /// or denied, along with diagnostic information.
     pub fn authorize(&self, request: &AuthzRequest) -> AuthzDecision {
+        self.authorize_with_context(request, None)
+    }
+
+    /// Authorize with an optional Cedar context JSON object.
+    ///
+    /// Context is validated against the selected action's schema. Invalid,
+    /// missing, or mistyped attributes fail closed rather than silently
+    /// degrading a context-conditioned policy.
+    pub fn authorize_with_context(
+        &self,
+        request: &AuthzRequest,
+        context: Option<serde_json::Value>,
+    ) -> AuthzDecision {
         let guard = self.inner.read();
 
         if !guard.enabled {
@@ -534,7 +547,7 @@ impl PolicyEngine {
 
         #[cfg(feature = "cedar")]
         {
-            self.authorize_cedar(&guard, request)
+            self.authorize_cedar(&guard, request, context)
         }
         #[cfg(not(feature = "cedar"))]
         {
@@ -548,6 +561,7 @@ impl PolicyEngine {
             // explicit permit-all posture is unaffected.
             let _ = &guard;
             let _ = request;
+            let _ = context;
             AuthzDecision::deny(
                 "policy engine built without the `cedar` feature cannot evaluate policies; \
                  denying (fail-closed). Enable the `cedar` feature or use PolicyEngine::open_mode() \
@@ -836,7 +850,12 @@ impl PolicyEngine {
     }
 
     #[cfg(feature = "cedar")]
-    fn authorize_cedar(&self, guard: &PolicyEngineInner, request: &AuthzRequest) -> AuthzDecision {
+    fn authorize_cedar(
+        &self,
+        guard: &PolicyEngineInner,
+        request: &AuthzRequest,
+        context: Option<serde_json::Value>,
+    ) -> AuthzDecision {
         let cedar = match &guard.cedar {
             Some(c) => c,
             None => return AuthzDecision::deny("policy engine not initialized"),
@@ -864,7 +883,15 @@ impl PolicyEngine {
             )
         };
 
-        let context = Context::empty();
+        let context = match context {
+            Some(value) => match Context::from_json_value(value, Some((&cedar.schema, &action))) {
+                Ok(context) => context,
+                Err(error) => {
+                    return AuthzDecision::deny(format!("invalid request context: {error}"));
+                }
+            },
+            None => Context::empty(),
+        };
 
         let cedar_request =
             match Request::new(principal, action, resource, context, Some(&cedar.schema)) {

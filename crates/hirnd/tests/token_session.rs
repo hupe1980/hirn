@@ -107,6 +107,14 @@ fn embedding() -> Vec<f32> {
     (0..128).map(|i| (i as f32) / 128.0).collect()
 }
 
+/// Seconds since the Unix epoch, matching how the server stamps token expiry.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before the Unix epoch")
+        .as_secs()
+}
+
 // ─── Token Issuance Tests ───────────────────────────────────
 
 /// Token issuance endpoint works: exchange API key for JWT.
@@ -157,6 +165,12 @@ async fn test_issue_token_custom_ttl() {
     let (url, _tmp, _h) = start_token_server().await;
     let c = client();
 
+    // Bracket the issuing call itself. The expiry is derived from the moment
+    // the server stamps the token, so comparing it against a clock read after
+    // some later, unrelated request measures that request's latency instead —
+    // and fails on a loaded machine for reasons that have nothing to do with
+    // token TTL.
+    let issued_after = unix_now();
     let resp = c
         .post(format!("{url}/v1/auth/token"))
         .bearer_auth("key-alpha")
@@ -164,6 +178,7 @@ async fn test_issue_token_custom_ttl() {
         .send()
         .await
         .unwrap();
+    let issued_before = unix_now();
 
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
@@ -180,13 +195,16 @@ async fn test_issue_token_custom_ttl() {
         .unwrap();
     assert_eq!(resp.status(), 200);
 
-    // Verify expiry is within expected range
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    assert!(expires_at <= now + 65);
-    assert!(expires_at >= now + 55);
+    // The stamp must fall inside the window the issuing call spanned, so this
+    // holds exactly however slow the machine is.
+    assert!(
+        expires_at >= issued_after + 60,
+        "expiry {expires_at} precedes issue time {issued_after} + 60s TTL"
+    );
+    assert!(
+        expires_at <= issued_before + 60,
+        "expiry {expires_at} exceeds issue time {issued_before} + 60s TTL"
+    );
 }
 
 /// Token issuance requires authentication — anonymous request fails.

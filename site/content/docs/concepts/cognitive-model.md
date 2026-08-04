@@ -1,0 +1,792 @@
++++
+title = "Cognitive Model"
+description = "How hirn's four-tier memory model — working, episodic, semantic, procedural — maps to neuroscience, plus RPE admission, spreading activation, and Hebbian learning."
+weight = 1
++++
+
+# Cognitive Model
+
+{% experimental() %}
+This project is under active development. APIs, on-disk formats, and behaviour may change without notice. Not recommended for production use.
+{% end %}
+
+
+## Why a cognitive model?
+
+Most agent "memory" systems are a single vector index with a similarity search bolted on top.
+That works for one-shot retrieval, but it collapses the distinctions the brain spends enormous
+metabolic effort to maintain: the difference between what you are thinking about *right now*
+(working memory), what happened *to you* (episodic memory), what you *know* in the abstract
+(semantic memory), and what you know *how to do* (procedural memory). Those distinctions are not
+cosmetic — they have different capacities, different write costs, different decay rates, and
+different retrieval dynamics.
+
+Hirn implements a **biologically-grounded four-tier memory model** that maps directly to human
+neuroanatomy. The design draws on two well-established research lineages. The first is the
+**Complementary Learning Systems (CLS)** theory of McClelland, McNaughton & O'Reilly (1995), which
+argues the brain needs *both* a fast hippocampal store for one-shot episodic encoding *and* a slow
+neocortical store that extracts statistical regularities over time — precisely the episodic →
+semantic split hirn implements as a consolidation pipeline. The second is **Squire's taxonomy of
+long-term memory** (1987) together with **Baddeley's working-memory model** (1974), which give the
+four-way partition its cognitive-science backbone. At the agent-architecture level the model is
+aligned with **CoALA** (Cognitive Architectures for Language Agents, Sumers et al.), which
+recommends exactly this separation of memory types for LLM agents.
+
+This document explains how the tiers map to neuroscience, what fires the tier transitions, how RPE,
+spreading activation, and Hebbian learning interplay, and how the model relates to published research.
+
+{% tip() %}
+The distinctions below are *load-bearing*: choosing the right tier for a write is the single most
+important decision an agent makes about its own memory. Working memory that should have been
+episodic is lost on TTL expiry; episodic noise that should never have been written pollutes recall.
+{% end %}
+
+
+See also: [Architecture](@/docs/concepts/architecture.md), [Causal Reasoning](@/docs/concepts/causal.md), [Write-Path Intelligence](@/docs/concepts/write-path.md), [HirnQL Reference](@/docs/hirnql-reference.md), [Performance Tuning](@/docs/operations/performance-tuning.md)
+
+---
+
+## The Four-Tier Model
+
+The four tiers form a pipeline from volatile-and-fast to durable-and-slow. Each tier maps to a
+distinct brain region, holds a distinct content type, and has its own admission and eviction rules:
+
+```mermaid
+flowchart LR
+  WM["Working Memory<br/>(dlPFC)<br/>session scratchpad<br/>sub-ms · TTL evicted"]
+  EP["Episodic Memory<br/>(hippocampus)<br/>timestamped events<br/>one-shot · volatile"]
+  SE["Semantic Memory<br/>(neocortex)<br/>concepts & beliefs<br/>slow · durable"]
+  PR["Procedural Memory<br/>(basal ganglia)<br/>skills & routines<br/>success-reinforced"]
+  WM -->|"TTL expiry<br/>high-relevance traces"| EP
+  EP -->|"consolidation<br/>pattern extraction"| SE
+  PR -.->|"written directly,<br/>NOT consolidated"| PR
+  classDef s fill:#1a1b26,stroke:#7c9cff,color:#e6e8f0;
+  class WM,EP,SE,PR s;
+```
+
+{% note() %}
+Read the arrows as *promotion under a condition*, not automatic flow: only high-relevance working
+entries survive to episodic, and only episodic patterns that clear the consolidation trigger become
+semantic. Procedural memory is deliberately outside this cascade — skills are earned by explicit
+writes and reinforced by success rate, never distilled from raw events.
+{% end %}
+
+
+The original ASCII sketch of the same model:
+
+```
+┌───────────────────────────────────────────────────────────────────────────┐
+│                         COGNITIVE MODEL                                   │
+│                                                                           │
+│  Working ──► Episodic ──► Semantic ──► Procedural                        │
+│  (PFC)       (hippocampus)  (cortex)    (basal ganglia)                  │
+│                                                                           │
+│  Speed: sub-ms    30ms       30ms         30ms                           │
+│  Scope: session   events     concepts     skills                          │
+└───────────────────────────────────────────────────────────────────────────┘
+```
+
+### Working Memory (Prefrontal Cortex equivalent)
+
+**Neurological basis:** The dorsolateral prefrontal cortex (dlPFC) maintains information in an
+active, immediately accessible state. Capacity is sharply limited (Miller's Law: 7±2 chunks) and
+content is subject to rapid displacement and interference.
+
+**Hirn implementation:**
+- Stored in Lance `working` dataset with TTL-based eviction (configurable `tier_working_to_episodic_ttl_secs`)
+- Hot path: BTree-indexed `logical_memory_id` for sub-millisecond lookup
+- On TTL expiry: high-relevance entries are automatically promoted to episodic as traces (low-relevance are discarded)
+- Content model: `WorkingMemoryEntry` with `logical_memory_id`, `content`, `relevance_score`, `token_count`, and an absolute `expires_at` timestamp (there is no `importance`/`ttl_ms` field — TTL is expressed as the `expires_at` instant)
+- Revision semantics: successive `set_working()` calls for the same `logical_memory_id` create a temporal revision chain
+
+**When to use:** Conversational context, current task state, agent scratch-pad. Anything the agent
+needs to access in the current interaction without the overhead of a full recall pipeline.
+
+---
+
+### Episodic Memory (Hippocampus equivalent)
+
+**Neurological basis:** The hippocampus encodes specific events with rich contextual binding:
+who, what, when, where. Episodic memory is the fastest mammalian memory for new learning (one-shot
+encoding). It is also the most volatile — subject to forgetting, interference, and reconsolidation
+during retrieval.
+
+**Hirn implementation:**
+- Stored in Lance `episodic` dataset (time-series ordered by `timestamp_ms`)
+- `SVO events` extracted at write time by the imperative write path (`extract_svo_regex`, Chronos subsystem) — indexes who/what/when
+- `ProspectiveImplications` generated at write time by the imperative write path (Kumiho subsystem) — enables future-query short-circuiting
+- **RPE-gated admission** (see below) — controls write enrichment depth
+- `TemporalNext` edges in the graph link episodes in namespace-local arrival order for temporal contiguity retrieval
+- Reconsolidation window: after retrieval, a labile window (default: 1 hour) re-opens the memory to correction
+
+**When to use:** Agent-generated events, observations, conversation turns, tool outputs. Any
+time-stamped fact the agent should recall later.
+
+---
+
+### Semantic Memory (Neocortex equivalent)
+
+**Neurological basis:** The neocortex (particularly temporal and association cortex) consolidates
+episodic patterns into abstract, decontextualized knowledge. Semantic memory survives hippocampal
+damage — it is robust, slow to form (requires repetition), but very long-lasting. Humans form
+semantic knowledge through sleep-based consolidation that replays episodic traces and extracts
+regularities.
+
+**Hirn implementation:**
+- Stored in Lance `semantic` dataset
+- Formed by the **Consolidation Pipeline** (see below) — not written directly by agents except via `REMEMBER semantic`
+- Represents concepts, beliefs, facts, summarized narratives
+- Supports explicit versioned revision via `CORRECT`, `SUPERSEDE`, `MERGE MEMORY`, `RETRACT`
+- Community-detection-based narrative clustering groups related episodes into coherent semantic threads
+- RAPTOR hierarchical summarization builds multi-level concept trees from episodic clusters
+
+**When to use:** Agent beliefs about the world, user preferences, extracted entities, summarized
+conversation history. Content that should survive session boundaries and be accessible across agents.
+
+---
+
+### Procedural Memory (Basal Ganglia equivalent)
+
+**Neurological basis:** The basal ganglia encode **skills** — sequences of actions that, with
+practice, become automatic. Procedural memory is implicit: it guides behavior without conscious
+recall. Success rate is the key currency: skills that work get reinforced, skills that fail get
+discarded.
+
+**Hirn implementation:**
+- Stored in Lance `procedural` dataset
+- `success_rate: f32` (clamped `[0.0, 1.0]`) — core signal for tier transitions
+- Tier transition: `tier_procedural_min_success_rate` — skills below this threshold are demoted
+- Graph edges link procedural records to the episodic evidence that shaped them (`DerivedFrom` edges)
+- Skills are never consolidated from episodic; they must be written explicitly via `REMEMBER procedural` or agent tools
+
+**When to use:** Reusable multi-step procedures, system prompt fragments, tool-use patterns,
+workflow templates.
+
+---
+
+## Tier Transitions
+
+```
+                    TTL expiry
+Working ──────────────────────────────► Episodic
+  │         (high-relevance traces)
+  └─ (low-relevance) ──► discarded
+
+                    Consolidation threshold
+Episodic ─────────────────────────────► Semantic
+          (pattern extraction,
+           RAPTOR summarization,
+           community detection)
+
+                    Archive threshold
+Semantic ──────────────────────────────► (archived)
+          (`tier_semantic_archive_threshold`)
+
+Procedural: written directly, NOT consolidated from episodic.
+```
+
+### Working → Episodic
+
+**Trigger:** Working memory TTL expiry (`tier_working_to_episodic_ttl_secs`, default configurable)
+
+**Condition:** Entry importance ≥ episodic admission threshold. Low-importance expired entries
+are discarded.
+
+**Process:**
+1. Background task scans for expired `working` entries
+2. High-importance entries are re-encoded as `EpisodicRecord` via the full write path
+3. Entry is deleted from the `working` dataset
+
+**HirnQL:** Tier promotion is automatic; no explicit query.
+
+### Episodic → Semantic
+
+**Trigger:** One of three paths:
+1. **Interference-driven:** Cumulative interference score in the write path exceeds
+   `interference_consolidation_threshold` (default 0.3). 5-minute cooldown prevents cascades.
+2. **Periodic:** Background task fires every `consolidation_interval_secs` (default 3600).
+3. **Explicit:** `CONSOLIDATE WHERE ...` HirnQL statement.
+
+**Process (Consolidation Pipeline):**
+1. **Segmentation:** Groups recent episodes by temporal proximity and topic
+2. **Community detection:** weighted Louvain-style modularity optimization with a connectivity post-pass (weighted-Louvain fidelity, not a full Leiden refinement) and adaptive resolution (`√(2·total_edge_weight/n)`)
+3. **Narrative clustering:** RAPTOR hierarchical summarization per community
+4. **Causal discovery:** temporal co-occurrence heuristic (labelled `temporal_granger`). Note: a true lagged-predictability Granger test, LLM validation, and Bayesian accumulation are **roadmap**, not yet wired into the pipeline.
+5. **Semantic upsert + memory evolution:** Results written to the `semantic` dataset; existing records are corroborated (A-MEM evolution); superseded episodes are archived.
+
+> **Contradiction detection and ABA/AGM conflict resolution** run in the engine's imperative
+> paths — admission `ContradictionGate` + `Contradicts` edges on write, `detect_conflicts_for_recall`
+> for `WITH CONFLICTS`, and `hirn_engine::resolve_aba` + `CausalView::apply_aba_resolution` for
+> reconsolidation. (The former `NliContradictionExec`/`AbaReconsolidationExec` operators were never
+> emitted into a compiled plan and have been retired.)
+
+### Semantic → Archived
+
+**Trigger:** Semantic record importance/retention falls below `tier_semantic_archive_threshold`
+(configurable; default `0.1`). Retention is the Ebbinghaus `R = exp(−h/S)` curve, so a record that
+has not been retrieved for a long time decays toward the threshold on its own. (There is no separate
+`tier_semantic_archive_after_days` knob — recency enters through `R`.)
+
+---
+
+## RPE: Reward Prediction Error — The Admission Gate
+
+**Neuroscience basis:** The dopaminergic system signals **surprise** (RPE = actual outcome −
+predicted outcome). Novel stimuli (high RPE) trigger deeper encoding; familiar stimuli (low RPE)
+pass through lightweight encoding. This is the biological basis for why you remember surprising
+events better than routine ones (von Restorff effect).
+
+**Hirn implementation:**
+
+RPE is computed per write via `compute_rpe()`:
+
+```
+1. Embed incoming content → query vector
+2. Search episodic + semantic + procedural datasets for nearest neighbors
+3. max_similarity = max cosine similarity across all search results
+4. distance = 1.0 − max_similarity
+5. z_score = (distance − μ) / σ   [Welford online, per partition key]
+6. RPE = distance × (1 + z_score)   [clamped to 0..=2]
+```
+
+**Partition key:** realm × namespace × embedding model — z-score baselines are not mixed across
+namespaces or model versions.
+
+**Fast path (RPE < `rpe_fast_path_threshold`, default 0.3):**
+- Importance heuristic: `0.3 + 0.2 × rpe_score`
+- Skip prospective indexing
+- Skip SVO extraction
+- Low enrichment cost
+
+**Slow path (RPE ≥ threshold):**
+- Full pipeline: prospective indexing (Kumiho templates), SVO extraction (Chronos), interference tracking
+- Full enrichment cost
+
+**Configuration:**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `rpe_enabled` | `false` | Enable RPE routing (false = always slow path) |
+| `rpe_fast_path_threshold` | `0.3` | RPE below this → fast path |
+| `rpe_similarity_search_limit` | `5` | Neighbors to consider per dataset |
+
+{% note() %}
+**Design rationale — why gate on surprise?** Encoding every write with the full pipeline (prospective
+indexing, SVO extraction, interference tracking) is expensive, and most agent writes are routine
+restatements of things already known. The dopaminergic system solves the same problem in the brain:
+novel stimuli that violate prediction (high RPE) trigger deep encoding, while familiar stimuli pass
+through cheaply. This is why surprising events are remembered better than routine ones — the von
+Restorff isolation effect (1933). RPE routing gives hirn the same "spend attention where it is
+warranted" economics. The z-score term makes novelty *relative* to a per-partition baseline, so a
+namespace full of similar content still surfaces its own outliers.
+{% end %}
+
+
+{% important() %}
+`rpe_enabled` defaults to `false`, meaning every write takes the slow path unless you opt in.
+Enable it when write throughput matters and your workload is dominated by low-novelty content.
+{% end %}
+
+
+---
+
+## Temporal State: What Ages and What Does Not
+
+Human memory does not treat every fact as equally perishable. "I live in Berlin" and "I
+had coffee on Tuesday" are both memories, but only one of them becomes less true as it
+ages. hirn models that difference explicitly, because a ranker that decays everything
+uniformly will eventually rank a recent irrelevant note above the correct answer.
+
+Every memory carries a **temporal envelope** ([`TemporalEnvelope`]) established at write
+time, distinct from both its ingestion timestamp and its belief-validity interval:
+
+| Field | Question it answers |
+|---|---|
+| `event_time` | When did the thing happen? (not: when did we record it) |
+| `precision` | How tightly does the source actually pin that — instant, day, month, year, or unknown? |
+| `state` | Is it ongoing, completed, planned, or timeless? |
+
+### Why precision is a separate field
+
+"I moved in March" parses to midnight on 1 March. That instant is an artefact of parsing,
+not a fact from the text. Without a precision field, proximity ranking treats it as though
+the source named a specific second, and a correct month-granular memory loses to a wrong
+one that happens to carry an exact timestamp.
+
+With precision, proximity is **flat inside the window**: a memory dated "March" is exactly
+as close to 3 March as to 20 March, and only decays outside it. A coarser precision is
+therefore more forgiving, which is the honest treatment of a vaguer source.
+
+### Why state changes ranking
+
+`TemporalState::decays_with_age()` is the rule:
+
+| State | Decays? | Rationale |
+|---|---|---|
+| `Timeless` | **No** | "My birthday is 14 March" is not less true two years on. |
+| `Ongoing` | **No** | "I live in Berlin" holds until something supersedes it. |
+| `Completed` | Yes | A finished event genuinely recedes. |
+| `Planned` | Yes | An intention ages toward irrelevance or fulfilment. |
+| `Unknown` | Yes | The conservative default — an unclassified memory ranks exactly as it did before this axis existed. |
+
+That last row matters for trust in the change: a corpus ingested without temporal
+extraction scores **bit-identically** to the pre-envelope engine, so enabling extraction
+is the only thing that alters ranking. A unit test pins that equivalence.
+
+### Not the same axis as `MemoryType`
+
+`MemoryType` (stable-fact / episodic-event / behavioral-rule / preference) encodes
+**authority** — which memory wins a conflict. `TemporalState` encodes **time-validity** —
+whether a memory is still current. Retrieval needs both, and they are genuinely
+independent: a preference can be ongoing or superseded, a stable fact can be timeless or
+historical.
+
+## Symbolic Temporal Arithmetic
+
+hirn's temporal calculus exists so an LLM never has to do date arithmetic — its
+documented failure mode. Measurement showed the loop was open: on LongMemEval's
+temporal-reasoning slice hirn *retrieved* the right evidence 77.5% of the time but
+answered correctly only 39.9% of the time. A 37-point gap that ranking cannot close,
+because the questions are arithmetic:
+
+- **Ordering** — "which did I attend first, the workshop or the webinar?"
+- **Duration** — "how many days between the mass and the service?"
+
+The dates live in the conversation text ("I attended it on January 10th"), not in record
+metadata, and a year-less expression needs an anchor.
+
+[`temporal_ledger`] closes the loop. Given retrieved excerpts, each paired with the time it
+was recorded, it:
+
+1. scans for date expressions — ISO, `Month D[, YYYY]`, and relative phrases;
+2. resolves each against the **excerpt's own recorded time**, so a 2023 conversation does
+   not resolve "January 10th" into the current year, and "today" in a February 1st session
+   is a different day from "today" in a February 8th one;
+3. sorts them, deduplicates a date restated across turns into one event, and
+4. computes the intervals.
+
+Step 2 is load-bearing and easy to get wrong. Anchoring every excerpt to a single reference
+— the question's date, say — is superficially reasonable and quietly catastrophic: relative
+expressions written weeks apart collapse onto one instant, and the ledger then publishes
+`0 day(s)` into a block the reader has been told is exact. Measured on LongMemEval, shared
+anchoring left only 27.6% of duration questions with the gold interval anywhere in their
+ledger; per-excerpt anchoring raised that to 69.0%. **A confident wrong interval is worse
+than no ledger at all**, which is why the anchoring rule is stated here rather than left as
+an implementation detail.
+
+The result is handed to the reader as an authoritative block it is told **not to
+recompute**:
+
+```text
+Computed temporal ledger (dates resolved and intervals calculated exactly;
+use these values directly and do not recompute them):
+- 2023-01-10 (Tue) [day] — I attended a workshop on Effective Communication on January 10th
+- 2023-01-17 (Tue) [day] — my team meeting is on January 17th to practice those skills
+Intervals between consecutive dates:
+- 2023-01-10 (Tue) → 2023-01-17 (Tue): 7 day(s)
+```
+
+The division of labour is deliberate: **hirn supplies exact dates and exact intervals;
+the model decides which entries the question meant.** Deciding that is a semantic match
+models are good at; subtracting dates is not. The ledger renders empty below two dated
+events, so a non-temporal question spends no tokens on it.
+
+### What the ledger deliberately refuses
+
+A block the reader is told to trust must not contain plausible-looking nonsense, so three
+rules bound what enters it — each added after the pattern was observed in real
+conversation data:
+
+- **A bare month name is not a date.** English month names collide with ordinary
+  vocabulary: "you *may* find", "we will *march* through the agenda". A month counts only
+  when a day number or 4-digit year corroborates it.
+- **Implausible years are rejected** (outside 1900–2200), so a parser artefact cannot
+  contribute an interval of several hundred thousand days.
+- **Dates beyond a 25-year personal horizon are excluded.** "The attack on December 7,
+  1941" in a travel recommendation parses *correctly* but is content, not a memory. This
+  one is a heuristic with a real cost — a genuinely ancient personal date is dropped too —
+  taken because historical references demonstrably appear in retrieved text and ancient
+  personal dates demonstrably do not appear in interval questions.
+- **An interval never claims more precision than its endpoints.** "March 2021" pins a
+  month, so a duration touching it is uncertain by up to that month's length. Such intervals
+  render as `~N day(s) (approximate: ±31 days, one endpoint is only month-precise)` rather
+  than as a bare day count. Day-precise pairs are reported exactly and unhedged.
+
+For ledgers of six events or fewer, **every pair** gets an interval rather than only
+consecutive ones, so "how many days between X and Y" never requires the model to sum
+gaps. There is no earliest-to-latest summary: across two unrelated events it would present
+a meaningless figure with the same authority as a real interval.
+
+## Preferences: Current State vs History
+
+**Neuroscience basis:** Preferences are not stored as a list of everything you ever liked.
+Updating a preference *replaces* the accessible value while leaving the episodic trace of
+having believed otherwise — you know you prefer window seats now, and separately remember
+that you used to ask for the aisle.
+
+**Hirn implementation.** A stated preference is stored as typed `PreferenceEvidence`
+(owner, polarity, target, qualifiers, observation time). Two rules turn a pile of
+observations into an answerable current state:
+
+**1. Targets are normalized before comparison.** `normalize_preference_target` collapses
+case, separators, surrounding punctuation, and a leading article, so "Dark Mode",
+"dark-mode", and "the dark_mode" are one preference rather than three. Stored verbatim they
+never line up, so a later contradiction cannot supersede what it contradicts and both
+survive into the answer.
+
+Normalization stops there deliberately — no stemming, no synonym table. Merging two
+genuinely different targets silently corrupts an answer; leaving two spellings apart is
+merely a miss. The asymmetry decides the design.
+
+**2. Recency resolves contradictions.** `current_preferences` groups observations by owner
+and normalized target and returns the most recent one plus the observations it superseded.
+Recency is the only signal comparable across extractions — confidence and specificity are
+not — and a stated change of mind is exactly what should win. Equal timestamps keep the
+first observation seen, so the result never depends on retrieval order.
+
+Supersession is a property of the **whole retrieved set**, so context assembly resolves it
+in a cross-candidate pass; deciding it while rendering one candidate at a time is not
+possible. A replaced observation is **marked, not dropped**:
+
+```text
+[Preference evidence: owner=u; polarity=positive; target=aisle seats;
+ observed_at=…; status=SUPERSEDED by a later statement at … — do not present
+ this as the current preference]
+```
+
+Keeping it matters: "what did I used to prefer?" is a legitimate question, and deleting the
+history makes it unanswerable. Only the current entry may be presented as what the user
+prefers now.
+
+## Spreading Activation
+
+**Neuroscience basis:** The associative cortex spreads activation from an input concept to
+semantically related concepts via Hebbian-strengthened synaptic pathways. This is how priming
+works: hearing "nurse" activates "hospital", "doctor", "medicine" without explicit retrieval.
+
+**Hirn implementation:**
+
+Spreading activation usually runs on the **hot-tier PropertyGraph** (in-memory petgraph, sub-ms);
+deep queries (`max_depth` above the delegation threshold) run on the **cold-tier PersistentGraph**
+via batched Lance scans. Both tiers execute the identical algorithm — the math lives once in
+`hirn_graph::activation_core` (spreading, static expansion, Jaccard-modulated inhibition, PPR with
+forward+backward reachability, frontier cap, deterministic score/`MemoryId` ordering), and each
+tier only supplies pre-fetched adjacency.
+
+```
+1. Seed nodes: memory IDs returned by LanceHybridSearchExec
+2. Per depth level:
+   a. For each frontier node, follow outgoing edges (weighted)
+   b. Propagate activation: A[child] += A[parent] × decay_factor × edge_weight
+   c. Apply SYNAPSE lateral inhibition:
+         inhibition = inhibition_strength × (1 − Jaccard_similarity(neighbors_j, neighbors_k))
+      (competing nodes suppress each other; related nodes are spared)
+   d. Prune nodes below convergence_threshold
+   e. Cap frontier at max_frontier_size
+3. Return top-scored activated nodes
+```
+
+As a control-flow diagram, one propagation level looks like this:
+
+```mermaid
+flowchart TB
+  seed["Seed nodes<br/>(LanceHybridSearchExec hits)"] --> front["Frontier at depth d"]
+  front --> prop["Propagate:<br/>A[child] += A[parent] × decay × edge_weight"]
+  prop --> inh["SYNAPSE lateral inhibition<br/>competing nodes suppress each other"]
+  inh --> prune["Prune below convergence_threshold"]
+  prune --> cap["Cap frontier at max_frontier_size"]
+  cap -->|"depth < max_depth"| front
+  cap -->|"converged / max depth"| out["Top-scored activated nodes"]
+  classDef s fill:#1a1b26,stroke:#7c9cff,color:#e6e8f0;
+  class seed,front,prop,inh,prune,cap,out s;
+```
+
+{% note() %}
+**Design rationale — why inhibition?** Pure additive spreading activation has a failure mode:
+a densely connected hub node accumulates activation from every path and drowns out specific,
+relevant memories. Lateral inhibition, modelled on cortical inhibitory interneurons (Douglas &
+Martin, 2004), makes topically *dissimilar* competitors suppress each other while sparing genuinely
+related nodes — the Jaccard term measures shared neighbourhoods, so only true competitors are
+penalised. This is the SYNAPSE mechanism.
+{% end %}
+
+
+**Activation modes (settable via `EXPAND GRAPH DEPTH n ACTIVATION mode`):**
+
+| Mode | Description |
+|------|-------------|
+| `spreading` | Full spreading activation (default) |
+| `ppr` | Personalized PageRank — globally re-ranks all nodes relative to seed |
+| `pagerank` | Global PageRank — ignores seeds |
+| `static` | No decay — uniform propagation |
+| `none` | Disable graph expansion entirely |
+
+**Deep traversal (depth > `graph_depth_delegation_threshold`, default 5):**
+Hot-tier DFS is used for shallow depths. Deeper traversals delegate to `PersistentGraph::deep_causal_bfs()`
+which performs batched BFS against the Lance `graph_nodes` + `graph_edges` cold-tier datasets.
+
+**Configuration:**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `activation_decay_factor` | `0.7` | Per-hop decay multiplier |
+| `activation_max_depth` | `3` | Maximum propagation depth |
+| `activation_convergence_threshold` | `0.01` | Prune nodes below this activation score |
+| `activation_max_iterations` | `10` | Maximum propagation iterations |
+| `inhibition_strength` | `0.1` | SYNAPSE lateral inhibition strength |
+| `activation_max_frontier_size` | `10000` | Safety cap on fan-out per depth level |
+
+---
+
+## Hebbian Learning
+
+**Neuroscience basis:** "Cells that fire together wire together" (Hebb, 1949). Synaptic connections
+between neurons that co-activate are strengthened. This is the biological basis for associative
+memory — retrieving item A makes item B more accessible because they were previously retrieved
+together.
+
+**Hirn implementation:**
+
+Hebbian learning operates via `HebbianBufferExec`:
+
+1. Every `RECALL` or `THINK` records all co-retrieved memory pairs to the `HebbianBuffer` (lock-free `crossbeam::SegQueue`)
+2. On buffer flush (threshold-triggered or explicit `close()`):
+   - Co-retrieved pairs with an **existing** associative edge (`SimilarTo` / `RelatedTo`): **edge weight increased** (bounded, clamped to `1.0`)
+   - Hebbian learning **only strengthens/decays existing edges; it does not create new edges.** (There is no `CoActivated` relation; a dedicated associative relation created on co-retrieval is a roadmap item.)
+3. Weights decay over time via FadeMem (see below)
+
+**FadeMem adaptive decay (replaces static temporal decay):**
+
+```
+rate = base_rate × (1 / (1 + importance)) × (1 / (1 + access_frequency))
+```
+
+High-importance, frequently-accessed memories decay slower. Working memory uses TTL eviction, not FadeMem.
+
+**Configuration:**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `hebbian_learning_rate` | `0.1` | Weight increase per co-retrieval (α) |
+| `hebbian_decay_rate` | `0.05` | Per-cycle weight decay for unused edges |
+
+The recall-buffer flush threshold is a fixed constant (every **16** recall operations,
+`DEFAULT_FLUSH_THRESHOLD` in `hirn-graph`), not a configurable knob.
+
+---
+
+## The Recall Pipeline
+
+A `RECALL` or `THINK` query compiles to a DataFusion `LogicalPlan` and executes through these
+composed physical operators:
+
+```
+[QueryComplexity]     → classify Simple/Medium/Complex
+       │
+LanceHybridSearch     → dense (ANN) + sparse (FTS) search over Lance datasets
+       │
+[GraphActivation]     → spread activation from seed nodes (hot-tier PropertyGraph)
+       │
+[CausalChain]         → traverse causal edges (Pearl rung 1)
+       │
+[IterativeRetrieval]  → multi-hop: retrieve → reformulate → retrieve (THINK only)
+       │
+[QualityGate]         → 4-dim score: coverage × confidence × coherence × sufficiency
+       │                 escalate depth if below threshold
+HebbianBuffer         → record co-retrieved pairs for future weight updates
+       │
+[ContextBudget]       → token-budget enforcement (greedy score/token ratio)
+```
+
+Brackets indicate conditionally-emitted operators (based on HirnQL clauses and query depth).
+
+### Depth Scheduling
+
+`DEPTH AUTO` (default) classifies query complexity and selects pipeline depth:
+
+| Complexity | Criteria | Pipeline |
+|------------|----------|---------|
+| `Simple` | Low token count, no temporal keywords, few entities | LanceHybridSearch → HebbianBuffer → ContextBudget |
+| `Medium` | Moderate complexity, some graph-adjacent content | + GraphActivation |
+| `Complex` | High token count, temporal reasoning, many entities, iterative needed | Full pipeline with QualityGate + IterativeRetrieval |
+
+`DEPTH FULL` forces the full pipeline. `DEPTH SUMMARY` skips graph activation.
+
+**Auto-escalation:** If quality score < threshold after retrieval and depth < Complex, the query is
+re-run at the next depth level (maximum 1 escalation per query). Metric: `hirn_quality_gate_escalations_total`.
+
+---
+
+## Causal Reasoning: Pearl's Three-Rung Hierarchy
+
+Hirn implements the full three-rung causal hierarchy (Pearl, 2018):
+
+| Rung | Question | HirnQL | Operator |
+|------|----------|--------|---------|
+| 1 — Association | "What causes X?" | `EXPLAIN CAUSES "X"` | `CausalChainExec` + `CausalQueryReadExec` |
+| 2 — Intervention | "What if we do Y?" | `WHAT_IF "Y" THEN "Z"` | `CausalQueryReadExec` (intervention mode) |
+| 3 — Counterfactual | "Would X have happened if not Y?" | `COUNTERFACTUAL "X" THEN "Y"` | `CausalQueryReadExec` (counterfactual mode) |
+
+**Causal edges** on the graph carry: `strength`, `confidence`, `evidence_count`, `confounders`,
+`provenance`, `mechanism`. Relevance score: `strength × confidence × ln(1 + evidence_count)`.
+
+**Causal discovery** during consolidation currently uses a temporal co-occurrence heuristic
+(edges labelled `temporal_granger`); a true Granger lagged-predictability test, LLM validation, and
+Bayesian evidence accumulation are roadmap. **Contradiction detection** runs imperatively (admission
+`ContradictionGate` + `Contradicts` edges on write; `detect_conflicts_for_recall` for `WITH
+CONFLICTS`), and **ABA/AGM conflict resolution** is a decide-then-apply engine capability
+(`hirn_engine::resolve_aba` → `CausalView::apply_aba_resolution`) — the former
+`NliContradictionExec`/`AbaReconsolidationExec` operators were never emitted into a plan and have
+been retired.
+
+---
+
+## Beliefs & Reflection
+
+Semantic records distinguish two epistemic classes. Most knowledge types
+(`Propositional`, `Taxonomic`, …) model *objective world facts*. The `Belief`
+knowledge type models a *subjective opinion with a credence*: the record's
+`confidence` field is interpreted as how strongly the agent currently holds
+the belief, not as extraction quality. This separation follows Hindsight
+(arXiv:2512.12818), which treats belief revision as a first-class memory
+operation rather than a retrieval concern.
+
+```rust
+let belief = SemanticRecord::builder()
+    .concept("postgres-default")
+    .description("Postgres is the right default database for new services")
+    .belief()            // KnowledgeType::Belief
+    .confidence(0.6)     // credence, not extraction confidence
+    .agent_id(agent_id)
+    .build()?;
+```
+
+### The Reflect operation
+
+`Reflect` takes one evidence record (episodic or semantic) and classifies it
+against the top-K nearest beliefs **in the same namespace** (K =
+`reflection_top_k`, default 5). Classification is two-stage:
+
+1. **Similarity gate** (always) — evidence/belief pairs below
+   `reflection_similarity_threshold` (default 0.75 cosine) are `Unrelated`
+   and never touch the belief.
+2. **Judgment** — with an `LlmProvider`, a compact prompt asks for exactly
+   `REINFORCES` / `WEAKENS` / `CONTRADICTS` / `UNRELATED` plus a one-sentence
+   rationale; the response is parsed strictly and anything malformed defaults
+   to `Unrelated`, so a confused model can never mutate a belief. Without an
+   LLM, a heuristic fallback reuses the insert-time contradiction signal
+   (negation-marker mismatch on a same-topic pair → `Contradicts`, otherwise
+   `Reinforces`). The heuristic never emits `Weakens` and misses paraphrase
+   contradictions — it is an availability fallback, not a substitute for
+   semantic judgment.
+
+### Confidence dynamics
+
+| Outcome | Update | Effect |
+|---------|--------|--------|
+| `Reinforces` | `c' = c + 0.15·(1 − c)` | asymptotic approach to the 0.99 ceiling; `evidence_count` +1 |
+| `Weakens` | `c' = c − 0.15·c` | asymptotic approach to the 0.05 floor |
+| `Contradicts` | `c' = c / 2` | Hindsight-style halving, plus a `Contradicts` graph edge and a `contradiction_ids` entry |
+| `Unrelated` | `c' = c` | no revision written |
+
+All results are clamped to `[0.05, 0.99]`: a belief never becomes certain and
+never silently dies — it stays revisable.
+
+### Audit trail
+
+Every adjustment is applied through the semantic revision machinery
+(`correct_semantic`), so each change appends an immutable revision with:
+
+- `revision_operation: Correct` and `version + 1`
+- the classification rationale in `revision_reason`
+- the triggering evidence id in `revision_causation_id`
+- a provenance `Mutation` entry recording old → new confidence
+
+`db.semantic().history(belief_id)` therefore reconstructs the full epistemic
+trajectory of a belief bi-temporally: what the agent believed, when, and which
+evidence moved it.
+
+Reflection runs on demand (`db.semantic().reflect(evidence_id)`,
+`AgentContext::reflect`) or as a budgeted offline sweep
+(`CognitiveJobKind::Reflect`) that processes recent evidence — bounded by the
+job's `temporal_window` cursor — against nearby beliefs. The offline sweep is
+storage-direct and records contradictions in `contradiction_ids` without
+drawing the graph edge; the online entry point does both.
+
+---
+
+## Neuroscience Literature Mapping
+
+| Hirn Concept | Neuroscience Basis | Reference |
+|-------------|-------------------|-----------|
+| Four-tier memory model | Baddeley's working memory model + Squire's taxonomy | Baddeley (1974); Squire (1987) |
+| RPE admission gate | Dopaminergic RPE signal (Schultz et al.) | Schultz, Dayan & Montague (1997) |
+| Spreading activation | Associative cortex spreading activation | Collins & Loftus (1975) |
+| Hebbian learning | Synaptic potentiation | Hebb (1949) |
+| Consolidation pipeline | Hippocampal → cortical memory consolidation | McClelland, McNaughton & O'Reilly (1995) |
+| Reconsolidation window | Memory lability after retrieval | Nader, Schafe & LeDoux (2000) |
+| SYNAPSE lateral inhibition | Cortical inhibitory interneurons | Douglas & Martin (2004) |
+| FadeMem adaptive decay | Ebbinghaus forgetting curve + Bahrick retention | Ebbinghaus (1885); Bahrick (1984) |
+| Causal reasoning | Pearl's do-calculus | Pearl (2009) |
+| RAPTOR consolidation | Hierarchical memory organization | Shu et al. "RAPTOR" (2024) |
+| RPE z-score novelty | von Restorff isolation effect | von Restorff (1933) |
+| Dream cycle hypothesis generation | REM sleep memory consolidation | Stickgold (2005) |
+
+---
+
+## Summary: How the Three Mechanisms Interplay
+
+```
+                    ┌─────────────────────────┐
+  Write             │   RPE ADMISSION GATE     │
+  ──────────────────►  (fast/slow path routing) │
+                    │   novelty-weighted depth  │
+                    └──────────┬──────────────┘
+                               │ slow path
+                               ▼
+                    ┌─────────────────────────┐
+                    │  EPISODIC STORE          │
+                    │  SVO events, prospective │
+                    │  implications, graph     │
+                    │  similarity edges        │
+                    └──────────┬──────────────┘
+                               │ consolidation trigger
+                               ▼
+  Consolidation     ┌─────────────────────────┐
+  ──────────────────►  SPREADING ACTIVATION    │◄──── Query
+                    │  (hot-tier PropertyGraph) │
+                    │  primes related nodes     │
+                    └──────────┬──────────────┘
+                               │ co-retrieval
+                               ▼
+                    ┌─────────────────────────┐
+                    │  HEBBIAN LEARNING        │
+                    │  strengthens edges       │
+                    │  between co-retrieved    │
+                    │  nodes                   │
+                    └─────────────────────────┘
+```
+
+The same loop as a graph — note that spreading activation sits at the intersection of the write
+side (which built the graph) and the read side (which queries it), and Hebbian learning feeds the
+edge weights back:
+
+```mermaid
+flowchart TB
+  write["Write"] --> rpe["RPE admission gate<br/>fast / slow path routing<br/>novelty-weighted depth"]
+  rpe -->|slow path| ep["Episodic store<br/>SVO events · prospective<br/>implications · similarity edges"]
+  ep -->|consolidation trigger| act
+  query["Query"] --> act["Spreading activation<br/>(hot-tier PropertyGraph)<br/>primes related nodes"]
+  act -->|co-retrieval| heb["Hebbian learning<br/>strengthens edges between<br/>co-retrieved nodes"]
+  heb -.->|"edge weights feed back"| act
+  classDef s fill:#1a1b26,stroke:#7c9cff,color:#e6e8f0;
+  class write,rpe,ep,query,act,heb s;
+```
+
+1. **RPE** controls _which_ memories get rich structure at write time.
+2. **Spreading activation** controls _which_ memories surface at query time.
+3. **Hebbian learning** ensures that memories retrieved together become easier to retrieve together in the future.
+
+Together these three mechanisms implement **use-dependent memory**: memories that are written
+with surprise, retrieved frequently, and retrieved together become the most accessible — exactly
+the pattern observed in human long-term memory.

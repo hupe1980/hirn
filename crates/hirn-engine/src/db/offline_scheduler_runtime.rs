@@ -39,10 +39,13 @@ use parking_lot::Mutex;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
+use hirn_core::config::NluConfig;
+use hirn_core::nlu::{NliModel, TextClassifier};
+use hirn_provider::{HybridClassifier, LlmNli, LlmTextClassifier};
+
 use crate::consolidation::{
-    DreamCycleConfig, ReflectionOutcome, apply_reflection_outcome, build_reflection_prompt,
-    generate_text_with_timeout, heuristic_reflection_outcome, parse_reflection_response,
-    reflection_cosine_similarity,
+    DreamCycleConfig, ReflectionOutcome, apply_reflection_outcome, classify_reflection,
+    generate_text_with_timeout, reflection_cosine_similarity, reflection_prompt_messages,
 };
 use crate::provider_registry::ProviderRegistry;
 use crate::ql::context::{
@@ -950,6 +953,14 @@ impl Drop for OfflineSchedulerRuntime {
 struct DefaultOfflineJobExecutor {
     storage: Arc<dyn PhysicalStore>,
     llm: Arc<dyn LlmProvider>,
+    /// Classification chain for belief-revision decisions, built from the same
+    /// provider the sweep generates with. Falls back to the deterministic
+    /// reflection floor when no real provider is registered.
+    classifier: Arc<HybridClassifier>,
+    /// Entailment reviewer for contradiction verdicts, when available.
+    nli: Option<Arc<dyn NliModel>>,
+    /// Confidence a contradiction verdict must clear before it halves credence.
+    contradiction_min_confidence: f32,
     default_realm: String,
     dream_config: DreamCycleConfig,
     conflict_resolution_policy: ConflictResolutionPolicy,
@@ -985,12 +996,34 @@ impl DefaultOfflineJobExecutor {
         embedding_dimensions: usize,
     ) -> Self {
         let registry = ProviderRegistry::from_env();
-        let llm = registry
-            .llm()
+        let configured_llm = registry.llm();
+        let llm = configured_llm
+            .clone()
             .unwrap_or_else(|| Arc::new(hirn_provider::MockLlmProvider::new("mock")));
+
+        // Only a *real* provider joins the classification chain: the mock
+        // stand-in would otherwise look like a model-backed decision in the
+        // metrics while producing nothing.
+        let nlu = NluConfig::default();
+        let mut classifier = HybridClassifier::new().with_budget(nlu.budget);
+        if let Some(provider) = configured_llm {
+            classifier = classifier.with_backend(Arc::new(
+                LlmTextClassifier::new(provider).with_calibration(nlu.llm_calibration),
+            ));
+        }
+        let classifier = Arc::new(classifier);
+        let nli: Option<Arc<dyn NliModel>> = classifier.is_model_backed().then(|| {
+            Arc::new(LlmNli::new(
+                Arc::clone(&classifier) as Arc<dyn TextClassifier>
+            )) as Arc<dyn NliModel>
+        });
+
         Self {
             storage,
             llm,
+            classifier,
+            nli,
+            contradiction_min_confidence: nlu.contradiction_min_confidence,
             default_realm,
             dream_config: DreamCycleConfig::default(),
             conflict_resolution_policy,
@@ -1891,52 +1924,48 @@ impl DefaultOfflineJobExecutor {
         Ok(evidence)
     }
 
-    /// Two-stage classification for the offline sweep, mirroring the online
-    /// path: LLM judgment (strictly parsed, `Unrelated` on parse failure)
-    /// with a heuristic fallback when the provider returns nothing — the
-    /// default scheduler wiring runs with a mock provider unless a real one
-    /// is configured via the environment.
+    /// Classify one belief/evidence pair for the offline sweep, using the same
+    /// [`classify_reflection`] contract as the online path — including the
+    /// contradiction confidence bar and entailment review.
     ///
-    /// Returns `(outcome, rationale, used_fallback, estimated_tokens)`.
+    /// The caller has already applied the similarity gate, so this passes a
+    /// satisfied gate rather than re-deriving one.
+    ///
+    /// Returns `(outcome, rationale, used_fallback, estimated_tokens)`. Tokens
+    /// are estimated from the prompt the classifier would build plus the
+    /// returned rationale; the offline budget only needs an upper-bound-ish
+    /// figure, and a fallback decision spends none.
     async fn classify_reflection_outcome(
         &self,
         belief: &SemanticRecord,
         evidence_text: &str,
     ) -> (ReflectionOutcome, String, bool, u32) {
-        let tokenizer = EstimatingTokenizer;
-        let prompt = build_reflection_prompt(belief, evidence_text);
-        let prompt_tokens = estimate_messages_tokens(&tokenizer, &prompt);
-
-        let response = generate_text_with_timeout(
-            self.llm.as_ref(),
-            &prompt,
-            &LlmOptions {
-                temperature: 0.0,
-                max_tokens: 120,
-                ..Default::default()
-            },
-            self.dream_config.consolidation_config.llm_timeout,
+        let decision = classify_reflection(
+            &self.classifier,
+            self.nli.as_deref(),
+            belief,
+            evidence_text,
+            1.0,
+            0.0,
+            self.contradiction_min_confidence,
         )
-        .await
-        .unwrap_or_default();
+        .await;
 
-        let trimmed = response.trim();
-        if trimmed.is_empty() {
-            let (outcome, rationale) =
-                heuristic_reflection_outcome(&belief.description, evidence_text);
-            return (outcome, rationale, true, prompt_tokens);
-        }
+        let used_fallback = !decision.source.is_model_backed();
+        let tokens = if used_fallback {
+            0
+        } else {
+            let tokenizer = EstimatingTokenizer;
+            let messages = reflection_prompt_messages(
+                belief,
+                evidence_text,
+                self.classifier.budget().max_input_chars,
+            );
+            estimate_messages_tokens(&tokenizer, &messages)
+                .saturating_add(tokenizer.count_tokens(&decision.rationale) as u32)
+        };
 
-        let total_tokens = prompt_tokens.saturating_add(tokenizer.count_tokens(trimmed) as u32);
-        match parse_reflection_response(trimmed) {
-            Some((outcome, rationale)) => (outcome, rationale, false, total_tokens),
-            None => (
-                ReflectionOutcome::Unrelated,
-                "llm response did not match the expected label format".to_string(),
-                false,
-                total_tokens,
-            ),
-        }
+        (decision.outcome, decision.rationale, used_fallback, tokens)
     }
 
     async fn load_dream_candidates(
@@ -2167,8 +2196,9 @@ impl DefaultOfflineJobExecutor {
         // `importance` is only present on the episodic dataset.
         // Semantic memories use `confidence` (managed separately); we only
         // decay episodic records here.
+        // Pinned records are never decayed by the automated sweep.
         let ep_filter = format!(
-            "last_accessed_ms < {cutoff_ms} AND importance > 0.0{ns_suffix}",
+            "last_accessed_ms < {cutoff_ms} AND importance > 0.0 AND pinned = false{ns_suffix}",
             cutoff_ms = cutoff_ms,
             ns_suffix = ns_clause.as_deref().unwrap_or(""),
         );

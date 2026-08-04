@@ -15,7 +15,7 @@ use hirn_core::provenance::Provenance;
 use hirn_core::revision::{LogicalMemoryId, RevisionId, RevisionOperation};
 use hirn_core::semantic::{ConceptEdge, SemanticRecord};
 use hirn_core::timestamp::Timestamp;
-use hirn_core::types::{KnowledgeType, Namespace};
+use hirn_core::types::{KnowledgeType, MemoryType, Namespace};
 
 use crate::HirnDbError;
 
@@ -50,6 +50,8 @@ pub const RECALL_HYDRATION_COLUMNS: &[&str] = &[
     "revision_operation",
     "revision_reason",
     "revision_causation_id",
+    "functional_role",
+    "pinned",
 ];
 
 /// Create scalar indices used by revision-head lookups.
@@ -120,6 +122,8 @@ pub fn schema(embedding_dims: usize) -> SchemaRef {
         Field::new("revision_operation", DataType::Utf8, false),
         Field::new("revision_reason", DataType::Utf8, true),
         Field::new("revision_causation_id", DataType::Utf8, true),
+        Field::new("functional_role", DataType::Utf8, true),
+        Field::new("pinned", DataType::Boolean, true),
     ]))
 }
 
@@ -157,6 +161,8 @@ pub fn to_batch(
     let mut revision_operations = Vec::with_capacity(n);
     let mut revision_reasons: Vec<Option<&str>> = Vec::with_capacity(n);
     let mut revision_causation_ids: Vec<Option<String>> = Vec::with_capacity(n);
+    let mut functional_roles: Vec<&str> = Vec::with_capacity(n);
+    let mut pinned_values: Vec<Option<bool>> = Vec::with_capacity(n);
     let mut embeddings: Vec<Option<Vec<f32>>> = Vec::with_capacity(n);
 
     for r in records {
@@ -198,6 +204,8 @@ pub fn to_batch(
         revision_operations.push(revision_operation_to_str(r.revision_operation));
         revision_reasons.push(r.revision_reason.as_deref());
         revision_causation_ids.push(r.revision_causation_id.map(|id| id.to_string()));
+        functional_roles.push(functional_role_to_str(r.functional_role));
+        pinned_values.push(Some(r.pinned));
         embeddings.push(r.embedding.clone());
     }
 
@@ -250,6 +258,8 @@ pub fn to_batch(
             Arc::new(StringArray::from(revision_operations)),
             Arc::new(StringArray::from(revision_reasons)),
             Arc::new(StringArray::from(revision_causation_refs)),
+            Arc::new(StringArray::from(functional_roles)),
+            Arc::new(BooleanArray::from(pinned_values)),
         ],
     )
     .map_err(|e| HirnDbError::InvalidArgument(e.to_string()))
@@ -288,6 +298,16 @@ pub fn from_batch(batch: &RecordBatch) -> Result<Vec<SemanticRecord>, HirnDbErro
     let operation_col = col_str(batch, "revision_operation")?;
     let reason_col = col_str(batch, "revision_reason")?;
     let causation_col = col_str(batch, "revision_causation_id")?;
+
+    // functional_role may be absent in older datasets (nullable column).
+    let functional_role_col = batch
+        .column_by_name("functional_role")
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+
+    // pinned may be absent in older datasets (nullable column); default to false.
+    let pinned_col = batch
+        .column_by_name("pinned")
+        .and_then(|c| c.as_any().downcast_ref::<BooleanArray>());
 
     // embedding may be absent when using recall-hydration column projection.
     let fsl = batch
@@ -378,6 +398,10 @@ pub fn from_batch(batch: &RecordBatch) -> Result<Vec<SemanticRecord>, HirnDbErro
             revision_id,
             concept: concept_col.value(i).to_string(),
             knowledge_type: str_to_knowledge_type(kt_col.value(i))?,
+            functional_role: match functional_role_col {
+                Some(col) if !col.is_null(i) => str_to_memory_type(col.value(i)),
+                _ => MemoryType::default(),
+            },
             description: desc_col.value(i).to_string(),
             embedding,
             related_concepts,
@@ -400,6 +424,7 @@ pub fn from_batch(batch: &RecordBatch) -> Result<Vec<SemanticRecord>, HirnDbErro
             superseded_by,
             merged_into,
             archived: arch_col.value(i),
+            pinned: pinned_col.map(|c| c.value(i)).unwrap_or(false),
         });
     }
 
@@ -432,6 +457,25 @@ fn str_to_knowledge_type(s: &str) -> Result<KnowledgeType, HirnDbError> {
         _ => Err(HirnDbError::InvalidArgument(format!(
             "unknown knowledge type: {s}"
         ))),
+    }
+}
+
+const fn functional_role_to_str(role: MemoryType) -> &'static str {
+    match role {
+        MemoryType::StableFact => "stable_fact",
+        MemoryType::EpisodicEvent => "episodic_event",
+        MemoryType::BehavioralRule => "behavioral_rule",
+        MemoryType::Preference => "preference",
+    }
+}
+
+fn str_to_memory_type(s: &str) -> MemoryType {
+    match s {
+        "stable_fact" => MemoryType::StableFact,
+        "episodic_event" => MemoryType::EpisodicEvent,
+        "behavioral_rule" => MemoryType::BehavioralRule,
+        "preference" => MemoryType::Preference,
+        _ => MemoryType::default(),
     }
 }
 
@@ -545,6 +589,7 @@ mod tests {
             revision_id: RevisionId::from_memory_id(id),
             concept: concept.into(),
             knowledge_type: KnowledgeType::Propositional,
+            functional_role: MemoryType::StableFact,
             description: format!("{concept} is important"),
             embedding: if with_embedding {
                 Some(vec![1.0, 2.0, 3.0, 4.0])
@@ -575,13 +620,16 @@ mod tests {
             superseded_by: None,
             merged_into: None,
             archived: false,
+            pinned: false,
         }
     }
 
     #[test]
     fn schema_field_count() {
         let s = schema(128);
-        assert_eq!(s.fields().len(), 27);
+        assert_eq!(s.fields().len(), 29);
+        assert!(s.field_with_name("functional_role").is_ok());
+        assert!(s.field_with_name("pinned").is_ok());
         assert!(s.field_with_name("logical_memory_id").is_ok());
         assert!(s.field_with_name("revision_id").is_ok());
         assert!(s.field_with_name("revision_operation").is_ok());

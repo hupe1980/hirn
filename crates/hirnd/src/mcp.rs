@@ -53,6 +53,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::auth::{
     AuthState, BearerIdentity, Operation, token_allows_namespace, token_allows_operation,
+    token_namespace_scope,
 };
 use crate::realm::RealmManager;
 use crate::throttle::{RateLimitClass, RateLimiter};
@@ -79,6 +80,36 @@ struct Caller {
     identity: BearerIdentity,
     agent_id: AgentId,
     db: Arc<HirnDB>,
+}
+
+fn redact_internal_error(error: impl std::fmt::Display) -> McpError {
+    tracing::error!(error = %error, "MCP request failed internally");
+    McpError::internal_error("internal server error", None)
+}
+
+/// Map an engine error onto the closest MCP error class.
+///
+/// Authorization and lookup failures are *caller* errors: reporting them as
+/// `internal_error` (-32603) tells the client the server broke when in fact the
+/// request was refused, and it erases the one detail the caller can act on. A
+/// namespace denial in particular is a normal, expected outcome of cross-agent
+/// isolation, not a fault.
+///
+/// Only these two variants are surfaced, and only because their message is
+/// built from identifiers the caller already supplied (the namespace it asked
+/// for, the id it passed). Everything else is redacted — including
+/// `InvalidInput`, which looks caller-facing but is also what a non-transient
+/// provider failure converts into, carrying provider status and response body.
+fn map_engine_error(error: hirn_core::HirnError) -> McpError {
+    match &error {
+        hirn_core::HirnError::AccessDenied(message) => {
+            McpError::invalid_params(format!("access denied: {message}"), None)
+        }
+        hirn_core::HirnError::NotFound(message) => {
+            McpError::invalid_params(format!("not found: {message}"), None)
+        }
+        _ => redact_internal_error(error),
+    }
 }
 
 impl HirnMcpService {
@@ -140,9 +171,11 @@ impl HirnMcpService {
                 None,
             )
         })?;
-        let db = self.realms.get(&identity.realm).await.map_err(|e| {
-            McpError::internal_error(format!("failed to open realm database: {e}"), None)
-        })?;
+        let db = self
+            .realms
+            .get(&identity.realm)
+            .await
+            .map_err(redact_internal_error)?;
 
         Ok(Caller {
             identity,
@@ -209,6 +242,33 @@ impl HirnMcpService {
         Ok(())
     }
 
+    async fn agent_context_for_caller<'a>(
+        &self,
+        caller: &'a Caller,
+    ) -> Result<hirn_engine::AgentContext<'a>, McpError> {
+        caller
+            .db
+            .ensure_agent(&caller.agent_id)
+            .await
+            .map_err(redact_internal_error)?;
+        match &caller.identity.namespaces {
+            Some(namespaces) => {
+                let namespaces = token_namespace_scope(&caller.agent_id, namespaces)
+                    .map_err(|error| McpError::invalid_params(error, None))?;
+                caller
+                    .db
+                    .as_agent_with_namespaces(&caller.agent_id, &namespaces)
+                    .await
+                    .map_err(redact_internal_error)
+            }
+            None => caller
+                .db
+                .as_agent(&caller.agent_id)
+                .await
+                .map_err(redact_internal_error),
+        }
+    }
+
     /// Execute a HirnQL statement under the caller's authority.
     ///
     /// Token-restricted identities run scoped to their agent's accessible
@@ -224,27 +284,18 @@ impl HirnMcpService {
     ) -> Result<QueryResult, McpError> {
         match &caller.identity.namespaces {
             Some(_) => {
-                caller
-                    .db
-                    .ensure_agent(&caller.agent_id)
-                    .await
-                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-                let agent_ctx = caller
-                    .db
-                    .as_agent(&caller.agent_id)
-                    .await
-                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                let agent_ctx = self.agent_context_for_caller(caller).await?;
                 agent_ctx
                     .execute_ql(query)
                     .await
-                    .map_err(|e| McpError::internal_error(e.to_string(), None))
+                    .map_err(redact_internal_error)
             }
             None => caller
                 .db
                 .ql()
                 .execute(query)
                 .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None)),
+                .map_err(redact_internal_error),
         }
     }
 }
@@ -462,7 +513,7 @@ impl HirnMcpService {
             .episodic()
             .remember(record)
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .map_err(redact_internal_error)?;
 
         Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "Memory stored with ID: {id}"
@@ -545,16 +596,7 @@ impl HirnMcpService {
         // authenticated caller regardless of its credential's scope.
         let results = match &caller.identity.namespaces {
             Some(_) => {
-                caller
-                    .db
-                    .ensure_agent(&caller.agent_id)
-                    .await
-                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-                let agent_ctx = caller
-                    .db
-                    .as_agent(&caller.agent_id)
-                    .await
-                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                let agent_ctx = self.agent_context_for_caller(&caller).await?;
                 let mut builder = agent_ctx.recall(embedding);
                 if let Some(limit) = params.limit {
                     builder = builder.limit(limit as usize);
@@ -562,10 +604,7 @@ impl HirnMcpService {
                 if let Some(ref mode) = params.activation_mode {
                     builder = builder.activation(parse_activation_mode(mode));
                 }
-                builder
-                    .execute()
-                    .await
-                    .map_err(|e| McpError::internal_error(e.to_string(), None))?
+                builder.execute().await.map_err(redact_internal_error)?
             }
             None => {
                 let mut builder = caller.db.recall_view().query(embedding).unrestricted();
@@ -575,10 +614,7 @@ impl HirnMcpService {
                 if let Some(ref mode) = params.activation_mode {
                     builder = builder.activation(parse_activation_mode(mode));
                 }
-                builder
-                    .execute()
-                    .await
-                    .map_err(|e| McpError::internal_error(e.to_string(), None))?
+                builder.execute().await.map_err(redact_internal_error)?
             }
         };
 
@@ -631,16 +667,7 @@ impl HirnMcpService {
         // across every namespace in their realm.
         let result = match &caller.identity.namespaces {
             Some(_) => {
-                caller
-                    .db
-                    .ensure_agent(&caller.agent_id)
-                    .await
-                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-                let agent_ctx = caller
-                    .db
-                    .as_agent(&caller.agent_id)
-                    .await
-                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                let agent_ctx = self.agent_context_for_caller(&caller).await?;
                 let mut builder = agent_ctx.think(embedding);
                 if let Some(budget) = params.budget {
                     builder = builder.budget(budget as usize);
@@ -648,10 +675,7 @@ impl HirnMcpService {
                 if let Some(limit) = params.limit {
                     builder = builder.limit(limit as usize);
                 }
-                builder
-                    .execute()
-                    .await
-                    .map_err(|e| McpError::internal_error(e.to_string(), None))?
+                builder.execute().await.map_err(redact_internal_error)?
             }
             None => {
                 let mut builder = caller.db.recall_view().think(embedding).unrestricted();
@@ -661,10 +685,7 @@ impl HirnMcpService {
                 if let Some(limit) = params.limit {
                     builder = builder.limit(limit as usize);
                 }
-                builder
-                    .execute()
-                    .await
-                    .map_err(|e| McpError::internal_error(e.to_string(), None))?
+                builder.execute().await.map_err(redact_internal_error)?
             }
         };
 
@@ -699,27 +720,24 @@ impl HirnMcpService {
 
         let memory_id = parse_memory_id(&params.id)
             .map_err(|e| McpError::invalid_params(format!("invalid id: {e}"), None))?;
+        let agent_ctx = self.agent_context_for_caller(&caller).await?;
 
         let mode = params.mode.unwrap_or_else(|| "archive".to_owned());
         match mode.as_str() {
-            "purge" => match caller.db.episodic().delete(memory_id).await {
+            "purge" => match agent_ctx.delete_episode(memory_id).await {
                 Ok(()) => {}
                 Err(_) => {
-                    caller
-                        .db
-                        .semantic()
-                        .purge(memory_id)
+                    agent_ctx
+                        .purge_semantic(memory_id)
                         .await
-                        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                        .map_err(redact_internal_error)?;
                 }
             },
             _ => {
-                caller
-                    .db
-                    .episodic()
-                    .archive(memory_id)
+                agent_ctx
+                    .archive_episode(memory_id)
                     .await
-                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                    .map_err(redact_internal_error)?;
             }
         }
 
@@ -745,23 +763,16 @@ impl HirnMcpService {
         // Validate the ID as a ULID to prevent HirnQL injection.
         let memory_id = MemoryId::parse(&params.id)
             .map_err(|e| McpError::invalid_params(format!("invalid memory ID: {e}"), None))?;
-        let ql = format!("INSPECT \"{}\"", memory_id);
-        let result = caller
-            .db
-            .ql()
-            .execute(&ql)
+        let agent_ctx = self.agent_context_for_caller(&caller).await?;
+        let result = agent_ctx
+            .inspect(memory_id)
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .map_err(map_engine_error)?;
 
-        match result {
-            QueryResult::Inspected(i) => {
-                let output = hirn_engine::inspected_result_to_json(&i);
-                Ok(CallToolResult::success(vec![ContentBlock::text(
-                    serde_json::to_string_pretty(&output).unwrap_or_default(),
-                )]))
-            }
-            _ => Err(McpError::internal_error("unexpected result", None)),
-        }
+        let output = hirn_engine::inspected_result_to_json(&result);
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            serde_json::to_string_pretty(&output).unwrap_or_default(),
+        )]))
     }
 
     /// Run the memory consolidation pipeline to extract patterns and form semantic knowledge.
@@ -784,10 +795,7 @@ impl HirnMcpService {
             builder = builder.archive(archive);
         }
 
-        let result = builder
-            .execute()
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let result = builder.execute().await.map_err(redact_internal_error)?;
 
         let output = serde_json::json!({
             "records_processed": result.records_processed,
@@ -964,10 +972,11 @@ impl HirnMcpService {
                     namespace: ns,
                     metadata: None,
                     entities: None,
+                    functional_role: None,
                 },
             )
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .map_err(redact_internal_error)?;
 
         Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "Memory stored with ID: {id}"
@@ -1007,7 +1016,7 @@ impl HirnMcpService {
                 },
             )
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .map_err(redact_internal_error)?;
 
         let output: Vec<serde_json::Value> = results
             .iter()
@@ -1073,7 +1082,7 @@ impl HirnMcpService {
                 },
             )
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .map_err(redact_internal_error)?;
 
         let entries: Vec<serde_json::Value> = timeline
             .entries
@@ -1130,7 +1139,7 @@ impl HirnMcpService {
                 },
             )
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .map_err(redact_internal_error)?;
 
         Ok(CallToolResult::success(vec![ContentBlock::text(
             "Memory updated successfully",
@@ -1159,7 +1168,7 @@ impl HirnMcpService {
         toolkit
             .delete(aid, memory_id)
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .map_err(redact_internal_error)?;
 
         Ok(CallToolResult::success(vec![ContentBlock::text(
             "Memory deleted (archived) successfully",
@@ -1201,7 +1210,7 @@ impl HirnMcpService {
                 },
             )
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .map_err(redact_internal_error)?;
 
         Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "Edge created with ID: {edge_id}"
@@ -1236,7 +1245,7 @@ impl HirnMcpService {
         let result = toolkit
             .introspect(aid, memory_id)
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .map_err(redact_internal_error)?;
 
         let mut output = serde_json::json!({
             "total_memories": result.total_memories,
@@ -1328,7 +1337,7 @@ impl ServerHandler for HirnMcpService {
                     .admin()
                     .stats()
                     .await
-                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                    .map_err(redact_internal_error)?;
                 let json = serde_json::json!({
                     "working_count": stats.working_count,
                     "episodic_count": stats.episodic_count,
@@ -1497,5 +1506,54 @@ fn parse_edge_relation(s: &str) -> Result<EdgeRelation, String> {
              contradicts, supports, temporal_next, part_of, instance_of, similar_to, inhibits, \
              participates_in, enables, prevents"
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Extract the numeric JSON-RPC code so the assertions read against the
+    /// wire contract rather than an internal enum.
+    fn code_of(error: &McpError) -> i32 {
+        error.code.0
+    }
+
+    #[test]
+    fn refusals_are_reported_as_caller_errors_not_server_faults() {
+        // Cross-agent isolation denying a read is an expected outcome, not a
+        // fault: reporting it as -32603 tells the client the server broke and
+        // hides the one thing it can act on.
+        let denied = map_engine_error(hirn_core::HirnError::AccessDenied(
+            "agent 'a' cannot access namespace 'private:b'".into(),
+        ));
+        assert_ne!(
+            code_of(&denied),
+            code_of(&McpError::internal_error("x", None)),
+            "an authorization refusal must not be an internal error"
+        );
+        assert!(denied.message.contains("access denied"));
+        assert!(denied.message.contains("private:b"));
+
+        let missing = map_engine_error(hirn_core::HirnError::NotFound("record xyz".into()));
+        assert!(missing.message.contains("not found"));
+        assert!(missing.message.contains("xyz"));
+    }
+
+    #[test]
+    fn everything_else_stays_redacted() {
+        // `InvalidInput` looks caller-facing, but a non-transient provider
+        // failure converts into it carrying provider status and response body,
+        // so it must not cross the boundary.
+        for error in [
+            hirn_core::HirnError::InvalidInput("provider openai 401: {\"key\":\"sk-live\"}".into()),
+            hirn_core::HirnError::storage("/var/lib/hirn/lance/episodic.lance is corrupt"),
+        ] {
+            let mapped = map_engine_error(error);
+            assert_eq!(
+                mapped.message, "internal server error",
+                "internal detail leaked to the caller"
+            );
+        }
     }
 }

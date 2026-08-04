@@ -10,6 +10,8 @@ from urllib.parse import unquote
 FENCE_RE = re.compile(r"^(```|~~~)")
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*$")
 LINK_RE = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
+# Backtick spans, longest-run first so `` x `` is matched before `.
+INLINE_CODE_RE = re.compile(r"```+.*?```+|``.*?``|`[^`]*`")
 EXCLUDED_PARTS = {".git", ".venv", "node_modules", "target", "dist"}
 IGNORED_SCHEMES = ("http://", "https://", "mailto:", "tel:", "data:")
 
@@ -40,6 +42,13 @@ def iter_markdown_files(args: list[str]) -> list[Path]:
 
 
 def strip_code_fences(lines: list[str]) -> list[tuple[int, str]]:
+    """Drop fenced blocks and blank out inline code spans.
+
+    Inline spans are blanked rather than removed so column positions stay
+    meaningful. Without this, prose that *documents* link syntax — the
+    contributing guide showing `` [Title](@/docs/page.md) `` — is reported as a
+    broken link, which trains readers to ignore the checker.
+    """
     result: list[tuple[int, str]] = []
     in_fence = False
     for line_number, line in enumerate(lines, start=1):
@@ -47,7 +56,7 @@ def strip_code_fences(lines: list[str]) -> list[tuple[int, str]]:
             in_fence = not in_fence
             continue
         if not in_fence:
-            result.append((line_number, line))
+            result.append((line_number, INLINE_CODE_RE.sub(lambda m: " " * len(m.group(0)), line)))
     return result
 
 
@@ -117,7 +126,25 @@ def validate_link(
         return errors
 
     path_part, _, anchor = target.partition("#")
-    resolved = (source.parent / path_part).resolve()
+
+    zola_link = path_part.startswith("@/")
+    if zola_link:
+        # Zola internal-link syntax, resolved against the site's content root.
+        content_root = next(
+            (parent for parent in source.parents if parent.name == "content"), None
+        )
+        if content_root is None:
+            return [
+                f"{source}:{line_number}: '@/' link outside a Zola content/ tree"
+            ]
+        resolved = (content_root / path_part[2:]).resolve()
+        # Anchors are left to `zola check`, which slugifies headings exactly as
+        # the renderer does. Reimplementing that here would drift and report
+        # working links as broken.
+        anchor = ""
+    else:
+        resolved = (source.parent / path_part).resolve()
+
     if not resolved.exists():
         errors.append(f"{source}:{line_number}: missing target '{target}'")
         return errors

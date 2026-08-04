@@ -1,5 +1,5 @@
 ---
-description: "Use when working with hirn-storage, Lance storage, PhysicalStore trait, datasets, scan operations, vector search, or storage performance. Covers Lance 4.0 patterns, caching, and dataset management."
+description: "Use when working with hirn-storage, Lance storage, PhysicalStore trait, datasets, scan operations, vector search, or storage performance. Covers Lance 9.0 patterns, caching, and dataset management."
 applyTo: "crates/hirn-storage/**"
 ---
 # hirn-storage — Storage Layer
@@ -9,7 +9,7 @@ applyTo: "crates/hirn-storage/**"
 All storage access goes through `PhysicalStore`. Never call Lance APIs from engine code.
 
 Three implementations:
-- `LancePhysicalStore` — production, `EpochCache` + Lance 4.0
+- `LancePhysicalStore` — production, `EpochCache` + Lance 9.0
 - `MemoryStore` — tests only, `DashMap`-backed, brute-force search
 - `PolicyEnforcedStore<S>` — wrapper, injects namespace predicates, delegates to inner
 

@@ -132,7 +132,7 @@ impl ConsolidationScheduler {
     ///
     /// Uses `SurpriseThreshold` as the default mode with the configured
     /// `consolidation_interval_secs` as the fallback.
-    pub fn new(db: Arc<HirnDB>, config: ConsolidationConfig) -> Self {
+    pub fn new(db: Arc<HirnDB>, config: ConsolidationConfig) -> hirn_core::HirnResult<Self> {
         Self::new_with_llm(db, config, None)
     }
 
@@ -142,7 +142,7 @@ impl ConsolidationScheduler {
         db: Arc<HirnDB>,
         config: ConsolidationConfig,
         llm: Option<Arc<dyn hirn_core::embed::LlmProvider>>,
-    ) -> Self {
+    ) -> hirn_core::HirnResult<Self> {
         let interval_secs = db.config().consolidation_interval_secs;
         let schedule = if interval_secs > 0 {
             ConsolidationSchedule::SurpriseThreshold {
@@ -160,7 +160,7 @@ impl ConsolidationScheduler {
         db: Arc<HirnDB>,
         config: ConsolidationConfig,
         schedule: ConsolidationSchedule,
-    ) -> Self {
+    ) -> hirn_core::HirnResult<Self> {
         Self::with_schedule_and_llm(db, config, schedule, None)
     }
 
@@ -171,7 +171,12 @@ impl ConsolidationScheduler {
         config: ConsolidationConfig,
         schedule: ConsolidationSchedule,
         llm: Option<Arc<dyn hirn_core::embed::LlmProvider>>,
-    ) -> Self {
+    ) -> hirn_core::HirnResult<Self> {
+        let runtime = tokio::runtime::Runtime::new().map_err(|error| {
+            hirn_core::HirnError::storage(format!(
+                "failed to create consolidation scheduler runtime: {error}"
+            ))
+        })?;
         let state = Arc::new(SchedulerState {
             running: AtomicBool::new(false),
             wake: parking_lot::Condvar::new(),
@@ -191,18 +196,18 @@ impl ConsolidationScheduler {
             let cfg = config.clone();
             let llm = llm.clone();
             thread::spawn(move || {
-                Self::background_loop(&db, &state, &cfg, &sched, llm.as_ref());
+                Self::background_loop(&db, &state, &cfg, &sched, llm.as_ref(), runtime);
             })
         };
 
-        Self {
+        Ok(Self {
             db,
             state,
             schedule,
             config,
             llm,
             handle: Some(handle),
-        }
+        })
     }
 
     /// Notify the scheduler that an episode was added.
@@ -255,7 +260,12 @@ impl ConsolidationScheduler {
     ///
     /// Stops the current background thread and starts a new one with
     /// the given schedule. Accumulated state (surprise, episode counts) is reset.
-    pub fn set_schedule(&mut self, schedule: ConsolidationSchedule) {
+    pub fn set_schedule(&mut self, schedule: ConsolidationSchedule) -> hirn_core::HirnResult<()> {
+        let runtime = tokio::runtime::Runtime::new().map_err(|error| {
+            hirn_core::HirnError::storage(format!(
+                "failed to create consolidation scheduler runtime: {error}"
+            ))
+        })?;
         // Stop the old background thread.
         self.state.shutdown.store(true, Ordering::Release);
         self.wake();
@@ -283,13 +293,14 @@ impl ConsolidationScheduler {
             let cfg = self.config.clone();
             let llm = self.llm.clone();
             thread::spawn(move || {
-                Self::background_loop(&db, &st, &cfg, &sched, llm.as_ref());
+                Self::background_loop(&db, &st, &cfg, &sched, llm.as_ref(), runtime);
             })
         };
 
         self.state = state;
         self.schedule = schedule;
         self.handle = Some(handle);
+        Ok(())
     }
 
     /// Gracefully stop the background thread.
@@ -328,11 +339,8 @@ impl ConsolidationScheduler {
         config: &ConsolidationConfig,
         schedule: &ConsolidationSchedule,
         llm: Option<&Arc<dyn hirn_core::embed::LlmProvider>>,
+        rt: tokio::runtime::Runtime,
     ) {
-        // Create a single Tokio runtime for the entire scheduler lifetime
-        // instead of spawning one per consolidation cycle.
-        let rt = tokio::runtime::Runtime::new().expect("tokio runtime for consolidation");
-
         let poll_interval = match schedule {
             ConsolidationSchedule::Periodic { interval_secs } => {
                 Duration::from_secs(*interval_secs)
@@ -611,7 +619,8 @@ mod tests {
             ConsolidationConfig::default(),
             ConsolidationSchedule::Manual,
             Some(llm),
-        );
+        )
+        .unwrap();
         sched.trigger();
 
         // Wait for the background consolidation to complete.
@@ -639,7 +648,8 @@ mod tests {
             Arc::clone(&db),
             ConsolidationConfig::default(),
             ConsolidationSchedule::Manual,
-        );
+        )
+        .unwrap();
         sched.trigger();
         std::thread::sleep(Duration::from_millis(500));
         sched.stop();
@@ -666,7 +676,8 @@ mod tests {
         let db = test_db().await;
         let config = ConsolidationConfig::default();
         let mut sched =
-            ConsolidationScheduler::with_schedule(db, config, ConsolidationSchedule::Manual);
+            ConsolidationScheduler::with_schedule(db, config, ConsolidationSchedule::Manual)
+                .unwrap();
         assert_eq!(sched.status(), ConsolidationStatus::Idle);
         // notify_episode_added should NOT trigger consolidation in Manual mode.
         sched.notify_episode_added();
@@ -680,7 +691,8 @@ mod tests {
         let db = test_db().await;
         let config = ConsolidationConfig::default();
         let mut sched =
-            ConsolidationScheduler::with_schedule(db, config, ConsolidationSchedule::Manual);
+            ConsolidationScheduler::with_schedule(db, config, ConsolidationSchedule::Manual)
+                .unwrap();
         sched.trigger();
         // Give the background thread time to process.
         std::thread::sleep(Duration::from_millis(200));
@@ -700,7 +712,8 @@ mod tests {
                 threshold: 2.0,
                 fallback_interval_secs: 0, // no fallback
             },
-        );
+        )
+        .unwrap();
         // Below threshold — no trigger.
         sched.notify_surprise(0.5);
         sched.notify_surprise(0.5);
@@ -721,7 +734,8 @@ mod tests {
             db,
             config,
             ConsolidationSchedule::Periodic { interval_secs: 1 },
-        );
+        )
+        .unwrap();
         // Wait for at least one periodic cycle.
         std::thread::sleep(Duration::from_secs(2));
         assert_eq!(sched.status(), ConsolidationStatus::Idle);
@@ -745,7 +759,8 @@ mod tests {
                 preferred_end_hour: end,
                 idle_timeout_secs: 0,
             },
-        );
+        )
+        .unwrap();
         std::thread::sleep(Duration::from_millis(200));
         assert_eq!(sched.status(), ConsolidationStatus::Idle);
         sched.stop();
@@ -762,7 +777,8 @@ mod tests {
         let db = test_db().await;
         let config = ConsolidationConfig::default();
         let mut sched =
-            ConsolidationScheduler::with_schedule(db, config, ConsolidationSchedule::Manual);
+            ConsolidationScheduler::with_schedule(db, config, ConsolidationSchedule::Manual)
+                .unwrap();
         assert!(matches!(sched.schedule(), ConsolidationSchedule::Manual));
         sched.stop();
     }
@@ -772,21 +788,26 @@ mod tests {
         let db = test_db().await;
         let config = ConsolidationConfig::default();
         let mut sched =
-            ConsolidationScheduler::with_schedule(db, config, ConsolidationSchedule::Manual);
+            ConsolidationScheduler::with_schedule(db, config, ConsolidationSchedule::Manual)
+                .unwrap();
         assert!(matches!(sched.schedule(), ConsolidationSchedule::Manual));
 
         // Switch to periodic.
-        sched.set_schedule(ConsolidationSchedule::Periodic { interval_secs: 60 });
+        sched
+            .set_schedule(ConsolidationSchedule::Periodic { interval_secs: 60 })
+            .unwrap();
         assert!(matches!(
             sched.schedule(),
             ConsolidationSchedule::Periodic { interval_secs: 60 }
         ));
 
         // Switch again to surprise threshold.
-        sched.set_schedule(ConsolidationSchedule::SurpriseThreshold {
-            threshold: 3.0,
-            fallback_interval_secs: 120,
-        });
+        sched
+            .set_schedule(ConsolidationSchedule::SurpriseThreshold {
+                threshold: 3.0,
+                fallback_interval_secs: 120,
+            })
+            .unwrap();
         assert!(matches!(
             sched.schedule(),
             ConsolidationSchedule::SurpriseThreshold { .. }

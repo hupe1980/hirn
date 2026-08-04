@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::id::MemoryId;
 use crate::revision::{LogicalMemoryId, RevisionId};
 use crate::timestamp::Timestamp;
-use crate::types::AgentId;
+use crate::types::{AgentId, ContradictionRelation};
 
 /// An action recorded in the audit log.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -118,6 +118,19 @@ pub enum AuditAction {
         loser_id: MemoryId,
         revised_confidence: f32,
         reason: String,
+    },
+    /// A contradiction was resolved by the auditable contradiction algebra
+    /// (TOKI). The winner supersedes/contradicts the loser; when the relation
+    /// invalidates, the loser's observed-time validity interval (`valid_until`)
+    /// is closed at `valid_until_closed_ms` (Zep-style `t_invalid`).
+    ContradictionResolved {
+        winner_revision_id: RevisionId,
+        loser_revision_id: RevisionId,
+        relation: ContradictionRelation,
+        detector: String,
+        valid_until_closed_ms: Option<i64>,
+        namespace: String,
+        rationale: String,
     },
     /// A dataset was restored to an earlier version from a named snapshot.
     DatasetRollback {

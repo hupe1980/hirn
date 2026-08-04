@@ -75,11 +75,17 @@ fn temporal_next_metadata(arrival: &super::write_runtime::TemporalArrival) -> Me
     metadata
 }
 
+enum AdmissionApplication {
+    Continue,
+    Deferred { review_not_before: i64 },
+    Merged { target: MemoryId },
+}
+
 fn apply_admission_decision(
     record: &mut EpisodicRecord,
     decision: crate::admission::AdmissionDecision,
     realm: &str,
-) -> HirnResult<()> {
+) -> HirnResult<AdmissionApplication> {
     match decision {
         crate::admission::AdmissionDecision::Accept {
             importance_override,
@@ -116,7 +122,7 @@ fn apply_admission_decision(
                 );
                 record.metadata.insert("admission_flags".to_string(), list);
             }
-            Ok(())
+            Ok(AdmissionApplication::Continue)
         }
         crate::admission::AdmissionDecision::Reject { reason } => {
             metrics::counter!(crate::metrics::ADMISSION_REJECTED_TOTAL, "realm" => realm.to_owned())
@@ -125,13 +131,155 @@ fn apply_admission_decision(
                 "admission rejected: {reason}"
             )))
         }
-        crate::admission::AdmissionDecision::Defer { until } => Err(HirnError::InvalidInput(
-            format!("admission deferred until {until}"),
-        )),
-        crate::admission::AdmissionDecision::Merge { target } => Err(HirnError::InvalidInput(
-            format!("admission: merge into {target}"),
-        )),
+        crate::admission::AdmissionDecision::Defer { review_not_before } => {
+            Ok(AdmissionApplication::Deferred { review_not_before })
+        }
+        crate::admission::AdmissionDecision::Merge { target } => {
+            Ok(AdmissionApplication::Merged { target })
+        }
     }
+}
+
+impl HirnDB {
+    async fn merge_admitted_duplicate(
+        &self,
+        target: MemoryId,
+        candidate: &EpisodicRecord,
+    ) -> HirnResult<MemoryId> {
+        let current = self.episodic_edit_target(target).await?;
+        if current.namespace != candidate.namespace {
+            return Err(HirnError::AccessDenied(format!(
+                "admission merge target {target} is outside namespace '{}'",
+                candidate.namespace
+            )));
+        }
+
+        let candidate_id = candidate.id;
+        let candidate_agent = candidate.provenance.created_by;
+        let candidate_timestamp = candidate.timestamp;
+        let candidate_importance = candidate.importance;
+        let candidate_surprise = candidate.surprise;
+        let candidate_entities = candidate.entities.clone();
+        let candidate_consolidation_ids = candidate.consolidation_ids.clone();
+        let reason = format!("admission duplicate merged from candidate {candidate_id}");
+
+        let merged = self
+            .append_episodic_successor(
+                &current,
+                RevisionOperation::Merge,
+                Some(reason),
+                move |next| {
+                    next.importance = next.importance.max(candidate_importance);
+                    next.surprise = next.surprise.max(candidate_surprise);
+                    for entity in candidate_entities {
+                        if !next.entities.contains(&entity) {
+                            next.entities.push(entity);
+                        }
+                    }
+                    for id in candidate_consolidation_ids {
+                        if !next.consolidation_ids.contains(&id) {
+                            next.consolidation_ids.push(id);
+                        }
+                    }
+
+                    let merge_count = match next.metadata.get("admission_merge_count") {
+                        Some(hirn_core::metadata::MetadataValue::Int(count)) => {
+                            count.saturating_add(1)
+                        }
+                        _ => 1,
+                    };
+                    next.metadata
+                        .insert("admission_merge_count".into(), merge_count.into());
+                    next.metadata.insert(
+                        "admission_last_merged_candidate_id".into(),
+                        candidate_id.to_string().into(),
+                    );
+                    next.metadata.insert(
+                        "admission_last_merged_agent_id".into(),
+                        candidate_agent.to_string().into(),
+                    );
+                    next.metadata.insert(
+                        "admission_last_merged_observed_at_ms".into(),
+                        candidate_timestamp.timestamp_ms().into(),
+                    );
+                },
+            )
+            .await?;
+
+        Ok(merged.id)
+    }
+}
+
+/// Populate a record's temporal envelope from its content.
+///
+/// A caller-supplied envelope always wins: an ingest path that already knows
+/// the event time must not have it overwritten by inference. Extraction
+/// failure leaves `TemporalEnvelope::unknown()`, which ranks exactly as an
+/// unextracted corpus does — so this can never make ranking worse than not
+/// running it.
+async fn annotate_temporal_envelope(
+    record: &mut hirn_core::episodic::EpisodicRecord,
+    extractor: Option<&dyn hirn_provider::TemporalExtractor>,
+    budget: &hirn_core::nlu::NluBudget,
+) {
+    if record.temporal != hirn_core::temporal::TemporalEnvelope::unknown() {
+        return;
+    }
+    let Some(extractor) = extractor else {
+        return;
+    };
+    if record.content.trim().is_empty() {
+        return;
+    }
+    // Relative expressions resolve against the record's own timestamp, not
+    // wall-clock now, so a replayed or backfilled ingest is deterministic.
+    match extractor
+        .extract_temporal(&record.content, record.timestamp, budget)
+        .await
+    {
+        Ok(Some(envelope)) => record.temporal = envelope,
+        Ok(None) => {}
+        Err(error) => {
+            tracing::debug!(%error, id = %record.id, "temporal extraction failed; leaving envelope unknown");
+        }
+    }
+}
+
+/// If an admission `Reject` reason carries a quarantine-routing prefix
+/// (`poisoning_quarantine_recommended:` or `trust_quarantine_recommended:`),
+/// return the score to record on the quarantine row; otherwise `None` (a
+/// genuine reject that must stay an `InvalidInput`).
+///
+/// The score is parsed from the reason so the audit/quarantine row reflects the
+/// same figure the gate computed: `score=<f>` for the poisoning defense, and
+/// `1 - effective trust` for the trust tier.
+fn quarantine_routing_score(reason: &str) -> Option<f32> {
+    use crate::admission::controllers::poisoning::REASON_POISONING_QUARANTINE;
+    use crate::admission::controllers::trust::REASON_QUARANTINE as TRUST_QUARANTINE;
+
+    if reason.starts_with(REASON_POISONING_QUARANTINE) {
+        return Some(parse_labeled_f32(reason, "score=").unwrap_or(0.5));
+    }
+    if reason.starts_with(TRUST_QUARANTINE) {
+        let effective = parse_labeled_f32(reason, "effective trust ").unwrap_or(0.5);
+        return Some((1.0 - effective).clamp(0.0, 1.0));
+    }
+    None
+}
+
+/// Parse the `score=<f>` field a poisoning gate embeds in its reject reason.
+/// Shared with the semantic write path so both record the same quarantine score.
+pub(crate) fn poison_score_from_reason(reason: &str) -> Option<f32> {
+    parse_labeled_f32(reason, "score=")
+}
+
+/// Parse the first `f32` appearing immediately after `label` in `text`.
+fn parse_labeled_f32(text: &str, label: &str) -> Option<f32> {
+    let rest = text.split(label).nth(1)?;
+    let end = rest
+        .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'))
+        .unwrap_or(rest.len());
+    rest[..end].parse::<f32>().ok()
 }
 
 fn remember_status_for_admission(
@@ -616,7 +764,7 @@ impl HirnDB {
         let dims = self.config.embedding_dimensions.as_usize();
         let batch = hirn_storage::datasets::episodic::to_batch(std::slice::from_ref(record), dims)
             .map_err(HirnError::storage)?;
-        self.storage_runtime
+        self.storage_backend()
             .append(hirn_storage::datasets::episodic::DATASET_NAME, batch)
             .await
             .map_err(HirnError::storage)?;
@@ -704,7 +852,7 @@ impl HirnDB {
     pub(super) async fn write_episodic_record(&self, record: &EpisodicRecord) -> HirnResult<()> {
         let id = record.id;
         let exact_filter = hirn_storage::store::ExactMatchFilter::utf8_value("id", id.to_string());
-        self.storage_runtime
+        self.storage_backend()
             .delete_exact(
                 hirn_storage::datasets::episodic::DATASET_NAME,
                 &exact_filter,
@@ -714,7 +862,7 @@ impl HirnDB {
         let dims = self.config.embedding_dimensions.as_usize();
         let batch = hirn_storage::datasets::episodic::to_batch(std::slice::from_ref(record), dims)
             .map_err(|e| HirnError::storage(e))?;
-        self.storage_runtime
+        self.storage_backend()
             .append(hirn_storage::datasets::episodic::DATASET_NAME, batch)
             .await
             .map_err(|e| HirnError::storage(e))?;
@@ -791,7 +939,7 @@ impl HirnDB {
     /// LanceDB append, and graph updates are batched for throughput.
     pub(crate) async fn batch_remember(
         &self,
-        records: Vec<EpisodicRecord>,
+        mut records: Vec<EpisodicRecord>,
     ) -> Vec<HirnResult<MemoryId>> {
         if records.is_empty() {
             return Vec::new();
@@ -820,6 +968,55 @@ impl HirnDB {
                     })
                     .collect();
             }
+        }
+        // Typed extraction is one provider round-trip per record. Awaiting them
+        // in a loop makes a large batch spend its entire wall-clock in provider
+        // latency for work that is embarrassingly parallel — a 10k-record
+        // corpus takes over an hour sequentially. Run them with bounded
+        // concurrency instead, preserving input order on the way out because
+        // downstream stages index `records` positionally.
+        //
+        // This pass runs whether or not a provider is configured. Preference
+        // annotation falls back to its deterministic cue matcher when handed
+        // no extractor, and that floor is the only preference annotation a
+        // deployment without an NLU provider gets, so gating the pass on an
+        // extractor being present silently disables it. Temporal annotation
+        // has no such floor and no-ops without a provider, leaving the
+        // envelope `unknown` — which scores identically to the pre-envelope
+        // behaviour by construction.
+        let preference_extractor = self.preference_extractor();
+        let temporal_extractor = self.temporal_extractor();
+        {
+            use futures::StreamExt;
+
+            let budget = self.config.nlu.budget;
+            let concurrency = self.config.nlu.extraction_concurrency.max(1);
+            let mut annotated: Vec<(usize, hirn_core::episodic::EpisodicRecord)> =
+                futures::stream::iter(records.into_iter().enumerate())
+                    .map(|(index, mut record)| {
+                        let preference_extractor = preference_extractor.clone();
+                        let temporal_extractor = temporal_extractor.clone();
+                        async move {
+                            hirn_core::preference::annotate_preference_with(
+                                &mut record,
+                                preference_extractor.as_deref(),
+                                &budget,
+                            )
+                            .await;
+                            annotate_temporal_envelope(
+                                &mut record,
+                                temporal_extractor.as_deref(),
+                                &budget,
+                            )
+                            .await;
+                            (index, record)
+                        }
+                    })
+                    .buffer_unordered(concurrency)
+                    .collect()
+                    .await;
+            annotated.sort_by_key(|(index, _)| *index);
+            records = annotated.into_iter().map(|(_, record)| record).collect();
         }
 
         // ── 2. Cedar enforce once per unique namespace ──────────────────
@@ -875,7 +1072,28 @@ impl HirnDB {
                     .await;
 
                     match apply_admission_decision(&mut rec, result.decision, &realm) {
-                        Ok(()) => admitted.push((idx, rec)),
+                        Ok(AdmissionApplication::Continue) => admitted.push((idx, rec)),
+                        Ok(AdmissionApplication::Merged { target }) => {
+                            results[idx] = Some(self.merge_admitted_duplicate(target, &rec).await);
+                        }
+                        Ok(AdmissionApplication::Deferred { review_not_before }) => {
+                            rec.metadata.insert(
+                                "admission_review_not_before_ms".to_string(),
+                                hirn_core::metadata::MetadataValue::Int(review_not_before),
+                            );
+                            let agent_id = rec.provenance.created_by;
+                            let deferred = self
+                                .quarantine_record(
+                                    &rec,
+                                    0.5,
+                                    &agent_id,
+                                    format!(
+                                        "admission deferred for review until {review_not_before}"
+                                    ),
+                                )
+                                .await;
+                            results[idx] = Some(deferred);
+                        }
                         Err(error) => results[idx] = Some(Err(error)),
                     }
                 }
@@ -1689,12 +1907,16 @@ impl HirnDB {
 
                     if self.config.svo_extraction_enabled {
                         if let Some(batch) = super::write_path::prepare_svo_events_batch(
+                            self.event_extractor().as_deref(),
+                            &self.config.nlu.budget,
                             p.record.id,
                             content,
                             self.config.svo_confidence_threshold,
                             info.namespace.as_str(),
                             self.config.embedding_dimensions.as_usize(),
-                        ) {
+                        )
+                        .await
+                        {
                             let count = batch.num_rows();
                             svo_rows += count;
                             svo_batches.push(batch);
@@ -1819,6 +2041,18 @@ impl HirnDB {
         mut record: EpisodicRecord,
         bypass_admission: bool,
     ) -> Result<(MemoryId, crate::RememberExplanation), crate::RememberFailure> {
+        hirn_core::preference::annotate_preference_with(
+            &mut record,
+            self.preference_extractor().as_deref(),
+            &self.config.nlu.budget,
+        )
+        .await;
+        annotate_temporal_envelope(
+            &mut record,
+            self.temporal_extractor().as_deref(),
+            &self.config.nlu.budget,
+        )
+        .await;
         let actor_id = record.provenance.created_by;
         let namespace = record.namespace;
         let initial_embedding = if record.embedding.is_some() {
@@ -1889,14 +2123,76 @@ impl HirnDB {
                     decision: decision.clone(),
                     controllers_consulted,
                 });
-                if let Err(error) = apply_admission_decision(
+                // Quarantine routing: a Reject carrying a quarantine-recommended
+                // prefix is NOT a hard reject — route the record into
+                // quarantine-for-review (deferred trust) and return
+                // `Quarantined` instead of `InvalidInput`. Every other reject
+                // stays a genuine `InvalidInput` via `apply_admission_decision`.
+                if let crate::admission::AdmissionDecision::Reject { reason } = &decision {
+                    if let Some(score) = quarantine_routing_score(reason) {
+                        let agent_id = record.provenance.created_by;
+                        explanation.status = crate::RememberStatus::Rejected;
+                        let error = match self
+                            .quarantine_record(&record, score, &agent_id, reason.clone())
+                            .await
+                        {
+                            // `quarantine_record` always returns `Err`
+                            // (Quarantined / RateLimited); the Ok arm is
+                            // defensive only.
+                            Ok(id) => HirnError::Quarantined(format!("memory {id} quarantined")),
+                            Err(error) => error,
+                        };
+                        explanation.error = Some(error.to_string());
+                        return Err(crate::RememberFailure::new(error, explanation));
+                    }
+                }
+                let application = apply_admission_decision(
                     &mut record,
                     result.decision,
                     &self.config.default_realm,
-                ) {
-                    explanation.status = remember_status_for_admission(&decision);
-                    explanation.error = Some(error.to_string());
-                    return Err(crate::RememberFailure::new(error, explanation));
+                );
+                match application {
+                    Ok(AdmissionApplication::Continue) => {}
+                    Ok(AdmissionApplication::Merged { target }) => {
+                        explanation.status = crate::RememberStatus::Merged;
+                        let merged = self
+                            .merge_admitted_duplicate(target, &record)
+                            .await
+                            .map_err(|error| {
+                                explanation.status = crate::RememberStatus::Failed;
+                                explanation.error = Some(error.to_string());
+                                crate::RememberFailure::new(error, explanation.clone())
+                            })?;
+                        return Ok((merged, explanation));
+                    }
+                    Ok(AdmissionApplication::Deferred { review_not_before }) => {
+                        record.metadata.insert(
+                            "admission_review_not_before_ms".to_string(),
+                            hirn_core::metadata::MetadataValue::Int(review_not_before),
+                        );
+                        explanation.status = crate::RememberStatus::Deferred;
+                        let error = match self
+                            .quarantine_record(
+                                &record,
+                                0.5,
+                                &record.provenance.created_by,
+                                format!("admission deferred for review until {review_not_before}"),
+                            )
+                            .await
+                        {
+                            Ok(id) => HirnError::Quarantined(format!(
+                                "memory {id} quarantined; review is not allowed before {review_not_before}"
+                            )),
+                            Err(error) => error,
+                        };
+                        explanation.error = Some(error.to_string());
+                        return Err(crate::RememberFailure::new(error, explanation));
+                    }
+                    Err(error) => {
+                        explanation.status = remember_status_for_admission(&decision);
+                        explanation.error = Some(error.to_string());
+                        return Err(crate::RememberFailure::new(error, explanation));
+                    }
                 }
                 if decision.is_accept()
                     && let Some(pipeline) = self.admission_runtime().admission_pipeline_arc()
@@ -2178,6 +2474,8 @@ impl HirnDB {
             if self.config.svo_extraction_enabled {
                 let count = super::write_path::extract_and_store_svo_events(
                     self.storage_backend(),
+                    self.event_extractor().as_deref(),
+                    &self.config.nlu.budget,
                     id,
                     content,
                     self.config.svo_confidence_threshold,
@@ -2568,7 +2866,7 @@ impl HirnDB {
                 .map(|record| format!("'{}'", record.id.to_string().replace('\'', "''")))
                 .collect::<Vec<_>>()
                 .join(", ");
-            self.storage_runtime
+            self.storage_backend()
                 .delete(
                     hirn_storage::datasets::episodic::DATASET_NAME,
                     &format!("id IN ({in_list})"),
@@ -2580,7 +2878,7 @@ impl HirnDB {
         let dims = self.config.embedding_dimensions.as_usize();
         let batch = hirn_storage::datasets::episodic::to_batch(&updated, dims)
             .map_err(HirnError::storage)?;
-        self.storage_runtime
+        self.storage_backend()
             .append(hirn_storage::datasets::episodic::DATASET_NAME, batch)
             .await
             .map_err(HirnError::storage)?;
@@ -2738,7 +3036,7 @@ impl HirnDB {
 
         // Delete the full logical chain from LanceDB.
         let exact_filter = Self::episodic_logical_exact_filter(record.logical_memory_id);
-        self.storage_runtime
+        self.storage_backend()
             .delete_exact(
                 hirn_storage::datasets::episodic::DATASET_NAME,
                 &exact_filter,
@@ -2808,6 +3106,10 @@ impl HirnDB {
             if !record.is_live() || record.is_expired(now) {
                 continue;
             }
+            // Pinned records are never decayed or archived by the automated pass.
+            if record.pinned {
+                continue;
+            }
 
             let last_dt = record.last_accessed.as_datetime();
             let hours_elapsed = (now_dt - last_dt).num_seconds().max(0) as f64 / 3600.0;
@@ -2822,6 +3124,9 @@ impl HirnDB {
             let exponent = hours_elapsed / half_life_hours as f64;
             let new_importance = record.importance * (decay_factor as f64).powf(exponent) as f32;
 
+            // Soft archival (recoverable) is gated only by importance falling
+            // below the archival threshold; the retention floor guards the
+            // irreversible hard-purge path (see `run_forgetting`), not this.
             if new_importance < min_importance {
                 let archived = self
                     .append_episodic_successor(
@@ -2863,11 +3168,13 @@ impl HirnDB {
     /// Returns the number of records purged.
     pub(crate) async fn purge_expired(&self) -> HirnResult<usize> {
         let now = Timestamp::now();
+        // A pinned record is exempt from TTL purge when `pin_overrides_ttl` is set.
+        let pin_overrides_ttl = self.config.pin_overrides_ttl;
         let expired_ids: Vec<MemoryId> = self
             .current_episodic_heads()
             .await?
             .into_values()
-            .filter(|record| record.is_expired(now))
+            .filter(|record| record.is_expired(now) && !(pin_overrides_ttl && record.pinned))
             .map(|record| record.id)
             .collect();
 
@@ -2915,7 +3222,7 @@ mod tests {
     use hirn_core::HirnConfig;
     use hirn_core::id::MemoryId;
     use hirn_core::revision::{LogicalMemoryId, RevisionId};
-    use hirn_core::types::{AgentId, EdgeRelation, EventType};
+    use hirn_core::types::{AgentId, EdgeRelation, EventType, MemoryType};
     use hirn_storage::memory_store::MemoryStore;
 
     fn agent() -> AgentId {
@@ -2963,6 +3270,140 @@ mod tests {
         record.updated_at = created_at;
         record.last_accessed = created_at;
         record
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn batch_remember_annotates_only_user_preference_evidence() {
+        let (db, _dir) = temp_db().await;
+        let records = vec![
+            EpisodicRecord::builder()
+                .event_type(EventType::Observation)
+                .content("[session] user: I prefer quiet hotels when traveling.")
+                .summary("I prefer quiet hotels when traveling.")
+                .agent_id(agent())
+                .build()
+                .unwrap(),
+            EpisodicRecord::builder()
+                .event_type(EventType::Observation)
+                .content("[session] assistant: I prefer expensive hotels.")
+                .summary("I prefer expensive hotels.")
+                .agent_id(agent())
+                .build()
+                .unwrap(),
+        ];
+
+        let ids: Vec<MemoryId> = db
+            .batch_remember(records)
+            .await
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
+        let user = db.get_episode(ids[0]).await.unwrap();
+        let assistant = db.get_episode(ids[1]).await.unwrap();
+
+        let evidence = hirn_core::PreferenceEvidence::from_metadata_value(
+            &user.metadata[hirn_core::PREFERENCE_EVIDENCE_METADATA_KEY],
+        )
+        .unwrap();
+        assert_eq!(evidence.target, "quiet hotels");
+        assert_eq!(evidence.qualifiers, vec!["traveling"]);
+        assert_eq!(user.functional_role, MemoryType::Preference);
+        assert!(
+            !assistant
+                .metadata
+                .contains_key(hirn_core::PREFERENCE_EVIDENCE_METADATA_KEY)
+        );
+    }
+
+    /// `batch_remember` and `remember` must annotate identically.
+    ///
+    /// The batch path once skipped its whole annotation pass when no NLU
+    /// provider was configured, so a provider-less deployment stored
+    /// preference-bearing episodes with no evidence and no `Preference` role
+    /// via batch, while the single-record path annotated them correctly. The
+    /// two paths are only comparable if the deterministic floor runs in both.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn batch_and_single_remember_annotate_identically_without_a_provider() {
+        let (db, _dir) = temp_db().await;
+        let content = "[session] user: I dislike early flights because jet lag.";
+        let build = || {
+            EpisodicRecord::builder()
+                .event_type(EventType::Observation)
+                .content(content)
+                .summary("I dislike early flights.")
+                .agent_id(agent())
+                .build()
+                .unwrap()
+        };
+
+        let batched = db.batch_remember(vec![build()]).await;
+        let batched = db.get_episode(batched[0].as_ref().copied().unwrap()).await;
+        let batched = batched.unwrap();
+        let single = db.remember(build()).await.unwrap();
+        let single = db.get_episode(single).await.unwrap();
+
+        let from_batch = hirn_core::PreferenceEvidence::from_metadata_value(
+            &batched.metadata[hirn_core::PREFERENCE_EVIDENCE_METADATA_KEY],
+        )
+        .expect("batch path must annotate without a provider");
+        let from_single = hirn_core::PreferenceEvidence::from_metadata_value(
+            &single.metadata[hirn_core::PREFERENCE_EVIDENCE_METADATA_KEY],
+        )
+        .expect("single path must annotate without a provider");
+
+        assert_eq!(from_batch.target, from_single.target);
+        assert_eq!(from_batch.polarity, from_single.polarity);
+        assert_eq!(from_batch.qualifiers, from_single.qualifiers);
+        assert_eq!(batched.functional_role, single.functional_role);
+        assert_eq!(batched.functional_role, MemoryType::Preference);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn admission_merge_appends_durable_target_successor() {
+        let (db, _dir) = temp_db().await;
+        let target = EpisodicRecord::builder()
+            .event_type(EventType::Observation)
+            .content("deployment completed")
+            .summary("deployment")
+            .importance(0.4)
+            .surprise(0.1)
+            .agent_id(agent())
+            .build()
+            .unwrap();
+        let target_id = db.remember_bypass_admission(target).await.unwrap();
+
+        let candidate = EpisodicRecord::builder()
+            .event_type(EventType::Observation)
+            .content("deployment completed")
+            .summary("duplicate deployment observation")
+            .importance(0.9)
+            .surprise(0.6)
+            .agent_id(agent())
+            .build()
+            .unwrap();
+        let candidate_id = candidate.id;
+
+        let merged_id = db
+            .merge_admitted_duplicate(target_id, &candidate)
+            .await
+            .unwrap();
+        assert_ne!(merged_id, target_id);
+
+        let merged = db.get_episode(merged_id).await.unwrap();
+        assert_eq!(merged.revision_operation, RevisionOperation::Merge);
+        assert_eq!(merged.version, 2);
+        assert_eq!(merged.importance, 0.9);
+        assert_eq!(merged.surprise, 0.6);
+        assert_eq!(
+            merged.metadata.get("admission_merge_count"),
+            Some(&hirn_core::metadata::MetadataValue::Int(1))
+        );
+        assert_eq!(
+            merged.metadata.get("admission_last_merged_candidate_id"),
+            Some(&hirn_core::metadata::MetadataValue::String(
+                candidate_id.to_string()
+            ))
+        );
     }
 
     #[test]

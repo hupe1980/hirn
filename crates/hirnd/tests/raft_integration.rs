@@ -1073,3 +1073,107 @@ async fn state_machine_apply_is_deterministic_across_replays() {
         "state machines diverged after applying identical entries"
     );
 }
+
+// ── DR-C1: durable state machine survives snapshot-driven restart ──────────
+
+/// The durable state machine must persist applied cluster metadata to redb and
+/// reload it on reopen — otherwise a snapshot-driven log purge + restart loses
+/// realm ownership, node registry, leases, and (critically) the monotonic lease
+/// fence, which would then regress to 0.
+#[tokio::test]
+async fn durable_state_machine_survives_reopen() {
+    use openraft::storage::RaftStateMachine;
+
+    let tmp = TempDir::new().unwrap();
+    let log_path = tmp.path().join("raft-log.redb");
+
+    // Real current epoch: the lease-expiry check consults the wall clock, so a
+    // stale fixed timestamp would read back as already-expired.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let fence_before;
+    {
+        let store = DurableLogStore::open(&log_path).unwrap();
+        let mut sm =
+            Arc::new(HirnStateMachine::open(store.database(), store.write_lock()).unwrap());
+
+        let entries = vec![
+            openraft::Entry::<TypeConfig> {
+                log_id: openraft::LogId::new(openraft::CommittedLeaderId::new(1, 0), 1),
+                payload: openraft::EntryPayload::Normal(RaftRequest::RegisterNode {
+                    node_id: 7,
+                    addr: "10.0.0.7:9000".to_string(),
+                }),
+            },
+            openraft::Entry::<TypeConfig> {
+                log_id: openraft::LogId::new(openraft::CommittedLeaderId::new(1, 0), 2),
+                payload: openraft::EntryPayload::Normal(RaftRequest::AssignRealm {
+                    realm: "tenant-a".to_string(),
+                    owner_node: 7,
+                }),
+            },
+            openraft::Entry::<TypeConfig> {
+                log_id: openraft::LogId::new(openraft::CommittedLeaderId::new(1, 0), 3),
+                payload: openraft::EntryPayload::Normal(RaftRequest::AcquireLease {
+                    realm: "tenant-a".to_string(),
+                    holder: 7,
+                    duration_secs: 3600,
+                    proposed_at_epoch_secs: now,
+                }),
+            },
+        ];
+        sm.apply(entries).await.unwrap();
+
+        fence_before = sm.active_lease("tenant-a").await.unwrap().fence;
+        assert_eq!(sm.realm_owner("tenant-a").await, Some(7));
+        assert_eq!(sm.node_addr(7).await, Some("10.0.0.7:9000".to_string()));
+    } // drop sm + store — simulates process restart
+
+    // Reopen at the same path: state must be reloaded from disk.
+    {
+        let store = DurableLogStore::open(&log_path).unwrap();
+        let mut sm =
+            Arc::new(HirnStateMachine::open(store.database(), store.write_lock()).unwrap());
+
+        assert_eq!(
+            sm.realm_owner("tenant-a").await,
+            Some(7),
+            "realm ownership must survive restart"
+        );
+        assert_eq!(
+            sm.node_addr(7).await,
+            Some("10.0.0.7:9000".to_string()),
+            "node registry must survive restart"
+        );
+        assert!(
+            sm.active_lease("tenant-a").await.is_some(),
+            "lease must survive restart"
+        );
+        let (last_applied, _) = sm.applied_state().await.unwrap();
+        assert_eq!(
+            last_applied.map(|l| l.index),
+            Some(3),
+            "last_applied_log must survive restart"
+        );
+
+        // A fresh acquisition must yield a strictly greater fence — never regress
+        // to 0 (the pre-fix failure mode).
+        let acquire = openraft::Entry::<TypeConfig> {
+            log_id: openraft::LogId::new(openraft::CommittedLeaderId::new(1, 0), 4),
+            payload: openraft::EntryPayload::Normal(RaftRequest::AcquireLease {
+                realm: "tenant-a".to_string(),
+                holder: 7,
+                duration_secs: 3600,
+                proposed_at_epoch_secs: now + 1,
+            }),
+        };
+        sm.apply(vec![acquire]).await.unwrap();
+        let fence_after = sm.active_lease("tenant-a").await.unwrap().fence;
+        assert!(
+            fence_after > fence_before,
+            "lease fence must not regress across restart: before={fence_before} after={fence_after}"
+        );
+    }
+}

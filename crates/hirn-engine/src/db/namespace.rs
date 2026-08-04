@@ -1173,6 +1173,30 @@ impl HirnDB {
             accessible,
         ))
     }
+
+    /// Create an agent-scoped context further narrowed by a credential's
+    /// namespace allowlist.
+    ///
+    /// The resulting scope is the intersection of namespaces granted by the
+    /// engine (team membership/Cedar) and namespaces carried by the external
+    /// credential. An empty intersection intentionally denies every
+    /// namespace; credential scope can never widen engine authorization.
+    pub async fn as_agent_with_namespaces(
+        &self,
+        agent_id: &hirn_core::types::AgentId,
+        credential_namespaces: &[Namespace],
+    ) -> HirnResult<crate::agent_context::AgentContext<'_>> {
+        let agent = self.as_agent(agent_id).await?;
+        let accessible = agent
+            .accessible_namespaces()
+            .iter()
+            .copied()
+            .filter(|namespace| credential_namespaces.contains(namespace))
+            .collect();
+        Ok(crate::agent_context::AgentContext::new(
+            self, *agent_id, accessible,
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -1503,6 +1527,33 @@ mod tests {
             .agent_id(test_agent())
             .build()
             .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn credential_namespace_scope_intersects_agent_grants() {
+        let (db, _config, _storage, _dir) = temp_db().await;
+        let agent = AgentId::new("credential_scope_agent").unwrap();
+        db.register_agent(&agent, "Credential Scope Agent")
+            .await
+            .unwrap();
+        let granted = Namespace::new("credential_granted_team").unwrap();
+        db.create_namespace(granted.as_str(), NamespaceKind::Team, vec![agent])
+            .await
+            .unwrap();
+
+        let context = db
+            .as_agent_with_namespaces(&agent, &[granted])
+            .await
+            .unwrap();
+        assert_eq!(context.accessible_namespaces(), &[granted]);
+        assert!(!context.can_access(&Namespace::private_for(&agent)));
+
+        let ungranted = Namespace::new("credential_ungranted_team").unwrap();
+        let context = db
+            .as_agent_with_namespaces(&agent, &[ungranted])
+            .await
+            .unwrap();
+        assert!(context.accessible_namespaces().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]

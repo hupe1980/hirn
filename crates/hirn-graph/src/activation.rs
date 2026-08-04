@@ -182,6 +182,13 @@ pub struct PprConfig {
     pub epsilon: f64,
     /// Maximum iterations. Default: 100.
     pub max_iterations: usize,
+    /// Maximum graph depth explored while constructing the PPR subgraph.
+    /// Default: 8.
+    pub max_depth: usize,
+    /// Maximum nodes retained in the query-local PPR subgraph. Default: 50,000.
+    pub max_nodes: usize,
+    /// Maximum nodes admitted to any BFS frontier. Default: 10,000.
+    pub max_frontier_size: usize,
 }
 
 impl Default for PprConfig {
@@ -190,6 +197,9 @@ impl Default for PprConfig {
             alpha: 0.15,
             epsilon: 1e-6,
             max_iterations: 100,
+            max_depth: 8,
+            max_nodes: 50_000,
+            max_frontier_size: 10_000,
         }
     }
 }
@@ -199,6 +209,9 @@ impl PartialEq for PprConfig {
         self.alpha == other.alpha
             && self.epsilon == other.epsilon
             && self.max_iterations == other.max_iterations
+            && self.max_depth == other.max_depth
+            && self.max_nodes == other.max_nodes
+            && self.max_frontier_size == other.max_frontier_size
     }
 }
 
@@ -218,6 +231,21 @@ impl PprConfig {
         if self.max_iterations == 0 {
             return Err(HirnError::InvalidInput(
                 "ppr.max_iterations must be greater than 0".into(),
+            ));
+        }
+        if self.max_depth == 0 {
+            return Err(HirnError::InvalidInput(
+                "ppr.max_depth must be greater than 0".into(),
+            ));
+        }
+        if self.max_nodes == 0 {
+            return Err(HirnError::InvalidInput(
+                "ppr.max_nodes must be greater than 0".into(),
+            ));
+        }
+        if self.max_frontier_size == 0 {
+            return Err(HirnError::InvalidInput(
+                "ppr.max_frontier_size must be greater than 0".into(),
             ));
         }
         Ok(())
@@ -393,7 +421,7 @@ fn personalized_pagerank_unchecked(
 
     // Restrict PPR to the seed-reachable induced subgraph. Full-graph ranking
     // biases toward hubs and turns each query into a global walk.
-    let all_nodes = collect_reachable_nodes(graph, seeds, allowed_namespaces, now);
+    let all_nodes = collect_reachable_nodes(graph, seeds, config, allowed_namespaces, now);
     if all_nodes.is_empty() {
         return HashMap::new();
     }
@@ -419,6 +447,7 @@ fn personalized_pagerank_unchecked(
 fn collect_reachable_nodes(
     graph: &PropertyGraph,
     seeds: &[MemoryId],
+    config: &PprConfig,
     allowed_namespaces: Option<&[Namespace]>,
     as_of: Timestamp,
 ) -> Vec<MemoryId> {
@@ -437,12 +466,19 @@ fn collect_reachable_nodes(
             continue;
         }
         if visited.insert(seed) {
-            queue.push_back(seed);
+            queue.push_back((seed, 0_usize));
             reachable.push(seed);
+            if reachable.len() >= config.max_nodes {
+                return reachable;
+            }
         }
     }
 
-    while let Some(node_id) = queue.pop_front() {
+    let mut depth_frontier_counts = vec![0_usize; config.max_depth.saturating_add(1)];
+    while let Some((node_id, depth)) = queue.pop_front() {
+        if depth >= config.max_depth {
+            continue;
+        }
         let Some(node_idx) = graph.node_index(node_id) else {
             continue;
         };
@@ -467,9 +503,17 @@ fn collect_reachable_nodes(
             {
                 continue;
             }
+            let next_depth = depth + 1;
+            if depth_frontier_counts[next_depth] >= config.max_frontier_size {
+                continue;
+            }
             if visited.insert(neighbor_id) {
-                queue.push_back(neighbor_id);
+                depth_frontier_counts[next_depth] += 1;
+                queue.push_back((neighbor_id, next_depth));
                 reachable.push(neighbor_id);
+                if reachable.len() >= config.max_nodes {
+                    return reachable;
+                }
             }
         }
     }
@@ -788,6 +832,22 @@ mod tests {
             .validate()
             .is_err()
         );
+        for invalid in [
+            PprConfig {
+                max_depth: 0,
+                ..Default::default()
+            },
+            PprConfig {
+                max_nodes: 0,
+                ..Default::default()
+            },
+            PprConfig {
+                max_frontier_size: 0,
+                ..Default::default()
+            },
+        ] {
+            assert!(invalid.validate().is_err());
+        }
     }
 
     #[test]
@@ -1576,6 +1636,44 @@ mod tests {
             "star leaves should have equal scores, spread = {}",
             max - min
         );
+    }
+
+    #[test]
+    fn ppr_reachable_subgraph_respects_node_and_depth_limits() {
+        let mut pg = PropertyGraph::new();
+        let seed = make_graph_node(&mut pg);
+        let first = make_graph_node(&mut pg);
+        let second = make_graph_node(&mut pg);
+        let third = make_graph_node(&mut pg);
+        pg.add_edge(seed, first, EdgeRelation::Causes, 1.0, Metadata::new())
+            .unwrap();
+        pg.add_edge(first, second, EdgeRelation::Causes, 1.0, Metadata::new())
+            .unwrap();
+        pg.add_edge(second, third, EdgeRelation::Causes, 1.0, Metadata::new())
+            .unwrap();
+
+        let depth_limited = personalized_pagerank(
+            &pg,
+            &[seed],
+            &PprConfig {
+                max_depth: 1,
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(depth_limited.contains_key(&first));
+        assert!(!depth_limited.contains_key(&second));
+
+        let node_limited = personalized_pagerank(
+            &pg,
+            &[seed],
+            &PprConfig {
+                max_nodes: 2,
+                ..Default::default()
+            },
+            None,
+        );
+        assert_eq!(node_limited.len(), 2);
     }
 
     #[test]

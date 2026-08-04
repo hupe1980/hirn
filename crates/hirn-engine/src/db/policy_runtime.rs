@@ -70,6 +70,11 @@ impl PolicyRuntime {
         storage: Arc<dyn PhysicalStore>,
         hmac_secret: Option<&[u8]>,
     ) -> HirnResult<Self> {
+        if hmac_secret.is_none() {
+            tracing::warn!(
+                "event_hmac_secret is not configured; audit entries will not be tamper-evident"
+            );
+        }
         let audit_key = hmac_secret.map(hirn_policy::audit::derive_key);
         let (next_seq, chain_head) = Self::recover_audit_chain_state(&*storage).await?;
         Ok(Self {

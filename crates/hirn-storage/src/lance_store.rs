@@ -401,6 +401,12 @@ impl LancePhysicalStore {
     pub fn refresh_dataset(&self, dataset: &str) {
         self.datasets.invalidate(&dataset.to_string());
         self.invalidate_dataset_caches(dataset);
+        // A negative index lookup is only valid for the dataset snapshot that
+        // produced it. An external writer may have created an index since the
+        // last refresh, while positive entries remain monotonic across normal
+        // dataset updates.
+        self.vector_index_cache
+            .retain(|key, has_index| key.dataset != dataset || *has_index);
     }
 
     /// Get a dataset handle for DataFusion `LanceTableProvider` registration.
@@ -722,6 +728,23 @@ impl LancePhysicalStore {
         let Some(first_query) = queries.first() else {
             return Ok(Vec::new());
         };
+
+        if queries
+            .iter()
+            .any(|query| query.column != first_query.column)
+        {
+            return Err(HirnDbError::InvalidArgument(
+                "batched flat vector search requires a shared column".into(),
+            ));
+        }
+        for query in queries {
+            if query.query.iter().any(|value| !value.is_finite()) {
+                return Err(HirnDbError::InvalidArgument(
+                    "vector query contains a non-finite value".into(),
+                ));
+            }
+        }
+
         let Some(first_batch) = batches.first() else {
             return Ok(vec![Vec::new(); queries.len()]);
         };
@@ -729,6 +752,26 @@ impl LancePhysicalStore {
         let col_idx = schema.index_of(&first_query.column).map_err(|_| {
             HirnDbError::InvalidArgument(format!("column `{}` not found", first_query.column))
         })?;
+        let expected_dimensions = match schema.field(col_idx).data_type() {
+            arrow_schema::DataType::FixedSizeList(child, dimensions)
+                if child.data_type() == &arrow_schema::DataType::Float32 =>
+            {
+                *dimensions as usize
+            }
+            _ => {
+                return Err(HirnDbError::InvalidArgument(
+                    "vector column must be FixedSizeList<Float32>".into(),
+                ));
+            }
+        };
+        for query in queries {
+            if query.query.len() != expected_dimensions {
+                return Err(HirnDbError::InvalidArgument(format!(
+                    "vector query dimension mismatch: expected {expected_dimensions}, got {}",
+                    query.query.len()
+                )));
+            }
+        }
 
         struct FlatVectorQueryState<'a> {
             prepared_query: PreparedDistanceQuery<'a>,
@@ -768,6 +811,16 @@ impl LancePhysicalStore {
                 let start = row_idx * value_length;
                 let end = start + value_length;
                 let vector = &raw_values[start..end];
+                if (start..end).any(|index| f32_values.is_null(index)) {
+                    return Err(HirnDbError::InvalidArgument(format!(
+                        "vector column contains a null component at batch {batch_idx}, row {row_idx}"
+                    )));
+                }
+                if vector.iter().any(|value| !value.is_finite()) {
+                    return Err(HirnDbError::InvalidArgument(format!(
+                        "vector column contains a non-finite value at batch {batch_idx}, row {row_idx}"
+                    )));
+                }
                 for query_state in &mut query_states {
                     if query_state.limit == 0 {
                         continue;
@@ -2462,8 +2515,7 @@ impl PartialOrd for ScoredRow {
 impl Ord for ScoredRow {
     fn cmp(&self, other: &Self) -> Ordering {
         self.distance
-            .partial_cmp(&other.distance)
-            .unwrap_or(Ordering::Equal)
+            .total_cmp(&other.distance)
             .then_with(|| self.batch_idx.cmp(&other.batch_idx))
             .then_with(|| self.row_idx.cmp(&other.row_idx))
     }
@@ -2734,6 +2786,59 @@ mod tests {
         );
 
         assert_eq!(cosine, 1.0);
+    }
+
+    #[test]
+    fn flat_vector_search_rejects_dimension_mismatch_and_non_finite_values() {
+        use crate::store::VectorSearchOptions;
+
+        let batches = vec![embedding_batch(2, 4)];
+        let query = |values: Vec<f32>| VectorSearchOptions {
+            column: "embedding".to_string(),
+            query: values,
+            metric: DistanceMetric::Cosine,
+            limit: 1,
+            filter: None,
+            nprobes: None,
+            refine_factor: None,
+        };
+
+        let dimension_error = super::LancePhysicalStore::flat_vector_search_batches(
+            &batches,
+            &query(vec![1.0, 0.0, 0.0]),
+        )
+        .unwrap_err();
+        assert!(dimension_error.to_string().contains("dimension mismatch"));
+
+        let non_finite_error = super::LancePhysicalStore::flat_vector_search_batches(
+            &batches,
+            &query(vec![f32::NAN, 0.0, 0.0, 0.0]),
+        )
+        .unwrap_err();
+        assert!(non_finite_error.to_string().contains("non-finite"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn refresh_dataset_clears_only_negative_vector_index_entries() {
+        let (_tmp, store) = lance_test_store().await;
+        let negative = super::VectorIndexCacheKey {
+            dataset: "vecs".to_string(),
+            column: "embedding".to_string(),
+        };
+        let positive = super::VectorIndexCacheKey {
+            dataset: "vecs".to_string(),
+            column: "other_embedding".to_string(),
+        };
+        store.vector_index_cache.insert(negative.clone(), false);
+        store.vector_index_cache.insert(positive.clone(), true);
+
+        store.refresh_dataset("vecs");
+
+        assert!(!store.vector_index_cache.contains_key(&negative));
+        assert_eq!(
+            store.vector_index_cache.get(&positive).as_deref(),
+            Some(&true)
+        );
     }
 
     #[test]

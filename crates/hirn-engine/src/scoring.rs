@@ -6,8 +6,9 @@
 //! formula. This module keeps the historical `crate::scoring::*` paths alive.
 
 pub use hirn_core::scoring::{
-    ScoreBreakdown, ScoringWeights, composite_score, fade_mem_recency,
-    source_reliability_for_origin, source_reliability_for_record,
+    ScoreBreakdown, ScoringWeights, composite_score, composite_score_for_state, fade_mem_recency,
+    fade_mem_recency_for_state, source_reliability_for_origin, source_reliability_for_record,
+    temporal_state_for_record,
 };
 
 /// F-34: Re-export the reranker trait from hirn-core.

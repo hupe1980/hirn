@@ -198,6 +198,13 @@ pub struct RecallBuilder<'a> {
     pub(crate) allowed_namespaces: Option<Vec<Namespace>>,
     pub(crate) after: Option<Timestamp>,
     pub(crate) before: Option<Timestamp>,
+    /// Soft temporal ranking hints: a time frame that boosts in-frame records via
+    /// the Allen-interval temporal term WITHOUT hard-excluding out-of-frame ones
+    /// (unlike `after`/`before`, which are scan prefilters). Used for
+    /// NL-parsed frames, where excluding on a literal calendar mention would drop
+    /// gold evidence stamped just outside it.
+    pub(crate) hint_after: Option<Timestamp>,
+    pub(crate) hint_before: Option<Timestamp>,
     pub(crate) snapshot: Option<RecallSnapshot>,
     pub(crate) weights: Option<ScoringWeights>,
     pub(crate) activation_mode: ActivationMode,
@@ -230,6 +237,8 @@ impl<'a> RecallBuilder<'a> {
             allowed_namespaces: None,
             after: None,
             before: None,
+            hint_after: None,
+            hint_before: None,
             snapshot: None,
             weights: None,
             activation_mode: ActivationMode::None,
@@ -276,12 +285,25 @@ impl<'a> RecallBuilder<'a> {
     /// Restrict results to a specific namespace.
     pub fn namespace(mut self, ns: Namespace) -> Self {
         self.namespace = Some(ns);
+        self.allowed_namespaces = None;
+        self.unrestricted = false;
         self
     }
 
-    pub(crate) fn allowed_namespaces(mut self, namespaces: Vec<Namespace>) -> Self {
-        self.allowed_namespaces = Some(namespaces);
+    /// Restrict results to an explicit set of namespaces.
+    ///
+    /// This is the multi-namespace counterpart to [`namespace`](Self::namespace).
+    /// An empty set is fail-closed and returns no records. The last call among
+    /// `namespace`, `namespaces`, and [`unrestricted`](Self::unrestricted) wins.
+    pub fn namespaces(mut self, namespaces: impl IntoIterator<Item = Namespace>) -> Self {
+        self.namespace = None;
+        self.unrestricted = false;
+        self.allowed_namespaces = Some(namespaces.into_iter().collect());
         self
+    }
+
+    pub(crate) fn allowed_namespaces(self, namespaces: Vec<Namespace>) -> Self {
+        self.namespaces(namespaces)
     }
 
     /// Read across every namespace, bypassing tenant isolation.
@@ -293,6 +315,8 @@ impl<'a> RecallBuilder<'a> {
     /// or an allowed-namespace set instead — an unscoped recall without this
     /// opt-in denies rather than leaking across tenants.
     pub fn unrestricted(mut self) -> Self {
+        self.namespace = None;
+        self.allowed_namespaces = None;
         self.unrestricted = true;
         self
     }
@@ -313,6 +337,19 @@ impl<'a> RecallBuilder<'a> {
     pub fn between(mut self, start: Timestamp, end: Timestamp) -> Self {
         self.after = Some(start);
         self.before = Some(end);
+        self
+    }
+
+    /// Provide a **soft** temporal ranking hint: `[after, before)` bounds that
+    /// boost in-frame records via the Allen-interval temporal term but do NOT
+    /// exclude out-of-frame records (unlike [`after`](Self::after)/[`before`](Self::before)).
+    /// Intended for NL-parsed time frames, where a hard filter on a literal
+    /// calendar mention would drop gold evidence stamped just outside it. Ignored
+    /// for a bound already set as a hard filter.
+    #[must_use]
+    pub fn temporal_hint(mut self, after: Option<Timestamp>, before: Option<Timestamp>) -> Self {
+        self.hint_after = after;
+        self.hint_before = before;
         self
     }
 
@@ -475,6 +512,13 @@ impl<'a> RecallBuilder<'a> {
             w.validate()
                 .map_err(|e| HirnError::InvalidInput(format!("invalid scoring weights: {e}")))?;
         }
+        let can_decompose = self.query_text.is_some()
+            && self.threshold.is_none()
+            && matches!(self.layer_filter, LayerFilter::All)
+            && self.after.is_none()
+            && self.before.is_none()
+            && self.snapshot.is_none()
+            && self.weights.is_none();
 
         let start = std::time::Instant::now();
         let query_id = QueryId::new();
@@ -537,6 +581,55 @@ impl<'a> RecallBuilder<'a> {
                 authz_start.elapsed().as_micros() as u64
             };
 
+            // An observed-time snapshot (`AS OF OBSERVED t`) becomes the query's
+            // point-in-time frame for temporal reranking; recorded/revision
+            // snapshots are transaction-time and carry no observed frame.
+            let as_of_ts = match &semantic_mode {
+                SemanticRecallMode::Snapshot(RecallSnapshot::Observed(ts)) => Some(*ts),
+                _ => None,
+            };
+
+            // Resolve natural-language calendar and event-relative frames once
+            // at the public recall boundary. Explicit hard bounds or caller-
+            // supplied hints always win. The grounded frame is a soft ranking
+            // hint, and the anchor lookup inherits the exact actor/namespace
+            // scope so it cannot widen tenant visibility.
+            let (hint_after, hint_before) = if self.after.is_none()
+                && self.before.is_none()
+                && self.hint_after.is_none()
+                && self.hint_before.is_none()
+                && self.query_text.is_some()
+            {
+                let temporal_scope = if let Some(namespace) = self.namespace {
+                    Some(vec![namespace])
+                } else if let Some(namespaces) = self.allowed_namespaces.as_ref() {
+                    Some(namespaces.clone())
+                } else if self.unrestricted {
+                    None
+                } else {
+                    Some(Vec::new())
+                };
+                let actor_id = AgentId::new(&agent).ok();
+                let frame = crate::retrieval::temporal_ground::ground_temporal_frame(
+                    self.db,
+                    actor_id.as_ref(),
+                    self.query_text.as_deref().unwrap_or_default(),
+                    temporal_scope.as_deref(),
+                    Timestamp::now().timestamp_ms(),
+                )
+                .await;
+                (
+                    frame
+                        .after_ms
+                        .map(|millis| Timestamp::from_millis(millis.max(0) as u64)),
+                    frame
+                        .before_ms
+                        .map(|millis| Timestamp::from_millis(millis.max(0) as u64)),
+                )
+            } else {
+                (self.hint_after, self.hint_before)
+            };
+
             let (results, mut diag) = self.db.execute_recall(
                 &self.query,
                 self.limit,
@@ -547,6 +640,9 @@ impl<'a> RecallBuilder<'a> {
                 self.unrestricted,
                 self.after.as_ref(),
                 self.before.as_ref(),
+                hint_after.as_ref(),
+                hint_before.as_ref(),
+                as_of_ts.as_ref(),
                 self.weights.as_ref(),
                 self.activation_mode,
                 self.activation_depth,
@@ -563,6 +659,28 @@ impl<'a> RecallBuilder<'a> {
                         .await?
                 }
             };
+
+                if can_decompose {
+                    let decomposition_scope = if let Some(namespace) = self.namespace {
+                        Some(vec![namespace])
+                    } else if let Some(namespaces) = self.allowed_namespaces.as_ref() {
+                        Some(namespaces.clone())
+                    } else if self.unrestricted {
+                        None
+                    } else {
+                        Some(Vec::new())
+                    };
+                    let actor_id = AgentId::new(&agent).ok();
+                    results = crate::retrieval::decompose::multi_entity_recall(
+                        self.db,
+                        actor_id.as_ref(),
+                        self.query_text.as_deref().unwrap_or_default(),
+                        results,
+                        decomposition_scope.as_deref(),
+                        self.limit,
+                    )
+                    .await;
+                }
 
             diag.query_id = Some(query_id);
             diag.authorize_us = Some(authz_us);
@@ -688,6 +806,7 @@ impl<'a> RecallBuilder<'a> {
             causal_relevance: self.db.config().scoring_causal_relevance_weight,
             surprise: self.db.config().scoring_surprise_weight,
             source_reliability: self.db.config().scoring_source_reliability_weight,
+            temporal_relevance: self.db.config().scoring_temporal_relevance_weight,
         })
     }
 }

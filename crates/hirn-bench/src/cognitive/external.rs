@@ -393,6 +393,7 @@ fn build_locomo_dataset(data_dir: &Path, conversations: &[LoCoMoConversation]) -
                 }
 
                 queries.push(QAQuery {
+                    question_date_ms: None,
                     id: format!("locomo-{}-{query_idx}", conv.id),
                     question: q.question.clone(),
                     expected_answers: vec![q.answer.clone()],
@@ -409,6 +410,7 @@ fn build_locomo_dataset(data_dir: &Path, conversations: &[LoCoMoConversation]) -
     CognitiveDataset {
         name: format!("LoCoMo ({})", data_dir.display()),
         benchmark: Benchmark::H1Retrieval,
+        retrieval_corpus: super::RetrievalCorpus::Shared,
         sessions,
         queries,
         truncated: None,
@@ -773,6 +775,7 @@ pub fn load_dmr(data_dir: &Path) -> Result<CognitiveDataset, String> {
         for q in &dialog.queries {
             query_idx += 1;
             queries.push(QAQuery {
+                question_date_ms: None,
                 id: format!("dmr-{}-{query_idx}", dialog.dialog_id),
                 question: q.query.clone(),
                 expected_answers: vec![q.answer.clone()],
@@ -792,6 +795,7 @@ pub fn load_dmr(data_dir: &Path) -> Result<CognitiveDataset, String> {
     Ok(CognitiveDataset {
         name: format!("DMR ({})", data_dir.display()),
         benchmark: Benchmark::H1Retrieval,
+        retrieval_corpus: super::RetrievalCorpus::Shared,
         sessions,
         queries,
         truncated: None,
@@ -942,6 +946,7 @@ pub fn load_longmemeval_with_limits(
                     })
                     .collect();
                 queries.push(QAQuery {
+                    question_date_ms: None,
                     id: format!("lme-{}-{query_idx}", case.id),
                     question: q.question.clone(),
                     expected_answers: vec![q.answer.clone()],
@@ -957,6 +962,7 @@ pub fn load_longmemeval_with_limits(
         return Ok(CognitiveDataset {
             name: format!("LongMemEval ({})", data_dir.display()),
             benchmark: Benchmark::H1Retrieval,
+            retrieval_corpus: super::RetrievalCorpus::PerQueryHaystack,
             sessions,
             queries,
             truncated: None,
@@ -1115,10 +1121,24 @@ struct LongMemEvalRawRow {
     answer: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_stringlike")]
     question_type: Option<String>,
+    /// `YYYY/MM/DD (Day) HH:MM` — anchors year-less dates in the context.
+    #[serde(default, deserialize_with = "deserialize_optional_stringlike")]
+    question_date: Option<String>,
     #[serde(default, deserialize_with = "deserialize_vec_stringlike")]
     answer_session_ids: Vec<String>,
     #[serde(default, deserialize_with = "deserialize_vec_stringlike")]
     haystack_session_ids: Vec<String>,
+    /// Per-session `YYYY/MM/DD (Day) HH:MM`, positionally aligned with
+    /// `haystack_sessions`.
+    ///
+    /// These are the conversation's real session dates. Dropping them makes
+    /// every session look simultaneous, which silently defeats anything that
+    /// reasons over *when* something was said: recency ranking has nothing to
+    /// order by, and a relative expression in the text ("today", "last
+    /// Tuesday") has no anchor but the question date, so excerpts written
+    /// weeks apart all resolve to the same day.
+    #[serde(default, deserialize_with = "deserialize_vec_stringlike")]
+    haystack_dates: Vec<String>,
     #[serde(default)]
     haystack_sessions: Vec<Vec<LongMemEvalRawTurn>>,
 }
@@ -1189,6 +1209,23 @@ fn register_longmemeval_session(
     (canonical_id, true)
 }
 
+/// Parse LongMemEval's `YYYY/MM/DD (Day) HH:MM` timestamp into epoch millis.
+///
+/// The weekday marker is decorative; only the date and time are needed. Used to
+/// anchor year-less date expressions found in the retrieved context.
+fn parse_longmemeval_datetime_ms(text: &str) -> Option<i64> {
+    let cleaned: String = text
+        .split_whitespace()
+        .filter(|token| !token.starts_with('('))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(&cleaned, "%Y/%m/%d %H:%M") {
+        return Some(dt.and_utc().timestamp_millis());
+    }
+    let date = chrono::NaiveDate::parse_from_str(cleaned.trim(), "%Y/%m/%d").ok()?;
+    Some(date.and_hms_opt(0, 0, 0)?.and_utc().timestamp_millis())
+}
+
 fn is_longmemeval_abstention(
     task_type: Option<&str>,
     answer: &str,
@@ -1225,8 +1262,10 @@ fn append_longmemeval_raw_row(
         question,
         answer,
         question_type,
+        question_date,
         answer_session_ids,
         haystack_session_ids,
+        haystack_dates,
         haystack_sessions,
     } = row;
 
@@ -1248,6 +1287,12 @@ fn append_longmemeval_raw_row(
 
     let mut relevant_session_ids = Vec::new();
     for (session_index, raw_session) in haystack_sessions.into_iter().enumerate() {
+        // The session's own date, not the question's: turns written weeks apart
+        // must not resolve to the same instant.
+        let session_date_text = haystack_dates.get(session_index).map(String::as_str);
+        let session_date_ms = session_date_text
+            .and_then(parse_longmemeval_datetime_ms)
+            .and_then(|ms| u64::try_from(ms).ok());
         let turns: Vec<Turn> = raw_session
             .into_iter()
             .filter_map(|turn| {
@@ -1269,7 +1314,13 @@ fn append_longmemeval_raw_row(
                         speaker
                     },
                     content,
-                    timestamp: None,
+                    timestamp: session_date_ms,
+                    // Deliberately structured-only. `render_turn_content`
+                    // splices `timestamp_text` into the record's text, which
+                    // would change every embedding key and confound a temporal
+                    // A/B with a retrieval change. Surfacing session dates
+                    // inside the content is a separate experiment that needs
+                    // the corpus re-embedded.
                     timestamp_text: None,
                     source_id: None,
                 })
@@ -1336,6 +1387,9 @@ fn append_longmemeval_raw_row(
         evidence_ids: Vec::new(),
         evidence_snippets: Vec::new(),
         negative: is_longmemeval_abstention(task_type.as_deref(), &answer, &answer_session_ids),
+        question_date_ms: question_date
+            .as_deref()
+            .and_then(parse_longmemeval_datetime_ms),
     });
 
     Ok(())
@@ -1400,6 +1454,7 @@ fn load_longmemeval_raw(
     Ok(CognitiveDataset {
         name: format!("LongMemEval ({})", data_dir.display()),
         benchmark: Benchmark::H1Retrieval,
+        retrieval_corpus: super::RetrievalCorpus::PerQueryHaystack,
         sessions,
         queries,
         truncated,
@@ -1895,6 +1950,7 @@ fn append_beam_conversation(
 
             *query_idx += 1;
             queries.push(QAQuery {
+                question_date_ms: None,
                 id: format!("beam-{conversation}-{query_idx}"),
                 question: question.to_string(),
                 expected_answers: vec![answer.to_string()],
@@ -1954,6 +2010,7 @@ pub fn load_beam_with_limits(
     Ok(CognitiveDataset {
         name: format!("BEAM ({})", data_dir.display()),
         benchmark: Benchmark::H1Retrieval,
+        retrieval_corpus: super::RetrievalCorpus::Shared,
         sessions,
         queries,
         truncated,
@@ -2274,6 +2331,10 @@ mod tests {
         .unwrap();
 
         let dataset = load_longmemeval(dir.path()).unwrap();
+        assert_eq!(
+            dataset.retrieval_corpus,
+            super::super::RetrievalCorpus::PerQueryHaystack
+        );
         assert_eq!(dataset.sessions.len(), 2);
         assert_eq!(dataset.queries.len(), 2);
         assert_eq!(dataset.queries[0].expected_answers, vec!["3"]);
@@ -2577,6 +2638,82 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let error = dataset_files_for_format(ExternalFormat::Dmr, dir.path()).unwrap_err();
         assert!(error.contains("no dataset files found"), "got: {error}");
+    }
+
+    /// Each session's turns must carry that session's own date.
+    ///
+    /// The adapter previously parsed `haystack_sessions` while ignoring
+    /// `haystack_dates`, so every turn arrived with no timestamp and the whole
+    /// conversation looked simultaneous. Anything reasoning over *when*
+    /// something was said then had nothing to work with, and a relative
+    /// expression in the text could only anchor to the question date — so
+    /// excerpts written weeks apart resolved to the same day and produced
+    /// zero-length intervals.
+    #[test]
+    fn longmemeval_turns_carry_their_own_session_date() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let raw = serde_json::json!([{
+            "question_id": "q1",
+            "question": "How many days between the museum visit and the exhibit?",
+            "answer": "7 days",
+            "question_type": "temporal-reasoning",
+            "question_date": "2023/02/10 (Fri) 12:00",
+            "haystack_session_ids": ["s-early", "s-late"],
+            "haystack_dates": ["2023/02/01 (Wed) 09:00", "2023/02/08 (Wed) 09:00"],
+            "haystack_sessions": [
+                [{"role": "user", "content": "I visited the museum today."}],
+                [{"role": "user", "content": "I saw the exhibit today."}]
+            ]
+        }]);
+        std::fs::write(
+            dir.path().join("longmemeval_oracle"),
+            serde_json::to_string(&raw).unwrap(),
+        )
+        .unwrap();
+
+        let dataset = load_longmemeval(dir.path()).unwrap();
+        assert_eq!(dataset.sessions.len(), 2);
+
+        let mut stamps: Vec<u64> = dataset
+            .sessions
+            .iter()
+            .flat_map(|session| session.turns.iter())
+            .map(|turn| {
+                turn.timestamp
+                    .expect("every turn must carry its session's date")
+            })
+            .collect();
+        stamps.sort_unstable();
+        stamps.dedup();
+
+        assert_eq!(
+            stamps.len(),
+            2,
+            "sessions dated a week apart must not collapse to one instant"
+        );
+        let seven_days_ms = 7 * 24 * 60 * 60 * 1000;
+        assert_eq!(
+            stamps[1] - stamps[0],
+            seven_days_ms,
+            "the gap between session dates must survive ingest"
+        );
+
+        // The date must stay OUT of the rendered text. `render_turn_content`
+        // splices `timestamp_text` into the content, so setting it would change
+        // every embedding key and silently invalidate a precomputed cache —
+        // turning a temporal-metadata fix into a retrieval change.
+        for session in &dataset.sessions {
+            for turn in &session.turns {
+                assert!(
+                    turn.timestamp_text.is_none(),
+                    "session dates belong in the record timestamp, not its text"
+                );
+                assert!(
+                    !crate::cognitive::render_turn_content(&session.id, turn).contains("DATE:"),
+                    "ingested text must stay byte-identical to the un-dated corpus"
+                );
+            }
+        }
     }
 
     #[test]

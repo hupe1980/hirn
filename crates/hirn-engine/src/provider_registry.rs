@@ -239,6 +239,27 @@ impl ProviderRegistry {
         }
     }
 
+    #[cfg(any(feature = "cohere", feature = "voyage"))]
+    fn default_embedder_is_unset_or_fallback(&self) -> bool {
+        matches!(
+            self.defaults.read().embedder.as_deref(),
+            None | Some("pseudo")
+        )
+    }
+
+    #[cfg(feature = "cross-encoder")]
+    fn default_reranker_is_unset_or_fallback(&self) -> bool {
+        matches!(
+            self.defaults.read().reranker.as_deref(),
+            None | Some("noop")
+        )
+    }
+
+    #[cfg(feature = "anthropic")]
+    fn default_llm_is_unset_or_fallback(&self) -> bool {
+        matches!(self.defaults.read().llm.as_deref(), None | Some("mock"))
+    }
+
     fn with_fallbacks() -> Self {
         let reg = Self::new();
 

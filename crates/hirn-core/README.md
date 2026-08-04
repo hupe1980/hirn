@@ -35,7 +35,32 @@ Builder validation at `.build()` enforces invariants (threshold ranges, template
 - `Embedder` — Embeds text → `Vec<f32>` (sync + async)
 - `LlmProvider` — LLM completion for consolidation, causal discovery
 - `EntityExtractor` — Named entity extraction from text
+- `TextClassifier` — Backend-agnostic classification of a `ClassificationTask`
+- `NliModel` — Entailment judgment (contradiction, polarity, negation scope)
+- `EventExtractor` — Typed subject/verb/object extraction
 - `McfaAuditSink` — Security audit reporting interface
+
+## Natural-Language Understanding (`nlu`)
+
+The contract every meaning-dependent decision runs through — distinct from the
+`semantic` module, which is the semantic *memory layer*.
+
+- `ClassificationTask` — a named decision surface: typed labels, model-readable
+  label descriptions, and exemplars. One `const` definition drives the LLM
+  prompt, the strict JSON schema, the embedding router's centroids, and the
+  deterministic fallback, so backends cannot disagree about the label set.
+- `Classification` / `DecisionSource` — the result records *which* backend
+  decided, making the fallback rate measurable rather than assumed.
+- `Calibration` / `NluBudget` — temperature and affine confidence calibration;
+  per-decision timeout, token ceiling, input ceiling, and acceptance gate.
+- `Calibration::evaluate` / `Calibration::fit` — measure calibration (expected
+  calibration error, Brier score, reliability diagram) against labeled samples
+  and fit `scale`/`floor` by least squares. `fit` refuses fewer than 30 samples
+  and clamps an anti-correlated signal to zero rather than inverting it.
+
+Parsing is strict: an unknown label, an out-of-range confidence, or malformed
+JSON is an abstention, never a guess — so a confused model can never widen a
+decision. Concrete backends live in `hirn-provider::nlu`.
 
 ## Error Handling
 

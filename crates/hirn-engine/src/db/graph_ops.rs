@@ -57,7 +57,7 @@ pub(super) struct HydratedCandidateRecord {
 impl HydratedCandidateRecord {
     pub(super) fn new(id: MemoryId, content: String, entity_names: Vec<String>) -> Self {
         let content_lower = content.to_lowercase();
-        let has_negation = crate::causal::contains_negation(&content_lower);
+        let has_negation = crate::causal::has_negation_cue(&content_lower);
         let normalized_entities = entity_names
             .iter()
             .map(|entity| normalize_entity_name(entity))
@@ -596,13 +596,16 @@ impl HirnDB {
                         .await?
                 };
 
-            match self.plan_contradiction_edge_requests_for_records(
-                new_id,
-                Some(new_namespace),
-                content,
-                entities,
-                &candidate_records,
-            ) {
+            match self
+                .plan_contradiction_edge_requests_for_records(
+                    new_id,
+                    Some(new_namespace),
+                    content,
+                    entities,
+                    &candidate_records,
+                )
+                .await
+            {
                 Ok(requests) => edge_requests.extend(requests),
                 Err(error) => {
                     tracing::warn!(id = %new_id, error = %error, "contradiction edge detection failed");
@@ -890,7 +893,15 @@ impl HirnDB {
         requests
     }
 
-    fn plan_contradiction_edge_requests_for_records(
+    /// Plan `Contradicts` edges for a newly written record.
+    ///
+    /// Two stages, deliberately separated: cheap deterministic signals
+    /// *nominate* candidate pairs, then an entailment model *decides* which are
+    /// genuine conflicts. Without a model configured the nominations stand, and
+    /// each edge records in its metadata which backend decided it — an
+    /// unreviewed surface signal and a model-confirmed contradiction are not
+    /// the same claim and must not look alike downstream.
+    async fn plan_contradiction_edge_requests_for_records(
         &self,
         new_id: MemoryId,
         new_namespace: Option<Namespace>,
@@ -898,8 +909,6 @@ impl HirnDB {
         entities: &[String],
         candidate_records: &[(MemoryId, HydratedCandidateRecord, f32)],
     ) -> HirnResult<Vec<EdgeInsert>> {
-        let pg = self.cached_graph();
-
         let mut similar_records = Vec::new();
         for (candidate_id, candidate, sim) in candidate_records {
             if *sim >= self.config.similarity_edge_threshold {
@@ -913,43 +922,74 @@ impl HirnDB {
             }
         }
 
-        let detection = crate::causal::detect_contradictions_on_insert(
+        let candidates = crate::causal::contradiction_candidates(
             content,
             entities,
             &similar_records,
             self.config.similarity_edge_threshold,
         );
-
-        let graph = pg.hot_graph();
-        let mut seen_targets = HashSet::new();
-        let mut requests = Vec::new();
-
-        for contradicting_id in &detection.contradicting_ids {
-            if !seen_targets.insert(*contradicting_id) {
-                continue;
-            }
-            if !graph.has_node(*contradicting_id) {
-                continue;
-            }
-            if !namespaces_compatible_for_pending_node(
-                &graph,
-                new_id,
-                new_namespace,
-                *contradicting_id,
-            ) {
-                continue;
-            }
-
-            requests.push(EdgeInsert {
-                source: new_id,
-                target: *contradicting_id,
-                relation: EdgeRelation::Contradicts,
-                weight: 1.0,
-                metadata: Metadata::new(),
-            });
+        if candidates.is_empty() {
+            return Ok(Vec::new());
         }
 
-        Ok(requests)
+        // Filter to writable targets *before* the semantic review so a model
+        // call is never spent on a pair that could not produce an edge anyway.
+        let admissible: Vec<(crate::causal::ContradictionCandidate, String)> = {
+            let graph = self.cached_graph().hot_graph();
+            let mut seen_targets = HashSet::new();
+            candidates
+                .into_iter()
+                .filter(|candidate| {
+                    seen_targets.insert(candidate.id)
+                        && graph.has_node(candidate.id)
+                        && namespaces_compatible_for_pending_node(
+                            &graph,
+                            new_id,
+                            new_namespace,
+                            candidate.id,
+                        )
+                })
+                .filter_map(|candidate| {
+                    candidate_records
+                        .iter()
+                        .find(|(id, _, _)| *id == candidate.id)
+                        .map(|(_, record, _)| (candidate, record.content_lower.clone()))
+                })
+                .collect()
+            // `graph` (a parking_lot guard) is dropped here: it is !Send and
+            // the entailment review below is an await point.
+        };
+
+        let detection = crate::causal::confirm_contradictions(
+            self.nli_model().as_deref(),
+            content,
+            &admissible,
+            self.config.nlu.contradiction_min_confidence,
+        )
+        .await;
+
+        Ok(detection
+            .contradictions
+            .into_iter()
+            .map(|contradiction| {
+                let mut metadata = Metadata::new();
+                metadata.insert(
+                    "contradiction_signal".to_string(),
+                    contradiction.signal.as_str().into(),
+                );
+                metadata.insert(
+                    "contradiction_decided_by".to_string(),
+                    contradiction.decided_by.as_str().into(),
+                );
+                EdgeInsert {
+                    source: new_id,
+                    target: contradiction.id,
+                    relation: EdgeRelation::Contradicts,
+                    weight: contradiction.confidence,
+                    metadata,
+                }
+            })
+            .collect())
     }
 
     /// Apply similarity candidates to the persistent graph (async).

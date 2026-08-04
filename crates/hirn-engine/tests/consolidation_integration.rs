@@ -1740,7 +1740,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn scheduler_starts_idle() {
         let (db, _dir) = temp_db_arc_with_interval(0).await;
-        let scheduler = ConsolidationScheduler::new(db, ConsolidationConfig::default());
+        let scheduler = ConsolidationScheduler::new(db, ConsolidationConfig::default()).unwrap();
         assert_eq!(scheduler.status(), ConsolidationStatus::Idle);
     }
 
@@ -1763,7 +1763,7 @@ mod tests {
         }
 
         let mut scheduler =
-            ConsolidationScheduler::new(Arc::clone(&db), ConsolidationConfig::default());
+            ConsolidationScheduler::new(Arc::clone(&db), ConsolidationConfig::default()).unwrap();
 
         // Manually trigger consolidation.
         scheduler.trigger();
@@ -1801,7 +1801,7 @@ mod tests {
         }
 
         let mut scheduler =
-            ConsolidationScheduler::new(Arc::clone(&db), ConsolidationConfig::default());
+            ConsolidationScheduler::new(Arc::clone(&db), ConsolidationConfig::default()).unwrap();
         scheduler.trigger();
 
         // While consolidation may be running, perform reads & writes.
@@ -1850,7 +1850,7 @@ mod tests {
         }
 
         let mut scheduler =
-            ConsolidationScheduler::new(Arc::clone(&db), ConsolidationConfig::default());
+            ConsolidationScheduler::new(Arc::clone(&db), ConsolidationConfig::default()).unwrap();
 
         // Trigger twice in rapid succession — second should be queued, not rejected.
         scheduler.trigger();
@@ -1880,7 +1880,7 @@ mod tests {
         }
 
         let mut scheduler =
-            ConsolidationScheduler::new(Arc::clone(&db), ConsolidationConfig::default());
+            ConsolidationScheduler::new(Arc::clone(&db), ConsolidationConfig::default()).unwrap();
 
         scheduler.trigger();
         std::thread::sleep(std::time::Duration::from_millis(500));

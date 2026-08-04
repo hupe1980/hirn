@@ -25,7 +25,7 @@ use tokio::sync::{Notify, broadcast};
 
 use crate::auth::{
     AuthState, ISSUER_KID_HEADER, Operation, auth_middleware, credential_kid,
-    token_allows_namespace, token_allows_operation,
+    token_allows_namespace, token_allows_operation, token_namespace_scope,
 };
 use crate::config::ClusterTransportProfile;
 use crate::convert;
@@ -452,17 +452,25 @@ pub fn router(state: Arc<HttpState>, auth_state: Arc<AuthState>) -> Router {
         ))
         .with_state(Arc::clone(&state));
 
+    let metrics_route = Router::new()
+        .route("/metrics", get(metrics_endpoint))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&auth_state),
+            auth_middleware,
+        ))
+        .with_state(Arc::clone(&state));
+
     // Public probe routes (no auth). These have no authenticated actor to key
     // the per-agent throttle on, so they get a per-source-IP rate limit — the
-    // only rate limit that applies to unauthenticated scans of `/health`,
-    // `/readyz`, `/metrics` (R-72). Raft transport is deliberately excluded:
+    // only rate limit that applies to unauthenticated scans of `/health` and
+    // `/readyz` (R-72). `/metrics` is authenticated because realm labels carry
+    // tenant metadata. Raft transport is deliberately excluded:
     // it is authenticated by the shared transport secret and runs at heartbeat
     // frequency, so per-IP throttling it would risk breaking consensus.
     let public_probe_routes = Router::new()
         .route("/health", get(health))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
-        .route("/metrics", get(metrics_endpoint))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             public_ip_throttle,
@@ -471,6 +479,7 @@ pub fn router(state: Arc<HttpState>, auth_state: Arc<AuthState>) -> Router {
 
     Router::new()
         .merge(public_probe_routes)
+        .merge(metrics_route)
         .merge(raft_transport_routes)
         .merge(control_plane_routes)
         .merge(api_routes)
@@ -793,9 +802,19 @@ fn enforce_rate_limit(
 async fn agent_context<'a>(
     db: &'a HirnDB,
     agent_id: &AgentId,
+    headers: &HeaderMap,
 ) -> Result<AgentContext<'a>, (StatusCode, Json<ErrorResponse>)> {
     db.ensure_agent(agent_id).await.map_err(map_err)?;
-    db.as_agent(agent_id).await.map_err(map_err)
+    match parse_token_namespaces(headers)? {
+        Some(namespaces) => {
+            let namespaces = token_namespace_scope(agent_id, &namespaces)
+                .map_err(|error| (StatusCode::FORBIDDEN, Json(ErrorResponse::new(error))))?;
+            db.as_agent_with_namespaces(agent_id, &namespaces)
+                .await
+                .map_err(map_err)
+        }
+        None => db.as_agent(agent_id).await.map_err(map_err),
+    }
 }
 
 /// Check that the token allows the requested operation.
@@ -1609,7 +1628,7 @@ async fn revoke_token(
                 )),
             ));
         }
-        revocations.revoke_jti(claims.jti.clone(), claims.exp);
+        revocations.revoke_jti(realm, claims.jti.clone(), claims.exp);
         response.revoked_jtis.push(claims.jti);
     }
 
@@ -1619,18 +1638,32 @@ async fn revoke_token(
         let exp = body.exp.unwrap_or_else(|| {
             jsonwebtoken::get_current_timestamp() + state.auth_state.token_ttl_secs()
         });
-        revocations.revoke_jti(jti.clone(), exp);
+        revocations.revoke_jti(realm, jti.clone(), exp);
         response.revoked_jtis.push(jti);
     }
 
     if let Some(kid) = body.iss_kid {
-        revocations.revoke_issuer(kid.clone());
+        revocations.revoke_issuer(realm, kid.clone());
         response.revoked_issuers.push(kid);
     }
 
     if let Some(ref api_key) = body.api_key {
+        let Some(identity) = state.auth_state.validate(api_key) else {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new("unknown API key")),
+            ));
+        };
+        if identity.realm != realm {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(ErrorResponse::new(
+                    "cannot revoke an API key belonging to another realm",
+                )),
+            ));
+        }
         let kid = credential_kid("key", api_key);
-        state.auth_state.revoke_api_key(api_key);
+        state.auth_state.revoke_api_key(realm, api_key);
         response.revoked_issuers.push(kid);
     }
 
@@ -1929,7 +1962,7 @@ async fn remember(
                 record.namespace = Namespace::private_for(&agent);
             }
             let id = {
-                let ctx = agent_context(&db, &agent).await?;
+                let ctx = agent_context(&db, &agent, &headers).await?;
                 ctx.remember(record).await.map_err(map_err)?
             };
             let _ = state.watch_tx.send(WatchEvent {
@@ -1984,7 +2017,7 @@ async fn remember(
                 record.namespace = Namespace::private_for(&agent);
             }
             let id = {
-                let ctx = agent_context(&db, &agent).await?;
+                let ctx = agent_context(&db, &agent, &headers).await?;
                 ctx.store_semantic(record).await.map_err(map_err)?
             };
             let _ = state.watch_tx.send(WatchEvent {
@@ -2026,7 +2059,7 @@ async fn recall(
     check_namespace(&headers, &agent, body.namespace.as_deref())?;
     ensure_read_consistency(&state, &headers).await?;
     let db = get_db(&state, &headers).await?;
-    let ctx = agent_context(&db, &agent).await?;
+    let ctx = agent_context(&db, &agent, &headers).await?;
 
     if body.query_embedding.is_empty() {
         return Err((
@@ -2089,7 +2122,7 @@ async fn think(
     check_namespace(&headers, &agent, body.namespace.as_deref())?;
     ensure_read_consistency(&state, &headers).await?;
     let db = get_db(&state, &headers).await?;
-    let ctx = agent_context(&db, &agent).await?;
+    let ctx = agent_context(&db, &agent, &headers).await?;
 
     if body.query_embedding.is_empty() {
         return Err((
@@ -2162,7 +2195,7 @@ async fn forget(
         ));
     }
     let db = realm_db(&state, &headers).await?;
-    let ctx = agent_context(&db, &agent).await?;
+    let ctx = agent_context(&db, &agent, &headers).await?;
 
     let memory_id = convert::parse_memory_id(&body.id).map_err(|e| {
         (
@@ -2222,7 +2255,7 @@ async fn connect(
         ));
     }
     let db = realm_db(&state, &headers).await?;
-    let ctx = agent_context(&db, &agent).await?;
+    let ctx = agent_context(&db, &agent, &headers).await?;
 
     let source_id = convert::parse_memory_id(&body.source).map_err(|e| {
         (
@@ -2278,7 +2311,7 @@ async fn inspect(
     enforce_rate_limit(&state, &headers, RateLimitClass::Read)?;
     ensure_read_consistency(&state, &headers).await?;
     let db = get_db(&state, &headers).await?;
-    let ctx = agent_context(&db, &agent).await?;
+    let ctx = agent_context(&db, &agent, &headers).await?;
 
     let memory_id = convert::parse_memory_id(&id).map_err(|e| {
         (
@@ -2307,7 +2340,7 @@ async fn trace(
     enforce_rate_limit(&state, &headers, RateLimitClass::Read)?;
     ensure_read_consistency(&state, &headers).await?;
     let db = get_db(&state, &headers).await?;
-    let ctx = agent_context(&db, &agent).await?;
+    let ctx = agent_context(&db, &agent, &headers).await?;
 
     let memory_id = convert::parse_memory_id(&id).map_err(|e| {
         (
@@ -2400,7 +2433,7 @@ async fn execute(
     }
 
     let db = get_db(&state, &headers).await?;
-    let ctx = agent_context(&db, &agent).await?;
+    let ctx = agent_context(&db, &agent, &headers).await?;
 
     // ── Cross-realm dispatch: FROM REALM "a", "b" ──────────────────
     if let hirn_engine::ql::ast::Statement::Recall(ref recall) = stmt {
@@ -2441,7 +2474,7 @@ async fn execute(
                     .get(realm_id)
                     .await
                     .map_err(|e| map_err(hirn_core::HirnError::InvalidInput(e)))?;
-                let realm_ctx = agent_context(&realm_db, &agent).await?;
+                let realm_ctx = agent_context(&realm_db, &agent, &headers).await?;
                 match realm_ctx.execute_ql(&single_query).await {
                     Ok(QueryResult::Records(r)) => {
                         for rec in r.records {

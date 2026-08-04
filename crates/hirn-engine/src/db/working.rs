@@ -263,6 +263,12 @@ impl HirnDB {
             .await
             .map_err(|e| HirnError::storage(e))?;
 
+        // Reflect the write in the L0 head cache immediately. `working_memory()`
+        // serves from this warm cache, so without the upsert a focused entry was
+        // invisible to reads until a cold restart re-hydrated the cache (and it
+        // never counted against eviction).
+        self.write_runtime.working_cache_upsert(entry.clone());
+
         let namespace = Namespace::private_for(&entry.agent_id);
         self.emit_scoped(
             namespace.as_str(),
@@ -271,7 +277,10 @@ impl HirnDB {
         )
         .await;
 
-        // Evict if over token budget.
+        // Promote/retract TTL-expired entries, then evict over-budget ones. Both
+        // run on this write path (never on the read path) so a `working_memory()`
+        // read stays side-effect-free.
+        self.evict_expired_working_memory().await?;
         self.evict_working_memory().await?;
 
         Ok(id)
@@ -333,7 +342,6 @@ impl HirnDB {
         };
 
         let mut entries = Vec::new();
-        let mut expired_entries = Vec::new();
         for entry in current_heads.into_values() {
             if !entry.is_live() {
                 continue;
@@ -341,51 +349,16 @@ impl HirnDB {
             let per_entry_expired = entry.is_expired(now);
             let tier_ttl_expired = tier_ttl_secs > 0
                 && now.millis().saturating_sub(entry.created_at.millis()) >= tier_ttl_millis;
+            // Expired entries are filtered from the read result but NOT mutated
+            // here. Promotion-to-episodic + retraction is a write-side concern
+            // handled by `evict_expired_working_memory`, so this read stays
+            // side-effect free: two concurrent `working_memory()` calls can no
+            // longer both encode the same expired entry (duplicate episodes) or
+            // race each other's retract.
             if per_entry_expired || tier_ttl_expired {
-                expired_entries.push(entry);
-            } else {
-                entries.push(entry);
+                continue;
             }
-        }
-
-        // TTL eviction: retract expired entries.
-        // All expired entries (both per-entry TTL and TierPolicy TTL) are
-        // auto-promoted to episodic memory — this is the key tier transition
-        // mechanism from working → episodic.
-        if !expired_entries.is_empty() {
-            let threshold = self.consolidation_config().working_to_episodic_threshold;
-            // Encode high-relevance expired entries before deleting.
-            for entry in expired_entries
-                .iter()
-                .filter(|entry| entry.relevance_score >= threshold)
-            {
-                if let Err(e) = self.encode_working_to_episodic(entry).await {
-                    tracing::warn!(
-                        id = %entry.id,
-                        error = %e,
-                        "failed to encode expired working memory to episodic"
-                    );
-                }
-            }
-            // Retract all expired entries after optional encoding. A failed
-            // retract is logged rather than silently discarded so the entry is
-            // retried on the next pass instead of vanishing.
-            for entry in &expired_entries {
-                if let Err(e) = self
-                    .append_working_successor(
-                        entry,
-                        RevisionOperation::Retract,
-                        Some("working memory expired".to_string()),
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        id = %entry.id,
-                        error = %e,
-                        "failed to retract expired working memory; will retry on next eviction pass"
-                    );
-                }
-            }
+            entries.push(entry);
         }
 
         // Sort: highest priority first, then most recent first.
@@ -396,6 +369,81 @@ impl HirnDB {
         });
 
         Ok(entries)
+    }
+
+    /// Promote and retract TTL-expired working entries (write-side only).
+    ///
+    /// This is the working→episodic tier transition, moved off the read path
+    /// (`working_memory`) so reads never mutate. It mirrors
+    /// [`Self::evict_working_memory`]'s ordering: retract **first**, and encode
+    /// only the entries whose durable retract actually succeeds — so a transient
+    /// failure neither loses the entry (it stays live and retries next pass) nor
+    /// duplicates it into episodic (the encode-before-retract bug).
+    async fn evict_expired_working_memory(&self) -> HirnResult<()> {
+        let now = Timestamp::now();
+        let tier_ttl_secs = self.tier_policy().working_to_episodic_ttl_secs;
+        let tier_ttl_millis = tier_ttl_secs.saturating_mul(1000);
+
+        // Operate over the warm L0 heads. When the cache is cold this is empty;
+        // startup hydration and the first `working_memory()` read populate it,
+        // and the next write triggers eviction — so nothing is stranded.
+        let heads: Vec<WorkingMemoryEntry> = self
+            .write_runtime
+            .working_heads
+            .iter()
+            .map(|r| r.value().clone())
+            .collect();
+        if heads.is_empty() {
+            return Ok(());
+        }
+
+        let threshold = self.consolidation_config().working_to_episodic_threshold;
+        let mut to_encode: Vec<WorkingMemoryEntry> = Vec::new();
+        for entry in heads {
+            if !entry.is_live() {
+                continue;
+            }
+            let per_entry_expired = entry.is_expired(now);
+            let tier_ttl_expired = tier_ttl_secs > 0
+                && now.millis().saturating_sub(entry.created_at.millis()) >= tier_ttl_millis;
+            if !(per_entry_expired || tier_ttl_expired) {
+                continue;
+            }
+
+            match self
+                .append_working_successor(
+                    &entry,
+                    RevisionOperation::Retract,
+                    Some("working memory expired".to_string()),
+                )
+                .await
+            {
+                Ok(_) => {
+                    if entry.relevance_score >= threshold {
+                        to_encode.push(entry);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        id = %entry.id,
+                        error = %e,
+                        "failed to retract expired working memory; will retry on next eviction pass"
+                    );
+                }
+            }
+        }
+
+        for entry in to_encode {
+            if let Err(e) = self.encode_working_to_episodic(&entry).await {
+                tracing::warn!(
+                    id = %entry.id,
+                    error = %e,
+                    "failed to encode expired working memory to episodic"
+                );
+            }
+        }
+
+        Ok(())
     }
 
     /// Pre-warm the L0 working memory cache from a single Lance scan.

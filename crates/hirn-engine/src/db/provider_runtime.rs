@@ -3,13 +3,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hirn_core::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+use hirn_core::config::NluConfig;
 use hirn_core::content::MemoryContent;
-use hirn_core::embed::{Embedder, Reranker};
+use hirn_core::embed::{Embedder, LlmProvider, Reranker};
+use hirn_core::nlu::{EventExtractor, NliModel, TextClassifier};
+use hirn_core::preference::PreferenceExtractor;
 use hirn_core::tokenizer::Tokenizer;
 use hirn_core::{HirnConfig, HirnError, HirnResult};
 use hirn_provider::{
-    BatchingEmbedder, CircuitBreakerEmbedder, MultiModalEmbedder, PersistentCacheConfig,
-    PersistentCachedEmbedder, RetryConfig, RetryingEmbedder,
+    BatchingEmbedder, CircuitBreakerEmbedder, ExemplarRouter, HybridClassifier, LlmEventExtractor,
+    LlmNli, LlmPreferenceExtractor, LlmTemporalExtractor, LlmTextClassifier, MultiModalEmbedder,
+    PersistentCacheConfig, PersistentCachedEmbedder, RetryConfig, RetryingEmbedder,
+    TemporalExtractor,
 };
 use hirn_storage::PhysicalStore;
 use parking_lot::RwLock;
@@ -109,19 +114,174 @@ pub(crate) struct ProviderRuntime {
     multivec_embedder: RwLock<Option<Arc<dyn Embedder>>>,
     tokenizer: RwLock<Arc<dyn Tokenizer>>,
     reranker: RwLock<Option<Arc<dyn Reranker>>>,
+    /// Optional ambient LLM provider for read-path reasoning (e.g. query
+    /// decomposition). `None` = deterministic fallbacks only.
+    llm_provider: RwLock<Option<Arc<dyn LlmProvider>>>,
+    /// Natural-language-understanding policy captured at `open()` time.
+    nlu_config: NluConfig,
+    /// The classification chain every meaning-dependent decision routes
+    /// through. Rebuilt whenever the LLM provider or embedder changes; empty
+    /// (deterministic fallbacks only) until one is configured.
+    classifier: RwLock<Arc<HybridClassifier>>,
+    /// Entailment model for contradiction, polarity, and negation scope.
+    /// An explicitly registered model (e.g. a local ONNX NLI cross-encoder)
+    /// takes priority over the classifier-backed one.
+    registered_nli: RwLock<Option<Arc<dyn NliModel>>>,
+    nli: RwLock<Option<Arc<dyn NliModel>>>,
+    /// Typed event extractor for the write path, when enabled.
+    event_extractor: RwLock<Option<Arc<dyn EventExtractor>>>,
+    /// Typed preference extractor for the write path, when enabled.
+    preference_extractor: RwLock<Option<Arc<dyn PreferenceExtractor>>>,
+    /// Explicitly registered temporal extractor, preferred over the
+    /// provider-derived one when temporal extraction is enabled.
+    registered_temporal: RwLock<Option<Arc<dyn TemporalExtractor>>>,
+    /// Write-time temporal envelope extractor, when enabled.
+    temporal_extractor: RwLock<Option<Arc<dyn TemporalExtractor>>>,
     embedding_dimensions: usize,
 }
 
 impl ProviderRuntime {
-    pub(crate) fn new(embedding_dimensions: usize) -> Self {
+    pub(crate) fn new(embedding_dimensions: usize, nlu_config: NluConfig) -> Self {
         Self {
             embedder: RwLock::new(None),
             multimodal_embedder: RwLock::new(None),
             multivec_embedder: RwLock::new(None),
             tokenizer: RwLock::new(hirn_provider::default_tokenizer()),
             reranker: RwLock::new(None),
+            llm_provider: RwLock::new(None),
+            nlu_config,
+            classifier: RwLock::new(Arc::new(HybridClassifier::new())),
+            registered_nli: RwLock::new(None),
+            nli: RwLock::new(None),
+            event_extractor: RwLock::new(None),
+            preference_extractor: RwLock::new(None),
+            registered_temporal: RwLock::new(None),
+            temporal_extractor: RwLock::new(None),
             embedding_dimensions,
         }
+    }
+
+    /// Rebuild the NLU stack from the currently installed providers.
+    ///
+    /// Called whenever the LLM provider or embedder changes, so a provider
+    /// registered after `open()` immediately upgrades every semantic decision
+    /// from the deterministic floor to the model-backed path — and removing
+    /// one degrades cleanly rather than leaving a dangling backend.
+    fn rebuild_nlu(&self) {
+        let llm = self.llm_provider.read().clone();
+        let embedder = self.embedder.read().clone();
+
+        let mut chain = HybridClassifier::new().with_budget(self.nlu_config.budget);
+        if self.nlu_config.enabled {
+            if let Some(llm) = llm.clone().filter(|_| self.nlu_config.llm_primary) {
+                chain = chain.with_backend(Arc::new(
+                    LlmTextClassifier::new(llm).with_calibration(self.nlu_config.llm_calibration),
+                ));
+            }
+            if let Some(embedder) = embedder.filter(|_| self.nlu_config.embedding_router) {
+                chain = chain.with_backend(Arc::new(
+                    ExemplarRouter::new(embedder)
+                        .with_calibration(self.nlu_config.embedding_calibration),
+                ));
+            }
+        }
+        let chain = Arc::new(chain);
+
+        // NLI: an explicitly registered model (typically a local ONNX
+        // cross-encoder) wins; otherwise the classifier chain judges
+        // entailment, which is still far better than negation-marker matching.
+        let registered = self.registered_nli.read().clone();
+        let nli: Option<Arc<dyn NliModel>> = match registered {
+            Some(model) => Some(model),
+            None if chain.is_model_backed() => Some(Arc::new(LlmNli::new(
+                Arc::clone(&chain) as Arc<dyn hirn_core::nlu::TextClassifier>
+            ))),
+            None => None,
+        };
+
+        let event_extractor: Option<Arc<dyn EventExtractor>> = llm
+            .clone()
+            .filter(|_| self.nlu_config.enabled && self.nlu_config.typed_event_extraction)
+            .map(|llm| Arc::new(LlmEventExtractor::new(llm)) as Arc<dyn EventExtractor>);
+
+        let preference_extractor: Option<Arc<dyn PreferenceExtractor>> = llm
+            .clone()
+            .filter(|_| self.nlu_config.enabled && self.nlu_config.typed_preference_extraction)
+            .map(|llm| Arc::new(LlmPreferenceExtractor::new(llm)) as Arc<dyn PreferenceExtractor>);
+
+        // The config flag decides *whether* temporal extraction runs — it
+        // gates a per-record provider call, so a deployment must opt in
+        // deliberately. An explicitly registered extractor decides *which* one
+        // runs, and does not override that gate.
+        let temporal_extractor: Option<Arc<dyn TemporalExtractor>> =
+            if self.nlu_config.enabled && self.nlu_config.typed_temporal_extraction {
+                self.registered_temporal.read().clone().or_else(|| {
+                    llm.map(|llm| {
+                        Arc::new(LlmTemporalExtractor::new(llm)) as Arc<dyn TemporalExtractor>
+                    })
+                })
+            } else {
+                None
+            };
+
+        tracing::debug!(
+            backends = chain.backend_id(),
+            nli = nli.as_ref().map(|n| n.model_id()).unwrap_or("none"),
+            typed_events = event_extractor.is_some(),
+            typed_preferences = preference_extractor.is_some(),
+            typed_temporal = temporal_extractor.is_some(),
+            "rebuilt the NLU decision stack"
+        );
+
+        *self.classifier.write() = chain;
+        *self.nli.write() = nli;
+        *self.event_extractor.write() = event_extractor;
+        *self.preference_extractor.write() = preference_extractor;
+        *self.temporal_extractor.write() = temporal_extractor;
+    }
+
+    /// The classification chain for meaning-dependent decisions.
+    pub(crate) fn classifier(&self) -> Arc<HybridClassifier> {
+        Arc::clone(&*self.classifier.read())
+    }
+
+    /// The entailment model, when one is available.
+    pub(crate) fn nli(&self) -> Option<Arc<dyn NliModel>> {
+        self.nli.read().clone()
+    }
+
+    /// The typed event extractor, when typed extraction is enabled.
+    pub(crate) fn event_extractor(&self) -> Option<Arc<dyn EventExtractor>> {
+        self.event_extractor.read().clone()
+    }
+
+    /// The typed preference extractor, when typed extraction is enabled.
+    pub(crate) fn preference_extractor(&self) -> Option<Arc<dyn PreferenceExtractor>> {
+        self.preference_extractor.read().clone()
+    }
+
+    /// The write-time temporal extractor, when typed extraction is enabled.
+    pub(crate) fn temporal_extractor(&self) -> Option<Arc<dyn TemporalExtractor>> {
+        self.temporal_extractor.read().clone()
+    }
+
+    /// The NLU policy this runtime was opened with.
+    pub(crate) const fn nlu_config(&self) -> &NluConfig {
+        &self.nlu_config
+    }
+
+    /// Install an explicit temporal extractor, superseding the
+    /// provider-derived one. Subject to `nlu.typed_temporal_extraction`.
+    pub(crate) fn set_temporal_extractor(&self, extractor: Arc<dyn TemporalExtractor>) {
+        *self.registered_temporal.write() = Some(extractor);
+        self.rebuild_nlu();
+    }
+
+    /// Install an explicit entailment model, superseding the classifier-backed
+    /// one.
+    pub(crate) fn set_nli_model(&self, nli: Arc<dyn NliModel>) {
+        *self.registered_nli.write() = Some(nli);
+        self.rebuild_nlu();
     }
 
     pub(crate) fn set_multimodal_embedder(
@@ -131,6 +291,7 @@ impl ProviderRuntime {
         *self.multimodal_embedder.write() = Some(Arc::clone(&embedder));
         let erased: Arc<dyn Embedder> = embedder;
         *self.embedder.write() = Some(Arc::clone(&erased));
+        self.rebuild_nlu();
         erased
     }
 
@@ -152,6 +313,15 @@ impl ProviderRuntime {
 
     pub(crate) fn reranker(&self) -> Option<Arc<dyn Reranker>> {
         self.reranker.read().clone()
+    }
+
+    pub(crate) fn set_llm_provider(&self, llm: Arc<dyn LlmProvider>) {
+        *self.llm_provider.write() = Some(llm);
+        self.rebuild_nlu();
+    }
+
+    pub(crate) fn llm_provider(&self) -> Option<Arc<dyn LlmProvider>> {
+        self.llm_provider.read().clone()
     }
 
     pub(crate) fn embedder(&self) -> Option<Arc<dyn Embedder>> {
@@ -342,14 +512,14 @@ mod tests {
 
     #[test]
     fn runtime_defaults_to_precomputed_model_id() {
-        let runtime = ProviderRuntime::new(32);
+        let runtime = ProviderRuntime::new(32, NluConfig::default());
         assert_eq!(runtime.rpe_model_id(), "precomputed");
         assert!(runtime.embedder().is_none());
     }
 
     #[test]
     fn dedicated_multivec_embedder_takes_priority() {
-        let runtime = ProviderRuntime::new(16);
+        let runtime = ProviderRuntime::new(16, NluConfig::default());
         runtime.set_multimodal_embedder(Arc::new(MultiModalEmbedder::new(Arc::new(
             TestEmbedder {
                 model_id: "base",
@@ -371,7 +541,7 @@ mod tests {
 
     #[test]
     fn tokenizer_and_reranker_are_swappable() {
-        let runtime = ProviderRuntime::new(8);
+        let runtime = ProviderRuntime::new(8, NluConfig::default());
         runtime.set_tokenizer(Arc::new(TestTokenizer));
         runtime.set_reranker(Arc::new(TestReranker));
 
@@ -381,14 +551,14 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn embed_text_falls_back_to_pseudo_embeddings() {
-        let runtime = ProviderRuntime::new(24);
+        let runtime = ProviderRuntime::new(24, NluConfig::default());
         let embedding = runtime.embed_text("fallback").await.unwrap();
         assert_eq!(embedding.len(), 24);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn embed_content_uses_multimodal_router_when_configured() {
-        let runtime = ProviderRuntime::new(64);
+        let runtime = ProviderRuntime::new(64, NluConfig::default());
         let multimodal = Arc::new(
             MultiModalEmbedder::new(Arc::new(hirn_provider::PseudoEmbedder::new(64)))
                 .with_audio_embedder(Arc::new(hirn_provider::PseudoEmbedder::new(32))),

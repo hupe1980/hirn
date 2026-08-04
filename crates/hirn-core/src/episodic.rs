@@ -7,8 +7,9 @@ use crate::metadata::{Metadata, MetadataValue};
 use crate::provenance::Provenance;
 use crate::resource::EvidenceLink;
 use crate::revision::{LogicalMemoryId, RevisionId, RevisionOperation, RevisionState};
+use crate::temporal::TemporalEnvelope;
 use crate::timestamp::Timestamp;
-use crate::types::{AgentId, EventType, Namespace, Origin};
+use crate::types::{AgentId, EventType, MemoryType, Namespace, Origin};
 
 const DEFAULT_EPISODIC_STABILITY_HOURS: f32 = 24.0;
 const EPISODIC_STABILITY_GROWTH_FACTOR: f32 = 1.1;
@@ -64,6 +65,14 @@ pub struct EpisodicRecord {
     pub namespace: Namespace,
     /// Whether this record has been soft-deleted (archived).
     pub archived: bool,
+    /// When the described event happened, how precisely that is known, and
+    /// whether it still holds.
+    ///
+    /// Distinct from `timestamp` (ingestion) and from `valid_until`
+    /// (belief-validity). Defaults to [`TemporalEnvelope::unknown`], which
+    /// ranks exactly as the pre-envelope engine did — so a corpus ingested
+    /// without temporal extraction is provably unaffected.
+    pub temporal: TemporalEnvelope,
     /// Optional TTL expiration timestamp. When present, the record is considered
     /// expired after this time and will be hard-deleted by `purge_expired()`.
     #[serde(default)]
@@ -86,6 +95,17 @@ pub struct EpisodicRecord {
     /// Modulates memory encoding, consolidation, and retrieval strength.
     #[serde(default)]
     pub valence: Option<f32>,
+    /// Functional role for type-aware composition (MemGuard). Episodes default
+    /// to [`MemoryType::EpisodicEvent`]; a caller may mark an episode as a
+    /// stable-fact/rule/preference when it carries that kind of claim.
+    #[serde(default)]
+    pub functional_role: MemoryType,
+    /// Pin: exempt this record from automated decay-driven archival and purge.
+    /// A pinned record is never auto-archived or hard-deleted by the forgetting
+    /// pass regardless of retention, and (per config) may also be exempt from TTL
+    /// expiry. Explicit user deletion still applies.
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 impl EpisodicRecord {
@@ -178,6 +198,8 @@ pub struct EpisodicRecordBuilder {
     valid_until: Option<Timestamp>,
     multi_content: Option<MemoryContent>,
     valence: Option<f32>,
+    functional_role: Option<MemoryType>,
+    pinned: bool,
     evidence_links: Vec<EvidenceLink>,
     origin: Option<Origin>,
 }
@@ -328,6 +350,21 @@ impl EpisodicRecordBuilder {
         self
     }
 
+    /// Set the functional role for type-aware composition (MemGuard). Defaults
+    /// to [`MemoryType::EpisodicEvent`] when unset.
+    #[must_use]
+    pub const fn functional_role(mut self, role: MemoryType) -> Self {
+        self.functional_role = Some(role);
+        self
+    }
+
+    /// Pin the record so automated decay never archives or purges it.
+    #[must_use]
+    pub const fn pinned(mut self, pinned: bool) -> Self {
+        self.pinned = pinned;
+        self
+    }
+
     /// Add a typed resource evidence link to this record's provenance.
     #[must_use]
     pub fn evidence_link(mut self, evidence_link: EvidenceLink) -> Self {
@@ -382,6 +419,7 @@ impl EpisodicRecordBuilder {
         });
 
         Ok(EpisodicRecord {
+            temporal: TemporalEnvelope::unknown(),
             id,
             logical_memory_id: LogicalMemoryId::from_memory_id(id),
             revision_id: RevisionId::from_memory_id(id),
@@ -413,6 +451,8 @@ impl EpisodicRecordBuilder {
             valid_until: self.valid_until,
             multi_content: self.multi_content,
             valence: self.valence.map(|v| v.clamp(-1.0, 1.0)),
+            functional_role: self.functional_role.unwrap_or(MemoryType::EpisodicEvent),
+            pinned: self.pinned,
         })
     }
 }

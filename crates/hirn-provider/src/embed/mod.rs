@@ -12,7 +12,7 @@ pub(crate) fn build_http_client(
     provider: &'static str,
     builder: reqwest::ClientBuilder,
 ) -> hirn_core::HirnResult<reqwest::Client> {
-    builder
+    crate::transport::secure_provider_client_builder(builder)
         .build()
         .map_err(|source| EmbedError::from_reqwest(provider, source).into())
 }
@@ -82,6 +82,7 @@ pub(crate) fn validate_embedding_batch(
                 .index
                 .expect("all_indices guarantees every embedding has an index");
             validate_embedding_dimensions(expected_dims, embedding.vector.len())?;
+            validate_embedding_values(provider, &embedding.vector)?;
 
             if index >= expected_inputs {
                 return Err(invalid_embedding_response(
@@ -122,6 +123,7 @@ pub(crate) fn validate_embedding_batch(
         .into_iter()
         .map(|embedding| {
             validate_embedding_dimensions(expected_dims, embedding.vector.len())?;
+            validate_embedding_values(provider, &embedding.vector)?;
             Ok(hirn_core::embed::Embedding {
                 vector: embedding.vector,
                 model_id: provider.to_owned(),
@@ -161,6 +163,25 @@ fn validate_embedding_dimensions(
     feature = "voyage"
 ))]
 #[allow(dead_code)]
+fn validate_embedding_values(provider: &str, vector: &[f32]) -> hirn_core::HirnResult<()> {
+    if let Some(index) = vector.iter().position(|value| !value.is_finite()) {
+        return Err(invalid_embedding_response(
+            provider,
+            format!("provider returned a non-finite embedding value at dimension {index}"),
+        ));
+    }
+
+    Ok(())
+}
+
+#[cfg(any(
+    test,
+    feature = "openai",
+    feature = "ollama",
+    feature = "cohere",
+    feature = "voyage"
+))]
+#[allow(dead_code)]
 fn invalid_embedding_response(provider: &str, details: impl Into<String>) -> hirn_core::HirnError {
     EmbedError::InvalidResponse {
         provider: provider.to_owned(),
@@ -184,7 +205,7 @@ pub use circuit_breaker::CircuitBreakerEmbedder;
 mod batching;
 pub use batching::BatchingEmbedder;
 
-mod retry;
+pub(crate) mod retry;
 pub use retry::{RetryConfig, RetryingEmbedder};
 
 mod multimodal;
@@ -310,5 +331,23 @@ mod tests {
             err.to_string()
                 .contains("omitted one or more embedding indices")
         );
+    }
+
+    #[test]
+    fn validate_embedding_batch_rejects_non_finite_values() {
+        let err = validate_embedding_batch(
+            "test-model",
+            2,
+            1,
+            vec![ProviderEmbeddingResponse {
+                index: Some(0),
+                vector: vec![0.0, f32::NAN],
+            }],
+            true,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("non-finite"));
+        assert!(err.to_string().contains("dimension 1"));
     }
 }

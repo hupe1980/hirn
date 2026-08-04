@@ -86,6 +86,9 @@ impl HirnDB {
         unrestricted: bool,
         after: Option<&Timestamp>,
         before: Option<&Timestamp>,
+        hint_after: Option<&Timestamp>,
+        hint_before: Option<&Timestamp>,
+        as_of: Option<&Timestamp>,
         weights: Option<&ScoringWeights>,
         activation_mode: ActivationMode,
         activation_depth: Option<usize>,
@@ -186,18 +189,63 @@ impl HirnDB {
                         ppr_cfg.validate()?;
                     }
 
-                    let output = hirn_exec::GraphReadRuntime::activate_graph(
+                    let needs_inhibition_embeddings =
+                        matches!(activation_mode, ActivationMode::Spreading)
+                            && self.config.inhibition_strength > 0.0;
+                    let mut output = hirn_exec::GraphReadRuntime::activate_graph(
                         self.cached_graph(),
                         &seed_ids,
                         mode,
                         direct_recall_ppr_config(&activation_mode),
                         max_depth as u32,
                         self.config.activation_convergence_threshold as f32,
-                        self.config.inhibition_strength as f32,
+                        if needs_inhibition_embeddings {
+                            0.0
+                        } else {
+                            self.config.inhibition_strength as f32
+                        },
                         self.config.graph_depth_delegation_threshold,
                         allowed_ns_slice,
                     )
                     .await?;
+
+                    if needs_inhibition_embeddings {
+                        let candidate_ids = output
+                            .ids
+                            .iter()
+                            .filter_map(|id| MemoryId::parse(id).ok())
+                            .collect::<Vec<_>>();
+                        let candidates = self
+                            .get_memories_batch_with_hints(&candidate_ids, &layer_hints)
+                            .await?;
+                        let embeddings = candidates
+                            .into_iter()
+                            .filter_map(|(id, record)| {
+                                let embedding = match record {
+                                    MemoryRecord::Episodic(record) => record.embedding,
+                                    MemoryRecord::Semantic(record) => record.embedding,
+                                    MemoryRecord::Procedural(record) => record.embedding,
+                                    MemoryRecord::Working(_) => None,
+                                }?;
+                                Some((id, embedding))
+                            })
+                            .collect::<HashMap<_, _>>();
+                        if !embeddings.is_empty() {
+                            output = hirn_exec::GraphReadRuntime::activate_graph_with_embeddings(
+                                self.cached_graph(),
+                                &seed_ids,
+                                mode,
+                                direct_recall_ppr_config(&activation_mode),
+                                max_depth as u32,
+                                self.config.activation_convergence_threshold as f32,
+                                self.config.inhibition_strength as f32,
+                                Some(&embeddings),
+                                self.config.graph_depth_delegation_threshold,
+                                allowed_ns_slice,
+                            )
+                            .await?;
+                        }
+                    }
 
                     output
                         .ids
@@ -224,6 +272,24 @@ impl HirnDB {
                 }
             }
         }
+
+        // ── Causal intervention scoring ────────────────────────────────
+        // Approximate P(candidate | do(seeds)) with a signed causal-reachability
+        // signal so the causal weight in the composite formula actually selects
+        // candidates on the imperative recall path (not just EXPLAIN). Computed
+        // ONCE per recall over the recall seeds, scoped by the same namespaces
+        // used for activation. Empty when disabled.
+        let causal_scores: HashMap<MemoryId, f32> = if self.config.causal_intervention_enabled {
+            crate::causal::causal_intervention_scores(
+                self.cached_graph(),
+                &seed_ids,
+                self.config.causal_intervention_max_depth,
+                allowed_ns_slice,
+            )
+            .await?
+        } else {
+            HashMap::new()
+        };
 
         // ── Multivector (ColBERT) MaxSim boost ─────────────────────────
         let maxsim_scores: HashMap<u128, f32> = if self.config.multivector_enabled
@@ -345,23 +411,58 @@ impl HirnDB {
                     MemoryRecord::Working(_) => 0,
                 };
 
-                let composite = scoring::composite_score(
+                // Allen-interval temporal relevance: score the record's validity
+                // interval against the query's time frame. Hard `after`/`before`
+                // bounds take precedence; when absent, a soft NL-parsed hint
+                // supplies the ranking frame WITHOUT excluding out-of-frame
+                // records (the hint never touches the scan prefilter). 0.0 when
+                // the query has no time context, so the θ term only ranks when
+                // time matters.
+                let eff_after = after.or(hint_after);
+                let eff_before = before.or(hint_before);
+                let temporal_rel = candidate_validity_interval(&record).map_or(0.0, |ivl| {
+                    temporal_relevance(&ivl, eff_after, eff_before, as_of)
+                });
+
+                // Signed causal-reachability signal from the intervention pass.
+                // The positive part feeds the composite formula's causal term
+                // (its `sane01` would clamp a negative value away); the negative
+                // part is applied as a multiplicative demotion below.
+                let raw = causal_scores.get(&id).copied().unwrap_or(0.0);
+                let causal_rel = raw.max(0.0);
+
+                // State-aware recency: a memory asserting an ongoing or
+                // timeless fact does not become less true with age, so it is
+                // exempt from decay. `Unknown` — every record ingested without
+                // temporal extraction — decays exactly as before.
+                let temporal_state = scoring::temporal_state_for_record(&record);
+                let composite = scoring::composite_score_for_state(
                     sim,
                     importance,
                     age_hours,
                     self.config.decay_lambda,
                     access_freq,
                     act_score,
-                    0.0, // causal_relevance — added by caller when FOLLOW CAUSES active
+                    causal_rel,
                     surprise,
                     source_rel,
+                    temporal_rel,
+                    temporal_state,
                     &weights,
                 );
 
                 // Blend MaxSim score if available.
                 let maxsim_boost = maxsim_scores.get(&ulid_u128).copied().unwrap_or(0.0);
-                let composite =
+                let mut composite =
                     (composite + maxsim_boost * self.config.multivector_weight).clamp(0.0, 1.0);
+
+                // A candidate reachable only through a net-negative causal path
+                // (an odd number of `Prevents` hops) is demoted: the prevented
+                // effect should rank lower, not vanish. Bounded to at most a 70%
+                // reduction so a demoted candidate is never fully suppressed.
+                if raw < 0.0 {
+                    composite = (composite * (1.0 + raw).clamp(0.3, 1.0)).clamp(0.0, 1.0);
+                }
                 let score_breakdown = crate::scoring::ScoreBreakdown {
                     similarity: sim,
                     importance,
@@ -372,9 +473,10 @@ impl HirnDB {
                         access_freq,
                     ),
                     activation: act_score,
-                    causal_relevance: 0.0,
+                    causal_relevance: causal_rel,
                     surprise,
                     source_reliability: source_rel,
+                    temporal_relevance: temporal_rel,
                 };
 
                 scored.push(RecallResult {
@@ -1071,6 +1173,99 @@ fn build_lance_filter(
     }
 }
 
+/// Temporal-relevance decay window: a candidate whose validity interval is this
+/// far from the query's time frame scores ~1/e. 30 days keeps within-month
+/// events meaningfully ranked while distant ones fade.
+const TEMPORAL_DECAY_WINDOW_MS: f64 = 30.0 * 24.0 * 3600.0 * 1000.0;
+
+/// Exponential decay of a temporal gap (ms) into [0.0, 1.0].
+fn temporal_gap_decay(gap_ms: i64) -> f32 {
+    if gap_ms <= 0 {
+        return 1.0;
+    }
+    (-(gap_ms as f64) / TEMPORAL_DECAY_WINDOW_MS).exp() as f32
+}
+
+/// Score a candidate's validity interval against a query interval by Allen
+/// relation: overlap/containment score high, adjacency mid, disjoint decays by gap.
+fn interval_match_score(
+    candidate: &hirn_core::temporal::TimeInterval,
+    query: &hirn_core::temporal::TimeInterval,
+) -> f32 {
+    use hirn_core::temporal::AllenRelation::{
+        After, Before, Contains, During, Equals, FinishedBy, Finishes, Meets, MetBy, OverlappedBy,
+        Overlaps, StartedBy, Starts,
+    };
+    match candidate.relation_to(query) {
+        Equals | During | Contains | Starts | StartedBy | Finishes | FinishedBy => 1.0,
+        Overlaps | OverlappedBy => 0.85,
+        Meets | MetBy => 0.6,
+        Before => temporal_gap_decay(candidate.gap_before_ms(query).unwrap_or(0)),
+        After => temporal_gap_decay(query.gap_before_ms(candidate).unwrap_or(0)),
+    }
+}
+
+/// Allen-interval temporal relevance of a candidate record's validity interval
+/// against the query's time frame. Returns 0.0 when the query expresses no time
+/// context (so the θ term only ranks when time actually matters).
+pub(crate) fn temporal_relevance(
+    candidate: &hirn_core::temporal::TimeInterval,
+    after: Option<&Timestamp>,
+    before: Option<&Timestamp>,
+    as_of: Option<&Timestamp>,
+) -> f32 {
+    use hirn_core::temporal::TimeInterval;
+
+    // Point-in-time (AS OF OBSERVED): 1.0 if the interval was valid at the
+    // instant, else decay by distance to the nearest boundary.
+    if let Some(&t) = as_of {
+        if candidate.contains(t) {
+            return 1.0;
+        }
+        let t_ms = t.timestamp_ms();
+        let start_ms = candidate.start().timestamp_ms();
+        let gap = if t_ms < start_ms {
+            start_ms - t_ms
+        } else {
+            candidate.end().map_or(0, |e| t_ms - e.timestamp_ms())
+        };
+        return temporal_gap_decay(gap);
+    }
+
+    match (after, before) {
+        (None, None) => 0.0,
+        (Some(&a), Some(&b)) => interval_match_score(candidate, &TimeInterval::new(a, Some(b))),
+        (Some(&a), None) => interval_match_score(candidate, &TimeInterval::since(a)),
+        (None, Some(&b)) => {
+            // Query is the open window (-inf, b): candidates starting before b
+            // fall inside it; later ones decay by how far past b they start.
+            let start_ms = candidate.start().timestamp_ms();
+            let b_ms = b.timestamp_ms();
+            if start_ms < b_ms {
+                1.0
+            } else {
+                temporal_gap_decay(start_ms - b_ms)
+            }
+        }
+    }
+}
+
+/// Build a candidate's validity interval for temporal ranking, or `None` for
+/// records without a meaningful validity interval (working/procedural).
+pub(crate) fn candidate_validity_interval(
+    record: &MemoryRecord,
+) -> Option<hirn_core::temporal::TimeInterval> {
+    use hirn_core::temporal::TimeInterval;
+    match record {
+        MemoryRecord::Episodic(e) => Some(match e.valid_until {
+            Some(end) => TimeInterval::new(e.timestamp, Some(end)),
+            None => TimeInterval::point(e.timestamp),
+        }),
+        MemoryRecord::Semantic(s) => Some(s.validity_interval()),
+        MemoryRecord::Working(_) | MemoryRecord::Procedural(_) => None,
+    }
+}
+
 /// Resolve the concrete namespace scope for a recall.
 ///
 /// Precedence: a specifically requested namespace wins; otherwise the caller's
@@ -1224,6 +1419,7 @@ mod tests {
                 causal_relevance: 0.0,
                 surprise: 0.0,
                 source_reliability: 1.0,
+                temporal_relevance: 0.0,
             },
             revision: None,
             resource_evidence: Vec::new(),
@@ -1618,6 +1814,123 @@ mod tests {
         temp_db_with_storage(Arc::new(MemoryStore::new())).await
     }
 
+    /// Causal intervention must actually SELECT candidates on the imperative
+    /// recall path: a candidate downstream of a query seed via a `Causes` edge
+    /// earns positive causal relevance and outranks an equally-similar
+    /// non-causal sibling, while a candidate reachable only via `Prevents` is
+    /// demoted below that sibling.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn causal_intervention_boosts_downstream_and_demotes_prevented() {
+        let (db, _dir) = temp_db().await;
+
+        // Query hits the seed exactly; the three candidates share one sibling
+        // embedding so they have identical similarity to the query.
+        let query = vec![1.0, 0.0, 0.0, 0.0];
+        let sibling = vec![1.0, 0.5, 0.0, 0.0];
+
+        async fn remember_ep(
+            db: &HirnDB,
+            content: &str,
+            embedding: Vec<f32>,
+        ) -> hirn_core::id::MemoryId {
+            db.remember(
+                EpisodicRecord::builder()
+                    .event_type(EventType::Observation)
+                    .content(content)
+                    .summary(content)
+                    .embedding(embedding)
+                    .importance(0.7)
+                    .agent_id(agent())
+                    .build()
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+
+        let seed = remember_ep(&db, "seed cause", query.clone()).await;
+        let downstream = remember_ep(&db, "downstream effect", sibling.clone()).await;
+        let neutral = remember_ep(&db, "neutral sibling", sibling.clone()).await;
+        let prevented = remember_ep(&db, "prevented effect", sibling.clone()).await;
+
+        // seed --Causes--> downstream ; seed --Prevents--> prevented.
+        db.graph_view()
+            .connect_with(
+                seed,
+                downstream,
+                EdgeRelation::Causes,
+                0.9,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        db.graph_view()
+            .connect_with(
+                seed,
+                prevented,
+                EdgeRelation::Prevents,
+                0.9,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+
+        let results = db
+            .recall(query.clone())
+            .unrestricted()
+            .limit(10)
+            .execute()
+            .await
+            .unwrap();
+
+        let result_for = |id: hirn_core::id::MemoryId| {
+            results
+                .iter()
+                .find(|r| r.record.id() == id)
+                .unwrap_or_else(|| panic!("record {id} missing from recall results"))
+        };
+
+        let downstream_res = result_for(downstream);
+        let neutral_res = result_for(neutral);
+        let prevented_res = result_for(prevented);
+
+        // Downstream candidate earns positive causal relevance.
+        assert!(
+            downstream_res.score_breakdown.causal_relevance > 0.0,
+            "downstream candidate must have positive causal relevance, got {}",
+            downstream_res.score_breakdown.causal_relevance
+        );
+        // The non-causal sibling earns none.
+        assert!(
+            neutral_res.score_breakdown.causal_relevance.abs() < f32::EPSILON,
+            "neutral sibling must have zero causal relevance, got {}",
+            neutral_res.score_breakdown.causal_relevance
+        );
+        // Despite equal similarity, the downstream candidate ranks higher.
+        assert!(
+            downstream_res.composite_score > neutral_res.composite_score,
+            "downstream candidate must outrank equally-similar neutral sibling: \
+             downstream={}, neutral={}",
+            downstream_res.composite_score,
+            neutral_res.composite_score
+        );
+
+        // A prevented candidate contributes no positive causal relevance and is
+        // demoted below the equally-similar neutral sibling.
+        assert!(
+            prevented_res.score_breakdown.causal_relevance.abs() < f32::EPSILON,
+            "prevented candidate must contribute no positive causal relevance, got {}",
+            prevented_res.score_breakdown.causal_relevance
+        );
+        assert!(
+            prevented_res.composite_score < neutral_res.composite_score,
+            "prevented candidate must be demoted below the neutral sibling: \
+             prevented={}, neutral={}",
+            prevented_res.composite_score,
+            neutral_res.composite_score
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn hebbian_threshold_flushes_without_close() {
         let (db, _dir) = temp_db().await;
@@ -1961,6 +2274,7 @@ mod tests {
             causal_relevance: 0.0,
             surprise: 0.0,
             source_reliability: 0.0,
+            temporal_relevance: 0.0,
         };
         let window_start = Timestamp::from_millis(0);
         let window_end =
@@ -2069,6 +2383,7 @@ mod tests {
             causal_relevance: 0.0,
             surprise: 0.0,
             source_reliability: 0.0,
+            temporal_relevance: 0.0,
         };
 
         let results = db

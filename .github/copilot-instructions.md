@@ -1,7 +1,7 @@
 # Hirn — Copilot Instructions
 
 Hirn is the best-in-class, state-of-the-art, fastest cognitive memory engine for AI agents.
-Written in Rust 2024 edition (1.91+). DataFusion-native execution, Lance 4.0 storage,
+Written in Rust 2024 edition (1.91+). DataFusion-native execution, Lance 9.0 storage,
 in-memory graph activation, Cedar authorization, 11 SOTA cognitive techniques,
 Pearl's 3-rung causal hierarchy. Engineered as a database, not a framework.
 
@@ -35,7 +35,7 @@ Post-roadmap increments:
 
 ## Architecture
 
-Cargo workspace with 13 crates. See [GREENFIELD.md](../GREENFIELD.md) §7 and [docs/architecture.md](../docs/architecture.md).
+Cargo workspace with 13 crates. See [GREENFIELD.md](../GREENFIELD.md) §7 and [Architecture](../docs/architecture.md).
 
 ### Runtime Ownership
 
@@ -56,12 +56,12 @@ In `hirnd`, `CoordinationRuntime` owns realm-owner lookup and forwarded write pl
 | Layer | Crate | Purpose |
 |-------|-------|---------|
 | Core | `hirn-core` | Types, traits, config, errors, stats (leaf crate) |
-| Storage | `hirn-storage` | Lance 4.0, `PhysicalStore` trait, DataFusion `SessionContext`, dataset schemas, `EpochCache` |
+| Storage | `hirn-storage` | Lance 9.0, `PhysicalStore` trait, DataFusion `SessionContext`, dataset schemas, `EpochCache` |
 | Graph | `hirn-graph` | In-memory `PropertyGraph` (petgraph), spreading activation, PPR, Hebbian learning, lateral inhibition |
 | Providers | `hirn-provider` | Embedders + LLMs: OpenAI, Anthropic, Ollama, Cohere, Voyage, ONNX. Circuit breaker, retry, batch |
 | Query | `hirn-query` | HirnQL: Pest grammar parser, TypedAST analyzer, DataFusion `LogicalPlan` compiler, `PlanCache` (DashMap+LRU), `QueryPipeline` (7-stage) |
 | Execution | `hirn-exec` | DataFusion custom operators, scoring UDFs, optimizer rules, `HirnSessionExt` |
-| Policy | `hirn-policy` | Cedar 4.9+ integration, Cedar entity schema, audit trail, HMAC integrity |
+| Policy | `hirn-policy` | Cedar 4.11+ integration, Cedar entity schema, audit trail, HMAC integrity |
 | Engine | `hirn-engine` | `HirnDB` orchestrator: wires storage + graph + exec + policy. Domain sub-modules |
 | Façade | `hirn` | Public API: zero-config wrapper plus first-class content/resource modules |
 | Server | `hirnd` | gRPC (tonic) + HTTP (axum) + MCP (rmcp) daemon. OpenRaft consensus, shard-per-realm, S3 backend, DynamoDB metadata (serverless feature) |
@@ -120,7 +120,7 @@ Every operation is a composable plan over Arrow batches — never imperative asy
 
 **Optimizer rules** (all in `hirn-exec`, 5 total): `PolicyPushdownRule`, `ActivationFusionRule`, `TemporalIndexRule`, `NamespacePartitionPruneRule`, `DepthSchedulingRule`
 
-### Storage — Lance 4.0
+### Storage — Lance 9.0
 
 Datasets registered as DataFusion tables via `LanceTableProvider`:
 `episodic`, `semantic`, `procedural`, `working`, `graph_nodes`, `graph_edges`,

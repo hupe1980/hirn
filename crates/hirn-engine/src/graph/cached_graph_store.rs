@@ -86,16 +86,10 @@ impl CachedGraphStore {
         // below). `all_edges()` would also return soft-expired edges and drop
         // them back into the hot tier as live.
         let all_edges = self.cold.active_edges().await?;
-        let all_node_ids = self.cold.node_ids().await?;
-
-        // Fetch all node data from cold tier *before* acquiring the write lock,
-        // so we don't hold a parking_lot guard across an await.
-        let mut node_data = Vec::with_capacity(all_node_ids.len());
-        for id in &all_node_ids {
-            if let Ok(Some(nd)) = self.cold.get_node(*id).await {
-                node_data.push(nd);
-            }
-        }
+        // Fetch all node data in one streamed scan before acquiring the write
+        // lock. The previous ID scan followed by one point query per node made
+        // startup O(N) storage round-trips.
+        let node_data = self.cold.all_nodes().await?;
 
         // Now apply everything synchronously under the write lock.
         let mut graph = self.hot.write();
@@ -413,42 +407,87 @@ impl GraphReadRuntime for CachedGraphStore {
         delegation_threshold: usize,
         allowed_namespaces: Option<&[Namespace]>,
     ) -> HirnResult<GraphActivationOutput> {
-        if max_depth as usize > delegation_threshold {
-            tracing::debug!(
-                depth = max_depth,
-                delegation_threshold,
-                mode = ?mode,
-                "CachedGraphStore: delegating graph activation to persistent tier"
-            );
-            return self
-                .activate_via_persistent_graph(
-                    seeds,
-                    mode,
-                    ppr_config,
-                    max_depth,
-                    epsilon,
-                    inhibition_mu,
-                    allowed_namespaces,
-                )
-                .await;
-        }
-
-        tracing::trace!(
-            depth = max_depth,
-            delegation_threshold,
-            mode = ?mode,
-            "CachedGraphStore: running graph activation on hot tier"
-        );
-        self.activate_via_hot_graph(
+        self.activate_graph_with_embeddings(
             seeds,
             mode,
             ppr_config,
             max_depth,
             epsilon,
             inhibition_mu,
+            None,
+            delegation_threshold,
             allowed_namespaces,
         )
         .await
+    }
+
+    async fn activate_graph_with_embeddings(
+        &self,
+        seeds: &[MemoryId],
+        mode: ExecActivationMode,
+        ppr_config: Option<&hirn_graph::PprConfig>,
+        max_depth: u32,
+        epsilon: f32,
+        inhibition_mu: f32,
+        embeddings: Option<&HashMap<MemoryId, Vec<f32>>>,
+        delegation_threshold: usize,
+        allowed_namespaces: Option<&[Namespace]>,
+    ) -> HirnResult<GraphActivationOutput> {
+        // Once the hot tier has evicted a node for capacity it is only a partial
+        // view, so a shallow hot-only traversal could silently miss interior
+        // nodes. Route to the complete cold tier in that case, regardless of depth.
+        let hot_incomplete = self.hot.read().has_evicted();
+        let output = if max_depth as usize > delegation_threshold || hot_incomplete {
+            tracing::debug!(
+                depth = max_depth,
+                delegation_threshold,
+                hot_incomplete,
+                mode = ?mode,
+                "CachedGraphStore: delegating graph activation to persistent tier"
+            );
+            self.activate_via_persistent_graph(
+                seeds,
+                mode,
+                ppr_config,
+                max_depth,
+                epsilon,
+                inhibition_mu,
+                embeddings,
+                allowed_namespaces,
+            )
+            .await?
+        } else {
+            tracing::trace!(
+                depth = max_depth,
+                delegation_threshold,
+                mode = ?mode,
+                "CachedGraphStore: running graph activation on hot tier"
+            );
+            self.activate_via_hot_graph(
+                seeds,
+                mode,
+                ppr_config,
+                max_depth,
+                epsilon,
+                inhibition_mu,
+                embeddings,
+                allowed_namespaces,
+            )
+            .await?
+        };
+
+        // Every node returned to a caller is a real hot-cache access. Record it
+        // after traversal so capacity eviction is LRU rather than insertion-order.
+        {
+            let mut graph = self.hot.write();
+            for id in &output.ids {
+                if let Ok(id) = MemoryId::parse(id) {
+                    graph.record_access(id);
+                }
+            }
+        }
+
+        Ok(output)
     }
 
     async fn activate_graph_min_weight(
@@ -463,14 +502,43 @@ impl GraphReadRuntime for CachedGraphStore {
         delegation_threshold: usize,
         allowed_namespaces: Option<&[Namespace]>,
     ) -> HirnResult<GraphActivationOutput> {
+        self.activate_graph_min_weight_with_embeddings(
+            seeds,
+            mode,
+            ppr_config,
+            max_depth,
+            epsilon,
+            inhibition_mu,
+            min_weight,
+            None,
+            delegation_threshold,
+            allowed_namespaces,
+        )
+        .await
+    }
+
+    async fn activate_graph_min_weight_with_embeddings(
+        &self,
+        seeds: &[MemoryId],
+        mode: ExecActivationMode,
+        ppr_config: Option<&hirn_graph::PprConfig>,
+        max_depth: u32,
+        epsilon: f32,
+        inhibition_mu: f32,
+        min_weight: Option<f32>,
+        embeddings: Option<&HashMap<MemoryId, Vec<f32>>>,
+        delegation_threshold: usize,
+        allowed_namespaces: Option<&[Namespace]>,
+    ) -> HirnResult<GraphActivationOutput> {
         let output = self
-            .activate_graph(
+            .activate_graph_with_embeddings(
                 seeds,
                 mode,
                 ppr_config,
                 max_depth,
                 epsilon,
                 inhibition_mu,
+                embeddings,
                 delegation_threshold,
                 allowed_namespaces,
             )
@@ -504,10 +572,12 @@ impl GraphReadRuntime for CachedGraphStore {
             return Ok(Vec::new());
         }
 
-        if max_depth as usize > delegation_threshold {
+        let hot_incomplete = self.hot.read().has_evicted();
+        if max_depth as usize > delegation_threshold || hot_incomplete {
             tracing::debug!(
                 depth = max_depth,
                 delegation_threshold,
+                hot_incomplete,
                 relation = ?relation,
                 "CachedGraphStore: delegating causal traversal to persistent tier"
             );
@@ -553,10 +623,12 @@ impl GraphReadRuntime for CachedGraphStore {
             return Ok(Vec::new());
         }
 
-        if max_depth as usize > delegation_threshold {
+        let hot_incomplete = self.hot.read().has_evicted();
+        if max_depth as usize > delegation_threshold || hot_incomplete {
             tracing::debug!(
                 depth = max_depth,
                 delegation_threshold,
+                hot_incomplete,
                 relation_filter = ?relation_filter,
                 "CachedGraphStore: delegating graph traversal to persistent tier"
             );
@@ -688,6 +760,7 @@ impl CachedGraphStore {
         max_depth: u32,
         epsilon: f32,
         inhibition_mu: f32,
+        embeddings: Option<&HashMap<MemoryId, Vec<f32>>>,
         allowed_namespaces: Option<&[Namespace]>,
     ) -> HirnResult<GraphActivationOutput> {
         // Spreading / PPR power iteration is CPU-bound and holds the hot-graph
@@ -697,6 +770,7 @@ impl CachedGraphStore {
         let hot = Arc::clone(&self.hot);
         let seeds = seeds.to_vec();
         let ppr_config = ppr_config.cloned();
+        let embeddings = embeddings.cloned();
         let allowed_namespaces = allowed_namespaces.map(<[Namespace]>::to_vec);
         tokio::task::spawn_blocking(move || {
             let graph = hot.read();
@@ -708,6 +782,7 @@ impl CachedGraphStore {
                 max_depth,
                 epsilon,
                 inhibition_mu,
+                embeddings.as_ref(),
                 allowed_namespaces.as_deref(),
             )
         })
@@ -725,6 +800,7 @@ impl CachedGraphStore {
         max_depth: u32,
         epsilon: f32,
         inhibition_mu: f32,
+        embeddings: Option<&HashMap<MemoryId, Vec<f32>>>,
         allowed_namespaces: Option<&[Namespace]>,
     ) -> HirnResult<GraphActivationOutput> {
         let config = hirn_graph::ActivationConfig {
@@ -756,8 +832,13 @@ impl CachedGraphStore {
                 })
             }
             ExecActivationMode::Spreading => {
-                let result =
-                    hirn_graph::spread_activation(graph, seeds, &config, None, allowed_namespaces)?;
+                let result = hirn_graph::spread_activation(
+                    graph,
+                    seeds,
+                    &config,
+                    embeddings,
+                    allowed_namespaces,
+                )?;
                 let mut entries: Vec<_> = result.activations.into_iter().collect();
                 hirn_graph::sort_by_score_then_id(&mut entries);
 
@@ -812,6 +893,7 @@ impl CachedGraphStore {
         max_depth: u32,
         epsilon: f32,
         inhibition_mu: f32,
+        embeddings: Option<&HashMap<MemoryId, Vec<f32>>>,
         allowed_namespaces: Option<&[Namespace]>,
     ) -> HirnResult<GraphActivationOutput> {
         let config = hirn_graph::ActivationConfig {
@@ -851,7 +933,7 @@ impl CachedGraphStore {
                     self.cold(),
                     seeds,
                     &config,
-                    None,
+                    embeddings,
                     allowed_namespaces,
                 )
                 .await?;
@@ -1262,26 +1344,45 @@ impl GraphStore for CachedGraphStore {
     }
 
     async fn has_node(&self, id: MemoryId) -> HirnResult<bool> {
-        let graph = self.hot.read();
-        Ok(graph.has_node(id))
+        // Hot is a complete write-through mirror of cold until a capacity
+        // eviction occurs; only after that can a hot miss hide a live node, so
+        // fall back to the authoritative cold tier just in that case.
+        let (hit, hot_incomplete) = {
+            let graph = self.hot.read();
+            (graph.has_node(id), graph.has_evicted())
+        };
+        if hit {
+            Ok(true)
+        } else if hot_incomplete {
+            self.cold.has_node(id).await
+        } else {
+            Ok(false)
+        }
     }
 
     async fn get_node(&self, id: MemoryId) -> HirnResult<Option<GraphNodeData>> {
-        let graph = self.hot.read();
-        let importance = graph.node_importance(id);
-        let layer = graph.node_layer(id);
-        match (importance, layer) {
-            (Some(imp), Some(lay)) => Ok(Some(GraphNodeData {
-                id,
-                layer: lay,
-                importance: imp,
-                // Return the real stored creation time (the hot-tier NodeData
-                // carries it) rather than fabricating `now()`.
-                created_at: graph.node_created_at(id).unwrap_or_else(Timestamp::now),
-                namespace: graph.node_namespace(id).cloned().unwrap_or_default(),
-                access_count: graph.access_count(id),
-            })),
-            _ => Ok(None),
+        let (hit, hot_incomplete) = {
+            let graph = self.hot.read();
+            let node = match (graph.node_importance(id), graph.node_layer(id)) {
+                (Some(imp), Some(lay)) => Some(GraphNodeData {
+                    id,
+                    layer: lay,
+                    importance: imp,
+                    // Return the real stored creation time (the hot-tier NodeData
+                    // carries it) rather than fabricating `now()`.
+                    created_at: graph.node_created_at(id).unwrap_or_else(Timestamp::now),
+                    namespace: graph.node_namespace(id).cloned().unwrap_or_default(),
+                    access_count: graph.access_count(id),
+                }),
+                _ => None,
+            };
+            (node, graph.has_evicted())
+        };
+        match hit {
+            Some(node) => Ok(Some(node)),
+            // After an eviction the node may live only in cold; read it back.
+            None if hot_incomplete => self.cold.get_node(id).await,
+            None => Ok(None),
         }
     }
 
@@ -1497,6 +1598,11 @@ impl GraphStore for CachedGraphStore {
         depth: usize,
         min_weight: f32,
     ) -> HirnResult<Vec<MemoryId>> {
+        // A hot-only BFS can silently truncate at an evicted interior node once
+        // the hot tier is a partial view; use the complete cold tier instead.
+        if self.hot.read().has_evicted() {
+            return self.cold.get_neighbors(start, depth, min_weight).await;
+        }
         let graph = self.hot.read();
         Ok(graph.get_neighbors(start, depth, min_weight))
     }
@@ -1508,6 +1614,12 @@ impl GraphStore for CachedGraphStore {
         min_weight: f32,
         namespace: Option<&Namespace>,
     ) -> HirnResult<Vec<MemoryId>> {
+        if self.hot.read().has_evicted() {
+            return self
+                .cold
+                .get_neighbors_filtered(start, depth, min_weight, namespace)
+                .await;
+        }
         let graph = self.hot.read();
         match namespace {
             Some(ns) => Ok(graph.get_neighbors_filtered(
@@ -1524,6 +1636,9 @@ impl GraphStore for CachedGraphStore {
         &self,
         node_id: MemoryId,
     ) -> HirnResult<Vec<(MemoryId, f32, EdgeRelation)>> {
+        if self.hot.read().has_evicted() {
+            return self.cold.outgoing_weighted(node_id).await;
+        }
         let graph = self.hot.read();
         Ok(graph.outgoing_weighted(node_id))
     }
@@ -1836,6 +1951,41 @@ mod tests {
 
         // Verify cold tier has the node too.
         assert!(cold.has_node(a).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn hot_evicted_node_is_read_back_from_cold() {
+        // With a hot cap of 2, inserting a 3rd node evicts the oldest from hot.
+        // Because writes are write-through, cold still holds it — and reads must
+        // fall back to cold so the evicted node stays visible (the recall gap
+        // past the hot cap that this closes).
+        let cold = test_cold().await;
+        let cached = CachedGraphStore::with_max_nodes(cold.clone(), 2);
+        let ns = Namespace::default();
+
+        let a = MemoryId::new();
+        let b = MemoryId::new();
+        let c = MemoryId::new();
+        for id in [a, b, c] {
+            cached
+                .add_node(id, Layer::Episodic, 0.8, Timestamp::now(), ns)
+                .await
+                .unwrap();
+        }
+
+        // Cold retains every node (write-through).
+        assert!(cold.has_node(a).await.unwrap());
+
+        // The cache reads the evicted node back from cold instead of reporting
+        // it missing.
+        assert!(
+            cached.has_node(a).await.unwrap(),
+            "evicted node must be found via cold read-back"
+        );
+        assert!(
+            cached.get_node(a).await.unwrap().is_some(),
+            "get_node must read the evicted node back from cold"
+        );
     }
 
     /// Graph: seed → strong (weight 0.9), seed → weak (weight 0.1).
@@ -2642,10 +2792,8 @@ mod tests {
 
     /// Cross-tier equivalence with lateral inhibition enabled (μ > 0).
     ///
-    /// Jaccard-modulated inhibition needs embeddings, which `activate_graph`
-    /// does not thread through, so the tier entry points are exercised
-    /// directly: `hirn_graph::spread_activation` (hot, petgraph) vs
-    /// `crate::persistent_activation::spread_activation` (cold, Lance). The
+    /// Jaccard-modulated inhibition is supplied through the embedding-aware
+    /// graph runtime entry point for both hot and cold tiers. The
     /// fixture places two seed-like nodes at depth 3 — outside the 2-hop
     /// protected set — one sharing the seed's single out-neighbor
     /// (Jaccard 1 → no suppression) and one sharing none (Jaccard 0 → full μ
@@ -2742,15 +2890,36 @@ mod tests {
             );
         }
 
-        // Engine-level parity with μ > 0 for both remaining modes (PPR has no
-        // inhibition term; both tiers must still agree when μ is configured).
+        // Engine-level parity with μ > 0. Spreading must preserve the score gap
+        // proven above; PPR has no inhibition term but must remain cross-tier
+        // equivalent when μ is configured.
         for mode in [ExecActivationMode::Spreading, ExecActivationMode::Ppr] {
             let hot = cached
-                .activate_graph(&[seed], mode, None, 3, 0.001, 0.5, usize::MAX, None)
+                .activate_graph_with_embeddings(
+                    &[seed],
+                    mode,
+                    None,
+                    3,
+                    0.001,
+                    0.5,
+                    Some(&embeddings),
+                    usize::MAX,
+                    None,
+                )
                 .await
                 .unwrap();
             let cold = cached
-                .activate_graph(&[seed], mode, None, 3, 0.001, 0.5, 0, None)
+                .activate_graph_with_embeddings(
+                    &[seed],
+                    mode,
+                    None,
+                    3,
+                    0.001,
+                    0.5,
+                    Some(&embeddings),
+                    0,
+                    None,
+                )
                 .await
                 .unwrap();
             assert_eq!(
@@ -2759,6 +2928,19 @@ mod tests {
             );
             for (h, c) in hot.scores.iter().zip(cold.scores.iter()) {
                 assert!((h - c).abs() < 1e-5);
+            }
+            if mode == ExecActivationMode::Spreading {
+                let shared = hot
+                    .ids
+                    .iter()
+                    .position(|id| id == &shares_neighbor.to_string())
+                    .unwrap();
+                let unshared = hot
+                    .ids
+                    .iter()
+                    .position(|id| id == &no_shared_neighbor.to_string())
+                    .unwrap();
+                assert!(hot.scores[unshared] < hot.scores[shared]);
             }
         }
     }

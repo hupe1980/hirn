@@ -155,13 +155,22 @@ async fn offline_reflect_job_applies_auditable_belief_revisions() -> TestResult<
         hirn_core::RevisionOperation::Correct
     );
     assert_eq!(head.revision_causation_id, Some(evidence_id));
-    // Hindsight-style halving on contradiction: 0.8 -> 0.4.
-    assert!((head.confidence - 0.4).abs() < 1e-6);
-    assert!(head.contradiction_ids.contains(&evidence_id));
+    // No real provider is registered, so the deterministic floor classified
+    // this pair. A negation-cue mismatch is not entailment — it fires on
+    // agreeing double negatives and misses negation-free conflicts — so the
+    // floor caps at the reversible Weakens step (0.8 - 0.15*0.8 = 0.68)
+    // instead of halving credence and recording a contradiction.
+    assert!(
+        (head.confidence - 0.68).abs() < 1e-6,
+        "confidence {} should be the Weakens step, not a halving",
+        head.confidence
+    );
+    assert!(
+        !head.contradiction_ids.contains(&evidence_id),
+        "the fallback must not assert a contradiction"
+    );
     let reason = head.revision_reason.as_deref().unwrap();
     assert!(reason.contains("reflection"), "reason: {reason}");
-    // The mock provider returns an empty response, so the documented
-    // heuristic fallback classified this pair.
     assert_eq!(
         head.provenance.extraction_model.as_deref(),
         Some("heuristic-offline-reflect")
@@ -358,8 +367,15 @@ async fn cedar_denies_reflect_updates_without_reflect_rights() -> TestResult<()>
 
     let updates = db.semantic().reflect(reviser_evidence_id).await?;
     assert_eq!(updates.len(), 1);
-    assert_eq!(updates[0].outcome, ReflectionOutcome::Contradicts);
-    assert!((updates[0].new_confidence - 0.4).abs() < 1e-6);
+    // With no classifier backend configured the deterministic floor decides,
+    // and it may only weaken. The Cedar right is what this test is about: the
+    // revision happened, which is what `reflect` permission gates.
+    assert_eq!(updates[0].outcome, ReflectionOutcome::Weakens);
+    assert!((updates[0].new_confidence - 0.68).abs() < 1e-6);
+    assert_eq!(
+        updates[0].decided_by,
+        hirn_core::nlu::DecisionSource::Heuristic
+    );
 
     Ok(())
 }

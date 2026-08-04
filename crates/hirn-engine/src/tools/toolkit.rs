@@ -86,6 +86,10 @@ impl MemoryToolkit {
             .agent_id(agent_id)
             .namespace(ns);
 
+        if let Some(role) = request.functional_role {
+            builder = builder.functional_role(role);
+        }
+
         if let Some(imp) = request.importance {
             builder = builder.importance(imp);
         }
@@ -273,11 +277,17 @@ impl MemoryToolkit {
     /// Query-adaptive recall: classify the query's intent and route it to the
     /// matching memory view (MAGMA-style, arXiv:2601.03236).
     ///
-    /// A "when/before/how long" query routes to the **temporal** view and returns
-    /// an exact [`timeline`](Self::timeline); "why/because/led-to", "who/which",
-    /// and everything else route to hybrid embedding [`recall`](Self::recall).
-    /// The per-view weights and the chosen `primary_view` are returned so callers
-    /// can see (and override) the routing. Enforces `Action::Recall`.
+    /// Intent is decided by the configured natural-language-understanding
+    /// chain (structured LLM, then embedding exemplar routing), falling back to
+    /// cue matching only when no backend produces a confident decision — so a
+    /// question like "how much time passed between the two releases" routes
+    /// temporally despite containing no temporal cue word. A temporal route
+    /// returns an exact [`timeline`](Self::timeline); every other view routes
+    /// to hybrid embedding [`recall`](Self::recall).
+    ///
+    /// The per-view weights, the chosen `primary_view`, and the deciding
+    /// backend are returned so callers can see (and override) the routing.
+    /// Enforces `Action::Recall`.
     pub async fn smart_recall(
         &self,
         agent_id: AgentId,
@@ -288,16 +298,16 @@ impl MemoryToolkit {
             return Err(HirnError::InvalidInput("query must not be empty".into()));
         }
 
-        let weights = crate::retrieval::query_intent::classify_query(query);
-        let primary = weights.primary();
+        let route =
+            crate::retrieval::query_intent::route_query(&self.db.nlu_classifier(), query).await;
         let route_weights = RouteWeights {
-            semantic: weights.semantic,
-            temporal: weights.temporal,
-            causal: weights.causal,
-            entity: weights.entity,
+            semantic: route.weights.semantic,
+            temporal: route.weights.temporal,
+            causal: route.weights.causal,
+            entity: route.weights.entity,
         };
 
-        if primary == crate::retrieval::query_intent::ViewKind::Temporal {
+        if route.primary == crate::retrieval::query_intent::ViewKind::Temporal {
             let timeline = self
                 .timeline(
                     agent_id,
@@ -310,8 +320,10 @@ impl MemoryToolkit {
                 )
                 .await?;
             return Ok(RoutedRecall {
-                primary_view: primary.label().to_string(),
+                primary_view: route.primary.label().to_string(),
                 weights: route_weights,
+                route_source: route.source.as_str().to_string(),
+                route_confidence: route.confidence,
                 records: Vec::new(),
                 timeline: Some(timeline),
             });
@@ -319,8 +331,10 @@ impl MemoryToolkit {
 
         let records = self.recall(agent_id, query, options).await?;
         Ok(RoutedRecall {
-            primary_view: primary.label().to_string(),
+            primary_view: route.primary.label().to_string(),
             weights: route_weights,
+            route_source: route.source.as_str().to_string(),
+            route_confidence: route.confidence,
             records,
             timeline: None,
         })

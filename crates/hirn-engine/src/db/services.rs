@@ -241,8 +241,10 @@ impl<'a> SemanticView<'a> {
     /// nearest beliefs in the same namespace, adjusting their confidence via
     /// auditable corrective revisions.
     ///
-    /// Uses the heuristic classifier; see [`Self::reflect_with_llm`] for
-    /// LLM-backed classification.
+    /// Classification uses the database's configured natural-language
+    /// understanding chain, falling back to the deterministic floor when no
+    /// backend decides. See [`Self::reflect_with_classifier`] to override the
+    /// chain for one call.
     #[inline]
     pub async fn reflect(
         &self,
@@ -251,16 +253,20 @@ impl<'a> SemanticView<'a> {
         self.0.reflect_semantic(evidence_id, None, None).await
     }
 
-    /// Reflect an evidence record against nearby beliefs using an LLM to
-    /// judge whether the evidence reinforces, weakens, or contradicts each
-    /// belief. Falls back to the heuristic when the provider fails.
+    /// Reflect an evidence record using a specific classification chain
+    /// instead of the database's configured one.
+    ///
+    /// Falls back to the deterministic floor whenever the supplied chain
+    /// abstains, exactly as the configured chain does.
     #[inline]
-    pub async fn reflect_with_llm(
+    pub async fn reflect_with_classifier(
         &self,
         evidence_id: MemoryId,
-        llm: &dyn hirn_core::embed::LlmProvider,
+        classifier: &hirn_provider::HybridClassifier,
     ) -> HirnResult<Vec<crate::consolidation::ReflectionUpdate>> {
-        self.0.reflect_semantic(evidence_id, None, Some(llm)).await
+        self.0
+            .reflect_semantic(evidence_id, None, Some(classifier))
+            .await
     }
 }
 
@@ -715,6 +721,21 @@ impl<'a> QueryView<'a> {
         allowed_namespaces: &[Namespace],
     ) -> HirnResult<crate::ql::results::QueryResult> {
         self.0.execute_ql_scoped(query, allowed_namespaces).await
+    }
+
+    /// Execute a namespace-scoped HirnQL query and return engine diagnostics.
+    #[inline]
+    pub async fn execute_scoped_with_diagnostics(
+        &self,
+        query: &str,
+        allowed_namespaces: &[Namespace],
+    ) -> HirnResult<(
+        crate::ql::results::QueryResult,
+        Option<crate::diagnostics::QueryDiagnostics>,
+    )> {
+        self.0
+            .execute_ql_scoped_with_diagnostics(query, allowed_namespaces)
+            .await
     }
 
     /// Return the EXPLAIN output for a query.

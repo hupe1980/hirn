@@ -167,8 +167,10 @@ async fn archive_cold_episodes(
     opts: &LifecycleCompactOptions,
     summarizer: Option<&dyn Summarizer>,
 ) -> Result<(u64, u64), HirnDbError> {
-    // Build filter: non-archived, optionally scoped to realm.
-    let mut filters: Vec<String> = vec!["archived = false".to_string()];
+    // Build filter: non-archived, not pinned, optionally scoped to realm.
+    // Pinned records are user-protected and must never be scanned for cold-archival.
+    let mut filters: Vec<String> =
+        vec!["archived = false".to_string(), "pinned = false".to_string()];
 
     if let Some(ref realm) = opts.realm {
         let escaped = realm.replace('\'', "''");
@@ -309,12 +311,20 @@ async fn collect_cold_ids_from_stream(
 
 /// Ebbinghaus retention score: `R = e^(-t / S)` where
 /// `S = stability × (1 + 0.5 × ln(rehearsal_count))`.
+///
+/// Hardened to mirror the engine's canonical `retention_score`: non-finite
+/// inputs collapse to `0.0`, elapsed time is clamped non-negative (guards
+/// against clock rollback / cross-machine restore giving `exp(+h/S) > 1` and
+/// making a record unarchivable), and effective stability is floored at
+/// `EPSILON` so a zero stability decays immediately instead of producing NaN.
 fn retention_score(hours_since_access: f64, stability: f32, rehearsal_count: u64) -> f32 {
-    let effective_stability = stability as f64 * (1.0 + 0.5 * (rehearsal_count.max(1) as f64).ln());
-    if effective_stability <= 0.0 {
+    if !hours_since_access.is_finite() || !stability.is_finite() {
         return 0.0;
     }
-    (-hours_since_access / effective_stability).exp() as f32
+    let effective_stability = stability as f64 * (1.0 + 0.5 * (rehearsal_count.max(1) as f64).ln());
+    let effective_stability = effective_stability.max(f64::EPSILON);
+    let hours = hours_since_access.max(0.0);
+    (-hours / effective_stability).exp() as f32
 }
 
 /// Fetch full rows for the given IDs, optionally filtered by realm.
@@ -440,6 +450,7 @@ mod tests {
             Field::new("stability", DataType::Float32, false),
             Field::new("access_count", DataType::UInt64, false),
             Field::new("archived", DataType::Boolean, false),
+            Field::new("pinned", DataType::Boolean, true),
             Field::new("namespace", DataType::Utf8, false),
             Field::new("content", DataType::Utf8, false),
         ]))
@@ -456,6 +467,31 @@ mod tests {
         namespace: &str,
         content: &str,
     ) -> RecordBatch {
+        make_episode_pinned(
+            id,
+            importance,
+            last_accessed_ms,
+            stability,
+            access_count,
+            archived,
+            false,
+            namespace,
+            content,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn make_episode_pinned(
+        id: &str,
+        importance: f32,
+        last_accessed_ms: i64,
+        stability: f32,
+        access_count: u64,
+        archived: bool,
+        pinned: bool,
+        namespace: &str,
+        content: &str,
+    ) -> RecordBatch {
         RecordBatch::try_new(
             test_episodic_schema(),
             vec![
@@ -465,6 +501,7 @@ mod tests {
                 Arc::new(Float32Array::from(vec![stability])),
                 Arc::new(UInt64Array::from(vec![access_count])),
                 Arc::new(BooleanArray::from(vec![archived])),
+                Arc::new(BooleanArray::from(vec![Some(pinned)])),
                 Arc::new(StringArray::from(vec![namespace])),
                 Arc::new(StringArray::from(vec![content])),
             ],
@@ -495,6 +532,7 @@ mod tests {
                     Arc::new(Float32Array::from(vec![100.0])),
                     Arc::new(UInt64Array::from(vec![5u64])),
                     Arc::new(BooleanArray::from(vec![false])),
+                    Arc::new(BooleanArray::from(vec![Some(false)])),
                     Arc::new(StringArray::from(vec!["default"])),
                     Arc::new(StringArray::from(vec![format!("content {i}")])),
                 ],
@@ -880,6 +918,81 @@ mod tests {
         // Zero stability → 0.0 (no crash).
         let r = retention_score(10.0, 0.0, 1);
         assert_eq!(r, 0.0);
+
+        // Clock rollback (negative elapsed) is clamped: never exceeds fresh.
+        let r = retention_score(-100.0, 24.0, 5);
+        assert!((r - 1.0).abs() < 0.01);
+
+        // Non-finite inputs collapse to 0.0.
+        assert_eq!(retention_score(f64::NAN, 24.0, 1), 0.0);
+        assert_eq!(retention_score(f64::INFINITY, 24.0, 1), 0.0);
+        assert_eq!(retention_score(10.0, f32::NAN, 1), 0.0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pinned_cold_episodes_not_archived() {
+        let store = MemoryStore::new();
+        let thirty_days_ago = now_millis() - 30 * 24 * 3_600_000;
+
+        let episodes = vec![
+            // Cold but pinned → must NOT be archived.
+            make_episode_pinned(
+                "ep-pinned",
+                0.01,
+                thirty_days_ago,
+                1.0,
+                1,
+                false,
+                true,
+                "default",
+                "pinned",
+            ),
+            // Cold and unpinned → should be archived.
+            make_episode_pinned(
+                "ep-unpinned",
+                0.01,
+                thirty_days_ago,
+                1.0,
+                1,
+                false,
+                false,
+                "default",
+                "unpinned",
+            ),
+        ];
+        seed_episodes(&store, episodes).await;
+
+        let opts = LifecycleCompactOptions {
+            archive_threshold: 0.05,
+            optimize_indices: false,
+            ..Default::default()
+        };
+
+        let result = lifecycle_compact(&store, "episodic", &opts, None)
+            .await
+            .unwrap();
+
+        // Only the unpinned cold episode is archived.
+        assert_eq!(result.episodes_archived, 1);
+
+        let batches = store
+            .scan(
+                "episodic",
+                ScanOptions {
+                    filter: Some("id = 'ep-pinned'".to_string()),
+                    columns: Some(vec!["archived".to_string()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let archived = batches[0]
+            .column_by_name("archived")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        assert!(!archived.value(0));
     }
 
     #[tokio::test(flavor = "multi_thread")]

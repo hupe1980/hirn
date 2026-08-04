@@ -91,6 +91,7 @@ pub fn schema(embedding_dims: usize) -> SchemaRef {
         Field::new("time_start_ms", DataType::Int64, true),
         Field::new("time_end_ms", DataType::Int64, true),
         Field::new("confidence", DataType::Float32, false),
+        Field::new("negated", DataType::Boolean, false),
         Field::new("source_ids_json", DataType::Binary, false),
         embedding_field,
         Field::new("namespace", DataType::Utf8, false),
@@ -143,6 +144,7 @@ pub fn to_batch_with_namespaces(
     let mut time_starts = Vec::with_capacity(n);
     let mut time_ends = Vec::with_capacity(n);
     let mut confidences = Vec::with_capacity(n);
+    let mut negated = Vec::with_capacity(n);
     let mut source_ids_json = Vec::with_capacity(n);
 
     for r in records {
@@ -164,6 +166,7 @@ pub fn to_batch_with_namespaces(
         time_starts.push(r.time_start.map(|ts| ts.timestamp_ms()));
         time_ends.push(r.time_end.map(|ts| ts.timestamp_ms()));
         confidences.push(r.confidence);
+        negated.push(r.negated);
 
         let src: Vec<String> = r.source_ids.iter().map(ToString::to_string).collect();
         source_ids_json.push(serde_json::to_vec(&src).map_err(ser_err)?);
@@ -199,6 +202,7 @@ pub fn to_batch_with_namespaces(
             Arc::new(Int64Array::from(time_starts)),
             Arc::new(Int64Array::from(time_ends)),
             Arc::new(arrow_array::Float32Array::from(confidences)),
+            Arc::new(arrow_array::BooleanArray::from(negated)),
             Arc::new(BinaryArray::from(src_refs)),
             embedding_col,
             Arc::new(StringArray::from(namespace_refs)),
@@ -222,6 +226,7 @@ pub fn from_batch(batch: &RecordBatch) -> Result<Vec<SvoEvent>, HirnDbError> {
     let ts_col = col_i64(batch, "time_start_ms")?;
     let te_col = col_i64(batch, "time_end_ms")?;
     let conf_col = col_f32(batch, "confidence")?;
+    let negated_col = col_bool(batch, "negated")?;
     let src_col = col_bin(batch, "source_ids_json")?;
 
     for i in 0..n {
@@ -266,6 +271,7 @@ pub fn from_batch(batch: &RecordBatch) -> Result<Vec<SvoEvent>, HirnDbError> {
             } else {
                 conf_col.value(i)
             },
+            negated: !negated_col.is_null(i) && negated_col.value(i),
             source_ids,
         });
     }
@@ -299,6 +305,16 @@ fn col_f32<'a>(
         .ok_or_else(|| HirnDbError::InvalidArgument(format!("missing column: {name}")))
 }
 
+fn col_bool<'a>(
+    batch: &'a RecordBatch,
+    name: &str,
+) -> Result<&'a arrow_array::BooleanArray, HirnDbError> {
+    batch
+        .column_by_name(name)
+        .and_then(|c| c.as_any().downcast_ref::<arrow_array::BooleanArray>())
+        .ok_or_else(|| HirnDbError::InvalidArgument(format!("missing column: {name}")))
+}
+
 fn col_bin<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a BinaryArray, HirnDbError> {
     batch
         .column_by_name(name)
@@ -325,7 +341,7 @@ mod tests {
         let batch = to_batch(std::slice::from_ref(&ev), &emb, 3).unwrap();
 
         assert_eq!(batch.num_rows(), 1);
-        assert_eq!(batch.num_columns(), 13);
+        assert_eq!(batch.num_columns(), 14);
 
         let decoded = from_batch(&batch).unwrap();
         assert_eq!(decoded.len(), 1);
@@ -334,6 +350,25 @@ mod tests {
         assert_eq!(decoded[0].verb, "met");
         assert_eq!(decoded[0].object, "Bob");
         assert_eq!(decoded[0].source_ids, vec![src]);
+        assert!(!decoded[0].negated);
+    }
+
+    #[test]
+    fn negation_survives_the_round_trip() {
+        // "We never shipped v2" and "we shipped v2" have identical S/V/O; the
+        // negation flag is the only thing that keeps them apart in storage.
+        let positive = make_event("we", "ship", "v2");
+        let negative = make_event("we", "ship", "v2").with_negated(true);
+        let emb = vec![None, None];
+        let batch = to_batch(&[positive, negative], &emb, 1).unwrap();
+
+        let decoded = from_batch(&batch).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert!(!decoded[0].negated);
+        assert!(
+            decoded[1].negated,
+            "a negated event must not decode as asserted"
+        );
     }
 
     #[test]
@@ -359,7 +394,7 @@ mod tests {
     #[test]
     fn schema_has_expected_columns() {
         let s = schema(128);
-        assert_eq!(s.fields().len(), 13);
+        assert_eq!(s.fields().len(), 14);
         assert!(s.field_with_name("id").is_ok());
         assert!(s.field_with_name("source_memory_id").is_ok());
         assert!(s.field_with_name("subject").is_ok());
@@ -370,6 +405,7 @@ mod tests {
         assert!(s.field_with_name("time_start_ms").is_ok());
         assert!(s.field_with_name("time_end_ms").is_ok());
         assert!(s.field_with_name("confidence").is_ok());
+        assert!(s.field_with_name("negated").is_ok());
         assert!(s.field_with_name("source_ids_json").is_ok());
         assert!(s.field_with_name("embedding").is_ok());
         assert!(s.field_with_name("namespace").is_ok());

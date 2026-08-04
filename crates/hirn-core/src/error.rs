@@ -124,8 +124,11 @@ pub enum HirnError {
     LimitExceeded(String),
 
     /// The agent has been rate-limited due to suspicious activity.
-    #[error("rate limited: {0}")]
-    RateLimited(String),
+    #[error("rate limited: {message}")]
+    RateLimited {
+        message: String,
+        retry_after: Option<std::time::Duration>,
+    },
 
     /// An external AI provider (embedder, reranker, LLM) returned an error.
     ///
@@ -219,6 +222,15 @@ impl HirnError {
         }
     }
 
+    /// Provider-directed delay for a rate-limited operation, when supplied.
+    #[must_use]
+    pub const fn retry_after(&self) -> Option<std::time::Duration> {
+        match self {
+            Self::RateLimited { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
+
     /// True if this is a `NotFound` variant.
     #[must_use]
     pub const fn is_not_found(&self) -> bool {
@@ -260,7 +272,7 @@ impl HirnError {
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::Timeout(_) | Self::RateLimited(_) => true,
+            Self::Timeout(_) | Self::RateLimited { .. } => true,
             Self::ProviderError { retryable, .. } => *retryable,
             Self::PartialEmbeddingFailure { partial, .. } => {
                 !partial.failures.is_empty()

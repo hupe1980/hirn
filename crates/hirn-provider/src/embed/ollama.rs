@@ -98,14 +98,15 @@ impl Embedder for OllamaEmbedder {
 
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
-            let body_text = resp.text().await.unwrap_or_default();
+            let body_text = crate::transport::read_error_response(resp).await;
             return Err(EmbedError::from_status(&self.model, status, body_text, None).into());
         }
 
-        let parsed: OllamaEmbedResponse =
-            resp.json().await.map_err(|e| EmbedError::InvalidResponse {
+        let parsed: OllamaEmbedResponse = crate::transport::decode_json_response(resp)
+            .await
+            .map_err(|details| EmbedError::InvalidResponse {
                 provider: self.model.clone(),
-                details: format!("failed to parse ollama response: {e}"),
+                details,
             })?;
 
         super::validate_embedding_batch(

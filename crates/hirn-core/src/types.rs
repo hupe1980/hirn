@@ -60,6 +60,61 @@ pub enum KnowledgeType {
     Belief,
 }
 
+/// Functional role of a memory for **type-aware composition** (MemGuard,
+/// arXiv:2605.28009).
+///
+/// Orthogonal to [`Layer`]/[`EventType`]/[`KnowledgeType`]: those describe *how*
+/// a memory is stored, this describes *what kind of claim it makes* and thus how
+/// it may compose with others at read time. The load-bearing rule is a
+/// precedence order used in conflict resolution — a lower-authority role must
+/// never override a higher-authority one (e.g. a `Preference` cannot supersede a
+/// `StableFact`). See [`Self::authority`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum MemoryType {
+    /// An objective, durable world fact ("Paris is the capital of France").
+    /// Highest composition authority.
+    StableFact,
+    /// A time-bound event or observation ("deployed v2 on Tuesday"). Composes as
+    /// supporting evidence; never overrides a stable fact. The default role for
+    /// episodic records and records loaded from data written before roles existed.
+    #[default]
+    EpisodicEvent,
+    /// An actionable rule or procedure ("when the build fails, roll back").
+    BehavioralRule,
+    /// A subjective preference or opinion ("I prefer dark mode"). Lowest
+    /// authority; never supersedes an objective fact.
+    Preference,
+}
+
+impl MemoryType {
+    /// Composition authority (higher wins conflicts). `StableFact` > `BehavioralRule`
+    /// > `Preference`, with `EpisodicEvent` treated as evidence below rules.
+    #[must_use]
+    pub const fn authority(self) -> u8 {
+        match self {
+            Self::StableFact => 3,
+            Self::BehavioralRule => 2,
+            Self::EpisodicEvent => 1,
+            Self::Preference => 0,
+        }
+    }
+
+    /// Derive the functional role from a semantic [`KnowledgeType`] — the single
+    /// source of truth so the semantic write path defaults stay consistent.
+    #[must_use]
+    pub const fn from_knowledge_type(kt: KnowledgeType) -> Self {
+        match kt {
+            KnowledgeType::Prescriptive => Self::BehavioralRule,
+            KnowledgeType::Belief => Self::Preference,
+            KnowledgeType::Propositional
+            | KnowledgeType::Taxonomic
+            | KnowledgeType::Inferred
+            | KnowledgeType::Community
+            | KnowledgeType::RaptorSummary => Self::StableFact,
+        }
+    }
+}
+
 /// Origin of a memory record for provenance tracking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Origin {
@@ -146,6 +201,49 @@ impl EdgeRelation {
             self,
             Self::Causes | Self::CausedBy | Self::Enables | Self::Prevents
         )
+    }
+}
+
+/// Typed relation between two facts in the **auditable contradiction algebra**
+/// (TOKI, arXiv:2606.06240).
+///
+/// When the contradiction/reflection machinery decides how a new claim relates
+/// to an existing one, it records the relation here; a `Contradicts` or
+/// `Supersedes` resolution physically closes the loser's validity interval
+/// (`valid_until`, Zep-style `t_invalid`) and the outcome is written to the
+/// hash-chained audit ledger so every resolution is independently verifiable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ContradictionRelation {
+    /// The new claim reinforces the existing one (no invalidation).
+    Supports,
+    /// The claims are mutually inconsistent; the higher-authority/newer one wins
+    /// and the loser's validity interval is closed.
+    Contradicts,
+    /// The new claim replaces the old one on the same subject (a newer truth);
+    /// the old fact's `valid_until` is closed at the new fact's `valid_from`.
+    Supersedes,
+    /// The new claim narrows/clarifies the old one without invalidating it (a
+    /// transaction-time correction — no observed-interval close).
+    Refines,
+}
+
+impl ContradictionRelation {
+    /// Whether resolving this relation closes the loser's `valid_until`
+    /// (observed-time invalidation). `Supports`/`Refines` do not.
+    #[must_use]
+    pub const fn invalidates(self) -> bool {
+        matches!(self, Self::Contradicts | Self::Supersedes)
+    }
+
+    /// Stable machine label for audit/EXPLAIN output.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Supports => "supports",
+            Self::Contradicts => "contradicts",
+            Self::Supersedes => "supersedes",
+            Self::Refines => "refines",
+        }
     }
 }
 
@@ -568,6 +666,28 @@ mod tests {
             let bytes = bincode::serialize(&kt).unwrap();
             let back: KnowledgeType = bincode::deserialize(&bytes).unwrap();
             assert_eq!(kt, back);
+        }
+        // MemoryType
+        for mt in [
+            MemoryType::StableFact,
+            MemoryType::EpisodicEvent,
+            MemoryType::BehavioralRule,
+            MemoryType::Preference,
+        ] {
+            let bytes = bincode::serialize(&mt).unwrap();
+            let back: MemoryType = bincode::deserialize(&bytes).unwrap();
+            assert_eq!(mt, back);
+        }
+        // ContradictionRelation
+        for cr in [
+            ContradictionRelation::Supports,
+            ContradictionRelation::Contradicts,
+            ContradictionRelation::Supersedes,
+            ContradictionRelation::Refines,
+        ] {
+            let bytes = bincode::serialize(&cr).unwrap();
+            let back: ContradictionRelation = bincode::deserialize(&bytes).unwrap();
+            assert_eq!(cr, back);
         }
         // Origin
         for o in [

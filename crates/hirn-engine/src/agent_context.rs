@@ -118,14 +118,21 @@ impl<'a> AgentContext<'a> {
         }
         self.check_access(&record.namespace)?;
 
-        // Run anomaly detection before storing.
+        // Run anomaly detection before storing. The quarantine cut-over uses the
+        // same config knob as the write-path poisoning defense so both entry
+        // points share one tunable threshold.
         let anomaly_score = self.db.compute_anomaly_score(&record).await?;
-        let threshold = 0.8_f32; // memories with anomaly_score >= 0.8 are quarantined
+        let threshold = self.db.config().admission_poisoning_reject_threshold;
 
         if anomaly_score >= threshold {
             return self
                 .db
-                .quarantine_record(&record, anomaly_score, &self.agent_id)
+                .quarantine_record(
+                    &record,
+                    anomaly_score,
+                    &self.agent_id,
+                    format!("anomaly score {anomaly_score:.2} exceeds threshold {threshold:.2}"),
+                )
                 .await;
         }
 
@@ -146,14 +153,19 @@ impl<'a> AgentContext<'a> {
         self.check_access(&namespace)?;
         record.namespace = namespace;
 
-        // Run anomaly detection before storing.
+        // Run anomaly detection before storing (see `remember`).
         let anomaly_score = self.db.compute_anomaly_score(&record).await?;
-        let threshold = 0.8_f32;
+        let threshold = self.db.config().admission_poisoning_reject_threshold;
 
         if anomaly_score >= threshold {
             return self
                 .db
-                .quarantine_record(&record, anomaly_score, &self.agent_id)
+                .quarantine_record(
+                    &record,
+                    anomaly_score,
+                    &self.agent_id,
+                    format!("anomaly score {anomaly_score:.2} exceeds threshold {threshold:.2}"),
+                )
                 .await;
         }
 

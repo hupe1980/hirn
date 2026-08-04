@@ -31,6 +31,7 @@ pub struct ThinkBuilder<'a> {
     threshold: Option<f32>,
     layer_filter: LayerFilter,
     namespace: Option<Namespace>,
+    allowed_namespaces: Option<Vec<Namespace>>,
     unrestricted: bool,
     after: Option<Timestamp>,
     before: Option<Timestamp>,
@@ -54,6 +55,7 @@ impl<'a> ThinkBuilder<'a> {
             threshold: None,
             layer_filter: LayerFilter::All,
             namespace: None,
+            allowed_namespaces: None,
             unrestricted: false,
             after: None,
             before: None,
@@ -110,6 +112,20 @@ impl<'a> ThinkBuilder<'a> {
     /// Restrict to a specific namespace.
     pub fn namespace(mut self, ns: Namespace) -> Self {
         self.namespace = Some(ns);
+        self.allowed_namespaces = None;
+        self.unrestricted = false;
+        self
+    }
+
+    /// Restrict context assembly to an explicit set of namespaces.
+    ///
+    /// An empty set is fail-closed and yields no candidates. The last call
+    /// among `namespace`, `namespaces`, and [`unrestricted`](Self::unrestricted)
+    /// wins.
+    pub fn namespaces(mut self, namespaces: impl IntoIterator<Item = Namespace>) -> Self {
+        self.namespace = None;
+        self.unrestricted = false;
+        self.allowed_namespaces = Some(namespaces.into_iter().collect());
         self
     }
 
@@ -120,6 +136,8 @@ impl<'a> ThinkBuilder<'a> {
     /// denies rather than reading across tenants. See
     /// [`RecallBuilder::unrestricted`](crate::recall::RecallBuilder::unrestricted).
     pub fn unrestricted(mut self) -> Self {
+        self.namespace = None;
+        self.allowed_namespaces = None;
         self.unrestricted = true;
         self
     }
@@ -217,6 +235,8 @@ impl<'a> ThinkBuilder<'a> {
         };
         if let Some(namespace) = self.namespace {
             recall = recall.namespace(namespace);
+        } else if let Some(ref allowed_namespaces) = self.allowed_namespaces {
+            recall = recall.namespaces(allowed_namespaces.iter().copied());
         } else if self.unrestricted {
             recall = recall.unrestricted();
         }
@@ -233,7 +253,7 @@ impl<'a> ThinkBuilder<'a> {
         if let Some(depth) = self.activation_depth {
             recall = recall.depth(depth);
         }
-        if let Some(query_text) = self.query_text {
+        if let Some(query_text) = self.query_text.as_deref() {
             recall = recall.query_text(query_text);
         }
         recall = recall.hybrid(self.hybrid);
@@ -269,7 +289,11 @@ impl<'a> ThinkBuilder<'a> {
         }
 
         // 4. Assemble context.
-        let visible_namespaces = self.namespace.as_ref().map(std::slice::from_ref);
+        let visible_namespaces = self
+            .namespace
+            .as_ref()
+            .map(std::slice::from_ref)
+            .or(self.allowed_namespaces.as_deref());
         let mut result = crate::ql::context::assemble_think_context(
             self.db,
             &self.actor_id,

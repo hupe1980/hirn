@@ -418,7 +418,8 @@ impl HirnDB {
         // domain-separated derived key) so a single configured secret makes
         // both the `events` and `_audit` datasets tamper-evident.
         let policy_runtime = PolicyRuntime::open(storage.clone(), config.event_hmac_key()).await?;
-        let provider_runtime = ProviderRuntime::new(config.embedding_dimensions.as_usize());
+        let provider_runtime =
+            ProviderRuntime::new(config.embedding_dimensions.as_usize(), config.nlu.clone());
         let query_runtime = QueryRuntime::new(
             graph_runtime.cached_graph(),
             &config,
@@ -822,6 +823,87 @@ impl HirnDB {
     /// custom `Reranker` implementation.
     pub fn set_reranker(&self, reranker: Arc<dyn Reranker>) {
         self.provider_runtime.set_reranker(reranker);
+    }
+
+    /// Set an ambient LLM provider used by read-path reasoning — currently
+    /// LLM-backed query decomposition (comparative/duration questions). When
+    /// unset, those paths use their deterministic fallbacks, so the engine stays
+    /// fully functional offline; a configured provider upgrades quality to the
+    /// SOTA hybrid (LLM-when-available, deterministic-otherwise).
+    pub fn set_llm_provider(&self, llm: Arc<dyn hirn_core::embed::LlmProvider>) {
+        self.provider_runtime.set_llm_provider(llm);
+    }
+
+    /// The ambient LLM provider, if one was configured via [`Self::set_llm_provider`].
+    #[must_use]
+    pub fn llm_provider(&self) -> Option<Arc<dyn hirn_core::embed::LlmProvider>> {
+        self.provider_runtime.llm_provider()
+    }
+
+    /// The natural-language-understanding chain that decides meaning-dependent
+    /// questions: query-view routing, belief/evidence relation, knowledge
+    /// typing, and contradiction.
+    ///
+    /// Composed from the configured LLM provider and embedder according to
+    /// [`HirnConfig::nlu`]; empty until one is registered, in which case every
+    /// decision uses its deterministic fallback.
+    #[must_use]
+    pub fn nlu_classifier(&self) -> Arc<hirn_provider::HybridClassifier> {
+        self.provider_runtime.classifier()
+    }
+
+    /// The entailment model used for contradiction, polarity, and negation
+    /// scope, when one is available.
+    #[must_use]
+    pub fn nli_model(&self) -> Option<Arc<dyn hirn_core::nlu::NliModel>> {
+        self.provider_runtime.nli()
+    }
+
+    /// Install an explicit entailment model — typically a local ONNX NLI
+    /// cross-encoder for write-path-volume or privacy-bound deployments.
+    ///
+    /// Supersedes the classifier-backed entailment path.
+    pub fn set_nli_model(&self, nli: Arc<dyn hirn_core::nlu::NliModel>) {
+        self.provider_runtime.set_nli_model(nli);
+    }
+
+    /// The typed event extractor, when `nlu.typed_event_extraction` is enabled
+    /// and an LLM provider is configured.
+    #[must_use]
+    pub fn event_extractor(&self) -> Option<Arc<dyn hirn_core::nlu::EventExtractor>> {
+        self.provider_runtime.event_extractor()
+    }
+
+    /// The typed preference extractor, when `nlu.typed_preference_extraction`
+    /// is enabled and an LLM provider is configured.
+    #[must_use]
+    pub fn preference_extractor(
+        &self,
+    ) -> Option<Arc<dyn hirn_core::preference::PreferenceExtractor>> {
+        self.provider_runtime.preference_extractor()
+    }
+
+    /// Install an explicit write-time temporal extractor — for a local model,
+    /// a domain-specific date parser, or a test double.
+    ///
+    /// Chooses *which* extractor runs; `nlu.typed_temporal_extraction` decides
+    /// *whether* extraction runs at all, because it gates a provider call per
+    /// ingested record.
+    pub fn set_temporal_extractor(&self, extractor: Arc<dyn hirn_provider::TemporalExtractor>) {
+        self.provider_runtime.set_temporal_extractor(extractor);
+    }
+
+    /// The write-time temporal extractor, when `nlu.typed_temporal_extraction`
+    /// is enabled and an LLM provider is configured.
+    #[must_use]
+    pub fn temporal_extractor(&self) -> Option<Arc<dyn hirn_provider::TemporalExtractor>> {
+        self.provider_runtime.temporal_extractor()
+    }
+
+    /// The active natural-language-understanding policy.
+    #[must_use]
+    pub fn nlu_config(&self) -> &hirn_core::config::NluConfig {
+        self.provider_runtime.nlu_config()
     }
 
     /// Ensure FTS indexes exist on all LanceDB datasets.
@@ -1442,6 +1524,7 @@ impl HirnDB {
         self.flush_episodic_access().await?;
         self.flush_semantic_access().await?;
         self.flush_importance_accumulator().await?;
+        self.cached_graph().flush_hot_access_counts().await?;
         Ok(())
     }
 
@@ -1475,6 +1558,9 @@ impl Drop for HirnDB {
             }
             if let Err(e) = self.flush_importance_accumulator().await {
                 tracing::error!(error = %e, "flush_importance_accumulator failed on HirnDB drop");
+            }
+            if let Err(e) = self.cached_graph().flush_hot_access_counts().await {
+                tracing::error!(error = %e, "graph access-count flush failed on HirnDB drop");
             }
         };
 

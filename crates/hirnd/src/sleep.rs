@@ -96,20 +96,38 @@ impl ConsolidationCoordinator {
     }
 
     /// Renew an in-progress lease so a long pass does not expire mid-flight.
-    async fn renew(&self, realm: &str) {
+    async fn renew(&self, realm: &str) -> bool {
         match self {
-            Self::Local => {}
-            Self::Raft(coord) => {
-                if let Err(error) = coord.renew_lease(realm, CONSOLIDATION_LEASE_SECS).await {
-                    warn!(realm, %error, "consolidation lease renewal failed");
+            Self::Local => true,
+            Self::Raft(coord) => match coord.renew_lease(realm, CONSOLIDATION_LEASE_SECS).await {
+                Ok(true) => true,
+                Ok(false) => {
+                    warn!(
+                        realm,
+                        "consolidation lease renewal rejected — aborting realm pass"
+                    );
+                    false
                 }
-            }
+                Err(error) => {
+                    warn!(realm, %error, "consolidation lease renewal failed — aborting realm pass");
+                    false
+                }
+            },
             #[cfg(feature = "serverless")]
-            Self::Dynamo(lease) => {
-                if let Err(error) = lease.acquire(realm, CONSOLIDATION_LEASE_SECS).await {
-                    warn!(realm, %error, "consolidation lease renewal failed");
+            Self::Dynamo(lease) => match lease.renew(realm, CONSOLIDATION_LEASE_SECS).await {
+                Ok(true) => true,
+                Ok(false) => {
+                    warn!(
+                        realm,
+                        "consolidation lease renewal rejected — aborting realm pass"
+                    );
+                    false
                 }
-            }
+                Err(error) => {
+                    warn!(realm, %error, "consolidation lease renewal failed — aborting realm pass");
+                    false
+                }
+            },
         }
     }
 
@@ -340,13 +358,29 @@ async fn run_sleep_pass_inner(
         // budgeted; the daemon does not override thresholds.
         debug!(realm, fence, "sleep pass: holding consolidation lease");
         let phase_start = Instant::now();
-        match db
-            .admin()
-            .consolidate()
-            .agent_id(SLEEP_AGENT_ID)
-            .execute()
-            .await
-        {
+        let consolidation = db.admin().consolidate().agent_id(SLEEP_AGENT_ID).execute();
+        tokio::pin!(consolidation);
+        let renewal_period = Duration::from_secs((CONSOLIDATION_LEASE_SECS / 3).max(1));
+        let mut renewal = tokio::time::interval(renewal_period);
+        renewal.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        renewal.tick().await;
+        let consolidation_result = loop {
+            tokio::select! {
+                biased;
+                _ = renewal.tick() => {
+                    if !coordinator.renew(&realm).await {
+                        break None;
+                    }
+                },
+                result = &mut consolidation => break Some(result),
+            }
+        };
+        let Some(consolidation_result) = consolidation_result else {
+            outcome.aborted = true;
+            coordinator.release(&realm).await;
+            break;
+        };
+        match consolidation_result {
             Ok(result) => {
                 outcome.consolidations_run += 1;
                 info!(
@@ -372,7 +406,11 @@ async fn run_sleep_pass_inner(
 
         // Renew the lease before the second phase so a long pass does not
         // expire mid-flight and let another node start consolidating.
-        coordinator.renew(&realm).await;
+        if !coordinator.renew(&realm).await {
+            outcome.aborted = true;
+            coordinator.release(&realm).await;
+            break;
+        }
 
         // Phase 2: bounded offline cognition (one dream + one reconcile +
         // one reflect), only when the engine's offline scheduler is enabled.

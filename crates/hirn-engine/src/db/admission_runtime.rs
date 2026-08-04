@@ -75,8 +75,22 @@ impl AdmissionRuntime {
                 config.admission_trust_quarantine_below,
             ));
         }
-        if config.admission_poisoning_action != AdmissionPoisoningAction::Off {
-            pipeline.add(PoisoningGate::new(config.admission_poisoning_action));
+        match config.admission_poisoning_action {
+            AdmissionPoisoningAction::Off => {}
+            // The write-path defense needs storage for its single namespace-scoped
+            // trusted-neighbor search plus the decision-band thresholds.
+            AdmissionPoisoningAction::Quarantine => {
+                pipeline.add(PoisoningGate::with_scoring(
+                    storage.clone(),
+                    "semantic",
+                    config.metric,
+                    config.admission_poisoning_quarantine_threshold,
+                    config.admission_poisoning_reject_threshold,
+                ));
+            }
+            content_only => {
+                pipeline.add(PoisoningGate::new(content_only));
+            }
         }
 
         let pipeline = pipeline

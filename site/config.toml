@@ -1,0 +1,69 @@
+# Zola configuration for the hirn website (landing page + documentation).
+#
+# Built and deployed by .github/workflows/pages.yml. The base URL is overridden
+# at build time with the Pages base path, so a fork or a custom domain does not
+# need this file edited.
+
+base_url = "https://hupe1980.github.io/hirn"
+title = "hirn"
+description = "A cognitive memory engine for AI agents. Graph-native long-term memory with spreading activation, temporal reasoning, Hebbian plasticity, and consolidation as database primitives. Embeddable, local-first, written in Rust."
+
+default_language = "en"
+compile_sass = true
+minify_html = true
+
+# Client-side search over the docs. Zola emits the index at build time; the UI
+# is a small vanilla-JS island in templates/docs.html — no framework.
+build_search_index = true
+
+# Sitemap and robots.txt are generated from templates/ so both stay in sync
+# with base_url automatically.
+generate_feeds = false
+
+taxonomies = []
+
+[markdown]
+render_emoji = false
+external_links_target_blank = true
+external_links_no_referrer = true
+smart_punctuation = false
+bottom_footnotes = true
+# Clickable anchors on every heading, so a reader can link to a specific
+# subsection of a long reference page.
+insert_anchor_links = "heading"
+
+[markdown.highlighting]
+theme = "catppuccin-mocha"
+
+[search]
+index_format = "elasticlunr_json"
+include_title = true
+include_description = true
+include_path = true
+# Full page content is indexed, not a truncated prefix. Truncating to 4k chars
+# would cut the index from 223KB to 76KB gzipped, but this site's reference
+# pages run past a thousand lines — a search that silently stops matching after
+# the first few hundred words is worse than a slightly larger download. The
+# index is fetched once, only when someone actually searches, and cached after.
+include_content = true
+
+[extra]
+# ── Identity ────────────────────────────────────────────────────────────
+tagline = "The brain an LLM never had"
+repo = "https://github.com/hupe1980/hirn"
+license = "Apache-2.0"
+
+# ── SEO ─────────────────────────────────────────────────────────────────
+# Used for og:image and twitter:image; the absolute URL is built in base.html.
+# PNG, not SVG: most social scrapers do not rasterise SVG previews.
+# Regenerate with: rsvg-convert -w 1200 -h 630 static/og-card.svg -o static/og-card.png
+og_image = "og-card.png"
+twitter_card = "summary_large_image"
+
+# ── Diagrams ────────────────────────────────────────────────────────────
+# Mermaid is loaded lazily and only on pages that actually contain a diagram,
+# so the bundle never touches a page that has none.
+mermaid_version = "11.4.1"
+
+# ── Status banner shown on the landing page and in the footer ───────────
+status_banner = "hirn is experimental. APIs, on-disk formats, and behaviour may change without notice."

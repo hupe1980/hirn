@@ -150,7 +150,10 @@ impl From<LlmError> for hirn_core::HirnError {
     fn from(err: LlmError) -> Self {
         match &err {
             LlmError::Timeout { .. } => Self::Timeout(err.to_string()),
-            LlmError::RateLimit { .. } => Self::RateLimited(err.to_string()),
+            LlmError::RateLimit { retry_after, .. } => Self::RateLimited {
+                message: err.to_string(),
+                retry_after: *retry_after,
+            },
             LlmError::AuthenticationFailed { .. } => Self::AccessDenied(err.to_string()),
             LlmError::TokenLimitExceeded { .. } => Self::LimitExceeded(err.to_string()),
             // Non-transient provider errors (4xx client errors) must NOT be retried.
@@ -309,12 +312,29 @@ mod tests {
 
     #[test]
     fn converts_to_hirn_error_rate_limit() {
+        // No Retry-After header: the delay is unknown, and the conversion
+        // must say so rather than inventing one. Callers apply their own
+        // backoff policy; a fabricated delay would be indistinguishable from
+        // a provider-directed one.
         let err = LlmError::RateLimit {
             provider: "test".into(),
             retry_after: None,
         };
         let hirn_err: hirn_core::HirnError = err.into();
-        assert!(matches!(hirn_err, hirn_core::HirnError::RateLimited(_)));
+        assert!(matches!(
+            &hirn_err,
+            hirn_core::HirnError::RateLimited { .. }
+        ));
+        assert_eq!(hirn_err.retry_after(), None);
+        assert!(hirn_err.is_retryable());
+
+        // A provider-directed delay propagates unchanged.
+        let err = LlmError::RateLimit {
+            provider: "test".into(),
+            retry_after: Some(Duration::from_secs(30)),
+        };
+        let hirn_err: hirn_core::HirnError = err.into();
+        assert_eq!(hirn_err.retry_after(), Some(Duration::from_secs(30)));
     }
 
     #[test]

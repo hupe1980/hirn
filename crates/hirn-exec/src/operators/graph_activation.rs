@@ -326,25 +326,81 @@ impl ExecutionPlan for GraphActivationExec {
                     "GraphActivationExec requires HirnSessionExt graph runtime".to_string(),
                 ));
             };
-            let (ids, scores, depths) = {
-                let output = runtime
-                    .activate_graph_min_weight(
-                        &seeds,
-                        mode,
-                        None,
-                        max_depth,
-                        epsilon,
-                        inhibition_mu,
-                        min_weight,
-                        delegation_threshold,
-                        allowed_namespaces.as_deref(),
-                    )
-                    .await
-                    .map_err(|error| {
-                        datafusion_common::DataFusionError::Execution(error.to_string())
-                    })?;
-                (output.ids, output.scores, output.depths)
+            let needs_inhibition_embeddings =
+                inhibition_mu > 0.0 && mode == ActivationMode::Spreading && storage.is_some();
+            let initial_inhibition_mu = if needs_inhibition_embeddings {
+                0.0
+            } else {
+                inhibition_mu
             };
+            let mut output = runtime
+                .activate_graph_min_weight(
+                    &seeds,
+                    mode,
+                    None,
+                    max_depth,
+                    epsilon,
+                    initial_inhibition_mu,
+                    min_weight,
+                    delegation_threshold,
+                    allowed_namespaces.as_deref(),
+                )
+                .await
+                .map_err(|error| {
+                    datafusion_common::DataFusionError::Execution(error.to_string())
+                })?;
+
+            if needs_inhibition_embeddings {
+                let candidate_ids = output
+                    .ids
+                    .iter()
+                    .filter_map(|id| MemoryId::parse(id).ok())
+                    .collect::<Vec<_>>();
+                let fetched_rows = fetch_recall_rows_by_ids(
+                    storage.as_deref().expect("checked above"),
+                    &candidate_ids,
+                )
+                .await
+                .map_err(|error| {
+                    datafusion_common::DataFusionError::Execution(error.to_string())
+                })?;
+                let embeddings = fetched_rows
+                    .iter()
+                    .filter_map(|row| {
+                        let id = MemoryId::parse(&row.id).ok()?;
+                        Some((id, row.embedding.clone()?))
+                    })
+                    .collect::<HashMap<_, _>>();
+
+                if !embeddings.is_empty() {
+                    output = runtime
+                        .activate_graph_min_weight_with_embeddings(
+                            &seeds,
+                            mode,
+                            None,
+                            max_depth,
+                            epsilon,
+                            inhibition_mu,
+                            min_weight,
+                            Some(&embeddings),
+                            delegation_threshold,
+                            allowed_namespaces.as_deref(),
+                        )
+                        .await
+                        .map_err(|error| {
+                            datafusion_common::DataFusionError::Execution(error.to_string())
+                        })?;
+                }
+
+                if let Some(rows) = passthrough_rows.as_mut() {
+                    for row in fetched_rows {
+                        let row_id = row.id.clone();
+                        rows.base_rows.entry(row_id).or_insert(row);
+                    }
+                }
+            }
+
+            let (ids, scores, depths) = (output.ids, output.scores, output.depths);
 
             if ids.is_empty() {
                 return Ok(RecordBatch::new_empty(schema));
@@ -804,6 +860,7 @@ fn recall_rows_from_batch(
             } else {
                 Some(invocation_counts.value(row))
             },
+            embedding: None,
         });
     }
 

@@ -1176,6 +1176,7 @@ mod tests {
                     namespace: None,
                     metadata: None,
                     entities: None,
+                    functional_role: None,
                 },
             )
             .await

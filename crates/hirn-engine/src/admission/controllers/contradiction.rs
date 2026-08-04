@@ -242,7 +242,7 @@ impl AdmissionController for ContradictionGate {
             // Defer for manual review / consolidation.
             let now = hirn_core::timestamp::Timestamp::now();
             Ok(AdmissionDecision::Defer {
-                until: now.timestamp_ms() + 3_600_000, // 1 hour in ms
+                review_not_before: now.timestamp_ms() + 3_600_000, // 1 hour in ms
             })
         } else {
             Ok(AdmissionDecision::Accept {
@@ -321,6 +321,7 @@ mod tests {
             namespace,
             importance: 0.5,
             surprise: 0.5,
+            timestamp: hirn_core::timestamp::Timestamp::now(),
             metadata: Metadata::default(),
         }
     }

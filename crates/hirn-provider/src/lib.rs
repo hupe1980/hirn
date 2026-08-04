@@ -40,6 +40,7 @@
 pub mod embed;
 pub mod llm;
 mod metrics;
+pub mod nlu;
 pub mod tokenizer;
 
 #[cfg(any(
@@ -62,6 +63,13 @@ pub use embed::{
 // LLM
 pub use llm::{
     CircuitBreakerLlmProvider, LlmError, LlmReranker, MockLlmProvider, RegexEntityExtractor,
+    RetryingLlmProvider,
+};
+
+// Natural-language understanding
+pub use nlu::{
+    ExemplarRouter, HybridClassifier, LlmEntityExtractor, LlmEventExtractor, LlmNli,
+    LlmPreferenceExtractor, LlmTemporalExtractor, LlmTextClassifier, TemporalExtractor,
 };
 
 #[cfg(feature = "hf-tokenizer")]

@@ -576,11 +576,15 @@ fn write_cognitive_markdown(result: &CognitiveSuiteResult, w: &mut dyn Write) ->
         "**Min Suite Score:** {:.1}%",
         result.min_suite_score * 100.0
     )?;
-    writeln!(
-        w,
-        "**All Competitive:** {}",
-        if result.all_competitive { "✓" } else { "✗" }
-    )?;
+    if result.competitive_gates_evaluated {
+        writeln!(
+            w,
+            "**All Competitive:** {}",
+            if result.all_competitive { "✓" } else { "✗" }
+        )?;
+    } else {
+        writeln!(w, "**Competitive Gates:** not configured")?;
+    }
     writeln!(w)?;
 
     writeln!(w, "## Run Metadata")?;
@@ -1105,18 +1109,19 @@ fn write_cognitive_reader_sections(
     writeln!(w)?;
     writeln!(
         w,
-        "| Benchmark | Reader | Judge | Protocol | official_reader_accuracy | containment (retrieval-only) | Judged | Abstention correct | Reader prompt tok/query (mean, p50/p95) | Reader completion tok/query (mean, p50/p95) |"
+        "| Benchmark | Reader | Prompt strategy | Judge | Protocol | official_reader_accuracy | containment (retrieval-only) | Judged | Abstention correct | Reader prompt tok/query (mean, p50/p95) | Reader completion tok/query (mean, p50/p95) |"
     )?;
     writeln!(
         w,
-        "|-----------|--------|-------|----------|-------------------------:|-----------------------------:|-------:|-------------------:|----------------------------------------:|--------------------------------------------:|"
+        "|-----------|--------|-----------------|-------|----------|-------------------------:|-----------------------------:|-------:|-------------------:|----------------------------------------:|--------------------------------------------:|"
     )?;
     for (r, reader) in &reader_rows {
         writeln!(
             w,
-            "| {} | {} | {} | {} | {} | {:.4} | {} | {}/{} | {:.0} (p50 {} / p95 {}) | {:.0} (p50 {} / p95 {}) |",
+            "| {} | {} | {} | {} | {} | {} | {:.4} | {} | {}/{} | {:.0} (p50 {} / p95 {}) | {:.0} (p50 {} / p95 {}) |",
             r.benchmark,
             reader.reader_model,
+            reader.reader_prompt_strategy,
             reader.judge_model.as_deref().unwrap_or("-"),
             reader.judge_protocol.as_deref().unwrap_or("-"),
             reader
@@ -1417,6 +1422,7 @@ mod tests {
                 execution_surface: BenchmarkExecutionSurface::DirectBuilders,
                 query_text_hybrid: true,
                 active_retrieval_surfaces: ActiveRetrievalSurfaces {
+                    per_query_haystack: false,
                     query_text_hybrid: true,
                     graph_routing: true,
                     multivector: true,
@@ -1454,6 +1460,7 @@ mod tests {
             final_score: 0.85,
             geometric_mean: 0.84,
             min_suite_score: 0.85,
+            competitive_gates_evaluated: true,
             all_competitive: true,
         }
     }
@@ -1625,6 +1632,21 @@ mod tests {
     }
 
     #[test]
+    fn cognitive_markdown_does_not_claim_external_competitiveness_without_gate() {
+        let mut result = sample_cognitive_suite();
+        result.results[0].benchmark = "LongMemEval (/tmp/oracle)".to_string();
+        result.competitive_gates_evaluated = false;
+        result.all_competitive = false;
+
+        let mut buf = Vec::new();
+        write_cognitive_result(&result, OutputFormat::Markdown, &mut buf).unwrap();
+        let markdown = String::from_utf8(buf).unwrap();
+
+        assert!(markdown.contains("**Competitive Gates:** not configured"));
+        assert!(!markdown.contains("**All Competitive:** ✓"));
+    }
+
+    #[test]
     fn cognitive_markdown_includes_tokens_per_query_column_and_estimator_note() {
         let result = sample_cognitive_suite();
         let mut buf = Vec::new();
@@ -1752,7 +1774,10 @@ mod tests {
 
     fn sample_reader_report() -> crate::cognitive::reader::ReaderJudgeReport {
         crate::cognitive::reader::ReaderJudgeReport {
+            judge_failures: Vec::new(),
+            per_query_verdicts: Vec::new(),
             reader_model: "gpt-4o".to_string(),
+            reader_prompt_strategy: "evidence-notes-v1".to_string(),
             judge_model: Some("gpt-4o".to_string()),
             judge_protocol: Some("longmemeval-official".to_string()),
             reader_temperature: 0.0,

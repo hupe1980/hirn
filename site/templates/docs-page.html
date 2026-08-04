@@ -1,0 +1,63 @@
+{% extends "docs.html" %}
+
+{% block breadcrumb %}
+  {%- set parent = get_section(path=page.ancestors | last) -%}
+  {%- if parent.title and parent.title != "Documentation" %}
+    <span aria-hidden="true">/</span>
+    <a href="{{ parent.permalink }}">{{ parent.title }}</a>
+  {%- endif %}
+  <span aria-hidden="true">/</span>
+  <span aria-current="page">{{ page.title }}</span>
+{% endblock breadcrumb %}
+
+{% block doc_body %}
+  {{ page.content | safe }}
+{% endblock doc_body %}
+
+{% block doc_toc %}
+  {#- Pages keep their `# Title` heading, so the ToC tree has a single root
+      with every section nested under it. Descend one level in that case,
+      otherwise a reader gets a "contents" list containing only the page
+      title. -#}
+  {%- if page.toc | length == 1 and page.toc[0].children -%}
+    {%- set_global entries = page.toc[0].children -%}
+  {%- else -%}
+    {%- set_global entries = page.toc -%}
+  {%- endif -%}
+  {%- if entries | length > 1 %}
+  <nav class="toc" aria-label="On this page">
+    <p class="toc-title">On this page</p>
+    <ul>
+      {%- for h in entries %}
+        <li><a href="#{{ h.id }}">{{ h.title }}</a>
+          {%- if h.children %}
+          <ul>
+            {%- for c in h.children %}
+              <li><a href="#{{ c.id }}">{{ c.title }}</a></li>
+            {%- endfor %}
+          </ul>
+          {%- endif %}
+        </li>
+      {%- endfor %}
+    </ul>
+  </nav>
+  {%- endif %}
+{% endblock doc_toc %}
+
+{% block doc_footer %}
+<footer class="doc-nav">
+  {%- if page.lower %}
+    <a class="doc-nav-prev" href="{{ page.lower.permalink }}">
+      <span>Previous</span><strong>{{ page.lower.title }}</strong>
+    </a>
+  {%- endif %}
+  {%- if page.higher %}
+    <a class="doc-nav-next" href="{{ page.higher.permalink }}">
+      <span>Next</span><strong>{{ page.higher.title }}</strong>
+    </a>
+  {%- endif %}
+</footer>
+<p class="edit-page">
+  <a href="{{ config.extra.repo }}/edit/main/site/content/{{ page.relative_path }}" rel="noopener">Edit this page on GitHub</a>
+</p>
+{% endblock doc_footer %}

@@ -31,6 +31,14 @@ pub struct SvoEvent {
     pub time_end: Option<Timestamp>,
     /// Extraction confidence score.
     pub confidence: f32,
+    /// Whether the source text asserts the event did **not** happen.
+    ///
+    /// "We never shipped v2" and "we shipped v2" have the same subject, verb,
+    /// and object; without this flag they are the same stored event, and a
+    /// timeline query answers that v2 shipped. Surface extraction cannot
+    /// populate this (it has no clause scope), so regex-extracted events are
+    /// always `false`; typed extraction sets it.
+    pub negated: bool,
     /// IDs of the source memories that produced this event.
     pub source_ids: Vec<MemoryId>,
 }
@@ -55,6 +63,7 @@ impl SvoEvent {
             time_start: Some(time_start),
             time_end: Some(time_end),
             confidence: 1.0,
+            negated: false,
             source_ids: Vec::new(),
         }
     }
@@ -76,6 +85,7 @@ impl SvoEvent {
             time_start: None,
             time_end: None,
             confidence: 1.0,
+            negated: false,
             source_ids: Vec::new(),
         }
     }
@@ -183,6 +193,13 @@ impl SvoEvent {
         self
     }
 
+    /// Mark whether the source asserts this event did *not* happen.
+    #[must_use]
+    pub const fn with_negated(mut self, negated: bool) -> Self {
+        self.negated = negated;
+        self
+    }
+
     /// Return the first source memory when one exists.
     #[must_use]
     pub fn primary_source_id(&self) -> Option<MemoryId> {
@@ -218,24 +235,50 @@ fn parse_iso_date(text: &str) -> Option<Timestamp> {
 }
 
 fn parse_named_date(text: &str, reference: Timestamp) -> Option<Timestamp> {
-    if let Ok(date) = NaiveDate::parse_from_str(text, "%B %d, %Y") {
-        return date_at_start_of_day(date);
-    }
-    if let Ok(date) = NaiveDate::parse_from_str(text, "%B %d %Y") {
-        return date_at_start_of_day(date);
-    }
-
+    // Token count is decided *before* any chrono format is tried.
+    //
+    // `%d` and `%Y` accept a leading run of digits without requiring the
+    // separator that the format string implies, so `"March 2021"` parsed as
+    // `"%B %d %Y"` yields day 20 of year 21 rather than failing. That is how a
+    // bare month plus a reference year became `0023-05-20` and produced
+    // 730,386-day intervals in the temporal ledger. Dispatching on shape first
+    // makes each format unambiguous.
+    let parts: Vec<&str> = text.split_whitespace().collect();
     let reference_year = reference.as_datetime().year();
-    if let Ok(partial) = NaiveDate::parse_from_str(&format!("{text} {reference_year}"), "%B %d %Y")
-    {
-        return date_at_start_of_day(partial);
-    }
 
-    if let Ok(month_start) = NaiveDate::parse_from_str(&format!("{text} 01"), "%B %Y %d") {
-        return date_at_start_of_day(month_start);
-    }
+    let is_digits = |token: &str, len: std::ops::RangeInclusive<usize>| {
+        len.contains(&token.len()) && token.chars().all(|c| c.is_ascii_digit())
+    };
 
-    None
+    match parts.as_slice() {
+        // `Month D, YYYY` / `Month D YYYY`
+        [month, day, year]
+            if is_digits(day.trim_end_matches(','), 1..=2) && is_digits(year, 4..=4) =>
+        {
+            let day = day.trim_end_matches(',');
+            NaiveDate::parse_from_str(&format!("{month} {day} {year}"), "%B %d %Y")
+                .ok()
+                .and_then(date_at_start_of_day)
+        }
+        // `Month YYYY` — first of that month.
+        [month, year] if is_digits(year, 4..=4) => {
+            NaiveDate::parse_from_str(&format!("{month} {year} 01"), "%B %Y %d")
+                .ok()
+                .and_then(date_at_start_of_day)
+        }
+        // `Month D` — resolved against the reference year.
+        [month, day] if is_digits(day.trim_end_matches(','), 1..=2) => {
+            let day = day.trim_end_matches(',');
+            NaiveDate::parse_from_str(&format!("{month} {day} {reference_year}"), "%B %d %Y")
+                .ok()
+                .and_then(date_at_start_of_day)
+        }
+        // A bare month name pins a month, not a day.
+        [month] => NaiveDate::parse_from_str(&format!("{month} {reference_year} 01"), "%B %Y %d")
+            .ok()
+            .and_then(date_at_start_of_day),
+        _ => None,
+    }
 }
 
 fn parse_relative_date(text: &str, reference: Timestamp) -> Option<Timestamp> {

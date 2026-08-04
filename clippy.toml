@@ -1,0 +1,6 @@
+# The memory record model is intentionally rich (bi-temporal fields, functional
+# role, pin, provenance, revision chain), so futures that hold a record on the
+# stack run a little larger than clippy's 16 KiB default. Raise the advisory
+# `large_futures` (pedantic) threshold to give the domain model headroom without
+# Box::pin-ing every record-holding await.
+future-size-threshold = 24576

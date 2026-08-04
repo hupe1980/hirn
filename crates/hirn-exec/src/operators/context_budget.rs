@@ -128,8 +128,10 @@ impl BudgetRankingConfig {
         let age_ms = now_ms.saturating_sub(created_at_ms).max(0);
         let age_hours = age_ms as f64 / 3_600_000.0;
 
-        // The batch carries no source-reliability column; pass the neutral
-        // 0.0 so the weighted term contributes nothing.
+        // The batch carries no source-reliability or temporal-interval column;
+        // pass neutral 0.0 for both so those weighted terms contribute nothing
+        // on this DataFusion path (temporal reranking runs on the imperative
+        // recall path, which has the validity intervals).
         scoring::composite_score(
             similarity,
             importance,
@@ -139,6 +141,7 @@ impl BudgetRankingConfig {
             activation,
             causal_relevance,
             surprise,
+            0.0,
             0.0,
             &self.weights,
         )
@@ -880,6 +883,7 @@ mod tests {
                 act,
                 caus,
                 surp,
+                0.0,
                 0.0,
                 &ScoringWeights::from_config(&config),
             );

@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+{% block body_class %}landing{% endblock body_class %}
+
+{% block content %}
+<main id="main">
+
+<section class="hero">
+  <div class="hero-inner">
+    <p class="eyebrow">{{ section.extra.eyebrow }}</p>
+    <h1>{{ section.extra.headline }}</h1>
+    <p class="hero-sub">{{ section.extra.subhead }}</p>
+    <div class="cta">
+      <a class="btn primary" href="{{ get_url(path='@/docs/getting-started.md') }}">Get started</a>
+      <a class="btn ghost" href="{{ get_url(path='@/docs/concepts/cognitive-model.md') }}">Read the model</a>
+      <a class="btn ghost" href="{{ config.extra.repo }}" rel="noopener">GitHub</a>
+    </div>
+    <p class="hero-note">{{ config.extra.status_banner }}</p>
+  </div>
+</section>
+
+{#- The measured result sits directly under the fold. A memory engine's central
+    claim is answer quality, so the number and its control arm lead rather than
+    hide in a benchmarks page. -#}
+<section class="band metrics" aria-labelledby="metrics-h">
+  <h2 id="metrics-h" class="visually-hidden">Measured results</h2>
+  <div class="metric-grid">
+    {%- for m in section.extra.metrics %}
+    <div class="metric">
+      <span class="metric-value">{{ m.value }}</span>
+      <span class="metric-label">{{ m.label }}</span>
+      <span class="metric-note">{{ m.note }}</span>
+    </div>
+    {%- endfor %}
+  </div>
+  <p class="metric-caption">{{ section.extra.metrics_caption | safe }}</p>
+</section>
+
+<section class="band" aria-labelledby="features-h">
+  <div class="band-inner">
+    <h2 id="features-h">{{ section.extra.features_title }}</h2>
+    <p class="band-lede">{{ section.extra.features_lede }}</p>
+    <div class="feature-grid">
+      {%- for f in section.extra.features %}
+      <article class="feature">
+        <h3>{{ f.title }}</h3>
+        <p>{{ f.body }}</p>
+      </article>
+      {%- endfor %}
+    </div>
+  </div>
+</section>
+
+<section class="band alt" aria-labelledby="narrative-h">
+  <div class="band-inner prose">
+    <h2 id="narrative-h" class="visually-hidden">Overview</h2>
+    {{ section.content | safe }}
+  </div>
+</section>
+
+<section class="band cta-band">
+  <div class="band-inner">
+    <h2>{{ section.extra.closing_title }}</h2>
+    <p>{{ section.extra.closing_body }}</p>
+    <div class="cta">
+      <a class="btn primary" href="{{ get_url(path='@/docs/getting-started.md') }}">Install hirn</a>
+      <a class="btn ghost" href="{{ get_url(path='@/docs/_index.md') }}">Browse the docs</a>
+    </div>
+  </div>
+</section>
+
+</main>
+{% endblock content %}

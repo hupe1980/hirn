@@ -235,6 +235,13 @@ async fn start_harness_with_policy() -> TestHarness {
     start_harness_with_db(100, 60, install_test_policy_engine).await
 }
 
+/// The agent the MCP surface authenticates as in the dev-mode harness.
+///
+/// Tests that write on one interface and read on another must use this for
+/// both: records are stored in the author's private namespace, so a mismatched
+/// identity is correctly refused.
+const MCP_CALLER_AGENT: &str = "system";
+
 fn request_with_agent<T>(inner: T) -> tonic::Request<T> {
     request_with_named_agent(inner, "test-agent")
 }
@@ -1357,16 +1364,23 @@ async fn test_grpc_remember_mcp_inspect() {
     let h = start_harness().await;
     let mut grpc = h.grpc_client.clone();
 
-    // Store via gRPC
+    // Store via gRPC **as the identity MCP authenticates as**. A record lands
+    // in its author's private namespace, and cross-agent private reads are
+    // denied by design — so writing as `test-agent` and inspecting as `system`
+    // would exercise the isolation boundary rather than the interface parity
+    // this test is about.
     let resp = grpc
-        .remember(request_with_agent(proto::RememberRequest {
-            record: Some(remember_request::Record::Episodic(proto::EpisodicRecord {
-                content: "Cross-interface test: gRPC to MCP".into(),
-                event_type: proto::EventType::Observation.into(),
-                importance: 0.8,
-                ..Default::default()
-            })),
-        }))
+        .remember(request_with_named_agent(
+            proto::RememberRequest {
+                record: Some(remember_request::Record::Episodic(proto::EpisodicRecord {
+                    content: "Cross-interface test: gRPC to MCP".into(),
+                    event_type: proto::EventType::Observation.into(),
+                    importance: 0.8,
+                    ..Default::default()
+                })),
+            },
+            MCP_CALLER_AGENT,
+        ))
         .await
         .unwrap();
 
@@ -1399,6 +1413,9 @@ async fn test_grpc_remember_mcp_inspect() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_inspect_conforms_across_direct_embedded_http_and_grpc() {
+    // Every surface reads as the *same* identity. Records live in their
+    // author's private namespace, so comparing surfaces under different
+    // agents would confound interface differences with isolation denials.
     let h = start_harness().await;
     let mut grpc = h.grpc_client.clone();
     let c = http_client();
@@ -1406,15 +1423,18 @@ async fn test_inspect_conforms_across_direct_embedded_http_and_grpc() {
     let target_embedding: Vec<f32> = (0..128).map(|i| ((i + 1) as f32) / 128.0).collect();
 
     let source_id = grpc
-        .remember(request_with_agent(proto::RememberRequest {
-            record: Some(remember_request::Record::Episodic(proto::EpisodicRecord {
-                content: "cross-interface inspect source".into(),
-                event_type: proto::EventType::Observation.into(),
-                importance: 0.8,
-                embedding: source_embedding,
-                ..Default::default()
-            })),
-        }))
+        .remember(request_with_named_agent(
+            proto::RememberRequest {
+                record: Some(remember_request::Record::Episodic(proto::EpisodicRecord {
+                    content: "cross-interface inspect source".into(),
+                    event_type: proto::EventType::Observation.into(),
+                    importance: 0.8,
+                    embedding: source_embedding,
+                    ..Default::default()
+                })),
+            },
+            MCP_CALLER_AGENT,
+        ))
         .await
         .unwrap()
         .into_inner()
@@ -1422,30 +1442,36 @@ async fn test_inspect_conforms_across_direct_embedded_http_and_grpc() {
         .unwrap()
         .value;
     let target_id = grpc
-        .remember(request_with_agent(proto::RememberRequest {
-            record: Some(remember_request::Record::Episodic(proto::EpisodicRecord {
-                content: "cross-interface inspect neighbor".into(),
-                event_type: proto::EventType::Observation.into(),
-                importance: 0.6,
-                embedding: target_embedding,
-                ..Default::default()
-            })),
-        }))
+        .remember(request_with_named_agent(
+            proto::RememberRequest {
+                record: Some(remember_request::Record::Episodic(proto::EpisodicRecord {
+                    content: "cross-interface inspect neighbor".into(),
+                    event_type: proto::EventType::Observation.into(),
+                    importance: 0.6,
+                    embedding: target_embedding,
+                    ..Default::default()
+                })),
+            },
+            MCP_CALLER_AGENT,
+        ))
         .await
         .unwrap()
         .into_inner()
         .id
         .unwrap()
         .value;
-    grpc.link_memories(request_with_agent(proto::ConnectRequest {
-        source: Some(proto::MemoryId {
-            value: source_id.clone(),
-        }),
-        target: Some(proto::MemoryId { value: target_id }),
-        relation: proto::EdgeRelation::Causes.into(),
-        weight: 0.9,
-        metadata: Default::default(),
-    }))
+    grpc.link_memories(request_with_named_agent(
+        proto::ConnectRequest {
+            source: Some(proto::MemoryId {
+                value: source_id.clone(),
+            }),
+            target: Some(proto::MemoryId { value: target_id }),
+            relation: proto::EdgeRelation::Causes.into(),
+            weight: 0.9,
+            metadata: Default::default(),
+        },
+        MCP_CALLER_AGENT,
+    ))
     .await
     .unwrap();
 
@@ -1469,7 +1495,7 @@ async fn test_inspect_conforms_across_direct_embedded_http_and_grpc() {
 
     let http_inspect_resp = c
         .get(format!("{}/v1/inspect/{source_id}", h.http_url))
-        .header("X-Agent-ID", "test-agent")
+        .header("X-Agent-ID", MCP_CALLER_AGENT)
         .send()
         .await
         .unwrap();
@@ -1479,7 +1505,7 @@ async fn test_inspect_conforms_across_direct_embedded_http_and_grpc() {
 
     let http_execute_resp = c
         .post(format!("{}/v1/execute", h.http_url))
-        .header("X-Agent-ID", "test-agent")
+        .header("X-Agent-ID", MCP_CALLER_AGENT)
         .json(&json!({ "query": format!(r#"INSPECT "{}""#, source_id) }))
         .send()
         .await
@@ -1490,21 +1516,27 @@ async fn test_inspect_conforms_across_direct_embedded_http_and_grpc() {
 
     let grpc_inspect = inspect_signature_from_grpc_response(
         &grpc
-            .inspect(request_with_agent(proto::InspectRequest {
-                id: Some(proto::MemoryId {
-                    value: source_id.clone(),
-                }),
-            }))
+            .inspect(request_with_named_agent(
+                proto::InspectRequest {
+                    id: Some(proto::MemoryId {
+                        value: source_id.clone(),
+                    }),
+                },
+                MCP_CALLER_AGENT,
+            ))
             .await
             .unwrap()
             .into_inner(),
     );
     let grpc_execute = inspect_signature_from_grpc_execute(
         &grpc
-            .execute(request_with_agent(proto::ExecuteRequest {
-                query: format!(r#"INSPECT "{}""#, source_id),
-                allowed_namespaces: vec![],
-            }))
+            .execute(request_with_named_agent(
+                proto::ExecuteRequest {
+                    query: format!(r#"INSPECT "{}""#, source_id),
+                    allowed_namespaces: vec![],
+                },
+                MCP_CALLER_AGENT,
+            ))
             .await
             .unwrap()
             .into_inner(),

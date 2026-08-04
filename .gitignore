@@ -41,3 +41,4 @@ _hirn.cpython-*.so
 embeddings/locomo_embeddings.json
 embeddings/longmemeval_oracle_embeddings.json
 crates/hirn-python/dist/
+.DS_Store

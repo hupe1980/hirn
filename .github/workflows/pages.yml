@@ -1,62 +1,73 @@
-# Build and deploy the hirn documentation site (docs/) to GitHub Pages.
+# Build and deploy the hirn website (site/) to GitHub Pages.
 #
-# Uses a GitHub Actions build (not "deploy from a branch") so the site runs on
-# current Jekyll 4 + the latest Just the Docs via docs/Gemfile, with full
-# control over plugins (SEO, sitemap, relative links).
-name: Docs (GitHub Pages)
+# Zola is a single static binary, so the build needs no package manager and no
+# lockfile — the pinned version below is the only moving part.
+name: Site (GitHub Pages)
 
 on:
   push:
     branches: [main]
     paths:
-      - "docs/**"
+      - "site/**"
+      - ".github/workflows/pages.yml"
+  pull_request:
+    paths:
+      - "site/**"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
 
-# Allow one concurrent deployment; let in-progress runs finish.
 permissions:
   contents: read
   pages: write
   id-token: write
 
+# Allow one concurrent deployment; let in-progress runs finish.
 concurrency:
   group: pages
   cancel-in-progress: false
 
+env:
+  ZOLA_VERSION: "0.22.1"
+
 jobs:
   build:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: docs
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Ruby
-        uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: "3.3"
-          bundler-cache: true
-          working-directory: docs
+      - name: Install Zola
+        run: |
+          curl -sSL "https://github.com/getzola/zola/releases/download/v${ZOLA_VERSION}/zola-v${ZOLA_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar xz -C /usr/local/bin zola
+          zola --version
 
       - name: Configure Pages
         id: pages
         uses: actions/configure-pages@v5
 
-      - name: Build with Jekyll
-        run: |
-          bundle exec jekyll build \
-            --baseurl "${{ steps.pages.outputs.base_path }}"
-        env:
-          JEKYLL_ENV: production
+      # Validates every internal link and heading anchor, so a dead
+      # cross-reference fails the job instead of becoming a 404 a reader finds
+      # later. External links are excluded deliberately: they make the result
+      # depend on third-party availability and rate limits, which would turn a
+      # green build red for reasons unrelated to the change.
+      - name: Check internal links
+        working-directory: site
+        run: zola check --skip-external-links
+
+      - name: Build
+        working-directory: site
+        run: zola build --base-url "${{ steps.pages.outputs.base_url }}"
 
       - name: Upload artifact
+        if: github.event_name != 'pull_request'
         uses: actions/upload-pages-artifact@v3
         with:
-          path: docs/_site
+          path: site/public
 
   deploy:
+    # Pull requests are built and link-checked but never published.
+    if: github.event_name != 'pull_request'
     needs: build
     runs-on: ubuntu-latest
     environment:

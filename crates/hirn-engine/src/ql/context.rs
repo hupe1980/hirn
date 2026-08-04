@@ -18,7 +18,7 @@ use hirn_core::resource::ResourceGovernanceState;
 use hirn_core::revision::{LogicalMemoryId, RecallSnapshot, RevisionId, RevisionState};
 use hirn_core::semantic::SemanticRecord;
 use hirn_core::tokenizer::Tokenizer;
-use hirn_core::types::{AgentId, EdgeRelation, Layer, Namespace};
+use hirn_core::types::{AgentId, EdgeRelation, Layer, MemoryType, Namespace};
 use hirn_core::working::WorkingMemoryEntry;
 use hirn_core::{ConflictResolutionPolicy, HirnConfig};
 
@@ -330,6 +330,10 @@ pub struct ConflictMember {
     pub content: String,
     pub in_result_set: bool,
     pub source_reliability: f32,
+    /// The composition authority tier for this member. In conflict arbitration a
+    /// lower-authority role (e.g. `Preference`) can never be selected over a
+    /// higher-authority one (e.g. `StableFact`) regardless of recency or support.
+    pub functional_role: MemoryType,
     #[serde(skip)]
     recency_basis_ms: i64,
 }
@@ -1123,7 +1127,49 @@ pub(crate) fn candidates_from_batches(batches: &[RecordBatch], limit: usize) -> 
     result
 }
 
+/// Identify preference observations a later statement has replaced.
+///
+/// Supersession is a property of the whole retrieved set, so it cannot be
+/// decided while rendering one candidate at a time. Without this pass, a user
+/// who said "I prefer aisle seats" and later "I prefer window seats now" has
+/// both surfaced as equally current and the answer depends on retrieval order.
+///
+/// Returns the keys of superseded observations, each with the time that
+/// replaced it. Superseded evidence is *marked*, never dropped: "what did I
+/// used to prefer" is a legitimate question, and silently deleting history
+/// would make it unanswerable.
+fn superseded_preference_observations(
+    candidates: &[ScoredMemory],
+) -> std::collections::HashMap<(String, String, u64), hirn_core::Timestamp> {
+    let evidence: Vec<hirn_core::PreferenceEvidence> = candidates
+        .iter()
+        .filter_map(|sm| match &sm.record {
+            MemoryRecord::Episodic(record) => record
+                .metadata
+                .get(hirn_core::PREFERENCE_EVIDENCE_METADATA_KEY)
+                .and_then(hirn_core::PreferenceEvidence::from_metadata_value),
+            _ => None,
+        })
+        .collect();
+
+    let mut superseded = std::collections::HashMap::new();
+    for group in hirn_core::preference::current_preferences(&evidence) {
+        for earlier in &group.superseded {
+            superseded.insert(
+                (
+                    earlier.owner.to_string(),
+                    earlier.normalized_target(),
+                    earlier.observed_at.millis(),
+                ),
+                group.current.observed_at,
+            );
+        }
+    }
+    superseded
+}
+
 fn classify_candidates(candidates: &[ScoredMemory], tokenizer: &dyn Tokenizer) -> Vec<Candidate> {
+    let superseded = superseded_preference_observations(candidates);
     candidates
         .iter()
         .map(|sm| {
@@ -1131,7 +1177,48 @@ fn classify_candidates(candidates: &[ScoredMemory], tokenizer: &dyn Tokenizer) -
                 MemoryRecord::Episodic(e) => {
                     let entities: Vec<String> =
                         e.entities.iter().map(|er| er.name.clone()).collect();
-                    (e.content.clone(), e.summary.clone(), entities)
+                    let preference = e
+                        .metadata
+                        .get(hirn_core::PREFERENCE_EVIDENCE_METADATA_KEY)
+                        .and_then(hirn_core::PreferenceEvidence::from_metadata_value);
+                    match preference {
+                        Some(preference) => {
+                            let qualifiers = if preference.qualifiers.is_empty() {
+                                String::new()
+                            } else {
+                                format!("; context: {}", preference.qualifiers.join(", "))
+                            };
+                            // A superseded observation stays visible but must
+                            // never read as the user's current position.
+                            let status = superseded
+                                .get(&(
+                                    preference.owner.to_string(),
+                                    preference.normalized_target(),
+                                    preference.observed_at.millis(),
+                                ))
+                                .map_or_else(String::new, |replaced_at| {
+                                    format!(
+                                        "; status=SUPERSEDED by a later statement at {replaced_at} \
+                                         — do not present this as the current preference"
+                                    )
+                                });
+                            let evidence = format!(
+                                "[Preference evidence: owner={}; polarity={}; target={}; observed_at={}{}{}]",
+                                preference.owner,
+                                preference.polarity.as_str(),
+                                preference.target,
+                                preference.observed_at,
+                                qualifiers,
+                                status,
+                            );
+                            (
+                                format!("{evidence} {}", e.content),
+                                format!("{evidence} {}", e.summary),
+                                entities,
+                            )
+                        }
+                        None => (e.content.clone(), e.summary.clone(), entities),
+                    }
                 }
                 MemoryRecord::Semantic(s) => (s.description.clone(), s.concept.clone(), vec![]),
                 MemoryRecord::Working(w) => (w.content.clone(), w.content.clone(), vec![]),
@@ -1906,6 +1993,7 @@ fn conflict_member_from_scored(scored: &ScoredMemory, in_result_set: bool) -> Co
         content: extract_content_str(&scored.record).to_string(),
         in_result_set,
         source_reliability: crate::scoring::source_reliability_for_record(&scored.record),
+        functional_role: hirn_core::scoring::functional_role_for_record(&scored.record),
         recency_basis_ms: conflict_member_recency_basis_ms(&scored.record),
     }
 }
@@ -1921,6 +2009,7 @@ fn conflict_member_from_record(record: &MemoryRecord, in_result_set: bool) -> Co
         content: extract_content_str(record).to_string(),
         in_result_set,
         source_reliability: crate::scoring::source_reliability_for_record(record),
+        functional_role: hirn_core::scoring::functional_role_for_record(record),
         recency_basis_ms: conflict_member_recency_basis_ms(record),
     }
 }
@@ -2278,8 +2367,17 @@ fn compare_conflict_member_preference(
         policy,
     );
 
-    left_score
-        .total_cmp(&right_score)
+    // Functional-role authority is a hard, dominant precedence that sits ABOVE the
+    // numeric weighted score: a higher-authority memory type (e.g. `StableFact`)
+    // must always be preferred over a lower-authority one (e.g. `Preference`),
+    // regardless of recency, source reliability, or supporting evidence. The
+    // numeric preference score only decides between members of EQUAL authority.
+    // This guarantees conflict arbitration can never let a subjective preference
+    // override an objective fact.
+    left.functional_role
+        .authority()
+        .cmp(&right.functional_role.authority())
+        .then_with(|| left_score.total_cmp(&right_score))
         .then_with(|| left.revision_id.cmp(&right.revision_id))
         .then_with(|| left.memory_id.cmp(&right.memory_id))
 }
@@ -2406,13 +2504,13 @@ fn allocate_budget(
             tokenizer,
         ));
 
-    // Working memory: mandatory reserve.
+    // Working memory demand. The configured reserve is an upper bound, not a
+    // quota to burn when the actual working set is smaller.
     let wm_needed: usize = working_entries
         .iter()
         .map(|w| tokenizer.count_tokens(&w.content) + 5)
         .sum();
     let wm_reserve = (total as f32 * config.working_memory_reserve) as usize;
-    let wm_budget = if wm_needed == 0 { 0 } else { wm_reserve.max(1) };
 
     // Contradiction overhead.
     let contra_budget = if contradictions.is_empty() {
@@ -2423,6 +2521,27 @@ fn allocate_budget(
             .map(|group| tokenizer.count_tokens(&format_conflict_group_line(group)) + 2)
             .sum();
         actual.min(total / 4)
+    };
+
+    // Preserve at least 25% of the post-format budget for direct evidence when
+    // such candidates exist. A caller-configured 100% working-memory reserve
+    // must not silently erase every semantic/episodic/procedural result.
+    let has_direct_candidates = classified.iter().any(|candidate| {
+        matches!(
+            candidate.layer,
+            Layer::Semantic | Layer::Episodic | Layer::Procedural
+        )
+    });
+    let max_reserved = if has_direct_candidates {
+        total.saturating_mul(3) / 4
+    } else {
+        total
+    };
+    let wm_cap = max_reserved.saturating_sub(contra_budget);
+    let wm_budget = if wm_needed == 0 {
+        0
+    } else {
+        wm_needed.min(wm_reserve.max(1)).min(wm_cap)
     };
 
     // Remaining budget after WM + contradictions.
@@ -4167,6 +4286,7 @@ mod tests {
                 causal_relevance: 0.0,
                 surprise: 0.0,
                 source_reliability: 0.0,
+                temporal_relevance: 0.0,
             },
             resource_evidence: Vec::new(),
             resource_preview_packages: Vec::new(),
@@ -4196,6 +4316,7 @@ mod tests {
                 causal_relevance: 0.0,
                 surprise: 0.0,
                 source_reliability: 0.0,
+                temporal_relevance: 0.0,
             },
             resource_evidence: Vec::new(),
             resource_preview_packages: Vec::new(),
@@ -4304,6 +4425,7 @@ mod tests {
                 causal_relevance: 0.0,
                 surprise: 0.0,
                 source_reliability: 0.0,
+                temporal_relevance: 0.0,
             },
             resource_evidence: Vec::new(),
             resource_preview_packages: Vec::new(),
@@ -4321,12 +4443,88 @@ mod tests {
             content: format!("claim {memory_id}"),
             in_result_set: true,
             source_reliability: 1.0,
+            functional_role: MemoryType::default(),
             recency_basis_ms: memory_id.timestamp_ms() as i64,
         }
     }
 
     fn default_conflict_policy() -> ConflictResolutionPolicy {
         ConflictResolutionPolicy::default()
+    }
+
+    fn make_preference_candidate(
+        target: &str,
+        polarity: hirn_core::PreferencePolarity,
+        observed_at_ms: u64,
+    ) -> ScoredMemory {
+        let evidence = hirn_core::PreferenceEvidence {
+            owner: AgentId::new("test").unwrap(),
+            polarity,
+            target: target.to_string(),
+            qualifiers: Vec::new(),
+            observed_at: hirn_core::Timestamp::from_millis(observed_at_ms),
+        };
+        let mut candidate = make_episodic(&format!("I prefer {target}"), "pref", 0.9);
+        if let MemoryRecord::Episodic(record) = &mut candidate.record {
+            record.metadata.insert(
+                hirn_core::PREFERENCE_EVIDENCE_METADATA_KEY.into(),
+                evidence.to_metadata_value(),
+            );
+        }
+        candidate
+    }
+
+    /// A preference the user later reversed must not read as current.
+    ///
+    /// Supersession is a property of the retrieved set, so rendering each
+    /// candidate independently leaves both statements looking equally current
+    /// and the answer decided by retrieval order.
+    #[test]
+    fn superseded_preference_evidence_is_marked_but_retained() {
+        let tok = test_tokenizer();
+        let candidates = vec![
+            make_preference_candidate("aisle seats", hirn_core::PreferencePolarity::Positive, 1_000),
+            // Same preference, different spelling, stated later.
+            make_preference_candidate(
+                "Aisle-Seats",
+                hirn_core::PreferencePolarity::Negative,
+                9_000,
+            ),
+        ];
+
+        let classified = classify_candidates(&candidates, tok.as_ref());
+        let older = &classified[0].full_content;
+        let newer = &classified[1].full_content;
+
+        assert!(
+            older.contains("SUPERSEDED"),
+            "the earlier statement must be marked: {older}"
+        );
+        assert!(
+            !newer.contains("SUPERSEDED"),
+            "the current statement must not be marked: {newer}"
+        );
+        assert!(
+            older.contains("aisle seats"),
+            "superseded evidence is marked, never dropped: {older}"
+        );
+    }
+
+    #[test]
+    fn distinct_preferences_are_never_marked_superseded() {
+        let tok = test_tokenizer();
+        let candidates = vec![
+            make_preference_candidate("window seats", hirn_core::PreferencePolarity::Positive, 1_000),
+            make_preference_candidate("oat milk", hirn_core::PreferencePolarity::Positive, 9_000),
+        ];
+
+        let classified = classify_candidates(&candidates, tok.as_ref());
+        assert!(
+            classified
+                .iter()
+                .all(|candidate| !candidate.full_content.contains("SUPERSEDED")),
+            "unrelated preferences must not supersede each other"
+        );
     }
 
     #[test]
@@ -5335,6 +5533,60 @@ mod tests {
             select_conflict_preferred_memory_id(&[older, newer], &[], 0, &HashSet::new(), policy);
 
         assert_eq!(selected, Some(older_id));
+    }
+
+    #[test]
+    fn functional_role_authority_dominates_conflict_arbitration() {
+        // A subjective `Preference` must NEVER be selected over an objective
+        // `StableFact` in the same conflict component, even when the preference has
+        // strictly higher recency and source-reliability (and therefore a higher
+        // numeric preference score). Functional-role authority is a hard precedence
+        // that sits above the weighted score, so the stable fact must win.
+        let fact_id = MemoryId::parse("01ARZ3NDEKTSV4RRFFQ69G5FC1").unwrap();
+        let preference_id = MemoryId::parse("01ARZ3NDEKTSV4RRFFQ69G5FC2").unwrap();
+
+        let mut stable_fact = make_conflict_member(fact_id, ConflictMemberStatus::Active);
+        stable_fact.functional_role = MemoryType::StableFact;
+        // Deliberately handicap the fact on every numeric axis.
+        stable_fact.source_reliability = 0.10;
+        stable_fact.recency_basis_ms = 1;
+        stable_fact.revision_id = Some(RevisionId::from_memory_id(fact_id));
+
+        let mut preference = make_conflict_member(preference_id, ConflictMemberStatus::Active);
+        preference.functional_role = MemoryType::Preference;
+        // Give the preference every numeric advantage.
+        preference.source_reliability = 0.99;
+        preference.recency_basis_ms = 1_000_000;
+        preference.revision_id = Some(RevisionId::from_memory_id(preference_id));
+
+        // A policy that heavily rewards recency and source reliability — the exact
+        // signals the preference dominates — to prove authority still overrides them.
+        let policy = ConflictResolutionPolicy {
+            recency_weight: 0.45,
+            source_reliability_weight: 0.45,
+            supporting_evidence_weight: 0.10,
+            human_override_weight: 0.0,
+            prefer_human_override: true,
+        };
+
+        // Assert regardless of input ordering.
+        let forward = select_conflict_preferred_memory_id(
+            &[stable_fact.clone(), preference.clone()],
+            &[],
+            0,
+            &HashSet::new(),
+            policy,
+        );
+        let reverse = select_conflict_preferred_memory_id(
+            &[preference, stable_fact],
+            &[],
+            0,
+            &HashSet::new(),
+            policy,
+        );
+
+        assert_eq!(forward, Some(fact_id));
+        assert_eq!(reverse, Some(fact_id));
     }
 
     #[test]

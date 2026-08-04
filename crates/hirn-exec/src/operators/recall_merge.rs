@@ -181,6 +181,7 @@ fn recall_rows_from_batch(batch: &RecordBatch) -> Result<Vec<RecallRow>> {
                 .and_then(|values| (!values.is_null(row)).then(|| values.value(row))),
             invocation_count: invocation_counts
                 .and_then(|values| (!values.is_null(row)).then(|| values.value(row))),
+            embedding: None,
         });
     }
 

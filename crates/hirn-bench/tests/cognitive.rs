@@ -18,6 +18,7 @@ fn run_benchmark(benchmark: Benchmark) -> hirn_bench::cognitive::CognitiveResult
         execution_surface: BenchmarkExecutionSurface::DirectBuilders,
         query_text_hybrid: false,
         embedder_policy: Default::default(),
+        ..Default::default()
     };
     hirn_bench::cognitive::runner::run(&ds, &config, &db_path, "integration-test")
 }

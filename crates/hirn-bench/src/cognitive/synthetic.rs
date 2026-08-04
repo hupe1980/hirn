@@ -291,6 +291,7 @@ fn generate_h1() -> CognitiveDataset {
     CognitiveDataset {
         name: "H1-Retrieval (synthetic)".into(),
         benchmark: Benchmark::H1Retrieval,
+        retrieval_corpus: super::RetrievalCorpus::Shared,
         sessions,
         queries,
         truncated: None,
@@ -515,6 +516,7 @@ fn generate_h2() -> CognitiveDataset {
     CognitiveDataset {
         name: "H2-Temporal (synthetic)".into(),
         benchmark: Benchmark::H2Temporal,
+        retrieval_corpus: super::RetrievalCorpus::Shared,
         sessions,
         queries,
         truncated: None,
@@ -747,6 +749,7 @@ fn generate_h3() -> CognitiveDataset {
     CognitiveDataset {
         name: "H3-Graph (synthetic)".into(),
         benchmark: Benchmark::H3Graph,
+        retrieval_corpus: super::RetrievalCorpus::Shared,
         sessions,
         queries,
         truncated: None,
@@ -957,6 +960,7 @@ fn generate_h4() -> CognitiveDataset {
     CognitiveDataset {
         name: "H4-Agent (synthetic)".into(),
         benchmark: Benchmark::H4Agent,
+        retrieval_corpus: super::RetrievalCorpus::Shared,
         sessions,
         queries,
         truncated: None,
@@ -1164,6 +1168,7 @@ fn generate_h5() -> CognitiveDataset {
     CognitiveDataset {
         name: "H5-Action (synthetic)".into(),
         benchmark: Benchmark::H5Action,
+        retrieval_corpus: super::RetrievalCorpus::Shared,
         sessions,
         queries,
         truncated: None,
@@ -1378,6 +1383,7 @@ fn generate_h6() -> CognitiveDataset {
     CognitiveDataset {
         name: "H6-Safety (synthetic)".into(),
         benchmark: Benchmark::H6Safety,
+        retrieval_corpus: super::RetrievalCorpus::Shared,
         sessions,
         queries,
         truncated: None,
@@ -1408,6 +1414,7 @@ fn turn_ts(speaker: &str, content: &str, ts: u64) -> Turn {
 
 fn qa(id: &str, question: &str, answers: &[&str], category: &str, session_ids: &[&str]) -> QAQuery {
     QAQuery {
+        question_date_ms: None,
         id: id.into(),
         question: question.into(),
         expected_answers: answers.iter().map(|s| (*s).to_string()).collect(),
@@ -1429,6 +1436,7 @@ fn qa_neg(
     session_ids: &[&str],
 ) -> QAQuery {
     QAQuery {
+        question_date_ms: None,
         id: id.into(),
         question: question.into(),
         expected_answers: forbidden_answers.iter().map(|s| (*s).to_string()).collect(),

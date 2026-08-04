@@ -31,7 +31,7 @@ pub(crate) async fn postprocess_scored_recall_results(
     actor_id: AgentId,
     allowed_query_namespaces: Option<&[Namespace]>,
 ) -> HirnResult<Vec<ScoredMemory>> {
-    apply_mcfa_filter_to_scored(db, &mut scored, stmt.with_mcfa, actor_id).await;
+    apply_mcfa_filter_to_scored(db, &mut scored, stmt.with_mcfa, actor_id).await?;
 
     if let Some(ref modalities) = stmt.modality {
         scored.retain(|record| scored_memory_matches_modalities(record, modalities));
@@ -291,37 +291,6 @@ pub(crate) fn recall_quality_should_escalate(results: &[ScoredMemory], threshold
     compute_quality_score(results, threshold).should_escalate
 }
 
-/// Detect common English temporal keywords in free-text query strings.
-///
-/// Used to enable temporal expansion even when no explicit `BETWEEN`/`AS OF`
-/// clause is present in the HirnQL statement.
-pub(crate) fn detect_temporal_in_query_text(query: &str) -> bool {
-    // Case-insensitive scan for common temporal anchors.
-    let lower = query.to_ascii_lowercase();
-    let patterns = [
-        "yesterday",
-        "last week",
-        "last month",
-        "last year",
-        "last night",
-        "this week",
-        "this month",
-        "this year",
-        "today",
-        "recently",
-        "earlier today",
-        "a few days ago",
-        "a week ago",
-        "a month ago",
-        "a year ago",
-        "days ago",
-        "weeks ago",
-        "months ago",
-        "years ago",
-    ];
-    patterns.iter().any(|p| lower.contains(p))
-}
-
 /// Derive a `[start_ms, end_ms]` window from common temporal phrases in a
 /// free-text query relative to `now_ms` (Unix milliseconds).
 ///
@@ -404,7 +373,7 @@ pub(crate) fn recall_candidate_limit(
     boosted.min(boosted_cap).max(candidate_limit)
 }
 
-fn recall_has_narrowing_postload(stmt: &RecallStmt) -> bool {
+pub(crate) fn recall_has_narrowing_postload(stmt: &RecallStmt) -> bool {
     stmt.temporal.is_some()
         || stmt.as_of.is_some()
         || stmt
@@ -431,9 +400,9 @@ async fn apply_mcfa_filter_to_scored(
     scored: &mut Vec<ScoredMemory>,
     enabled: Option<bool>,
     actor_id: AgentId,
-) {
+) -> HirnResult<()> {
     if !enabled.unwrap_or(false) {
-        return;
+        return Ok(());
     }
 
     let config = hirn_exec::operators::McfaConfig::default();
@@ -469,18 +438,13 @@ async fn apply_mcfa_filter_to_scored(
     });
 
     if flagged.is_empty() {
-        return;
+        return Ok(());
     }
 
-    let batch = match hirn_storage::datasets::mcfa_audit_log::to_batch(&flagged) {
-        Ok(batch) => batch,
-        Err(error) => {
-            // The RESULT rows were already dropped above (fail-closed); surface
-            // the encode failure loudly rather than losing it silently (R-55).
-            tracing::error!(%error, count = flagged.len(), "failed to encode MCFA audit entries — audit records LOST");
-            return;
-        }
-    };
+    let batch = hirn_storage::datasets::mcfa_audit_log::to_batch(&flagged).map_err(|error| {
+        tracing::error!(%error, count = flagged.len(), "failed to encode MCFA audit entries");
+        HirnError::storage(format!("failed to encode MCFA audit entries: {error}"))
+    })?;
 
     // R-55: a lost security-audit append must not be silent. Retry a few times
     // before giving up; the flagged rows stay dropped from the result either
@@ -495,7 +459,7 @@ async fn apply_mcfa_filter_to_scored(
             )
             .await
         {
-            Ok(()) => return,
+            Ok(()) => return Ok(()),
             Err(error) => {
                 tracing::warn!(%error, attempt, "failed to persist MCFA audit entries; retrying");
                 last_error = Some(error);
@@ -507,9 +471,13 @@ async fn apply_mcfa_filter_to_scored(
             %error,
             count = flagged.len(),
             retries = MCFA_AUDIT_APPEND_RETRIES,
-            "failed to persist MCFA audit entries after retries — audit records LOST"
+            "failed to persist MCFA audit entries after retries"
         );
+        return Err(HirnError::storage(format!(
+            "failed to persist MCFA audit entries after {MCFA_AUDIT_APPEND_RETRIES} attempts: {error}"
+        )));
     }
+    Ok(())
 }
 
 /// Number of times a failed MCFA audit-log append is retried before it is
@@ -1096,6 +1064,7 @@ async fn expand_provenance(
                             causal_relevance: 0.0,
                             surprise: 0.0,
                             source_reliability: 0.0,
+                            temporal_relevance: 0.0,
                         },
                         record,
                         resource_evidence: Vec::new(),
@@ -1856,30 +1825,6 @@ mod tests {
         });
 
         assert_eq!(recall_candidate_limit(10, &stmt, false), 120);
-    }
-
-    #[test]
-    fn detect_temporal_positive_cases() {
-        assert!(detect_temporal_in_query_text("What happened yesterday?"));
-        assert!(detect_temporal_in_query_text(
-            "Tell me about last week's meeting"
-        ));
-        assert!(detect_temporal_in_query_text("What did I do today?"));
-        assert!(detect_temporal_in_query_text(
-            "Show me events from last month"
-        ));
-        assert!(detect_temporal_in_query_text("What happened recently?"));
-        assert!(detect_temporal_in_query_text(
-            "Tell me about things from days ago"
-        ));
-        assert!(detect_temporal_in_query_text("YESTERDAY upper case")); // case-insensitive
-    }
-
-    #[test]
-    fn detect_temporal_negative_cases() {
-        assert!(!detect_temporal_in_query_text("What is quantum computing?"));
-        assert!(!detect_temporal_in_query_text("List all my memories"));
-        assert!(!detect_temporal_in_query_text(""));
     }
 
     #[test]

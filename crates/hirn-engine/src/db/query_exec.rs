@@ -44,6 +44,7 @@ use crate::ql::results::{
     QueryResult, RecordResults, ScoreBreakdown, ScoredMemory, SvoEventResult, SvoEventResults,
 };
 use crate::resource_presentation::apply_resource_preview_rerank_to_scored_records;
+use crate::retrieval::temporal_parse::ParsedTimeFrame;
 use crate::scoring::{self, ScoringWeights};
 
 use super::HirnDB;
@@ -71,6 +72,44 @@ struct CompiledPlanExecution {
 struct PreparedCompiledScoredRecords {
     records: Vec<ScoredMemory>,
     allowed_query_namespaces: Option<Vec<Namespace>>,
+}
+
+async fn resolve_compiled_temporal_frame(
+    db: &HirnDB,
+    query: &str,
+    explicit_start_ms: Option<i64>,
+    explicit_end_ms: Option<i64>,
+    scope: QueryExecutionScope<'_>,
+) -> ParsedTimeFrame {
+    if explicit_start_ms.is_some() || explicit_end_ms.is_some() {
+        return ParsedTimeFrame {
+            after_ms: explicit_start_ms,
+            before_ms: explicit_end_ms,
+        };
+    }
+
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let grounded = crate::retrieval::temporal_ground::ground_temporal_frame(
+        db,
+        Some(&scope.actor_id),
+        query,
+        scope.allowed_namespaces,
+        now_ms,
+    )
+    .await;
+    if grounded.matched() {
+        return grounded;
+    }
+
+    // Retain broad relative phrases ("recently", "months ago", "last
+    // night") that predate the exact calendar/event parser.
+    read_support::derive_temporal_bounds_from_query_text(query, now_ms).map_or_else(
+        ParsedTimeFrame::default,
+        |(after_ms, before_ms)| ParsedTimeFrame {
+            after_ms: Some(after_ms),
+            before_ms: Some(before_ms),
+        },
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1219,6 +1258,20 @@ impl HirnDB {
         .await
     }
 
+    pub(crate) async fn execute_ql_scoped_with_diagnostics(
+        &self,
+        query: &str,
+        allowed_namespaces: &[Namespace],
+    ) -> HirnResult<(QueryResult, Option<crate::diagnostics::QueryDiagnostics>)> {
+        let compiled = self.query_pipeline().compile(query)?;
+        self.execute_authoritative_statement_with_diagnostics(
+            compiled.as_ref(),
+            QueryExecutionScope::scoped(allowed_namespaces),
+            None,
+        )
+        .await
+    }
+
     /// Parse and execute a HirnQL query for an agent-scoped context.
     pub(crate) async fn execute_ql_scoped_as_agent(
         &self,
@@ -2360,6 +2413,7 @@ impl HirnDB {
                     causal_relevance: 0.0,
                     surprise: 0.0,
                     source_reliability: 0.0,
+                    temporal_relevance: 0.0,
                 },
                 resource_evidence: Vec::new(),
                 resource_preview_packages: Vec::new(),
@@ -2424,19 +2478,16 @@ impl HirnDB {
             .temporal
             .as_ref()
             .and_then(|temporal| temporal.end.map(|end| end.timestamp_millis()));
-        // Derive temporal bounds from query text when no explicit clause is set.
-        let (temporal_start_ms, temporal_end_ms) = if temporal_start_ms.is_none()
-            && temporal_end_ms.is_none()
-            && read_support::detect_temporal_in_query_text(&typed.query)
-        {
-            let now_ms = chrono::Utc::now().timestamp_millis();
-            match read_support::derive_temporal_bounds_from_query_text(&typed.query, now_ms) {
-                Some((s, e)) => (Some(s), Some(e)),
-                None => (None, None),
-            }
-        } else {
-            (temporal_start_ms, temporal_end_ms)
-        };
+        let temporal_frame = resolve_compiled_temporal_frame(
+            self,
+            &typed.query,
+            temporal_start_ms,
+            temporal_end_ms,
+            scope,
+        )
+        .await;
+        let temporal_start_ms = temporal_frame.after_ms;
+        let temporal_end_ms = temporal_frame.before_ms;
         let temporal_expansion = temporal_start_ms.is_some() || temporal_end_ms.is_some();
         configure_datafusion_recall_search_binding(
             self,
@@ -2466,6 +2517,7 @@ impl HirnDB {
                 &typed.query,
                 scope,
                 typed.as_of.clone(),
+                temporal_frame,
                 None,
                 batches,
             )
@@ -2590,20 +2642,19 @@ impl HirnDB {
             .temporal
             .as_ref()
             .and_then(|temporal| temporal.end.map(|end| end.timestamp_millis()));
-        // Derive temporal bounds from query text when no explicit clause is set.
-        let (temporal_start_ms, temporal_end_ms) = if temporal_start_ms.is_none()
-            && temporal_end_ms.is_none()
-            && read_support::detect_temporal_in_query_text(&typed.query)
-        {
-            let now_ms = chrono::Utc::now().timestamp_millis();
-            match read_support::derive_temporal_bounds_from_query_text(&typed.query, now_ms) {
-                Some((s, e)) => (Some(s), Some(e)),
-                None => (None, None),
-            }
-        } else {
-            (temporal_start_ms, temporal_end_ms)
-        };
+        let temporal_frame = resolve_compiled_temporal_frame(
+            self,
+            &typed.query,
+            temporal_start_ms,
+            temporal_end_ms,
+            scope,
+        )
+        .await;
+        let temporal_start_ms = temporal_frame.after_ms;
+        let temporal_end_ms = temporal_frame.before_ms;
         let temporal_expansion = temporal_start_ms.is_some() || temporal_end_ms.is_some();
+        let requires_temporal_or_comparison_assembly = temporal_frame.matched()
+            || crate::retrieval::decompose::has_comparison_cue(&typed.query);
         configure_datafusion_recall_search_binding(
             self,
             RecallSearchBinding {
@@ -2633,7 +2684,7 @@ impl HirnDB {
         let batches_for_assembly = batches.clone();
         let decode_start = std::time::Instant::now();
         let PreparedCompiledScoredRecords {
-            records,
+            mut records,
             allowed_query_namespaces,
         } = self
             .prepare_compiled_scored_records(
@@ -2641,10 +2692,36 @@ impl HirnDB {
                 &typed.query,
                 scope,
                 None,
+                temporal_frame,
                 Some(compiled_think_context_candidate_limit(typed.limit)),
                 batches,
             )
             .await?;
+
+        // Comparative and duration questions need evidence for every named
+        // event in the assembled THINK context. Fuse scoped entity sub-recalls
+        // with the compiled candidates before context budgeting. Skip queries
+        // with narrowing predicates because a generic entity recall cannot
+        // safely reproduce those constraints.
+        if numeric_filters.is_empty() && !read_support::recall_has_narrowing_postload(&recall_stmt)
+        {
+            records = crate::retrieval::decompose::multi_entity_scored_memories(
+                self,
+                Some(&scope.actor_id),
+                &typed.query,
+                records,
+                scope.allowed_namespaces,
+                compiled_think_context_candidate_limit(typed.limit),
+            )
+            .await;
+        }
+        let requires_hydrated_assembly = requires_temporal_or_comparison_assembly
+            || crate::retrieval::preference::requires_preference_aware_assembly(
+                self,
+                &typed.query,
+                &records,
+            )
+            .await;
         let decode_ms = duration_ms(decode_start.elapsed());
 
         let context_candidate_count = records
@@ -2677,8 +2754,11 @@ impl HirnDB {
         } else {
             let context_config = think_context_config(self, typed, think_context_override);
 
-            // Phase 3: Assemble THINK context via assemble_think_context, using the
-            // Arrow fast path (raw_batches from ContextBudgetExec skip secondary Lance scan).
+            // Phase 3: Assemble THINK context. The Arrow fast path preserves the
+            // physical batch order, so it is only safe when post-hydration temporal
+            // scoring / entity fusion cannot have changed ranking or membership.
+            // Otherwise assemble from `records`; passing raw batches here would
+            // silently discard the product-level rerank.
             let think_result = crate::ql::context::assemble_think_context(
                 self,
                 &scope.actor_id,
@@ -2686,7 +2766,7 @@ impl HirnDB {
                 &context_config,
                 allowed_query_namespaces.as_deref(),
                 Some(&records),
-                Some(&batches_for_assembly),
+                (!requires_hydrated_assembly).then_some(&batches_for_assembly),
             )
             .await?;
 
@@ -2736,11 +2816,12 @@ impl HirnDB {
         query_text: &str,
         scope: QueryExecutionScope<'_>,
         snapshot: Option<hirn_core::RecallSnapshot>,
+        temporal_frame: ParsedTimeFrame,
         pre_evidence_limit: Option<usize>,
         batches: Vec<RecordBatch>,
     ) -> HirnResult<PreparedCompiledScoredRecords> {
         let mut records = self
-            .load_scored_memories_from_batches(&batches, scope.actor_id)
+            .load_scored_memories_from_batches(&batches, scope.actor_id, temporal_frame)
             .await?;
         records = read_support::apply_scored_recall_postload_filters(
             self,
@@ -2845,6 +2926,7 @@ impl HirnDB {
         &self,
         batches: &[RecordBatch],
         actor_id: AgentId,
+        temporal_frame: ParsedTimeFrame,
     ) -> HirnResult<Vec<ScoredMemory>> {
         let ordered = ordered_memory_scores_from_batches(batches)?;
         let mut fetch_ids = Vec::with_capacity(ordered.len());
@@ -2864,6 +2946,12 @@ impl HirnDB {
         let now = Timestamp::now();
         let weights = recall_scoring_weights(self);
         let decay_lambda = self.config().decay_lambda;
+        let temporal_after = temporal_frame
+            .after_ms
+            .map(|millis| Timestamp::from_millis(millis.max(0) as u64));
+        let temporal_before = temporal_frame
+            .before_ms
+            .map(|millis| Timestamp::from_millis(millis.max(0) as u64));
 
         let mut scored = Vec::with_capacity(ordered.len());
         for row in ordered {
@@ -2888,7 +2976,21 @@ impl HirnDB {
             let source_reliability = scoring::source_reliability_for_record(&record);
             let recency =
                 scoring::fade_mem_recency(importance, age_hours, decay_lambda, access_freq);
-            let composite_score = scoring::composite_score(
+            let temporal_relevance = crate::db::recall_exec::candidate_validity_interval(&record)
+                .map_or(0.0, |interval| {
+                    crate::db::recall_exec::temporal_relevance(
+                        &interval,
+                        temporal_after.as_ref(),
+                        temporal_before.as_ref(),
+                        None,
+                    )
+                });
+            // State-aware recency, matching the direct recall path: an
+            // ongoing or timeless fact is exempt from age decay. Both read
+            // paths must agree, or the same corpus ranks differently depending
+            // on which surface asked.
+            let temporal_state = scoring::temporal_state_for_record(&record);
+            let composite_score = scoring::composite_score_for_state(
                 row.similarity,
                 importance,
                 age_hours,
@@ -2898,6 +3000,8 @@ impl HirnDB {
                 row.causal_relevance,
                 surprise,
                 source_reliability,
+                temporal_relevance,
+                temporal_state,
                 &weights,
             );
 
@@ -2912,6 +3016,7 @@ impl HirnDB {
                     causal_relevance: row.causal_relevance,
                     surprise,
                     source_reliability,
+                    temporal_relevance,
                 },
                 record,
                 resource_evidence: Vec::new(),
@@ -4238,6 +4343,7 @@ mod tests {
                         causal_relevance: 0.0,
                         surprise: 0.0,
                         source_reliability: 1.0,
+                        temporal_relevance: 0.0,
                     },
                     resource_evidence: Vec::new(),
                     resource_preview_packages: Vec::new(),
@@ -4255,6 +4361,7 @@ mod tests {
                         causal_relevance: 0.0,
                         surprise: 0.0,
                         source_reliability: 1.0,
+                        temporal_relevance: 0.0,
                     },
                     resource_evidence: Vec::new(),
                     resource_preview_packages: Vec::new(),
@@ -4296,6 +4403,269 @@ mod tests {
         assert_eq!(ordered.len(), 2);
         assert_eq!(ordered[0].layer, Some(Layer::Semantic));
         assert_eq!(ordered[1].layer, Some(Layer::Episodic));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compiled_scoring_boosts_candidate_inside_soft_temporal_frame() {
+        let storage: Arc<dyn PhysicalStore> = Arc::new(MemoryStore::new());
+        let (db, _dir) = temp_db_with_storage(storage).await;
+        let inside_ts = Timestamp::parse_date_or_rfc3339("2026-01-15T00:00:00Z").unwrap();
+        let outside_ts = Timestamp::parse_date_or_rfc3339("2025-01-15T00:00:00Z").unwrap();
+
+        let inside_id = db
+            .remember(
+                EpisodicRecord::builder()
+                    .event_type(EventType::Observation)
+                    .content("inside temporal frame")
+                    .summary("inside temporal frame")
+                    .embedding(vec![1.0, 0.0, 0.0, 0.0])
+                    .importance(0.5)
+                    .timestamp(inside_ts)
+                    .agent_id(test_agent())
+                    .build()
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let outside_id = db
+            .remember(
+                EpisodicRecord::builder()
+                    .event_type(EventType::Observation)
+                    .content("outside temporal frame")
+                    .summary("outside temporal frame")
+                    .embedding(vec![1.0, 0.0, 0.0, 0.0])
+                    .importance(0.5)
+                    .timestamp(outside_ts)
+                    .agent_id(test_agent())
+                    .build()
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Utf8, false),
+            arrow_schema::Field::new("layer", arrow_schema::DataType::Utf8, false),
+            arrow_schema::Field::new("score", arrow_schema::DataType::Float32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![
+                    outside_id.to_string(),
+                    inside_id.to_string(),
+                ])),
+                Arc::new(StringArray::from(vec!["episodic", "episodic"])),
+                Arc::new(Float32Array::from(vec![0.8, 0.8])),
+            ],
+        )
+        .unwrap();
+        let frame = ParsedTimeFrame {
+            after_ms: Some(
+                Timestamp::parse_date_or_rfc3339("2026-01-01T00:00:00Z")
+                    .unwrap()
+                    .timestamp_ms(),
+            ),
+            before_ms: Some(
+                Timestamp::parse_date_or_rfc3339("2026-02-01T00:00:00Z")
+                    .unwrap()
+                    .timestamp_ms(),
+            ),
+        };
+
+        let scored = db
+            .load_scored_memories_from_batches(&[batch], test_agent(), frame)
+            .await
+            .unwrap();
+
+        assert_eq!(scored[0].record.id(), inside_id);
+        assert_eq!(scored[0].score_breakdown.temporal_relevance, 1.0);
+        assert!(
+            scored[0].score_breakdown.temporal_relevance
+                > scored[1].score_breakdown.temporal_relevance
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compiled_think_context_preserves_soft_temporal_reranking() {
+        let storage: Arc<dyn PhysicalStore> = Arc::new(MemoryStore::new());
+        let (db, _dir) = temp_db_with_storage(storage).await;
+        db.set_embedder(Arc::new(UniformKeywordEmbedder));
+
+        for (content, timestamp) in [
+            (
+                "outside calendar evidence",
+                Timestamp::parse_date_or_rfc3339("2025-12-15T00:00:00Z").unwrap(),
+            ),
+            (
+                "inside calendar evidence",
+                Timestamp::parse_date_or_rfc3339("2026-01-15T00:00:00Z").unwrap(),
+            ),
+        ] {
+            db.remember(
+                EpisodicRecord::builder()
+                    .event_type(EventType::Observation)
+                    .content(content)
+                    .summary(content)
+                    .embedding(vec![1.0, 0.0, 0.0, 0.0])
+                    .importance(0.5)
+                    .timestamp(timestamp)
+                    .agent_id(test_agent())
+                    .build()
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+
+        let (result, _diagnostics) = db
+            .ql()
+            .execute_with_diagnostics(
+                r#"THINK ABOUT "What happened in January 2026?" BUDGET 4096 LIMIT 2"#,
+            )
+            .await
+            .unwrap();
+        let context = match result {
+            QueryResult::Records(records) => records.context.unwrap(),
+            other => panic!("expected contextual record results, got {other:?}"),
+        };
+        let inside = context.find("inside calendar evidence").unwrap();
+        let outside = context.find("outside calendar evidence").unwrap();
+
+        assert!(
+            inside < outside,
+            "in-frame evidence must precede out-of-frame evidence in THINK context: {context}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compiled_think_renders_typed_preference_evidence() {
+        let storage: Arc<dyn PhysicalStore> = Arc::new(MemoryStore::new());
+        let (db, _dir) = temp_db_with_storage(storage).await;
+        db.set_embedder(Arc::new(UniformKeywordEmbedder));
+        let observed_at = Timestamp::parse_date_or_rfc3339("2026-01-15T00:00:00Z").unwrap();
+
+        db.remember(
+            EpisodicRecord::builder()
+                .event_type(EventType::Observation)
+                .content("[session] user: I prefer Sony accessories when traveling.")
+                .summary("I prefer Sony accessories when traveling.")
+                .embedding(vec![1.0, 0.0, 0.0, 0.0])
+                .timestamp(observed_at)
+                .agent_id(test_agent())
+                .build()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let (result, _diagnostics) = db
+            .ql()
+            .execute_with_diagnostics(
+                r#"THINK ABOUT "Can you recommend photography accessories?" BUDGET 4096 LIMIT 2"#,
+            )
+            .await
+            .unwrap();
+        let context = match result {
+            QueryResult::Records(records) => records.context.unwrap(),
+            other => panic!("expected contextual record results, got {other:?}"),
+        };
+
+        assert!(context.contains("Preference evidence: owner=query-exec-tests"));
+        assert!(context.contains("polarity=positive"));
+        assert!(context.contains("target=Sony accessories"));
+        assert!(context.contains("context: traveling"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn entity_sub_recalls_preserve_namespace_scope() {
+        let storage: Arc<dyn PhysicalStore> = Arc::new(MemoryStore::new());
+        let (db, _dir) = temp_db_with_storage(storage).await;
+        db.set_embedder(Arc::new(UniformKeywordEmbedder));
+        let allowed = Namespace::default();
+        let hidden = Namespace::new("hidden-entity-scope").unwrap();
+
+        for (content, namespace) in [
+            ("bike maintenance in allowed namespace", allowed),
+            ("car maintenance in allowed namespace", allowed),
+            ("bike secret from hidden namespace", hidden),
+            ("car secret from hidden namespace", hidden),
+        ] {
+            db.remember(
+                EpisodicRecord::builder()
+                    .event_type(EventType::Observation)
+                    .content(content)
+                    .summary(content)
+                    .embedding(vec![1.0, 0.0, 0.0, 0.0])
+                    .namespace(namespace)
+                    .agent_id(test_agent())
+                    .build()
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+
+        let lists = crate::retrieval::decompose::entity_recall_lists(
+            &db,
+            None,
+            "Which did I maintain first, the bike or the car?",
+            Some(&[allowed]),
+            4,
+        )
+        .await;
+
+        assert_eq!(lists.len(), 2);
+        assert!(lists.iter().flatten().all(|result| {
+            result
+                .record
+                .namespace()
+                .is_some_and(|namespace| *namespace == allowed)
+        }));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn event_anchor_grounding_preserves_namespace_scope() {
+        let storage: Arc<dyn PhysicalStore> = Arc::new(MemoryStore::new());
+        let (db, _dir) = temp_db_with_storage(storage).await;
+        db.set_embedder(Arc::new(UniformKeywordEmbedder));
+        let allowed = Namespace::default();
+        let hidden = Namespace::new("hidden-anchor-scope").unwrap();
+        let allowed_ts = Timestamp::parse_date_or_rfc3339("2026-01-10T00:00:00Z").unwrap();
+        let hidden_ts = Timestamp::parse_date_or_rfc3339("2026-02-10T00:00:00Z").unwrap();
+
+        for (content, namespace, timestamp, importance) in [
+            ("the migration", allowed, allowed_ts, 0.2),
+            ("the migration hidden copy", hidden, hidden_ts, 1.0),
+        ] {
+            db.remember(
+                EpisodicRecord::builder()
+                    .event_type(EventType::Observation)
+                    .content(content)
+                    .summary(content)
+                    .embedding(vec![1.0, 0.0, 0.0, 0.0])
+                    .importance(importance)
+                    .timestamp(timestamp)
+                    .namespace(namespace)
+                    .agent_id(test_agent())
+                    .build()
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+
+        let frame = crate::retrieval::temporal_ground::ground_temporal_frame(
+            &db,
+            None,
+            "what changed after the migration?",
+            Some(&[allowed]),
+            Timestamp::now().timestamp_ms(),
+        )
+        .await;
+
+        assert_eq!(frame.after_ms, Some(allowed_ts.timestamp_ms()));
+        assert_eq!(frame.before_ms, None);
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -103,13 +103,18 @@ impl<E: Embedder> RetryingEmbedder<E> {
                 Ok(result) => return Ok(result),
                 Err(e) if e.is_retryable() => {
                     tracing::warn!(attempt, %e, "transient embedding failure, will retry");
-                    last_error = Some(e);
+                    let retry_after = e.retry_after();
+                    last_error = Some((e, retry_after));
                 }
                 Err(e) => return Err(e),
             }
 
             if attempt < self.config.max_retries {
-                let backoff = jittered_backoff(self.config.base_backoff, attempt, jitter_seed);
+                let jittered = jittered_backoff(self.config.base_backoff, attempt, jitter_seed);
+                let backoff = last_error
+                    .as_ref()
+                    .and_then(|(_, retry_after)| *retry_after)
+                    .map_or(jittered, |retry_after| retry_after.max(jittered));
                 let elapsed = start.elapsed();
                 let remaining = self.config.max_cumulative_timeout.saturating_sub(elapsed);
 
@@ -132,9 +137,10 @@ impl<E: Embedder> RetryingEmbedder<E> {
             }
         }
 
-        Err(last_error.unwrap_or_else(|| {
-            hirn_core::HirnError::provider_permanent("retry loop exited without an attempt")
-        }))
+        Err(last_error.map_or_else(
+            || hirn_core::HirnError::provider_permanent("retry loop exited without an attempt"),
+            |(error, _)| error,
+        ))
     }
 }
 
@@ -175,7 +181,7 @@ impl<E: Embedder> Embedder for RetryingEmbedder<E> {
 /// Full jitter samples in `0..base * 2^attempt`, capped at 64x the base.
 /// That spreads concurrent clients instead of preserving synchronized retry
 /// waves under provider rate limits or outages.
-fn jittered_backoff(base: Duration, attempt: u32, request_seed: u64) -> Duration {
+pub(crate) fn jittered_backoff(base: Duration, attempt: u32, request_seed: u64) -> Duration {
     if base.is_zero() {
         return Duration::ZERO;
     }
@@ -186,7 +192,7 @@ fn jittered_backoff(base: Duration, attempt: u32, request_seed: u64) -> Duration
     Duration::from_nanos(mixed % cap_nanos.max(1))
 }
 
-fn random_retry_seed() -> u64 {
+pub(crate) fn random_retry_seed() -> u64 {
     static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0x243f_6a88_85a3_08d3);
 
     let counter = REQUEST_COUNTER.fetch_add(0x9e37_79b9_7f4a_7c15, Ordering::Relaxed);

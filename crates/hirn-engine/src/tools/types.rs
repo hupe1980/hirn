@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use hirn_core::id::MemoryId;
 use hirn_core::metadata::Metadata;
 use hirn_core::timestamp::Timestamp;
-use hirn_core::types::{EdgeRelation, EventType, Namespace};
+use hirn_core::types::{EdgeRelation, EventType, MemoryType, Namespace};
 
 /// Request to store a new memory.
 #[derive(Debug, Clone)]
@@ -24,6 +24,10 @@ pub struct StoreRequest {
     pub metadata: Option<Metadata>,
     /// Optional entity names to extract/associate.
     pub entities: Option<Vec<String>>,
+    /// Optional composition authority tier (functional role) for the stored
+    /// memory. Controls type-aware conflict arbitration on the read path; when
+    /// unset, the role is derived from the record at scoring time.
+    pub functional_role: Option<MemoryType>,
 }
 
 /// Options for recalling memories.
@@ -108,6 +112,12 @@ pub struct RoutedRecall {
     pub primary_view: String,
     /// Normalized per-view routing weights.
     pub weights: RouteWeights,
+    /// Which backend decided the route: "model", "embedding", "local_model",
+    /// or "heuristic" (the provider-free cue fallback). Exposed so callers can
+    /// tell a model-backed route from a degraded one.
+    pub route_source: String,
+    /// Calibrated confidence in the primary view.
+    pub route_confidence: f32,
     /// Ranked records (populated for semantic/causal/entity routing; empty when
     /// a timeline was returned instead).
     pub records: Vec<RecallRecord>,

@@ -3616,6 +3616,7 @@ mod tests {
             causal_relevance: 0.0,
             surprise: 0.0,
             source_reliability: 0.0,
+            temporal_relevance: 0.0,
         };
         let results = db
             .recall_view()
@@ -3671,6 +3672,7 @@ mod tests {
             causal_relevance: 0.0,
             surprise: 0.0,
             source_reliability: 0.0,
+            temporal_relevance: 0.0,
         };
         assert!(w.validate().is_err());
     }
@@ -4103,6 +4105,7 @@ mod tests {
             causal_relevance: 0.0,
             surprise: 0.0,
             source_reliability: 0.0,
+            temporal_relevance: 0.0,
         };
         let results = db
             .recall_view()
@@ -4543,6 +4546,7 @@ mod tests {
             causal_relevance: 0.0,
             surprise: 0.0,
             source_reliability: 0.0,
+            temporal_relevance: 0.0,
         };
         let results = db
             .recall_view()
@@ -4615,6 +4619,7 @@ mod tests {
             causal_relevance: 0.0,
             surprise: 0.0,
             source_reliability: 0.0,
+            temporal_relevance: 0.0,
         };
         let results = db
             .recall_view()
@@ -5434,6 +5439,7 @@ mod tests {
             causal_relevance: 0.0,
             surprise: 0.0,
             source_reliability: 0.0,
+            temporal_relevance: 0.0,
         };
         let results = db
             .recall_view()
@@ -5583,6 +5589,7 @@ mod tests {
             causal_relevance: 0.0,
             surprise: 0.0,
             source_reliability: 0.0,
+            temporal_relevance: 0.0,
         };
         let results = db
             .recall_view()
@@ -5819,6 +5826,7 @@ mod tests {
             causal_relevance: 0.0,
             surprise: 0.0,
             source_reliability: 0.6,
+            temporal_relevance: 0.0,
         };
 
         let results = db
@@ -5854,13 +5862,14 @@ mod tests {
             causal_relevance: 0.0,
             surprise: 0.0,
             source_reliability: 0.0,
+            temporal_relevance: 0.0,
         };
 
         // Two calls with different source_rel but weight=0: scores should be identical.
         let score_direct =
-            scoring::composite_score(0.8, 0.5, 0.0, 0.01, 0, 0.0, 0.0, 0.0, 1.0, &w_with);
+            scoring::composite_score(0.8, 0.5, 0.0, 0.01, 0, 0.0, 0.0, 0.0, 1.0, 0.0, &w_with);
         let score_cross =
-            scoring::composite_score(0.8, 0.5, 0.0, 0.01, 0, 0.0, 0.0, 0.0, 0.5, &w_with);
+            scoring::composite_score(0.8, 0.5, 0.0, 0.01, 0, 0.0, 0.0, 0.0, 0.5, 0.0, &w_with);
 
         assert!(
             (score_direct - score_cross).abs() < 1e-6,
@@ -5881,12 +5890,13 @@ mod tests {
             causal_relevance: 0.0,
             surprise: 0.0,
             source_reliability: 1.0,
+            temporal_relevance: 0.0,
         };
 
         let score_high =
-            scoring::composite_score(0.0, 0.0, 0.0, 0.01, 0, 0.0, 0.0, 0.0, 1.0, &weights);
+            scoring::composite_score(0.0, 0.0, 0.0, 0.01, 0, 0.0, 0.0, 0.0, 1.0, 0.0, &weights);
         let score_low =
-            scoring::composite_score(0.0, 0.0, 0.0, 0.01, 0, 0.0, 0.0, 0.0, 0.5, &weights);
+            scoring::composite_score(0.0, 0.0, 0.0, 0.01, 0, 0.0, 0.0, 0.0, 0.5, 0.0, &weights);
 
         assert!(
             score_high > score_low,
@@ -6070,11 +6080,14 @@ mod tests {
             causal_relevance: 0.0,
             surprise: 0.0,
             source_reliability: 0.0,
+            temporal_relevance: 0.0,
         };
 
         // Same age (720h), same importance (0.5), different access_freq.
-        let unused = scoring::composite_score(0.0, 0.5, 720.0, 0.01, 0, 0.0, 0.0, 0.0, 0.0, &w);
-        let frequent = scoring::composite_score(0.0, 0.5, 720.0, 0.01, 10, 0.0, 0.0, 0.0, 0.0, &w);
+        let unused =
+            scoring::composite_score(0.0, 0.5, 720.0, 0.01, 0, 0.0, 0.0, 0.0, 0.0, 0.0, &w);
+        let frequent =
+            scoring::composite_score(0.0, 0.5, 720.0, 0.01, 10, 0.0, 0.0, 0.0, 0.0, 0.0, &w);
 
         assert!(
             frequent > unused,
@@ -6095,11 +6108,14 @@ mod tests {
             causal_relevance: 0.0,
             surprise: 0.0,
             source_reliability: 0.0,
+            temporal_relevance: 0.0,
         };
 
         // Same age (720h), same access_freq (0), different importance.
-        let low_imp = scoring::composite_score(0.0, 0.1, 720.0, 0.01, 0, 0.0, 0.0, 0.0, 0.0, &w);
-        let high_imp = scoring::composite_score(0.0, 0.9, 720.0, 0.01, 0, 0.0, 0.0, 0.0, 0.0, &w);
+        let low_imp =
+            scoring::composite_score(0.0, 0.1, 720.0, 0.01, 0, 0.0, 0.0, 0.0, 0.0, 0.0, &w);
+        let high_imp =
+            scoring::composite_score(0.0, 0.9, 720.0, 0.01, 0, 0.0, 0.0, 0.0, 0.0, 0.0, &w);
 
         assert!(
             high_imp > low_imp,
@@ -6122,9 +6138,11 @@ mod tests {
             causal_relevance: 0.0,
             surprise: 0.0,
             source_reliability: 0.0,
+            temporal_relevance: 0.0,
         };
 
-        let score_base = scoring::composite_score(0.0, 0.0, 100.0, 0.01, 0, 0.0, 0.0, 0.0, 0.0, &w);
+        let score_base =
+            scoring::composite_score(0.0, 0.0, 100.0, 0.01, 0, 0.0, 0.0, 0.0, 0.0, 0.0, &w);
         assert!(
             (score_base - 0.368).abs() < 0.01,
             "base case: exp(-0.01 * 100) ≈ 0.368, got {score_base}"
@@ -6132,7 +6150,8 @@ mod tests {
 
         // With importance=1.0, access_freq=0: adaptive_rate = 0.01 * 0.5 * 1 = 0.005
         // recency = exp(-0.005 * 100) = exp(-0.5) ≈ 0.607
-        let score_imp = scoring::composite_score(0.0, 1.0, 100.0, 0.01, 0, 0.0, 0.0, 0.0, 0.0, &w);
+        let score_imp =
+            scoring::composite_score(0.0, 1.0, 100.0, 0.01, 0, 0.0, 0.0, 0.0, 0.0, 0.0, &w);
         assert!(
             (score_imp - 0.607).abs() < 0.01,
             "important: exp(-0.005 * 100) ≈ 0.607, got {score_imp}"
@@ -6140,7 +6159,8 @@ mod tests {
 
         // With importance=0, access_freq=9: adaptive_rate = 0.01 * 1 * 0.1 = 0.001
         // recency = exp(-0.001 * 100) = exp(-0.1) ≈ 0.905
-        let score_freq = scoring::composite_score(0.0, 0.0, 100.0, 0.01, 9, 0.0, 0.0, 0.0, 0.0, &w);
+        let score_freq =
+            scoring::composite_score(0.0, 0.0, 100.0, 0.01, 9, 0.0, 0.0, 0.0, 0.0, 0.0, &w);
         assert!(
             (score_freq - 0.905).abs() < 0.01,
             "frequent: exp(-0.001 * 100) ≈ 0.905, got {score_freq}"

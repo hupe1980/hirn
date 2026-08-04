@@ -429,6 +429,14 @@ pub fn analyze(stmt: &ast::Statement, ctx: &AnalyzeContext) -> HirnResult<TypedS
 // ── Statement analyzers ────────────────────────────────────────────────
 
 fn analyze_recall(r: &ast::RecallStmt, ctx: &AnalyzeContext) -> HirnResult<TypedRecall> {
+    if r.as_of.is_some()
+        && (r.expand.is_some() || r.follow_causes.is_some() || r.with_prospective.unwrap_or(false))
+    {
+        return Err(HirnError::InvalidInput(
+            "AS OF cannot be combined with EXPAND GRAPH, FOLLOW CAUSES, or WITH PROSPECTIVE until snapshot constraints are enforced across expansion"
+                .to_string(),
+        ));
+    }
     if let Some(topic) = &r.topic {
         reject_unbound_string_param(topic, "TOPIC")?;
     }
@@ -1413,6 +1421,19 @@ mod tests {
                 assert_eq!(r.topic.as_deref(), Some("deployment"));
             }
             _ => panic!("expected Recall"),
+        }
+    }
+
+    #[test]
+    fn rejects_as_of_graph_expansion_that_cannot_preserve_snapshot() {
+        for query in [
+            r#"RECALL episodic ABOUT "deployment" AS OF "2026-03-01T12:00:00Z" EXPAND GRAPH DEPTH 2"#,
+            r#"RECALL episodic ABOUT "deployment" AS OF "2026-03-01T12:00:00Z" FOLLOW CAUSES DEPTH 2"#,
+            r#"RECALL episodic ABOUT "deployment" AS OF "2026-03-01T12:00:00Z" WITH PROSPECTIVE ON"#,
+        ] {
+            let statement = parse(query).unwrap();
+            let error = analyze(&statement, &AnalyzeContext::default()).unwrap_err();
+            assert!(error.to_string().contains("AS OF cannot be combined"));
         }
     }
 

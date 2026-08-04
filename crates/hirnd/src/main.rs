@@ -602,7 +602,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let raft = match log_store_result {
             Ok(log_store) => {
-                let state_machine = Arc::new(hirnd::raft::HirnStateMachine::new());
+                // Durable state machine sharing the log store's redb database, so
+                // applied cluster metadata (realm ownership, node registry,
+                // leases, lease fence) survives a snapshot-driven log purge +
+                // restart instead of resetting to empty.
+                let state_machine = Arc::new(
+                    hirnd::raft::HirnStateMachine::open(
+                        log_store.database(),
+                        log_store.write_lock(),
+                    )
+                    .map_err(|e| format!("failed to open durable Raft state machine: {e}"))?,
+                );
                 let network = hirnd::raft::network::HirnRaftNetworkFactory::new(
                     raft_config
                         .transport_secret

@@ -117,6 +117,19 @@ impl DurableLogStore {
             write_lock: Arc::new(Mutex::new(())),
         })
     }
+
+    /// Share the underlying redb database so the Raft state machine can persist
+    /// its own tables in the same file (durability across snapshot + restart).
+    pub fn database(&self) -> Arc<Database> {
+        Arc::clone(&self.db)
+    }
+
+    /// Share the write-serialization mutex. redb permits one writer at a time;
+    /// the state machine takes the same lock so its writes never contend with
+    /// the log store's on `begin_write`.
+    pub fn write_lock(&self) -> Arc<Mutex<()>> {
+        Arc::clone(&self.write_lock)
+    }
 }
 
 impl RaftLogReader<TypeConfig> for DurableLogStore {

@@ -123,6 +123,21 @@ cargo run -p hirn-bench -- external --format-name longmemeval --auto-download --
 
 By default every run is **retrieval-only**: no chat-completion network calls are made and the published scores are retrieval metrics (containment, token F1, recall accuracy, MRR, nDCG). The `external` subcommand can additionally run an LLM QA reader and an LLM judge:
 
+LongMemEval uses each question's published `haystack_sessions` as a pre-retrieval
+visibility boundary. Both THINK context assembly and RECALL—including temporal
+grounding on the direct surface and query decomposition on both surfaces—remain
+inside that boundary. The active surface is recorded as
+`per-query-haystack`. The reader prompt strategy is versioned and published as
+`reader_prompt_strategy`; the current `evidence-notes-v1` strategy reconciles
+updates and temporal relations internally while returning only a short final answer.
+
+The current checked-in full oracle result is **0.6500 `official_reader_accuracy`**
+over 500 questions, with 0.7913 retrieval containment and 27/30 correct abstentions.
+It is reviewable as
+[Markdown](../../bench-results/longmemeval-oracle-product-temporal-reader-v2.md) and
+[JSON](../../bench-results/longmemeval-oracle-product-temporal-reader-v2.json). It does not
+establish SOTA: preference following scores 0.2000 and temporal reasoning 0.3985.
+
 | Flag | Default | Meaning |
 |------|---------|---------|
 | `--reader <MODEL>` | disabled | Generate an answer per query from the SAME retrieved context the harness scores (e.g. `gpt-4o`). Requires `OPENAI_API_KEY` (or a `.env` file, same convention as `precompute`). |
@@ -153,14 +168,20 @@ LongMemEval auto-download is pinned to HuggingFace revision `2ec2a557f339b6c0369
 ```bash
 # 1. Acquire the dataset (pinned HF revision; needs HF_TOKEN if gated for you)
 cargo run -p hirn-bench -- precompute-external --format-name longmemeval --auto-download \
-  --output embeddings/longmemeval_embeddings.json
+  --output embeddings/longmemeval_oracle_embeddings.json
 
-# 2. Full-corpus run with reader + official judge, seed + dataset hash pinned
-cargo run --release -p hirn-bench -- external --format-name longmemeval --auto-download \
-  --embeddings embeddings/longmemeval_embeddings.json --embedding-model-label text-embedding-3-small \
-  --full-corpus --runs 1 --seed 0 \
+# 2. Full 500-query oracle run with official per-query haystacks, reader, and judge
+cargo run --release -p hirn-bench -- external --format-name longmemeval \
+  --data-dir "$LONGMEMEVAL_ORACLE_DIR" \
+  --embeddings embeddings/longmemeval_oracle_embeddings.json \
+  --embedding-model-label text-embedding-3-small --dims 1536 --token-budget 4096 --k 10 \
+  --retrieval-profile minimal --execution-surface compiled-hirnql \
+  --full-corpus --runs 1 --no-baselines --seed 0 \
   --reader gpt-4o --judge gpt-4o --reader-temperature 0.0 --reader-concurrency 4 \
-  --format markdown --output bench-results/longmemeval.md --json-output bench-results/longmemeval.json
+  --expect-dataset-hash ff7ed687a502556b330b41fee915854b7b944c950fb54c6715a7cb28a1fa9034 \
+  --environment-label "macOS arm64; official per-query haystack; evidence-notes-v1; hydrated product temporal+RRF" \
+  --format markdown --output bench-results/longmemeval-oracle-product-temporal-reader-v2.md \
+  --json-output bench-results/longmemeval-oracle-product-temporal-reader-v2.json
 
 # 3. Re-runs: pin the dataset bytes with the hash printed in step 2
 #    (also published as metadata.dataset_hash_blake3 in the JSON artifact)

@@ -140,6 +140,7 @@ fn sample_scoring_weights() -> ScoringWeights {
         activation: 0.4,
         causal_relevance: 0.2,
         source_reliability: 0.0,
+        temporal_relevance: 0.0,
     }
 }
 
@@ -152,6 +153,7 @@ fn sample_score_breakdown() -> ScoreBreakdown {
         causal_relevance: 0.10,
         surprise: 0.15,
         source_reliability: 0.0,
+        temporal_relevance: 0.20,
     }
 }
 

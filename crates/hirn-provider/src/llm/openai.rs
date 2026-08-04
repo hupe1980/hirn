@@ -217,16 +217,19 @@ impl LlmProvider for OpenAILlmProvider {
                 .get("retry-after")
                 .and_then(|v| v.to_str().ok())
                 .and_then(parse_retry_after);
-            let body = resp.text().await.unwrap_or_default();
+            let body = crate::transport::read_error_response(resp).await;
             return Err(
                 LlmError::from_status(&self.model, status.as_u16(), body, retry_after).into(),
             );
         }
 
-        let parsed: ChatResponse = resp.json().await.map_err(|e| LlmError::InvalidResponse {
-            provider: self.model.clone(),
-            details: format!("failed to parse LLM response: {e}"),
-        })?;
+        let parsed: ChatResponse =
+            crate::transport::decode_json_response(resp)
+                .await
+                .map_err(|details| LlmError::InvalidResponse {
+                    provider: self.model.clone(),
+                    details,
+                })?;
 
         let content = parsed
             .choices

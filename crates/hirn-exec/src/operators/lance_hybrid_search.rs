@@ -5,7 +5,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, Float32Array, Int64Array, RecordBatch, StringArray, UInt32Array, UInt64Array,
+    Array, FixedSizeListArray, Float32Array, Int64Array, RecordBatch, StringArray, UInt32Array,
+    UInt64Array,
 };
 use arrow_schema::SchemaRef;
 use datafusion_common::{DataFusionError, Result};
@@ -230,6 +231,9 @@ pub(crate) struct RecallRow {
     pub(crate) surprise: Option<f32>,
     pub(crate) evidence_count: Option<u32>,
     pub(crate) invocation_count: Option<u64>,
+    /// Internal vector payload used by downstream graph lateral inhibition.
+    /// This is deliberately omitted from the public recall output schema.
+    pub(crate) embedding: Option<Vec<f32>>,
 }
 
 impl RecallRow {
@@ -650,6 +654,7 @@ fn standardize_batches(
                         surprise: Some(surprise.value(row)),
                         evidence_count: None,
                         invocation_count: None,
+                        embedding: embedding_value(batch, row),
                     });
                 }
             }
@@ -677,6 +682,7 @@ fn standardize_batches(
                         surprise: None,
                         evidence_count: Some(evidence_count.value(row)),
                         invocation_count: None,
+                        embedding: embedding_value(batch, row),
                     });
                 }
             }
@@ -704,6 +710,7 @@ fn standardize_batches(
                         surprise: None,
                         evidence_count: None,
                         invocation_count: Some(invocation_count.value(row)),
+                        embedding: embedding_value(batch, row),
                     });
                 }
             }
@@ -828,6 +835,7 @@ fn standardize_scanned_batches(
                         surprise: Some(surprise.value(row)),
                         evidence_count: None,
                         invocation_count: None,
+                        embedding: embedding_value(batch, row),
                     });
                 }
             }
@@ -855,6 +863,7 @@ fn standardize_scanned_batches(
                         surprise: None,
                         evidence_count: Some(evidence_count.value(row)),
                         invocation_count: None,
+                        embedding: embedding_value(batch, row),
                     });
                 }
             }
@@ -882,6 +891,7 @@ fn standardize_scanned_batches(
                         surprise: None,
                         evidence_count: None,
                         invocation_count: Some(invocation_count.value(row)),
+                        embedding: embedding_value(batch, row),
                     });
                 }
             }
@@ -922,6 +932,19 @@ fn f32_column<'a>(
                 "missing/bad `{name}` column in search batch"
             ))
         })
+}
+
+fn embedding_value(batch: &RecordBatch, row: usize) -> Option<Vec<f32>> {
+    let embeddings = batch
+        .column_by_name("embedding")?
+        .as_any()
+        .downcast_ref::<FixedSizeListArray>()?;
+    if embeddings.is_null(row) {
+        return None;
+    }
+    let values = embeddings.value(row);
+    let values = values.as_any().downcast_ref::<Float32Array>()?;
+    Some(values.values().to_vec())
 }
 
 fn i64_column<'a>(

@@ -1,0 +1,63 @@
+{% extends "docs.html" %}
+
+{% block breadcrumb %}
+  {%- if section.title != "Documentation" %}
+    <span aria-hidden="true">/</span>
+    <span aria-current="page">{{ section.title }}</span>
+  {%- endif %}
+{% endblock breadcrumb %}
+
+{% block doc_body %}
+  {{ section.content | safe }}
+
+  {#- A section index lists what it contains. Without this a reader who lands
+      on /docs/concepts/ from search sees prose and no way onward. -#}
+  {%- if section.pages or section.subsections %}
+  <div class="card-grid">
+    {%- for p in section.pages %}
+      <a class="card" href="{{ p.permalink }}">
+        <h3>{{ p.title }}</h3>
+        {%- if p.description %}<p>{{ p.description }}</p>{% endif %}
+      </a>
+    {%- endfor %}
+    {%- for sp in section.subsections %}
+      {%- set sub = get_section(path=sp) %}
+      <a class="card" href="{{ sub.permalink }}">
+        <h3>{{ sub.title }}</h3>
+        {%- if sub.description %}<p>{{ sub.description }}</p>{% endif %}
+      </a>
+    {%- endfor %}
+  </div>
+  {%- endif %}
+
+  {#- Cross-section pointers come last, after the reader has seen what this
+      section actually contains. Held in front matter so the template controls
+      that ordering rather than wherever the prose happened to put them. -#}
+  {%- if section.extra.related %}
+  <h2 id="related">Related</h2>
+  <ul>
+    {%- for item in section.extra.related %}
+      <li>{{ item | markdown(inline=true) | safe }}</li>
+    {%- endfor %}
+  </ul>
+  {%- endif %}
+{% endblock doc_body %}
+
+{% block doc_toc %}
+  {#- Same single-root shape as a page: descend past the `# Title` heading. -#}
+  {%- if section.toc | length == 1 and section.toc[0].children -%}
+    {%- set_global entries = section.toc[0].children -%}
+  {%- else -%}
+    {%- set_global entries = section.toc -%}
+  {%- endif -%}
+  {%- if entries | length > 1 %}
+  <nav class="toc" aria-label="On this page">
+    <p class="toc-title">On this page</p>
+    <ul>
+      {%- for h in entries %}
+        <li><a href="#{{ h.id }}">{{ h.title }}</a></li>
+      {%- endfor %}
+    </ul>
+  </nav>
+  {%- endif %}
+{% endblock doc_toc %}

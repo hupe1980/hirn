@@ -12,8 +12,10 @@ pub mod id;
 pub mod interner;
 pub mod metadata;
 pub mod namespace;
+pub mod nlu;
 pub mod offline;
 pub mod persist;
+pub mod preference;
 pub mod procedural;
 pub mod prospective;
 pub mod provenance;
@@ -27,6 +29,7 @@ pub mod semantic;
 pub mod stats;
 pub mod svo_event;
 pub mod temporal;
+pub mod temporal_ledger;
 pub mod text_util;
 pub mod timestamp;
 pub mod tokenizer;
@@ -38,8 +41,8 @@ pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState};
 pub use config::{
     AdmissionPoisoningAction, ConflictResolutionPolicy, ConflictResolutionPolicyOverrides,
     DistanceMetric, EmbedderCircuitBreakerRuntimeConfig, EmbedderPersistentCacheRuntimeConfig,
-    EmbedderRetryConfig, EmbedderRuntimeConfig, EvolutionMode, HirnConfig, TextRetention,
-    TierPolicy,
+    EmbedderRetryConfig, EmbedderRuntimeConfig, EvolutionMode, HirnConfig, NluConfig,
+    TextRetention, TierPolicy,
 };
 pub use content::{ExternalFetchPolicy, MemoryContent};
 pub use embed::{
@@ -50,6 +53,11 @@ pub use embed::{
 pub use embedding_dimension::EmbeddingDimension;
 pub use error::{EmbeddingFailureDetail, HirnError, HirnResult, PartialEmbeddingBatch};
 pub use id::MemoryId;
+pub use nlu::{
+    Calibration, CalibrationBin, CalibrationReport, CalibrationSample, Classification,
+    ClassificationTask, DecisionSource, EventExtractor, LabelSpec, MIN_CALIBRATION_SAMPLES,
+    NliJudgment, NliLabel, NliModel, NluBudget, StructuredEvent, TextClassifier,
+};
 pub use offline::{
     BudgetExceededPolicy, CognitiveJob, CognitiveJobKind, ConflictResolutionPolicySnapshot,
     GeneratedCognitionDecision, GeneratedCognitionKind, GeneratedCognitionReview,
@@ -59,6 +67,10 @@ pub use offline::{
     OfflineSchedulerConfig, OfflineSchedulerMetrics, OperatorBudget, PlanningAgenda,
     PlanningMemoryRef, PlanningSubgoal, PlanningSupportKind, ReconcileArbitrationStatus,
     ReconcileProposal, ReconcileProposalAction, ReconcileProposalMember, TemporalWindow,
+};
+pub use preference::{
+    PREFERENCE_EVIDENCE_METADATA_KEY, PreferenceEvidence, PreferencePolarity,
+    annotate_inferred_preference, infer_preference_evidence,
 };
 pub use quarantine::QuarantinedRecordKind;
 pub use resource::{
@@ -73,5 +85,6 @@ pub use revision::{
     LogicalMemoryId, RecallSnapshot, RevisionId, RevisionOperation, RevisionRef, RevisionState,
 };
 pub use stats::WelfordStats;
+pub use temporal::{TemporalEnvelope, TemporalState, TimePrecision};
 pub use timestamp::Timestamp;
 pub use tokenizer::{EstimatingTokenizer, Tokenizer};

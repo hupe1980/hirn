@@ -6,7 +6,7 @@ use crate::provenance::Provenance;
 use crate::resource::EvidenceLink;
 use crate::revision::{LogicalMemoryId, RevisionId, RevisionOperation, RevisionState};
 use crate::timestamp::Timestamp;
-use crate::types::{AgentId, EdgeRelation, KnowledgeType, Namespace, Origin};
+use crate::types::{AgentId, EdgeRelation, KnowledgeType, MemoryType, Namespace, Origin};
 
 /// A typed relationship to another semantic concept.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -63,6 +63,14 @@ pub struct SemanticRecord {
     pub merged_into: Option<LogicalMemoryId>,
     /// Whether this record has been archived (importance decayed below threshold).
     pub archived: bool,
+    /// Functional role for type-aware composition (MemGuard). Defaults from
+    /// `knowledge_type` (see [`MemoryType::from_knowledge_type`]): propositional/
+    /// taxonomic → stable-fact, prescriptive → behavioral-rule, belief → preference.
+    #[serde(default)]
+    pub functional_role: MemoryType,
+    /// Pin: exempt this record from automated decay-driven archival/purge.
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 impl SemanticRecord {
@@ -96,6 +104,25 @@ impl SemanticRecord {
     #[must_use]
     pub const fn is_live(&self) -> bool {
         !self.is_retracted() && !self.is_merged()
+    }
+
+    /// Whether this fact's observed-time validity interval contains instant `t`
+    /// (`valid_from <= t < valid_until`, with `None` meaning still-valid). This
+    /// is the exact bi-temporal `AS OF OBSERVED` test — accurate once
+    /// supersession closes `valid_until` (Zep-style `t_invalid`).
+    #[must_use]
+    pub fn is_valid_at(&self, t: Timestamp) -> bool {
+        self.valid_from.timestamp_ms() <= t.timestamp_ms()
+            && self
+                .valid_until
+                .is_none_or(|end| t.timestamp_ms() < end.timestamp_ms())
+    }
+
+    /// The observed-time validity interval `[valid_from, valid_until)` as a
+    /// [`TimeInterval`] for Allen-relation temporal ranking.
+    #[must_use]
+    pub fn validity_interval(&self) -> crate::temporal::TimeInterval {
+        crate::temporal::TimeInterval::new(self.valid_from, self.valid_until)
     }
 
     /// Computed state for this revision when treated as the active head.
@@ -136,6 +163,8 @@ pub struct SemanticRecordBuilder {
     agent_id: Option<AgentId>,
     evidence_links: Vec<EvidenceLink>,
     origin: Option<Origin>,
+    functional_role: Option<MemoryType>,
+    pinned: bool,
 }
 
 impl SemanticRecordBuilder {
@@ -159,6 +188,30 @@ impl SemanticRecordBuilder {
     #[must_use]
     pub const fn belief(self) -> Self {
         self.knowledge_type(KnowledgeType::Belief)
+    }
+
+    /// Set the functional role for type-aware composition (MemGuard). When unset,
+    /// it is derived from `knowledge_type` at `build()`.
+    #[must_use]
+    pub const fn functional_role(mut self, role: MemoryType) -> Self {
+        self.functional_role = Some(role);
+        self
+    }
+
+    /// Mark this record as a user preference (`KnowledgeType::Belief` +
+    /// `MemoryType::Preference`), keeping the storage and composition axes in sync.
+    #[must_use]
+    pub const fn preference(mut self) -> Self {
+        self.knowledge_type = Some(KnowledgeType::Belief);
+        self.functional_role = Some(MemoryType::Preference);
+        self
+    }
+
+    /// Pin the record so automated decay never archives or purges it.
+    #[must_use]
+    pub const fn pinned(mut self, pinned: bool) -> Self {
+        self.pinned = pinned;
+        self
     }
 
     /// Set the concept description.
@@ -255,12 +308,19 @@ impl SemanticRecordBuilder {
             Provenance::with_origin(self.origin.unwrap_or(Origin::DirectObservation), agent_id);
         provenance.evidence_links = self.evidence_links;
 
+        let knowledge_type = self.knowledge_type.unwrap_or(KnowledgeType::Propositional);
+        // Default the functional role from the knowledge type so the storage and
+        // composition axes stay consistent unless the caller overrode it.
+        let functional_role = self
+            .functional_role
+            .unwrap_or_else(|| MemoryType::from_knowledge_type(knowledge_type));
+
         Ok(SemanticRecord {
             id,
             logical_memory_id: LogicalMemoryId::from_memory_id(id),
             revision_id: RevisionId::from_memory_id(id),
             concept,
-            knowledge_type: self.knowledge_type.unwrap_or(KnowledgeType::Propositional),
+            knowledge_type,
             description,
             embedding: self.embedding,
             related_concepts: self.related_concepts,
@@ -283,6 +343,8 @@ impl SemanticRecordBuilder {
             superseded_by: None,
             merged_into: None,
             archived: false,
+            functional_role,
+            pinned: self.pinned,
         })
     }
 }

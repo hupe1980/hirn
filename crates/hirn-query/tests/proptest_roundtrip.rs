@@ -291,11 +291,18 @@ proptest! {
         assert_round_trip(&query);
     }
 
-    /// R-47: the plan-cache key must distinguish string literals that differ
-    /// only by ASCII case. Whenever lowercasing the literal actually changes
-    /// it, the two RECALL queries must hash to distinct cache keys — otherwise
-    /// one query would be served the other's compiled plan (wrong embedding
-    /// vector + FTS term). Lowercasing the *keywords* must never change the key.
+    /// The plan-cache key must distinguish queries that differ only by ASCII
+    /// case — in a string literal *or* outside one.
+    ///
+    /// Inside a literal, a collision would serve one query the other's
+    /// compiled plan with the wrong embedding vector and FTS term. Outside a
+    /// literal, unquoted identifiers are case-sensitive: `NAMESPACE alice` and
+    /// `NAMESPACE ALICE` name different namespaces, so folding case there
+    /// would hand one tenant a plan compiled for another.
+    ///
+    /// Normalization therefore collapses only whitespace outside literals.
+    /// Keyword-case variants key to distinct — but individually correct —
+    /// entries; that costs a cache slot, never correctness.
     #[test]
     fn case_variant_literals_get_distinct_keys(about in "[A-Za-z][A-Za-z ]{0,19}") {
         let about = about.trim().to_string();
@@ -313,13 +320,24 @@ proptest! {
             );
         }
 
-        // Lowercasing only the KEYWORDS (literal unchanged) keeps the same key.
+        // Case outside the literal is preserved too, so keyword-case variants
+        // key separately rather than sharing one entry.
         let q_lower_kw = format!("recall episodic about \"{about}\"");
-        prop_assert_eq!(
+        prop_assert_ne!(
             query_hash(&q_upper),
             query_hash(&q_lower_kw),
-            "case-variant keywords must share a key: {:?} vs {:?}",
+            "case-variant keywords must key independently: {:?} vs {:?}",
             q_upper, q_lower_kw
+        );
+
+        // Whitespace outside the literal *is* collapsed, so a query that
+        // differs only by run-length still hits the same entry.
+        let q_spaced = format!("RECALL   episodic    ABOUT  \"{about}\"");
+        prop_assert_eq!(
+            query_hash(&q_upper),
+            query_hash(&q_spaced),
+            "outside-literal whitespace must not change the key: {:?} vs {:?}",
+            q_upper, q_spaced
         );
     }
 

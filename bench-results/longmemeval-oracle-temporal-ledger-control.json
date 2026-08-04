@@ -1,0 +1,3303 @@
+{
+  "run_id": "01KZ5TQ9YVH1CZ0016PXNAW6MX",
+  "metadata": {
+    "generated_at_rfc3339": "2026-08-04T07:37:41.284963+00:00",
+    "dataset_source": "external:longmemeval",
+    "corpus_embedding_source": "cache:embeddings/longmemeval_oracle_embeddings.json",
+    "embedding_model_label": "text-embedding-3-small",
+    "query_embedding_source": "cache",
+    "query_embedding_model_label": "text-embedding-3-small",
+    "embedding_dims": 1536,
+    "token_budget": 4096,
+    "k": 10,
+    "retrieval_profile": "minimal",
+    "execution_surface": "compiled-hirnql",
+    "query_text_hybrid": false,
+    "active_retrieval_surfaces": {
+      "per_query_haystack": true,
+      "query_text_hybrid": false,
+      "graph_routing": true,
+      "multivector": false,
+      "reranker": false,
+      "tokenizer": false,
+      "compiled_hirnql": true,
+      "quality_gate": false,
+      "iterative_retrieval": false,
+      "notes": [
+        "typed_temporal_extraction=false (no temporal envelope — every record ages uniformly (H-01 control arm))",
+        "nlu_enabled=true (model-backed routing/relation decisions with deterministic fallback)",
+        "compiled_hirnql=true via plain THINK/RECALL execution with diagnostics; quality_gate=false for benchmark minimal-profile parity, while iterative retrieval remains off because benchmark queries use local THINK mode",
+        "cache-backed benchmark embedder installed for query-time parity with ingest",
+        "ambient LLM enabled for query decomposition",
+        "minimal profile keeps provider-backed retrieval extras disabled",
+        "retrieval and THINK context are isolated to each query's official haystack"
+      ]
+    },
+    "runs": 1,
+    "seed": 0,
+    "dataset_files": [
+      {
+        "path": "longmemeval_oracle",
+        "blake3": "c7b0a5dc8cbb1170629c43e06f0c7029375324acb7c5bd7d73a7959be386d37a"
+      }
+    ],
+    "dataset_hash_blake3": "ff7ed687a502556b330b41fee915854b7b944c950fb54c6715a7cb28a1fa9034",
+    "reader_model": "gpt-4o",
+    "judge_model": "gpt-4o",
+    "environment": {
+      "os": "macos",
+      "arch": "aarch64",
+      "logical_cpus": 14,
+      "git_commit_sha": "07476b5fbc2320e6c5471b6c895924cef31a8d97",
+      "cargo_lock_blake3": "40dc8f7052baacf3fb8102b767f759d2e65f879c286ecec7789413bcfb6e43c4"
+    }
+  },
+  "results": [
+    {
+      "benchmark": "LongMemEval (/private/tmp/hirn-lme-oracle)",
+      "strategy": "hirn",
+      "run_id": "01KZ5TQ9YVH1CZ0016PXNAW6MX",
+      "categories": [
+        {
+          "name": "knowledge-update",
+          "containment": 0.9276695526695524,
+          "token_f1": 0.0028592555228064797,
+          "recall_accuracy": 0.7307692307692307,
+          "mrr": 0.4313695563695564,
+          "ndcg": 0.49714799805431864,
+          "semantic_similarity": 0.0129980141916176,
+          "false_positive_rate": 0.0,
+          "total": 78
+        },
+        {
+          "name": "multi-session",
+          "containment": 0.5967359039380511,
+          "token_f1": 0.0033889963801368344,
+          "recall_accuracy": 0.3533834586466165,
+          "mrr": 0.21790786490034603,
+          "ndcg": 0.24897054156259582,
+          "semantic_similarity": 0.0074239271192363815,
+          "false_positive_rate": 0.0,
+          "total": 133
+        },
+        {
+          "name": "single-session-assistant",
+          "containment": 0.9528468581335122,
+          "token_f1": 0.018383605241110556,
+          "recall_accuracy": 0.5535714285714286,
+          "mrr": 0.39836309523809527,
+          "ndcg": 0.4389973538169799,
+          "semantic_similarity": 0.01511486334273304,
+          "false_positive_rate": 0.0,
+          "total": 56
+        },
+        {
+          "name": "single-session-preference",
+          "containment": 0.6577947708008167,
+          "token_f1": 0.04920419247381593,
+          "recall_accuracy": 0.0,
+          "mrr": 0.0,
+          "ndcg": 0.0,
+          "semantic_similarity": 0.004784757072296911,
+          "false_positive_rate": 0.0,
+          "total": 30
+        },
+        {
+          "name": "single-session-user",
+          "containment": 0.94218641842702,
+          "token_f1": 0.0057197978708255146,
+          "recall_accuracy": 0.8142857142857143,
+          "mrr": 0.7785714285714286,
+          "ndcg": 0.7691087116182929,
+          "semantic_similarity": 0.016483728835956588,
+          "false_positive_rate": 0.0,
+          "total": 70
+        },
+        {
+          "name": "temporal-reasoning",
+          "containment": 0.7717310687423181,
+          "token_f1": 0.005331231846667125,
+          "recall_accuracy": 0.2706766917293233,
+          "mrr": 0.21190476190476187,
+          "ndcg": 0.21428828618889584,
+          "semantic_similarity": 0.008401563131341303,
+          "false_positive_rate": 0.0,
+          "total": 133
+        }
+      ],
+      "overall_containment": 0.7868212978882139,
+      "overall_token_f1": 0.008577611607236565,
+      "overall_recall_accuracy": 0.456,
+      "overall_mrr": 0.33524047619047626,
+      "overall_ndcg": 0.357624859132433,
+      "overall_semantic_similarity": 0.010524942776303834,
+      "false_positive_rate": 0.0,
+      "execution_latency": {
+        "p50": 705818.208,
+        "p95": 1292275.625,
+        "p99": 2712466.6250000005,
+        "min": 49483.375,
+        "max": 3079380.875,
+        "mean": 642809.9689999999
+      },
+      "evaluation_latency": {
+        "p50": 110.167,
+        "p95": 244.54099999999997,
+        "p99": 422.125,
+        "min": 20.75,
+        "max": 2193.458,
+        "mean": 128.486
+      },
+      "end_to_end_latency": {
+        "p50": 705944.375,
+        "p95": 1292385.875,
+        "p99": 2712576.75,
+        "min": 49588.209,
+        "max": 3079490.292,
+        "mean": 642938.456
+      },
+      "token_cost": {
+        "context_tokens": 1308992,
+        "prompt_tokens": 1317997,
+        "completion_tokens": 0,
+        "total_tokens": 1317997,
+        "avg_context_tokens_per_query": 2617.984,
+        "avg_prompt_tokens_per_query": 2635.994,
+        "avg_total_tokens_per_query": 2635.994
+      },
+      "tokens_per_query_mean": 4945.074,
+      "tokens_per_query_p50": 5241,
+      "tokens_per_query_p95": 6531,
+      "token_estimator": "tiktoken-rs/cl100k_base",
+      "context_tokens_per_query_mean": 2617.984,
+      "context_tokens_per_query_p50": 3002,
+      "context_tokens_per_query_p95": 3389,
+      "reader": {
+        "reader_model": "gpt-4o",
+        "reader_prompt_strategy": "evidence-notes-v2",
+        "judge_model": "gpt-4o",
+        "judge_protocol": "longmemeval-official",
+        "reader_temperature": 0.0,
+        "official_reader_accuracy": 0.678,
+        "answered_queries": 500,
+        "judged_queries": 500,
+        "abstention_queries": 30,
+        "abstention_correct": 27,
+        "category_accuracy": [
+          {
+            "name": "knowledge-update",
+            "accuracy": 0.7564102564102564,
+            "total": 78
+          },
+          {
+            "name": "multi-session",
+            "accuracy": 0.6691729323308271,
+            "total": 133
+          },
+          {
+            "name": "single-session-assistant",
+            "accuracy": 0.9642857142857143,
+            "total": 56
+          },
+          {
+            "name": "single-session-preference",
+            "accuracy": 0.4,
+            "total": 30
+          },
+          {
+            "name": "single-session-user",
+            "accuracy": 0.9571428571428572,
+            "total": 70
+          },
+          {
+            "name": "temporal-reasoning",
+            "accuracy": 0.43609022556390975,
+            "total": 133
+          }
+        ],
+        "reader_prompt_tokens_total": 1432819,
+        "reader_completion_tokens_total": 10622,
+        "reader_prompt_tokens_per_query_mean": 2865.638,
+        "reader_prompt_tokens_per_query_p50": 3241,
+        "reader_prompt_tokens_per_query_p95": 3615,
+        "reader_completion_tokens_per_query_mean": 21.244,
+        "reader_completion_tokens_per_query_p50": 14,
+        "reader_completion_tokens_per_query_p95": 61,
+        "judge_prompt_tokens_total": 93076,
+        "judge_completion_tokens_total": 827,
+        "per_query_verdicts": [
+          {
+            "query_id": "lme-gpt4_2655b836-1",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_2487a7cb-2",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_76048e76-3",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_2312f94c-4",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-0bb5a684-5",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-08f4fc43-6",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-2c63a862-7",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_385a5000-8",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-2a1811e2-9",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-bbf86515-10",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_5dcc0aab-11",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_0b2f1d21-12",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-f0853d11-13",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_6ed717ea-14",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_70e84552-15",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-a3838d2b-16",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_93159ced-17",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_2d58bcd6-18",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_65aabe59-19",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-982b5123-20",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-b9cfe692-21",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_4edbafa2-22",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-c8090214-23",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_483dd43c-24",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-e4e14d04-25",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-c9f37c46-26",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_2c50253f-27",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-dcfa8644-28",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_b4a80587-29",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_9a159967-30",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-cc6d1ec1-31",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_8c8961ae-32",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_d9af6064-33",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_7de946e7-34",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-d01c6aa8-35",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-993da5e2-36",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-a3045048-37",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_d31cdae3-38",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_cd90e484-39",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_88806d6e-40",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_4cd9eba1-41",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_93f6379c-42",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-b29f3365-43",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_2f56ae70-44",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-6613b389-45",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_78cf46a3-46",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_0a05b494-47",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_1a1dc16d-48",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_2f584639-49",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_213fd887-50",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_5438fa52-51",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_c27434e8-52",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_fe651585-53",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-8c18457d-54",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_70e84552_abs-55",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": true
+          },
+          {
+            "query_id": "lme-gpt4_93159ced_abs-56",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": true
+          },
+          {
+            "query_id": "lme-982b5123_abs-57",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": true
+          },
+          {
+            "query_id": "lme-c8090214_abs-58",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": true
+          },
+          {
+            "query_id": "lme-gpt4_c27434e8_abs-59",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": true
+          },
+          {
+            "query_id": "lme-gpt4_fe651585_abs-60",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": true
+          },
+          {
+            "query_id": "lme-0a995998-61",
+            "category": "multi-session",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-6d550036-62",
+            "category": "multi-session",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_59c863d7-63",
+            "category": "multi-session",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-b5ef892d-64",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-e831120c-65",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-3a704032-66",
+            "category": "multi-session",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_d84a3211-67",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-aae3761f-68",
+            "category": "multi-session",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_f2262a51-69",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-dd2973ad-70",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-c4a1ceb8-71",
+            "category": "multi-session",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_a56e767c-72",
+            "category": "multi-session",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-6cb6f249-73",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-46a3abf7-74",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-36b9f61e-75",
+            "category": "multi-session",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-28dc39ac-76",
+            "category": "multi-session",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_2f8be40d-77",
+            "category": "multi-session",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-2e6d26dc-78",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_15e38248-79",
+            "category": "multi-session",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-88432d0a-80",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-80ec1f4f-81",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-d23cf73b-82",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_7fce9456-83",
+            "category": "multi-session",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-d682f1a2-84",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-7024f17c-85",
+            "category": "multi-session",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_5501fe77-86",
+            "category": "multi-session",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_2ba83207-87",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-2318644b-88",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-2ce6a0f2-89",
+            "category": "multi-session",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_d12ceb0e-90",
+            "category": "multi-session",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-00ca467f-91",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-b3c15d39-92",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_31ff4165-93",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-eeda8a6d-94",
+            "category": "multi-session",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-2788b940-95",
+            "category": "multi-session",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-60bf93ed-96",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-9d25d4e0-97",
+            "category": "multi-session",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-129d1232-98",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-60472f9c-99",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_194be4b3-100",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-a9f6b44c-101",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-d851d5ba-102",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-5a7937c8-103",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_ab202e7f-104",
+            "category": "multi-session",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_e05b82a6-105",
+            "category": "multi-session",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_731e37d7-106",
+            "category": "multi-session",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-edced276-107",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-10d9b85a-108",
+            "category": "multi-session",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-e3038f8c-109",
+            "category": "multi-session",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-2b8f3739-110",
+            "category": "multi-session",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-1a8a66a6-111",
+            "category": "multi-session",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-c2ac3c61-112",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-bf659f65-113",
+            "category": "multi-session",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_372c3eed-114",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_2f91af09-115",
+            "category": "multi-session",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-81507db6-116",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-88432d0a_abs-117",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": true
+          },
+          {
+            "query_id": "lme-80ec1f4f_abs-118",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": true
+          },
+          {
+            "query_id": "lme-eeda8a6d_abs-119",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": true
+          },
+          {
+            "query_id": "lme-60bf93ed_abs-120",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": true
+          },
+          {
+            "query_id": "lme-edced276_abs-121",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": true
+          },
+          {
+            "query_id": "lme-gpt4_372c3eed_abs-122",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": true
+          },
+          {
+            "query_id": "lme-6a1eabeb-123",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-6aeb4375-124",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-830ce83f-125",
+            "category": "knowledge-update",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-852ce960-126",
+            "category": "knowledge-update",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-945e3d21-127",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-d7c942c3-128",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-71315a70-129",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-89941a93-130",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-ce6d2d27-131",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-9ea5eabc-132",
+            "category": "knowledge-update",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-07741c44-133",
+            "category": "knowledge-update",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-a1eacc2a-134",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-184da446-135",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-031748ae-136",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-4d6b87c8-137",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-0f05491a-138",
+            "category": "knowledge-update",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-08e075c7-139",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-f9e8c073-140",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-41698283-141",
+            "category": "knowledge-update",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-2698e78f-142",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-b6019101-143",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-45dc21b6-144",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-5a4f22c0-145",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-6071bd76-146",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-e493bb7c-147",
+            "category": "knowledge-update",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-618f13b2-148",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-72e3ee87-149",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-c4ea545c-150",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-01493427-151",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-6a27ffc2-152",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-2133c1b5-153",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-18bc8abd-154",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-db467c8c-155",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-7a87bd0c-156",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-e61a7584-157",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-1cea1afa-158",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-ed4ddc30-159",
+            "category": "knowledge-update",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-8fb83627-160",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-b01defab-161",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-22d2cb42-162",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-0e4e4c46-163",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-4b24c848-164",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-7e974930-165",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-603deb26-166",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-59524333-167",
+            "category": "knowledge-update",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-5831f84d-168",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-eace081b-169",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-affe2881-170",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-50635ada-171",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-e66b632c-172",
+            "category": "knowledge-update",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-0ddfec37-173",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-f685340e-174",
+            "category": "knowledge-update",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-cc5ded98-175",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-dfde3500-176",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-69fee5aa-177",
+            "category": "knowledge-update",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-7401057b-178",
+            "category": "knowledge-update",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-cf22b7bf-179",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-a2f3aa27-180",
+            "category": "knowledge-update",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-c7dc5443-181",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-06db6396-182",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-3ba21379-183",
+            "category": "knowledge-update",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-9bbe84a2-184",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-10e09553-185",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-dad224aa-186",
+            "category": "knowledge-update",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-ba61f0b9-187",
+            "category": "knowledge-update",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-42ec0761-188",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-5c40ec5b-189",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-c6853660-190",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-26bdc477-191",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-0977f2af-192",
+            "category": "knowledge-update",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-6aeb4375_abs-193",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": true
+          },
+          {
+            "query_id": "lme-031748ae_abs-194",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": true
+          },
+          {
+            "query_id": "lme-2698e78f_abs-195",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": true
+          },
+          {
+            "query_id": "lme-2133c1b5_abs-196",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": true
+          },
+          {
+            "query_id": "lme-0ddfec37_abs-197",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": true
+          },
+          {
+            "query_id": "lme-f685340e_abs-198",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": true
+          },
+          {
+            "query_id": "lme-89941a94-199",
+            "category": "knowledge-update",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-07741c45-200",
+            "category": "knowledge-update",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-8a2466db-201",
+            "category": "single-session-preference",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-06878be2-202",
+            "category": "single-session-preference",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-75832dbd-203",
+            "category": "single-session-preference",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-0edc2aef-204",
+            "category": "single-session-preference",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-35a27287-205",
+            "category": "single-session-preference",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-32260d93-206",
+            "category": "single-session-preference",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-195a1a1b-207",
+            "category": "single-session-preference",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-afdc33df-208",
+            "category": "single-session-preference",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-caf03d32-209",
+            "category": "single-session-preference",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-54026fce-210",
+            "category": "single-session-preference",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-06f04340-211",
+            "category": "single-session-preference",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-6b7dfb22-212",
+            "category": "single-session-preference",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-1a1907b4-213",
+            "category": "single-session-preference",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-09d032c9-214",
+            "category": "single-session-preference",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-38146c39-215",
+            "category": "single-session-preference",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-d24813b1-216",
+            "category": "single-session-preference",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-57f827a0-217",
+            "category": "single-session-preference",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-95228167-218",
+            "category": "single-session-preference",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-505af2f5-219",
+            "category": "single-session-preference",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-75f70248-220",
+            "category": "single-session-preference",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-d6233ab6-221",
+            "category": "single-session-preference",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-1da05512-222",
+            "category": "single-session-preference",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-fca70973-223",
+            "category": "single-session-preference",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-b6025781-224",
+            "category": "single-session-preference",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-a89d7624-225",
+            "category": "single-session-preference",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-b0479f84-226",
+            "category": "single-session-preference",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-1d4e3b97-227",
+            "category": "single-session-preference",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-07b6f563-228",
+            "category": "single-session-preference",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-1c0ddc50-229",
+            "category": "single-session-preference",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-0a34ad58-230",
+            "category": "single-session-preference",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-7161e7e2-231",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-c4f10528-232",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-89527b6b-233",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-e9327a54-234",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-4c36ccef-235",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-6ae235be-236",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-7e00a6cb-237",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-1903aded-238",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-ceb54acb-239",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-f523d9fe-240",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-0e5e2d1a-241",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-fea54f57-242",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-cc539528-243",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-dc439ea3-244",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-18dcd5a5-245",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-488d3006-246",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-58470ed2-247",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-8cf51dda-248",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-1d4da289-249",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-8464fc84-250",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-8aef76bc-251",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-71a3fd6b-252",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-2bf43736-253",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-70b3e69b-254",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-8752c811-255",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-3249768e-256",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-1b9b7252-257",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-1568498a-258",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-6222b6eb-259",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-e8a79c70-260",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-d596882b-261",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-e3fc4d6e-262",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-51b23612-263",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-3e321797-264",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-e982271f-265",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-352ab8bd-266",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-fca762bc-267",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-7a8d0b71-268",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-a40e080f-269",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-8b9d4367-270",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-5809eb10-271",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-41275add-272",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-4388e9dd-273",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-4baee567-274",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-561fabcd-275",
+            "category": "single-session-assistant",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-b759caee-276",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-ac031881-277",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-28bcfaac-278",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-16c90bf4-279",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-c8f1aeed-280",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-eaca4986-281",
+            "category": "single-session-assistant",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-c7cf7dfd-282",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-e48988bc-283",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-1de5cff2-284",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-65240037-285",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-778164c6-286",
+            "category": "single-session-assistant",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-e47becba-287",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-118b2229-288",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-51a45a95-289",
+            "category": "single-session-user",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-58bf7951-290",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-1e043500-291",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-c5e8278d-292",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-6ade9755-293",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-6f9b354f-294",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-58ef2f1c-295",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-f8c5f88b-296",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-5d3d2817-297",
+            "category": "single-session-user",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-7527f7e2-298",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-c960da58-299",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-3b6f954b-300",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-726462e0-301",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-94f70d80-302",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-66f24dbb-303",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-ad7109d1-304",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-af8d2e46-305",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-dccbc061-306",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-c8c3f81d-307",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-8ebdbe50-308",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-6b168ec8-309",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-75499fd8-310",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-21436231-311",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-95bcc1c8-312",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-0862e8bf-313",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-853b0a1d-314",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-a06e4cfe-315",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-37d43f65-316",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-b86304ba-317",
+            "category": "single-session-user",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-d52b4f67-318",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-25e5aa4f-319",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-caf9ead2-320",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-8550ddae-321",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-60d45044-322",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-3f1e9474-323",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-86b68151-324",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-577d4d32-325",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-ec81a493-326",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-15745da0-327",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-e01b8e2f-328",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-bc8a6e93-329",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-ccb36322-330",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-001be529-331",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-b320f3f8-332",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-19b5f2b3-333",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-4fd1909e-334",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-545bd2b5-335",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-8a137a7f-336",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-76d63226-337",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-86f00804-338",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-8e9d538c-339",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-311778f1-340",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-c19f7a0b-341",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-4100d0a0-342",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-29f2956b-343",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-1faac195-344",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-faba32e5-345",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-f4f1d8a4-346",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-c14c00dd-347",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-36580ce8-348",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-3d86fd0a-349",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-a82c026e-350",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-0862e8bf_abs-351",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": true
+          },
+          {
+            "query_id": "lme-15745da0_abs-352",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": true
+          },
+          {
+            "query_id": "lme-bc8a6e93_abs-353",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": true
+          },
+          {
+            "query_id": "lme-19b5f2b3_abs-354",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": true
+          },
+          {
+            "query_id": "lme-29f2956b_abs-355",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": true
+          },
+          {
+            "query_id": "lme-f4f1d8a4_abs-356",
+            "category": "single-session-user",
+            "correct": true,
+            "abstention": true
+          },
+          {
+            "query_id": "lme-gpt4_59149c77-357",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_f49edff3-358",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-71017276-359",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-b46e15ed-360",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_fa19884c-361",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-0bc8ad92-362",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-af082822-363",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_4929293a-364",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_b5700ca9-365",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-9a707b81-366",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_1d4ab0c9-367",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_e072b769-368",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-0db4c65d-369",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_1d80365e-370",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_7f6b06db-371",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_6dc9b45b-372",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_8279ba02-373",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_18c2b244-374",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_a1b77f9c-375",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_1916e0ea-376",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_7a0daae1-377",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_468eb063-378",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_7abb270c-379",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_1e4a8aeb-380",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_4fc4f797-381",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-4dfccbf7-382",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_61e13b3c-383",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_45189cb4-384",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-2ebe6c90-385",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_e061b84f-386",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-370a8ff4-387",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_d6585ce8-388",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_4ef30696-389",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_ec93e27f-390",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-6e984301-391",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-8077ef71-392",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_f420262c-393",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_8e165409-394",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_74aed68e-395",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-bcbe585f-396",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_21adecb5-397",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-5e1b23de-398",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_98f46fc6-399",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_af6db32f-400",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-eac54adc-401",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_7ddcf75f-402",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_a2d1d1f6-403",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_85da3956-404",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_b0863698-405",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_68e94287-406",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_e414231e-407",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_7ca326fa-408",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_7bc6cf22-409",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-2ebe6c92-410",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_e061b84g-411",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-71017277-412",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-b46e15ee-413",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_d6585ce9-414",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_1e4a8aec-415",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_f420262d-416",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_59149c78-417",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_e414231f-418",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_4929293b-419",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_468eb064-420",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_fa19884d-421",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-9a707b82-422",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-eac54add-423",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-4dfccbf8-424",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-0bc8ad93-425",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-6e984302-426",
+            "category": "temporal-reasoning",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_8279ba03-427",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_b5700ca0-428",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-gpt4_68e94288-429",
+            "category": "temporal-reasoning",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-d3ab962e-430",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-2311e44b-431",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-cc06de0d-432",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-a11281a2-433",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-4f54b7c9-434",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-85fa3a3f-435",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-9aaed6a3-436",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-1f2b8d4f-437",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-e6041065-438",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-51c32626-439",
+            "category": "multi-session",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-d905b33f-440",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-7405e8b1-441",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-f35224e0-442",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-6456829e-443",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-a4996e51-444",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-3c1045c8-445",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-60036106-446",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-681a1674-447",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-e25c3b8d-448",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-4adc0475-449",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-4bc144e2-450",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-ef66a6e5-451",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-5025383b-452",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-a1cc6108-453",
+            "category": "multi-session",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-9ee3ecd6-454",
+            "category": "multi-session",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-3fdac837-455",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-91b15a6e-456",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-27016adc-457",
+            "category": "multi-session",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-720133ac-458",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-77eafa52-459",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-8979f9ec-460",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-0100672e-461",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-a96c20ee-462",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-92a0aa75-463",
+            "category": "multi-session",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-3fe836c9-464",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-1c549ce4-465",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-6c49646a-466",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-1192316e-467",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-0ea62687-468",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-67e0d0f2-469",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-bb7c3b45-470",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-ba358f49-471",
+            "category": "multi-session",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-61f8c8f8-472",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-60159905-473",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-ef9cf60a-474",
+            "category": "multi-session",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-73d42213-475",
+            "category": "multi-session",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-bc149d6b-476",
+            "category": "multi-session",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-099778bb-477",
+            "category": "multi-session",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-09ba9854-478",
+            "category": "multi-session",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-d6062bb9-479",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-157a136e-480",
+            "category": "multi-session",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-c18a7dc8-481",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-a3332713-482",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-55241a1f-483",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-a08a253f-484",
+            "category": "multi-session",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-f0e564bc-485",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-078150f1-486",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-8cf4d046-487",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-a346bb18-488",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-37f165cf-489",
+            "category": "multi-session",
+            "correct": false,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-8e91e7d9-490",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-87f22b4a-491",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-e56a43b9-492",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-efc3f7c2-493",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-21d02d0d-494",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": false
+          },
+          {
+            "query_id": "lme-2311e44b_abs-495",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": true
+          },
+          {
+            "query_id": "lme-6456829e_abs-496",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": true
+          },
+          {
+            "query_id": "lme-e5ba910e_abs-497",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": true
+          },
+          {
+            "query_id": "lme-a96c20ee_abs-498",
+            "category": "multi-session",
+            "correct": false,
+            "abstention": true
+          },
+          {
+            "query_id": "lme-ba358f49_abs-499",
+            "category": "multi-session",
+            "correct": true,
+            "abstention": true
+          },
+          {
+            "query_id": "lme-09ba9854_abs-500",
+            "category": "multi-session",
+            "correct": false,
+            "abstention": true
+          }
+        ]
+      },
+      "oracle_assisted": false,
+      "total_queries": 500,
+      "ingest_time_secs": 56.538690834,
+      "query_time_secs": 321.669279584,
+      "total_time_secs": 378.606918708,
+      "compiled_phase_timings": {
+        "optimize": {
+          "p50": 146.959,
+          "p95": 261.33299999999997,
+          "p99": 482.292,
+          "min": 133.833,
+          "max": 952.334,
+          "mean": 166.46200000000002
+        },
+        "physical_plan": {
+          "p50": 297.126,
+          "p95": 566.25,
+          "p99": 752.167,
+          "min": 245.125,
+          "max": 1446.25,
+          "mean": 337.796
+        },
+        "execute_plan": {
+          "p50": 3620.333,
+          "p95": 7622.0,
+          "p99": 9690.417,
+          "min": 882.625,
+          "max": 83338.208,
+          "mean": 4100.598
+        },
+        "embed": {
+          "p50": 7.626,
+          "p95": 11.375,
+          "p99": 26.333,
+          "min": 5.25,
+          "max": 1649.376,
+          "mean": 11.58
+        },
+        "decode": {
+          "p50": 542218.333,
+          "p95": 982925.583,
+          "p99": 2381776.75,
+          "min": 2740.5,
+          "max": 2900773.208,
+          "mean": 420391.621
+        },
+        "assemble": {
+          "p50": 10893.708999999999,
+          "p95": 24494.251,
+          "p99": 48628.25,
+          "min": 3620.125,
+          "max": 84594.625,
+          "mean": 11938.989000000001
+        },
+        "total": {
+          "p50": 702823.625,
+          "p95": 1290190.459,
+          "p99": 2708710.5409999997,
+          "min": 47917.0,
+          "max": 3077307.8740000003,
+          "mean": 640624.716
+        }
+      },
+      "embedding_cache_miss_count": 500
+    }
+  ],
+  "total_time_secs": 378.606918708,
+  "final_score": 0.7868212978882139,
+  "geometric_mean": 0.7868212978882139,
+  "min_suite_score": 0.7868212978882139,
+  "competitive_gates_evaluated": false,
+  "all_competitive": false
+}

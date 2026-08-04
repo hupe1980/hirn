@@ -212,6 +212,7 @@ mod tests {
             namespace: Namespace::shared(),
             importance: 0.5,
             surprise: 0.5,
+            timestamp: hirn_core::timestamp::Timestamp::now(),
             metadata: Metadata::default(),
         }
     }
@@ -271,7 +272,9 @@ mod tests {
             "defer"
         }
         async fn evaluate(&self, _: &MemoryCandidate) -> HirnResult<AdmissionDecision> {
-            Ok(AdmissionDecision::Defer { until: self.0 })
+            Ok(AdmissionDecision::Defer {
+                review_not_before: self.0,
+            })
         }
     }
 
@@ -335,7 +338,9 @@ mod tests {
         let result = pipeline.evaluate(&test_candidate()).await.unwrap();
         assert!(matches!(
             result.decision,
-            AdmissionDecision::Defer { until: 99999 }
+            AdmissionDecision::Defer {
+                review_not_before: 99999
+            }
         ));
     }
 

@@ -7,7 +7,7 @@ pub(crate) fn build_http_client(
     provider: &'static str,
     builder: reqwest::ClientBuilder,
 ) -> hirn_core::HirnResult<reqwest::Client> {
-    builder
+    crate::transport::secure_provider_client_builder(builder)
         .build()
         .map_err(|source| LlmError::from_reqwest(provider, source).into())
 }
@@ -23,6 +23,9 @@ pub use mock_provider::MockLlmProvider;
 
 mod circuit_breaker_provider;
 pub use circuit_breaker_provider::CircuitBreakerLlmProvider;
+
+mod retry;
+pub use retry::RetryingLlmProvider;
 
 mod llm_reranker;
 pub use llm_reranker::LlmReranker;

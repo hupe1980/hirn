@@ -690,6 +690,7 @@ fn recall_rows_from_batch(
                 } else {
                     Some(invocation_counts.value(row))
                 },
+                embedding: None,
             },
             activation_score: activation_scores
                 .filter(|scores| !scores.is_null(row))

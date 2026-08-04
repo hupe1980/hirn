@@ -290,6 +290,51 @@ pub mod store {
             }
         }
 
+        /// Renew a live lease held by `holder` without changing its fence.
+        ///
+        /// A fence identifies one acquisition epoch and must remain stable for
+        /// that epoch. Only a fresh acquisition after release/expiry increments
+        /// it; otherwise in-flight writes would unexpectedly carry a stale
+        /// token relative to their own holder.
+        pub async fn renew_lease(
+            &self,
+            realm: &str,
+            holder: &str,
+            duration_secs: u64,
+        ) -> Result<bool, String> {
+            let now = now_epoch_secs();
+            let expires = now + duration_secs;
+            let result = self
+                .client
+                .update_item()
+                .table_name(&self.locks_table)
+                .key("pk", AttributeValue::S(format!("lease#{realm}")))
+                .update_expression("SET expires_at = :expires, #ttl = :ttl")
+                .condition_expression("holder = :holder AND expires_at >= :now")
+                .expression_attribute_names("#ttl", "ttl")
+                .expression_attribute_values(":now", AttributeValue::N(now.to_string()))
+                .expression_attribute_values(":expires", AttributeValue::N(expires.to_string()))
+                .expression_attribute_values(":ttl", AttributeValue::N((expires + 60).to_string()))
+                .expression_attribute_values(":holder", AttributeValue::S(holder.to_string()))
+                .send()
+                .await;
+
+            match result {
+                Ok(_) => {
+                    debug!(realm, holder, expires, "DynamoDB lease renewed");
+                    Ok(true)
+                }
+                Err(sdk_err)
+                    if sdk_err
+                        .as_service_error()
+                        .is_some_and(|error| error.is_conditional_check_failed_exception()) =>
+                {
+                    Ok(false)
+                }
+                Err(sdk_err) => Err(format!("DynamoDB lease renew error: {sdk_err}")),
+            }
+        }
+
         /// Release a compaction lease.
         ///
         /// Silently succeeds if the lease was already released or expired (idempotent).
@@ -464,6 +509,13 @@ pub mod store {
         ) -> Result<Option<u64>, String> {
             self.store
                 .acquire_lease(realm, &self.node_id, duration_secs)
+                .await
+        }
+
+        /// Renew the current acquisition epoch without incrementing its fence.
+        pub async fn renew(&self, realm: &str, duration_secs: u64) -> Result<bool, String> {
+            self.store
+                .renew_lease(realm, &self.node_id, duration_secs)
                 .await
         }
 

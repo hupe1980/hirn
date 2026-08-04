@@ -1,0 +1,1193 @@
+{
+  "majority_class_baseline": 0.2608695652173913,
+  "generated_at_rfc3339": "2026-08-03T22:35:46.986640+00:00",
+  "environment": {
+    "label": "local-dev-m4",
+    "os": "macos",
+    "arch": "aarch64",
+    "logical_cpus": 14,
+    "git_commit_sha": "07476b5fbc2320e6c5471b6c895924cef31a8d97",
+    "cargo_lock_blake3": "b94c9adfe44c8c8dcbe34b4cc655d3b64c27d3a1cb4963e84798ece0d5921667"
+  },
+  "cases": 46,
+  "backends": "llm:gpt-4o-mini -> embedding:text-embedding-3-small",
+  "model_backed": {
+    "arm": "model_backed",
+    "overall": {
+      "total": 46,
+      "correct": 45,
+      "accuracy": 0.9782608695652174,
+      "ci95": [
+        0.9347826086956522,
+        1.0
+      ]
+    },
+    "by_category": [
+      [
+        "implicit_intent",
+        {
+          "total": 10,
+          "correct": 10,
+          "accuracy": 1.0
+        }
+      ],
+      [
+        "literal",
+        {
+          "total": 12,
+          "correct": 12,
+          "accuracy": 1.0
+        }
+      ],
+      [
+        "misleading_cue",
+        {
+          "total": 8,
+          "correct": 7,
+          "accuracy": 0.875
+        }
+      ],
+      [
+        "multilingual",
+        {
+          "total": 10,
+          "correct": 10,
+          "accuracy": 1.0
+        }
+      ],
+      [
+        "passive_voice",
+        {
+          "total": 6,
+          "correct": 6,
+          "accuracy": 1.0
+        }
+      ]
+    ],
+    "by_source": [
+      [
+        "model",
+        46
+      ]
+    ],
+    "mean_latency_ms": 880.508472804348,
+    "p95_latency_ms": 1060.044417,
+    "outcomes": [
+      {
+        "query": "when did the lease renewal go through",
+        "category": "literal",
+        "expected": "temporal",
+        "routed": "temporal",
+        "correct": true,
+        "confidence": 0.9,
+        "source": "model",
+        "latency_ms": 1020.420375
+      },
+      {
+        "query": "why did the flight get cancelled",
+        "category": "literal",
+        "expected": "causal",
+        "routed": "causal",
+        "correct": true,
+        "confidence": 0.9,
+        "source": "model",
+        "latency_ms": 795.593625
+      },
+      {
+        "query": "who recommended that dentist",
+        "category": "literal",
+        "expected": "entity",
+        "routed": "entity",
+        "correct": true,
+        "confidence": 0.9,
+        "source": "model",
+        "latency_ms": 1027.068375
+      },
+      {
+        "query": "what did the doctor say about my knee",
+        "category": "literal",
+        "expected": "semantic",
+        "routed": "semantic",
+        "correct": true,
+        "confidence": 0.8,
+        "source": "model",
+        "latency_ms": 1060.044417
+      },
+      {
+        "query": "what happened after the tax filing",
+        "category": "literal",
+        "expected": "temporal",
+        "routed": "temporal",
+        "correct": true,
+        "confidence": 0.8,
+        "source": "model",
+        "latency_ms": 1025.1189590000001
+      },
+      {
+        "query": "what caused the leak in the basement",
+        "category": "literal",
+        "expected": "causal",
+        "routed": "causal",
+        "correct": true,
+        "confidence": 0.9,
+        "source": "model",
+        "latency_ms": 789.064834
+      },
+      {
+        "query": "which insurance plan did i pick",
+        "category": "literal",
+        "expected": "entity",
+        "routed": "entity",
+        "correct": true,
+        "confidence": 0.9,
+        "source": "model",
+        "latency_ms": 793.176
+      },
+      {
+        "query": "notes from the parent teacher meeting",
+        "category": "literal",
+        "expected": "semantic",
+        "routed": "semantic",
+        "correct": true,
+        "confidence": 0.8,
+        "source": "model",
+        "latency_ms": 873.8093329999999
+      },
+      {
+        "query": "how long was the hotel stay",
+        "category": "literal",
+        "expected": "temporal",
+        "routed": "temporal",
+        "correct": true,
+        "confidence": 0.9,
+        "source": "model",
+        "latency_ms": 870.6732499999999
+      },
+      {
+        "query": "the reason we switched banks",
+        "category": "literal",
+        "expected": "causal",
+        "routed": "causal",
+        "correct": true,
+        "confidence": 0.9,
+        "source": "model",
+        "latency_ms": 837.00825
+      },
+      {
+        "query": "where did i park at the airport",
+        "category": "literal",
+        "expected": "entity",
+        "routed": "entity",
+        "correct": true,
+        "confidence": 0.9,
+        "source": "model",
+        "latency_ms": 946.6850420000001
+      },
+      {
+        "query": "what did we cover in the book club",
+        "category": "literal",
+        "expected": "semantic",
+        "routed": "semantic",
+        "correct": true,
+        "confidence": 0.9,
+        "source": "model",
+        "latency_ms": 1043.698959
+      },
+      {
+        "query": "how many weeks stood between the offer and the start date",
+        "category": "implicit_intent",
+        "expected": "temporal",
+        "routed": "temporal",
+        "correct": true,
+        "confidence": 0.9,
+        "source": "model",
+        "latency_ms": 916.749542
+      },
+      {
+        "query": "take me through the run of events at the wedding",
+        "category": "implicit_intent",
+        "expected": "temporal",
+        "routed": "temporal",
+        "correct": true,
+        "confidence": 0.9,
+        "source": "model",
+        "latency_ms": 808.545
+      },
+      {
+        "query": "did i renew the passport or the license earlier",
+        "category": "implicit_intent",
+        "expected": "temporal",
+        "routed": "temporal",
+        "correct": true,
+        "confidence": 0.8,
+        "source": "model",
+        "latency_ms": 759.668291
+      },
+      {
+        "query": "i still do not understand how the roof ended up damaged",
+        "category": "implicit_intent",
+        "expected": "causal",
+        "routed": "causal",
+        "correct": true,
+        "confidence": 0.9,
+        "source": "model",
+        "latency_ms": 689.215375
+      },
+      {
+        "query": "something made the sourdough collapse and i want to know what",
+        "category": "implicit_intent",
+        "expected": "causal",
+        "routed": "causal",
+        "correct": true,
+        "confidence": 0.9,
+        "source": "model",
+        "latency_ms": 1031.34575
+      },
+      {
+        "query": "the colleague who lent me the drill",
+        "category": "implicit_intent",
+        "expected": "entity",
+        "routed": "entity",
+        "correct": true,
+        "confidence": 0.9,
+        "source": "model",
+        "latency_ms": 863.816083
+      },
+      {
+        "query": "my cousin's new address",
+        "category": "implicit_intent",
+        "expected": "entity",
+        "routed": "entity",
+        "correct": true,
+        "confidence": 0.9,
+        "source": "model",
+        "latency_ms": 821.744416
+      },
+      {
+        "query": "everything i have stored on my knee rehab",
+        "category": "implicit_intent",
+        "expected": "semantic",
+        "routed": "semantic",
+        "correct": true,
+        "confidence": 0.9,
+        "source": "model",
+        "latency_ms": 757.8272910000001
+      },
+      {
+        "query": "bring back what i saved about beekeeping",
+        "category": "implicit_intent",
+        "expected": "semantic",
+        "routed": "semantic",
+        "correct": true,
+        "confidence": 0.9,
+        "source": "model",
+        "latency_ms": 829.798042
+      },
+      {
+        "query": "jog my memory on the pension paperwork",
+        "category": "implicit_intent",
+        "expected": "semantic",
+        "routed": "semantic",
+        "correct": true,
+        "confidence": 0.8,
+        "source": "model",
+        "latency_ms": 866.269917
+      },
+      {
+        "query": "what set off the smoke alarm",
+        "category": "misleading_cue",
+        "expected": "causal",
+        "routed": "causal",
+        "correct": true,
+        "confidence": 0.9,
+        "source": "model",
+        "latency_ms": 925.191333
+      },
+      {
+        "query": "which decision left us short on savings",
+        "category": "misleading_cue",
+        "expected": "causal",
+        "routed": "causal",
+        "correct": true,
+        "confidence": 0.9,
+        "source": "model",
+        "latency_ms": 1016.436458
+      },
+      {
+        "query": "what is behind my recurring headaches",
+        "category": "misleading_cue",
+        "expected": "causal",
+        "routed": "causal",
+        "correct": true,
+        "confidence": 0.9,
+        "source": "model",
+        "latency_ms": 739.990292
+      },
+      {
+        "query": "what is the most recent invoice i paid",
+        "category": "misleading_cue",
+        "expected": "temporal",
+        "routed": "entity",
+        "correct": false,
+        "confidence": 0.8,
+        "source": "model",
+        "latency_ms": 775.9769170000001
+      },
+      {
+        "query": "who sat with me during the recital",
+        "category": "misleading_cue",
+        "expected": "entity",
+        "routed": "entity",
+        "correct": true,
+        "confidence": 0.9,
+        "source": "model",
+        "latency_ms": 863.148083
+      },
+      {
+        "query": "what results came back from the blood panel",
+        "category": "misleading_cue",
+        "expected": "semantic",
+        "routed": "semantic",
+        "correct": true,
+        "confidence": 0.8,
+        "source": "model",
+        "latency_ms": 874.708834
+      },
+      {
+        "query": "summarize the effects chapter from that nutrition book",
+        "category": "misleading_cue",
+        "expected": "semantic",
+        "routed": "semantic",
+        "correct": true,
+        "confidence": 0.9,
+        "source": "model",
+        "latency_ms": 799.5738329999999
+      },
+      {
+        "query": "which order did the packages arrive in",
+        "category": "misleading_cue",
+        "expected": "temporal",
+        "routed": "temporal",
+        "correct": true,
+        "confidence": 0.9,
+        "source": "model",
+        "latency_ms": 1049.637666
+      },
+      {
+        "query": "the mortgage was signed by which lender",
+        "category": "passive_voice",
+        "expected": "entity",
+        "routed": "entity",
+        "correct": true,
+        "confidence": 0.9,
+        "source": "model",
+        "latency_ms": 873.260208
+      },
+      {
+        "query": "when was the car serviced last",
+        "category": "passive_voice",
+        "expected": "temporal",
+        "routed": "temporal",
+        "correct": true,
+        "confidence": 0.9,
+        "source": "model",
+        "latency_ms": 893.5229999999999
+      },
+      {
+        "query": "the fence was knocked down by what",
+        "category": "passive_voice",
+        "expected": "causal",
+        "routed": "causal",
+        "correct": true,
+        "confidence": 0.8,
+        "source": "model",
+        "latency_ms": 723.7015409999999
+      },
+      {
+        "query": "what was talked about at the council session",
+        "category": "passive_voice",
+        "expected": "semantic",
+        "routed": "semantic",
+        "correct": true,
+        "confidence": 0.9,
+        "source": "model",
+        "latency_ms": 1201.161084
+      },
+      {
+        "query": "the prescription was written by whom",
+        "category": "passive_voice",
+        "expected": "entity",
+        "routed": "entity",
+        "correct": true,
+        "confidence": 0.9,
+        "source": "model",
+        "latency_ms": 713.817958
+      },
+      {
+        "query": "what was brought up in the performance review",
+        "category": "passive_voice",
+        "expected": "semantic",
+        "routed": "semantic",
+        "correct": true,
+        "confidence": 0.8,
+        "source": "model",
+        "latency_ms": 1023.6654999999998
+      },
+      {
+        "query": "wann wurde die heizung zuletzt gewartet",
+        "category": "multilingual",
+        "expected": "temporal",
+        "routed": "temporal",
+        "correct": true,
+        "confidence": 0.9,
+        "source": "model",
+        "latency_ms": 837.303417
+      },
+      {
+        "query": "warum wurde der vertrag gekündigt",
+        "category": "multilingual",
+        "expected": "causal",
+        "routed": "causal",
+        "correct": true,
+        "confidence": 0.9,
+        "source": "model",
+        "latency_ms": 1038.0915
+      },
+      {
+        "query": "wer hat mir den zahnarzt empfohlen",
+        "category": "multilingual",
+        "expected": "entity",
+        "routed": "entity",
+        "correct": true,
+        "confidence": 0.9,
+        "source": "model",
+        "latency_ms": 891.687916
+      },
+      {
+        "query": "was habe ich über meine knie reha notiert",
+        "category": "multilingual",
+        "expected": "semantic",
+        "routed": "semantic",
+        "correct": true,
+        "confidence": 0.8,
+        "source": "model",
+        "latency_ms": 1120.5491670000001
+      },
+      {
+        "query": "cuándo renové el pasaporte",
+        "category": "multilingual",
+        "expected": "temporal",
+        "routed": "temporal",
+        "correct": true,
+        "confidence": 0.9,
+        "source": "model",
+        "latency_ms": 781.336041
+      },
+      {
+        "query": "por qué se canceló el vuelo",
+        "category": "multilingual",
+        "expected": "causal",
+        "routed": "causal",
+        "correct": true,
+        "confidence": 0.9,
+        "source": "model",
+        "latency_ms": 743.711292
+      },
+      {
+        "query": "quién me prestó el taladro",
+        "category": "multilingual",
+        "expected": "entity",
+        "routed": "entity",
+        "correct": true,
+        "confidence": 0.9,
+        "source": "model",
+        "latency_ms": 743.342834
+      },
+      {
+        "query": "qué guardé sobre la apicultura",
+        "category": "multilingual",
+        "expected": "semantic",
+        "routed": "semantic",
+        "correct": true,
+        "confidence": 0.9,
+        "source": "model",
+        "latency_ms": 815.5643329999999
+      },
+      {
+        "query": "quand ai-je payé la dernière facture",
+        "category": "multilingual",
+        "expected": "temporal",
+        "routed": "temporal",
+        "correct": true,
+        "confidence": 0.9,
+        "source": "model",
+        "latency_ms": 793.595583
+      },
+      {
+        "query": "pourquoi la toiture a-t-elle été endommagée",
+        "category": "multilingual",
+        "expected": "causal",
+        "routed": "causal",
+        "correct": true,
+        "confidence": 0.9,
+        "source": "model",
+        "latency_ms": 837.073833
+      }
+    ],
+    "calibration": [
+      [
+        "model",
+        {
+          "before": {
+            "samples": 46,
+            "accuracy": 0.9782609,
+            "mean_confidence": 0.8782609,
+            "expected_calibration_error": 0.10000019,
+            "brier_score": 0.02956521,
+            "bins": [
+              {
+                "count": 0,
+                "mean_confidence": 0.0,
+                "accuracy": 0.0
+              },
+              {
+                "count": 0,
+                "mean_confidence": 0.0,
+                "accuracy": 0.0
+              },
+              {
+                "count": 0,
+                "mean_confidence": 0.0,
+                "accuracy": 0.0
+              },
+              {
+                "count": 0,
+                "mean_confidence": 0.0,
+                "accuracy": 0.0
+              },
+              {
+                "count": 0,
+                "mean_confidence": 0.0,
+                "accuracy": 0.0
+              },
+              {
+                "count": 0,
+                "mean_confidence": 0.0,
+                "accuracy": 0.0
+              },
+              {
+                "count": 0,
+                "mean_confidence": 0.0,
+                "accuracy": 0.0
+              },
+              {
+                "count": 0,
+                "mean_confidence": 0.0,
+                "accuracy": 0.0
+              },
+              {
+                "count": 10,
+                "mean_confidence": 0.8000001,
+                "accuracy": 0.9
+              },
+              {
+                "count": 36,
+                "mean_confidence": 0.89999974,
+                "accuracy": 1.0
+              }
+            ]
+          },
+          "fit": "fitted scale=1.0000 floor=0.1000",
+          "fitted_scale": 1.0,
+          "fitted_floor": 0.099999666,
+          "after": {
+            "samples": 46,
+            "accuracy": 0.9782609,
+            "mean_confidence": 0.9782609,
+            "expected_calibration_error": 1.4512435e-7,
+            "brier_score": 0.019565215,
+            "bins": [
+              {
+                "count": 0,
+                "mean_confidence": 0.0,
+                "accuracy": 0.0
+              },
+              {
+                "count": 0,
+                "mean_confidence": 0.0,
+                "accuracy": 0.0
+              },
+              {
+                "count": 0,
+                "mean_confidence": 0.0,
+                "accuracy": 0.0
+              },
+              {
+                "count": 0,
+                "mean_confidence": 0.0,
+                "accuracy": 0.0
+              },
+              {
+                "count": 0,
+                "mean_confidence": 0.0,
+                "accuracy": 0.0
+              },
+              {
+                "count": 0,
+                "mean_confidence": 0.0,
+                "accuracy": 0.0
+              },
+              {
+                "count": 0,
+                "mean_confidence": 0.0,
+                "accuracy": 0.0
+              },
+              {
+                "count": 0,
+                "mean_confidence": 0.0,
+                "accuracy": 0.0
+              },
+              {
+                "count": 10,
+                "mean_confidence": 0.89999974,
+                "accuracy": 0.9
+              },
+              {
+                "count": 36,
+                "mean_confidence": 0.9999999,
+                "accuracy": 1.0
+              }
+            ]
+          },
+          "adopt": true
+        }
+      ]
+    ]
+  },
+  "fallback_only": {
+    "arm": "fallback_only",
+    "overall": {
+      "total": 46,
+      "correct": 20,
+      "accuracy": 0.43478260869565216,
+      "ci95": [
+        0.2826086956521739,
+        0.5869565217391305
+      ]
+    },
+    "by_category": [
+      [
+        "implicit_intent",
+        {
+          "total": 10,
+          "correct": 4,
+          "accuracy": 0.4
+        }
+      ],
+      [
+        "literal",
+        {
+          "total": 12,
+          "correct": 10,
+          "accuracy": 0.8333333333333334
+        }
+      ],
+      [
+        "misleading_cue",
+        {
+          "total": 8,
+          "correct": 1,
+          "accuracy": 0.125
+        }
+      ],
+      [
+        "multilingual",
+        {
+          "total": 10,
+          "correct": 2,
+          "accuracy": 0.2
+        }
+      ],
+      [
+        "passive_voice",
+        {
+          "total": 6,
+          "correct": 3,
+          "accuracy": 0.5
+        }
+      ]
+    ],
+    "by_source": [
+      [
+        "heuristic",
+        46
+      ]
+    ],
+    "mean_latency_ms": 0.024797152173913043,
+    "p95_latency_ms": 0.027583,
+    "outcomes": [
+      {
+        "query": "when did the lease renewal go through",
+        "category": "literal",
+        "expected": "temporal",
+        "routed": "temporal",
+        "correct": true,
+        "confidence": 0.5,
+        "source": "heuristic",
+        "latency_ms": 0.31016699999999997
+      },
+      {
+        "query": "why did the flight get cancelled",
+        "category": "literal",
+        "expected": "causal",
+        "routed": "causal",
+        "correct": true,
+        "confidence": 0.75,
+        "source": "heuristic",
+        "latency_ms": 0.017084000000000002
+      },
+      {
+        "query": "who recommended that dentist",
+        "category": "literal",
+        "expected": "entity",
+        "routed": "entity",
+        "correct": true,
+        "confidence": 0.5,
+        "source": "heuristic",
+        "latency_ms": 0.013334
+      },
+      {
+        "query": "what did the doctor say about my knee",
+        "category": "literal",
+        "expected": "semantic",
+        "routed": "entity",
+        "correct": false,
+        "confidence": 0.5,
+        "source": "heuristic",
+        "latency_ms": 0.018958
+      },
+      {
+        "query": "what happened after the tax filing",
+        "category": "literal",
+        "expected": "temporal",
+        "routed": "temporal",
+        "correct": true,
+        "confidence": 0.33333334,
+        "source": "heuristic",
+        "latency_ms": 0.016
+      },
+      {
+        "query": "what caused the leak in the basement",
+        "category": "literal",
+        "expected": "causal",
+        "routed": "causal",
+        "correct": true,
+        "confidence": 0.33333334,
+        "source": "heuristic",
+        "latency_ms": 0.029292
+      },
+      {
+        "query": "which insurance plan did i pick",
+        "category": "literal",
+        "expected": "entity",
+        "routed": "entity",
+        "correct": true,
+        "confidence": 0.5,
+        "source": "heuristic",
+        "latency_ms": 0.016125
+      },
+      {
+        "query": "notes from the parent teacher meeting",
+        "category": "literal",
+        "expected": "semantic",
+        "routed": "semantic",
+        "correct": true,
+        "confidence": 1.0,
+        "source": "heuristic",
+        "latency_ms": 0.016208
+      },
+      {
+        "query": "how long was the hotel stay",
+        "category": "literal",
+        "expected": "temporal",
+        "routed": "temporal",
+        "correct": true,
+        "confidence": 0.6666667,
+        "source": "heuristic",
+        "latency_ms": 0.021166
+      },
+      {
+        "query": "the reason we switched banks",
+        "category": "literal",
+        "expected": "causal",
+        "routed": "causal",
+        "correct": true,
+        "confidence": 0.5,
+        "source": "heuristic",
+        "latency_ms": 0.014667
+      },
+      {
+        "query": "where did i park at the airport",
+        "category": "literal",
+        "expected": "entity",
+        "routed": "entity",
+        "correct": true,
+        "confidence": 0.5,
+        "source": "heuristic",
+        "latency_ms": 0.017374999999999998
+      },
+      {
+        "query": "what did we cover in the book club",
+        "category": "literal",
+        "expected": "semantic",
+        "routed": "entity",
+        "correct": false,
+        "confidence": 0.5,
+        "source": "heuristic",
+        "latency_ms": 0.018708000000000002
+      },
+      {
+        "query": "how many weeks stood between the offer and the start date",
+        "category": "implicit_intent",
+        "expected": "temporal",
+        "routed": "entity",
+        "correct": false,
+        "confidence": 0.5,
+        "source": "heuristic",
+        "latency_ms": 0.023125
+      },
+      {
+        "query": "take me through the run of events at the wedding",
+        "category": "implicit_intent",
+        "expected": "temporal",
+        "routed": "semantic",
+        "correct": false,
+        "confidence": 1.0,
+        "source": "heuristic",
+        "latency_ms": 0.022541
+      },
+      {
+        "query": "did i renew the passport or the license earlier",
+        "category": "implicit_intent",
+        "expected": "temporal",
+        "routed": "temporal",
+        "correct": true,
+        "confidence": 0.5,
+        "source": "heuristic",
+        "latency_ms": 0.020292
+      },
+      {
+        "query": "i still do not understand how the roof ended up damaged",
+        "category": "implicit_intent",
+        "expected": "causal",
+        "routed": "semantic",
+        "correct": false,
+        "confidence": 1.0,
+        "source": "heuristic",
+        "latency_ms": 0.023208
+      },
+      {
+        "query": "something made the sourdough collapse and i want to know what",
+        "category": "implicit_intent",
+        "expected": "causal",
+        "routed": "entity",
+        "correct": false,
+        "confidence": 0.5,
+        "source": "heuristic",
+        "latency_ms": 0.027583
+      },
+      {
+        "query": "the colleague who lent me the drill",
+        "category": "implicit_intent",
+        "expected": "entity",
+        "routed": "entity",
+        "correct": true,
+        "confidence": 0.5,
+        "source": "heuristic",
+        "latency_ms": 0.01925
+      },
+      {
+        "query": "my cousin's new address",
+        "category": "implicit_intent",
+        "expected": "entity",
+        "routed": "semantic",
+        "correct": false,
+        "confidence": 1.0,
+        "source": "heuristic",
+        "latency_ms": 0.014375
+      },
+      {
+        "query": "everything i have stored on my knee rehab",
+        "category": "implicit_intent",
+        "expected": "semantic",
+        "routed": "semantic",
+        "correct": true,
+        "confidence": 1.0,
+        "source": "heuristic",
+        "latency_ms": 0.018333
+      },
+      {
+        "query": "bring back what i saved about beekeeping",
+        "category": "implicit_intent",
+        "expected": "semantic",
+        "routed": "entity",
+        "correct": false,
+        "confidence": 0.5,
+        "source": "heuristic",
+        "latency_ms": 0.018792
+      },
+      {
+        "query": "jog my memory on the pension paperwork",
+        "category": "implicit_intent",
+        "expected": "semantic",
+        "routed": "semantic",
+        "correct": true,
+        "confidence": 1.0,
+        "source": "heuristic",
+        "latency_ms": 0.01875
+      },
+      {
+        "query": "what set off the smoke alarm",
+        "category": "misleading_cue",
+        "expected": "causal",
+        "routed": "entity",
+        "correct": false,
+        "confidence": 0.5,
+        "source": "heuristic",
+        "latency_ms": 0.0165
+      },
+      {
+        "query": "which decision left us short on savings",
+        "category": "misleading_cue",
+        "expected": "causal",
+        "routed": "entity",
+        "correct": false,
+        "confidence": 0.5,
+        "source": "heuristic",
+        "latency_ms": 0.017
+      },
+      {
+        "query": "what is behind my recurring headaches",
+        "category": "misleading_cue",
+        "expected": "causal",
+        "routed": "entity",
+        "correct": false,
+        "confidence": 0.75,
+        "source": "heuristic",
+        "latency_ms": 0.01575
+      },
+      {
+        "query": "what is the most recent invoice i paid",
+        "category": "misleading_cue",
+        "expected": "temporal",
+        "routed": "entity",
+        "correct": false,
+        "confidence": 0.75,
+        "source": "heuristic",
+        "latency_ms": 0.018416000000000002
+      },
+      {
+        "query": "who sat with me during the recital",
+        "category": "misleading_cue",
+        "expected": "entity",
+        "routed": "temporal",
+        "correct": false,
+        "confidence": 0.33333334,
+        "source": "heuristic",
+        "latency_ms": 0.017374999999999998
+      },
+      {
+        "query": "what results came back from the blood panel",
+        "category": "misleading_cue",
+        "expected": "semantic",
+        "routed": "causal",
+        "correct": false,
+        "confidence": 0.33333334,
+        "source": "heuristic",
+        "latency_ms": 0.018667
+      },
+      {
+        "query": "summarize the effects chapter from that nutrition book",
+        "category": "misleading_cue",
+        "expected": "semantic",
+        "routed": "causal",
+        "correct": false,
+        "confidence": 0.5,
+        "source": "heuristic",
+        "latency_ms": 0.018708000000000002
+      },
+      {
+        "query": "which order did the packages arrive in",
+        "category": "misleading_cue",
+        "expected": "temporal",
+        "routed": "temporal",
+        "correct": true,
+        "confidence": 0.33333334,
+        "source": "heuristic",
+        "latency_ms": 0.017249999999999998
+      },
+      {
+        "query": "the mortgage was signed by which lender",
+        "category": "passive_voice",
+        "expected": "entity",
+        "routed": "entity",
+        "correct": true,
+        "confidence": 0.5,
+        "source": "heuristic",
+        "latency_ms": 0.017625000000000002
+      },
+      {
+        "query": "when was the car serviced last",
+        "category": "passive_voice",
+        "expected": "temporal",
+        "routed": "temporal",
+        "correct": true,
+        "confidence": 0.6666667,
+        "source": "heuristic",
+        "latency_ms": 0.015917
+      },
+      {
+        "query": "the fence was knocked down by what",
+        "category": "passive_voice",
+        "expected": "causal",
+        "routed": "entity",
+        "correct": false,
+        "confidence": 0.5,
+        "source": "heuristic",
+        "latency_ms": 0.017374999999999998
+      },
+      {
+        "query": "what was talked about at the council session",
+        "category": "passive_voice",
+        "expected": "semantic",
+        "routed": "entity",
+        "correct": false,
+        "confidence": 0.5,
+        "source": "heuristic",
+        "latency_ms": 0.01875
+      },
+      {
+        "query": "the prescription was written by whom",
+        "category": "passive_voice",
+        "expected": "entity",
+        "routed": "entity",
+        "correct": true,
+        "confidence": 0.5,
+        "source": "heuristic",
+        "latency_ms": 0.016
+      },
+      {
+        "query": "what was brought up in the performance review",
+        "category": "passive_voice",
+        "expected": "semantic",
+        "routed": "entity",
+        "correct": false,
+        "confidence": 0.5,
+        "source": "heuristic",
+        "latency_ms": 0.018792
+      },
+      {
+        "query": "wann wurde die heizung zuletzt gewartet",
+        "category": "multilingual",
+        "expected": "temporal",
+        "routed": "semantic",
+        "correct": false,
+        "confidence": 1.0,
+        "source": "heuristic",
+        "latency_ms": 0.019084
+      },
+      {
+        "query": "warum wurde der vertrag gekündigt",
+        "category": "multilingual",
+        "expected": "causal",
+        "routed": "semantic",
+        "correct": false,
+        "confidence": 1.0,
+        "source": "heuristic",
+        "latency_ms": 0.018625
+      },
+      {
+        "query": "wer hat mir den zahnarzt empfohlen",
+        "category": "multilingual",
+        "expected": "entity",
+        "routed": "semantic",
+        "correct": false,
+        "confidence": 1.0,
+        "source": "heuristic",
+        "latency_ms": 0.018542
+      },
+      {
+        "query": "was habe ich über meine knie reha notiert",
+        "category": "multilingual",
+        "expected": "semantic",
+        "routed": "semantic",
+        "correct": true,
+        "confidence": 1.0,
+        "source": "heuristic",
+        "latency_ms": 0.01925
+      },
+      {
+        "query": "cuándo renové el pasaporte",
+        "category": "multilingual",
+        "expected": "temporal",
+        "routed": "semantic",
+        "correct": false,
+        "confidence": 1.0,
+        "source": "heuristic",
+        "latency_ms": 0.013959
+      },
+      {
+        "query": "por qué se canceló el vuelo",
+        "category": "multilingual",
+        "expected": "causal",
+        "routed": "semantic",
+        "correct": false,
+        "confidence": 1.0,
+        "source": "heuristic",
+        "latency_ms": 0.020125
+      },
+      {
+        "query": "quién me prestó el taladro",
+        "category": "multilingual",
+        "expected": "entity",
+        "routed": "semantic",
+        "correct": false,
+        "confidence": 1.0,
+        "source": "heuristic",
+        "latency_ms": 0.017374999999999998
+      },
+      {
+        "query": "qué guardé sobre la apicultura",
+        "category": "multilingual",
+        "expected": "semantic",
+        "routed": "semantic",
+        "correct": true,
+        "confidence": 1.0,
+        "source": "heuristic",
+        "latency_ms": 0.016917
+      },
+      {
+        "query": "quand ai-je payé la dernière facture",
+        "category": "multilingual",
+        "expected": "temporal",
+        "routed": "semantic",
+        "correct": false,
+        "confidence": 1.0,
+        "source": "heuristic",
+        "latency_ms": 0.017417
+      },
+      {
+        "query": "pourquoi la toiture a-t-elle été endommagée",
+        "category": "multilingual",
+        "expected": "causal",
+        "routed": "semantic",
+        "correct": false,
+        "confidence": 1.0,
+        "source": "heuristic",
+        "latency_ms": 0.019917
+      }
+    ],
+    "calibration": []
+  },
+  "accuracy_delta": 0.5434782608695652
+}

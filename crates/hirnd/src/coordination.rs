@@ -36,6 +36,9 @@ const FORWARDED_WRITE_HEADERS: &[&str] = &[
     "x-trace-id",
     "x-idempotency-key",
     "authorization",
+    "x-token-namespaces",
+    "x-token-operations",
+    "x-hirnd-issuer-kid",
 ];
 
 pub(crate) struct CoordinationRuntime;

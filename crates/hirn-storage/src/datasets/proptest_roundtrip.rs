@@ -15,7 +15,7 @@ mod tests {
     use hirn_core::semantic::SemanticRecord;
     use hirn_core::timestamp::Timestamp;
     use hirn_core::types::{
-        AgentId, EdgeRelation, EventType, KnowledgeType, Layer, Namespace, Priority,
+        AgentId, EdgeRelation, EventType, KnowledgeType, Layer, MemoryType, Namespace, Priority,
     };
     use hirn_core::working::WorkingMemoryEntry;
     use hirn_graph::graph::{GraphEdge, GraphNodeData};
@@ -55,6 +55,15 @@ mod tests {
             Just(KnowledgeType::Inferred),
             Just(KnowledgeType::Community),
             Just(KnowledgeType::RaptorSummary),
+        ]
+    }
+
+    fn arb_memory_type() -> impl Strategy<Value = MemoryType> {
+        prop_oneof![
+            Just(MemoryType::StableFact),
+            Just(MemoryType::EpisodicEvent),
+            Just(MemoryType::BehavioralRule),
+            Just(MemoryType::Preference),
         ]
     }
 
@@ -115,10 +124,13 @@ mod tests {
             embedding in prop::option::of(arb_embedding()),
             archived in proptest::bool::ANY,
             valence in prop::option::of(-1.0f32..=1.0f32),
+            functional_role in arb_memory_type(),
+            pinned in proptest::bool::ANY,
         ) -> EpisodicRecord {
             let id = MemoryId::new();
             let now = Timestamp::now();
             EpisodicRecord {
+            temporal: hirn_core::temporal::TemporalEnvelope::unknown(),
                 id,
                 logical_memory_id: LogicalMemoryId::from_memory_id(id),
                 revision_id: RevisionId::from_memory_id(id),
@@ -150,6 +162,8 @@ mod tests {
                 valid_until: None,
                 multi_content: None,
                 valence,
+                functional_role,
+                pinned,
             }
         }
     }
@@ -174,6 +188,8 @@ mod tests {
             prop_assert_eq!(d.archived, record.archived);
             prop_assert_eq!(&d.embedding, &record.embedding);
             prop_assert_eq!(d.valence, record.valence);
+            prop_assert_eq!(d.functional_role, record.functional_role);
+            prop_assert_eq!(d.pinned, record.pinned);
         }
 
         #[test]
@@ -197,16 +213,22 @@ mod tests {
             knowledge_type in arb_knowledge_type(),
             confidence in 0.0f32..=1.0,
             embedding in prop::option::of(arb_embedding()),
+            functional_role in arb_memory_type(),
+            pinned in proptest::bool::ANY,
         ) -> SemanticRecord {
             SemanticRecord::builder()
                 .concept(concept)
                 .description(description)
                 .knowledge_type(knowledge_type)
+                .functional_role(functional_role)
                 .confidence(confidence)
                 .agent_id(agent())
                 .build()
                 .unwrap()
-                .tap_mut(|r| r.embedding = embedding)
+                .tap_mut(|r| {
+                    r.embedding = embedding;
+                    r.pinned = pinned;
+                })
         }
     }
 
@@ -232,8 +254,10 @@ mod tests {
             prop_assert_eq!(&d.concept, &record.concept);
             prop_assert_eq!(&d.description, &record.description);
             prop_assert_eq!(d.knowledge_type, record.knowledge_type);
+            prop_assert_eq!(d.functional_role, record.functional_role);
             prop_assert!((d.confidence - record.confidence).abs() < f32::EPSILON);
             prop_assert_eq!(&d.embedding, &record.embedding);
+            prop_assert_eq!(d.pinned, record.pinned);
         }
 
         #[test]

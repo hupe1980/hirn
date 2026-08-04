@@ -156,6 +156,7 @@ mod tests {
             namespace: Namespace::shared(),
             importance: 0.5,
             surprise: 0.5,
+            timestamp: hirn_core::timestamp::Timestamp::now(),
             metadata: Metadata::default(),
         }
     }

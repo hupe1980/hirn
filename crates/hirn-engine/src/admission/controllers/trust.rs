@@ -88,37 +88,55 @@ impl TrustGate {
     ///   so `evaluate` fails *closed* instead of silently ignoring a
     ///   possibly-low reputation.
     async fn agent_trust(&self, agent_id: &AgentId) -> HirnResult<Option<f32>> {
-        let dataset = hirn_storage::datasets::agent::DATASET_NAME;
-        if !self
-            .storage
-            .exists(dataset)
-            .await
-            .map_err(hirn_core::HirnError::storage)?
-        {
-            return Ok(None);
-        }
-        let batches = self
-            .storage
-            .scan(dataset, ScanOptions::default())
-            .await
-            .map_err(hirn_core::HirnError::storage)?;
-        for batch in &batches {
-            let records = hirn_storage::datasets::agent::from_batch(batch)
-                .map_err(hirn_core::HirnError::storage)?;
-            if let Some(record) = records.into_iter().find(|r| r.id == *agent_id) {
-                return Ok(Some(record.trust_score));
-            }
-        }
-        Ok(None)
+        lookup_agent_trust(self.storage.as_ref(), agent_id).await
     }
 
     /// Blend provenance trust with optional agent reputation.
-    fn effective_trust(provenance_trust: f32, agent_trust: Option<f32>) -> f32 {
-        match agent_trust {
-            // 0.5 (neutral prior) is the fixed point: factor 1.0.
-            Some(agent) => (provenance_trust * (0.5 + agent)).clamp(0.0, 1.0),
-            None => provenance_trust,
+    pub(crate) fn effective_trust(provenance_trust: f32, agent_trust: Option<f32>) -> f32 {
+        effective_trust(provenance_trust, agent_trust)
+    }
+}
+
+/// Look up the authoring agent's Bayesian trust score, if registered.
+///
+/// Shared by [`TrustGate`] and the write-path poisoning defense so both derive
+/// the same reputation blend from the single tiny `_agents` dataset. Returns:
+/// - `Ok(None)` — dataset absent or agent unregistered (provenance-only).
+/// - `Ok(Some(score))` — the agent is registered.
+/// - `Err(_)` — the lookup itself failed; callers fail *closed*.
+pub(crate) async fn lookup_agent_trust(
+    storage: &dyn PhysicalStore,
+    agent_id: &AgentId,
+) -> HirnResult<Option<f32>> {
+    let dataset = hirn_storage::datasets::agent::DATASET_NAME;
+    if !storage
+        .exists(dataset)
+        .await
+        .map_err(hirn_core::HirnError::storage)?
+    {
+        return Ok(None);
+    }
+    let batches = storage
+        .scan(dataset, ScanOptions::default())
+        .await
+        .map_err(hirn_core::HirnError::storage)?;
+    for batch in &batches {
+        let records = hirn_storage::datasets::agent::from_batch(batch)
+            .map_err(hirn_core::HirnError::storage)?;
+        if let Some(record) = records.into_iter().find(|r| r.id == *agent_id) {
+            return Ok(Some(record.trust_score));
         }
+    }
+    Ok(None)
+}
+
+/// Blend provenance trust with optional agent reputation. `0.5` (the neutral
+/// registration prior) is the fixed point (factor `1.0`); a distrusted agent
+/// drags the score down, a confirmed one lifts it (clamped to `1.0`).
+pub(crate) fn effective_trust(provenance_trust: f32, agent_trust: Option<f32>) -> f32 {
+    match agent_trust {
+        Some(agent) => (provenance_trust * (0.5 + agent)).clamp(0.0, 1.0),
+        None => provenance_trust,
     }
 }
 
@@ -194,6 +212,7 @@ mod tests {
             namespace: Namespace::shared(),
             importance: 0.5,
             surprise: 0.5,
+            timestamp: hirn_core::timestamp::Timestamp::now(),
             metadata: Metadata::default(),
         }
     }

@@ -122,6 +122,7 @@ mod tests {
                     namespace: None,
                     metadata: None,
                     entities: None,
+                    functional_role: None,
                 },
             )
             .await
@@ -164,6 +165,7 @@ mod tests {
                     namespace: None,
                     metadata: None,
                     entities: None,
+                    functional_role: None,
                 },
             )
             .await
@@ -210,6 +212,7 @@ mod tests {
                     namespace: None,
                     metadata: None,
                     entities: None,
+                    functional_role: None,
                 },
             )
             .await
@@ -247,6 +250,7 @@ mod tests {
                     namespace: None,
                     metadata: None,
                     entities: None,
+                    functional_role: None,
                 },
             )
             .await
@@ -264,6 +268,7 @@ mod tests {
                     namespace: None,
                     metadata: None,
                     entities: None,
+                    functional_role: None,
                 },
             )
             .await
@@ -321,6 +326,7 @@ mod tests {
                     namespace: None,
                     metadata: None,
                     entities: None,
+                    functional_role: None,
                 },
             )
             .await
@@ -350,6 +356,7 @@ mod tests {
                     namespace: None,
                     metadata: None,
                     entities: None,
+                    functional_role: None,
                 },
             )
             .await;
@@ -380,6 +387,7 @@ mod tests {
                     namespace: None,
                     metadata: None,
                     entities: None,
+                    functional_role: None,
                 },
             )
             .await;
@@ -456,6 +464,7 @@ mod tests {
                     namespace: None,
                     metadata: None,
                     entities: None,
+                    functional_role: None,
                 },
             )
             .await;
@@ -507,6 +516,7 @@ permit(
                     namespace: None,
                     metadata: None,
                     entities: None,
+                    functional_role: None,
                 },
             )
             .await;
@@ -616,6 +626,7 @@ permit(
                     namespace: None,
                     metadata: None,
                     entities: None,
+                    functional_role: None,
                 },
             )
             .await;
@@ -658,6 +669,7 @@ permit(
                     namespace: None,
                     metadata: None,
                     entities: None,
+                    functional_role: None,
                 },
             )
             .await
@@ -673,6 +685,7 @@ permit(
                     namespace: None,
                     metadata: None,
                     entities: None,
+                    functional_role: None,
                 },
             )
             .await
@@ -744,6 +757,7 @@ permit(
                     namespace: None,
                     metadata: None,
                     entities: None,
+                    functional_role: None,
                 },
             )
             .await;
@@ -788,6 +802,7 @@ permit(
                     namespace: None,
                     metadata: Some(meta),
                     entities: None,
+                    functional_role: None,
                 },
             )
             .await
@@ -827,6 +842,7 @@ permit(
                     namespace: None,
                     metadata: None,
                     entities: None,
+                    functional_role: None,
                 },
             )
             .await
@@ -896,6 +912,7 @@ permit(
                     namespace: Some(Namespace::new("forbidden").unwrap()),
                     metadata: None,
                     entities: None,
+                    functional_role: None,
                 },
             )
             .await;
@@ -917,6 +934,7 @@ permit(
                     namespace: Some(Namespace::new("allowed").unwrap()),
                     metadata: None,
                     entities: None,
+                    functional_role: None,
                 },
             )
             .await;
@@ -1022,6 +1040,7 @@ permit(
                         namespace: None,
                         metadata: None,
                         entities: None,
+                        functional_role: None,
                     },
                 )
                 .await
@@ -1251,6 +1270,14 @@ permit(
         );
         assert!(routed.records.is_empty());
         assert!(routed.weights.temporal > routed.weights.semantic);
+        // No provider is configured here, so routing must come from the
+        // deterministic floor — and must say so rather than presenting a cue
+        // match as a model decision.
+        assert_eq!(
+            routed.route_source, "heuristic",
+            "an unconfigured deployment routes on the fallback and reports it"
+        );
+        assert!((0.0..=1.0).contains(&routed.route_confidence));
 
         // A plain semantic query routes to hybrid recall (ranked records).
         let routed2 = toolkit

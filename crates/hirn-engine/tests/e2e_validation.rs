@@ -5692,9 +5692,16 @@ mod predictive_prefetch {
         );
     }
 
-    /// Prefetch does not slow down RECALL response (runs inline but fast).
+    /// Prefetch runs inline during RECALL and the call still returns.
+    ///
+    /// The wall-clock bound below is a hang detector, not a performance
+    /// assertion: an absolute threshold measured on a shared machine reports
+    /// load as a regression, and "does not slow recall" cannot be established
+    /// without a prefetch-disabled control anyway. The real claim this test
+    /// carries is the mechanism assertion — prefetch ran, and recall returned
+    /// results regardless.
     #[tokio::test(flavor = "multi_thread")]
-    async fn prefetch_does_not_slow_recall() {
+    async fn prefetch_runs_inline_and_recall_still_returns() {
         let (db, _storage, _dir) = temp_db_prefetch(true, 2, 10_485_760, 300).await;
         let _ = setup_graph_with_neighbors(&db).await;
 
@@ -5710,10 +5717,9 @@ mod predictive_prefetch {
         let elapsed = start.elapsed();
 
         assert!(!results.is_empty());
-        // Prefetch of a few records should take < 1 second.
         assert!(
-            elapsed.as_secs() < 2,
-            "recall + prefetch took too long: {elapsed:?}"
+            elapsed.as_secs() < 30,
+            "recall + prefetch appears hung: {elapsed:?}"
         );
 
         let stats = db.prefetch_stats();

@@ -3,8 +3,8 @@ mod tests {
     use cedar_policy::{PolicySet, Schema, ValidationMode, Validator};
     use hirn_policy::DEFAULT_SCHEMA;
 
-    const CEDAR_GUIDE_DOC: &str = include_str!("../../../docs/cedar-guide.md");
-    const CEDAR_PATTERNS_DOC: &str = include_str!("../../../docs/cedar-patterns.md");
+    const CEDAR_GUIDE_DOC: &str = include_str!("../../../site/content/docs/security/cedar-guide.md");
+    const CEDAR_PATTERNS_DOC: &str = include_str!("../../../site/content/docs/security/cedar-patterns.md");
 
     fn fenced_blocks(markdown: &str, language: &str) -> Vec<String> {
         let fence = format!("```{language}");

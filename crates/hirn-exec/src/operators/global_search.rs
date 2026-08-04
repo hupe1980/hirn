@@ -216,6 +216,7 @@ async fn search_rows(
             surprise: None,
             evidence_count: Some(record.evidence_count),
             invocation_count: None,
+            embedding: None,
         });
 
         let inherited_score = similarity * 0.8;

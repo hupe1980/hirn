@@ -138,14 +138,15 @@ impl LlmProvider for OllamaLlmProvider {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = crate::transport::read_error_response(resp).await;
             return Err(LlmError::from_status(&self.model, status.as_u16(), body, None).into());
         }
 
-        let parsed: OllamaChatResponse =
-            resp.json().await.map_err(|e| LlmError::InvalidResponse {
+        let parsed: OllamaChatResponse = crate::transport::decode_json_response(resp)
+            .await
+            .map_err(|details| LlmError::InvalidResponse {
                 provider: self.model.clone(),
-                details: format!("failed to parse ollama response: {e}"),
+                details,
             })?;
 
         let usage = match (parsed.prompt_eval_count, parsed.eval_count) {

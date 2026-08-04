@@ -1421,14 +1421,18 @@ pub fn query_hash(query: &str) -> u64 {
 /// Use this in the query pipeline so the normalized source can be stored in
 /// the plan cache for collision detection (N-M19).
 ///
-/// Normalization is keyword case-insensitive and whitespace-collapsing **only
-/// outside string literals**. Literal contents (the bytes between matching `"`
-/// or `'` quotes, honoring `\` escapes) are preserved verbatim — including
-/// their case and interior whitespace — so that `ABOUT "Apple"` and
-/// `ABOUT "apple"`, or `ABOUT "a  b"` and `ABOUT "a b"`, produce distinct
-/// normalized strings and hashes. Collapsing them would let the plan cache
-/// serve one query the compiled plan of another whose only difference is a
-/// literal value that feeds the embedding vector and FTS term (R-47).
+/// Normalization only collapses whitespace **outside string literals** and is
+/// **case-preserving**. Literal contents (the bytes between matching `"` or `'`
+/// quotes, honoring `\` escapes) are preserved verbatim — including their case
+/// and interior whitespace — so that `ABOUT "Apple"` and `ABOUT "apple"`, or
+/// `ABOUT "a  b"` and `ABOUT "a b"`, produce distinct normalized strings and
+/// hashes. Collapsing them would let the plan cache serve one query the compiled
+/// plan of another whose only difference is a literal value that feeds the
+/// embedding vector and FTS term (R-47). Case outside literals is likewise
+/// preserved: unquoted identifiers (namespace names, WHERE field names) are
+/// case-sensitive, so folding them would conflate distinct queries. Keyword-case
+/// variants therefore key to distinct — but individually correct — cache
+/// entries.
 pub fn query_normalize_and_hash(query: &str) -> (String, u64) {
     let normalized = normalize_outside_literals(query);
     let mut hasher = DefaultHasher::new();
@@ -1437,8 +1441,9 @@ pub fn query_normalize_and_hash(query: &str) -> (String, u64) {
     (normalized, hash)
 }
 
-/// Uppercase + whitespace-collapse the query text, but preserve the byte-exact
-/// contents of every string literal (single- or double-quoted, `\`-escaped).
+/// Collapse whitespace outside string literals (case-preserving), keeping the
+/// byte-exact contents of every string literal (single- or double-quoted,
+/// `\`-escaped).
 fn normalize_outside_literals(query: &str) -> String {
     let mut out = String::with_capacity(query.len());
     // Quote char of the literal we are currently inside, if any.
@@ -1473,14 +1478,17 @@ fn normalize_outside_literals(query: &str) -> String {
                         out.push(' ');
                         pending_space = false;
                     }
+                    // Preserve case verbatim. Case is semantically significant
+                    // for unquoted identifiers — namespace names and WHERE field
+                    // names are case-sensitive — so folding them (as an earlier
+                    // keyword-insensitive pass did) made `NAMESPACE alice` and
+                    // `NAMESPACE ALICE` collide on one plan-cache key, serving the
+                    // second query the first's plan with the wrong namespace baked
+                    // in. Only whitespace outside literals is normalized; keyword
+                    // case variants now key to distinct (still-correct) entries.
+                    out.push(c);
                     if c == '"' || c == '\'' {
                         in_string = Some(c);
-                        out.push(c);
-                    } else {
-                        // uppercase (may expand to multiple chars, e.g. ß)
-                        for up in c.to_uppercase() {
-                            out.push(up);
-                        }
                     }
                 }
             }
@@ -1815,11 +1823,16 @@ mod tests {
 
     #[test]
     fn query_hash_normalizes() {
-        // Case-insensitive keywords and collapsed whitespace *outside* the
-        // literal produce the same key when the literal content is identical.
+        // Whitespace *outside* the literal is collapsed, so runs of spaces
+        // produce the same key when case and literal content are identical.
         let h1 = query_hash(r#"RECALL  episodic  ABOUT  "test""#);
-        let h2 = query_hash(r#"recall episodic about "test""#);
+        let h2 = query_hash(r#"RECALL episodic ABOUT "test""#);
         assert_eq!(h1, h2);
+
+        // Case is preserved (identifiers are case-sensitive), so keyword-case
+        // variants key independently.
+        let h3 = query_hash(r#"recall episodic about "test""#);
+        assert_ne!(h1, h3);
     }
 
     #[test]
@@ -1837,8 +1850,9 @@ mod tests {
         assert_ne!(n1, n2);
         assert!(n1.contains("Apple"), "literal case preserved: {n1}");
         assert!(n2.contains("apple"), "literal case preserved: {n2}");
-        // Keywords are still upper-cased outside the literal.
-        assert!(n1.starts_with("RECALL EPISODIC ABOUT "));
+        // Case outside the literal is preserved verbatim (only whitespace is
+        // collapsed), so identifiers are never conflated by folding.
+        assert!(n1.starts_with("RECALL episodic ABOUT "));
     }
 
     #[test]
@@ -1854,12 +1868,28 @@ mod tests {
     }
 
     #[test]
-    fn query_hash_case_variant_keywords_share_key() {
-        // Keyword case folding still collapses variants that differ only in
-        // keyword casing (and outside-literal whitespace).
+    fn query_hash_case_variants_key_independently() {
+        // Normalization is case-preserving: keyword-case variants key to
+        // distinct (individually correct) plan-cache entries. This is the
+        // deliberate trade for not folding case-sensitive identifiers — the only
+        // cost is that `recall` and `RECALL` compile+cache separately.
         let h1 = query_hash(r#"recall   episodic ABOUT "x""#);
         let h2 = query_hash(r#"RECALL episodic about "x""#);
-        assert_eq!(h1, h2);
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn query_hash_namespace_case_does_not_collide() {
+        // Regression: unquoted identifiers are case-sensitive, so two queries
+        // differing only in namespace case must NOT share a plan-cache key (the
+        // second would otherwise be served the first's plan with the wrong
+        // namespace baked in).
+        let (n1, h1) = query_normalize_and_hash(r#"RECALL episodic ABOUT "x" NAMESPACE alice"#);
+        let (n2, h2) = query_normalize_and_hash(r#"RECALL episodic ABOUT "x" NAMESPACE ALICE"#);
+        assert_ne!(h1, h2);
+        assert_ne!(n1, n2);
+        assert!(n1.ends_with("NAMESPACE alice"));
+        assert!(n2.ends_with("NAMESPACE ALICE"));
     }
 
     #[test]
@@ -1873,8 +1903,8 @@ mod tests {
             "escaped-quote literal preserved: {n1}"
         );
         assert!(
-            n1.ends_with("LIMIT 5"),
-            "keyword after literal upper-cased: {n1}"
+            n1.ends_with("limit 5"),
+            "keyword after literal preserved verbatim (case-preserving): {n1}"
         );
     }
 

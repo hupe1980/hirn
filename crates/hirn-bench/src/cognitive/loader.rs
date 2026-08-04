@@ -10,7 +10,7 @@
 use std::io::BufRead;
 use std::path::Path;
 
-use super::{Benchmark, CognitiveDataset, QAQuery, Session};
+use super::{Benchmark, CognitiveDataset, QAQuery, RetrievalCorpus, Session};
 
 /// Load a cognitive dataset from a directory with `sessions.jsonl` and `queries.jsonl`.
 pub fn load(benchmark: Benchmark, data_dir: &Path) -> Result<CognitiveDataset, String> {
@@ -33,6 +33,7 @@ pub fn load(benchmark: Benchmark, data_dir: &Path) -> Result<CognitiveDataset, S
     Ok(CognitiveDataset {
         name: format!("{} ({})", benchmark.name(), data_dir.display()),
         benchmark,
+        retrieval_corpus: RetrievalCorpus::Shared,
         sessions,
         queries,
         truncated: None,

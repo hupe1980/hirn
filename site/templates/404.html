@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block body_class %}landing{% endblock body_class %}
+{% block head %}<meta name="robots" content="noindex, follow">{% endblock head %}
+{% block content %}
+<main id="main" class="band">
+  <div class="band-inner prose" style="text-align:center">
+    <p class="eyebrow">404</p>
+    <h1>That page does not exist</h1>
+    <p>It may have moved when the documentation was reorganised.</p>
+    <div class="cta" style="justify-content:center">
+      <a class="btn primary" href="{{ get_url(path='@/docs/_index.md') }}">Browse the docs</a>
+      <a class="btn ghost" href="{{ get_url(path='@/_index.md') }}">Home</a>
+    </div>
+  </div>
+</main>
+{% endblock content %}

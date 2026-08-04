@@ -308,6 +308,22 @@ struct ReaderJudgeArgs {
     #[arg(long, default_value_t = hirn_bench::cognitive::reader::DEFAULT_READER_CONCURRENCY)]
     reader_concurrency: usize,
 
+    /// Cache generated reader answers at this path, reusing them when the file
+    /// already matches this run's queries. Answer generation is the expensive
+    /// half of a reader run; this makes a judge-stage failure recoverable
+    /// without paying for the answers again. A cache that does not align with
+    /// the current queries is a hard error, never a silent regeneration.
+    #[arg(long)]
+    reader_answers: Option<std::path::PathBuf>,
+
+    /// Omit the precomputed symbolic temporal ledger from reader prompts.
+    ///
+    /// This is the control arm for the ledger experiment. Keeping it a flag
+    /// rather than a code edit means both arms run the same binary, so a
+    /// paired comparison differs only in the prompt.
+    #[arg(long)]
+    no_temporal_ledger: bool,
+
     /// Fail fast unless the combined blake3 hash of the loaded dataset files
     /// matches this hex value (published as `dataset_hash_blake3` in provenance).
     #[arg(long)]
@@ -399,6 +415,24 @@ enum Command {
         /// For the ablation profile, opt into passing raw question text into hybrid BM25+vector retrieval.
         #[arg(long)]
         query_text_hybrid: bool,
+
+        /// Extract the write-time temporal envelope during ingest (event
+        /// time, precision, ongoing/completed/planned/timeless state), making
+        /// recency decay state-aware.
+        ///
+        /// The H-01 treatment arm. Costs one provider call per ingested
+        /// record, issued with bounded concurrency.
+        #[arg(long)]
+        typed_temporal_extraction: bool,
+
+        /// Disable model-backed language understanding, pinning every
+        /// meaning-dependent decision to its deterministic cue fallback.
+        ///
+        /// This is the control arm for the M-06 A/B: run the same dataset,
+        /// protocol, reader, and seed with and without this flag, and the
+        /// difference is attributable to model-backed decisions.
+        #[arg(long)]
+        disable_nlu: bool,
 
         #[command(flatten)]
         outputs: ArtifactOutputArgs,
@@ -508,6 +542,24 @@ enum Command {
         /// For the ablation profile, opt into passing raw question text into hybrid BM25+vector retrieval.
         #[arg(long)]
         query_text_hybrid: bool,
+
+        /// Extract the write-time temporal envelope during ingest (event
+        /// time, precision, ongoing/completed/planned/timeless state), making
+        /// recency decay state-aware.
+        ///
+        /// The H-01 treatment arm. Costs one provider call per ingested
+        /// record, issued with bounded concurrency.
+        #[arg(long)]
+        typed_temporal_extraction: bool,
+
+        /// Disable model-backed language understanding, pinning every
+        /// meaning-dependent decision to its deterministic cue fallback.
+        ///
+        /// This is the control arm for the M-06 A/B: run the same dataset,
+        /// protocol, reader, and seed with and without this flag, and the
+        /// difference is attributable to model-backed decisions.
+        #[arg(long)]
+        disable_nlu: bool,
 
         /// Number of independent runs for variance analysis.
         #[arg(long, default_value_t = 1)]
@@ -675,6 +727,27 @@ enum Command {
         format: String,
     },
 
+    /// Query-intent routing evaluation: the surface LongMemEval and HIRN-Bench
+    /// do not reach.
+    ///
+    /// Scores the model-backed router and the deterministic cue fallback on the
+    /// same labeled set, reports accuracy per difficulty category and the
+    /// deciding backend per decision, and fits confidence calibration from the
+    /// resulting labeled samples.
+    NluRouting {
+        /// Additional JSON artifact path.
+        #[arg(long)]
+        json_output: Option<String>,
+
+        /// Additional Markdown artifact path.
+        #[arg(long)]
+        markdown_output: Option<String>,
+
+        /// Optional environment label for published artifacts.
+        #[arg(long)]
+        environment_label: Option<String>,
+    },
+
     /// Storage-level benchmarks (hirn-storage): vector/hybrid/multivector search,
     /// resource persist/fetch, batch BFS.
     Storage {
@@ -746,6 +819,8 @@ fn main() {
             retrieval_profile,
             execution_surface,
             query_text_hybrid,
+            disable_nlu,
+            typed_temporal_extraction,
             outputs,
             tracker,
             runs,
@@ -764,6 +839,8 @@ fn main() {
             retrieval_profile,
             execution_surface,
             query_text_hybrid,
+            disable_nlu,
+            typed_temporal_extraction,
             outputs,
             tracker,
             runs,
@@ -834,6 +911,8 @@ fn main() {
             retrieval_profile,
             execution_surface,
             query_text_hybrid,
+            disable_nlu,
+            typed_temporal_extraction,
             runs,
             repro_threshold_percent,
             no_baselines,
@@ -857,6 +936,8 @@ fn main() {
             retrieval_profile,
             execution_surface,
             query_text_hybrid,
+            disable_nlu,
+            typed_temporal_extraction,
             runs,
             repro_threshold_percent,
             no_baselines,
@@ -897,6 +978,12 @@ fn main() {
             k,
             outputs,
         ),
+        Command::NluRouting {
+            json_output,
+            markdown_output,
+            environment_label,
+        } => run_nlu_routing(json_output, markdown_output, environment_label),
+
         Command::Storage {
             records,
             dims,
@@ -1144,6 +1231,50 @@ fn run_advanced(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Run the query-intent routing evaluation against whatever providers the
+/// environment supplies.
+///
+/// Uses `from_env` (not `from_env_strict`): with no provider configured the
+/// model arm degrades to the fallback, which the per-source counts report
+/// explicitly rather than presenting as a model result.
+fn run_nlu_routing(
+    json_output: Option<String>,
+    markdown_output: Option<String>,
+    environment_label: Option<String>,
+) {
+    let registry = hirn_engine::ProviderRegistry::from_env();
+    let llm = registry.llm();
+    let embedder = registry.embedder();
+
+    if llm.is_none() && embedder.is_none() {
+        eprintln!(
+            "[hirn-bench] WARNING: no LLM or embedder configured — the model-backed arm \
+             will fall back for every case and the measured delta will be zero by \
+             construction, not by result."
+        );
+    }
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let result = runtime.block_on(hirn_bench::nlu_eval::run(llm, embedder, environment_label));
+
+    let markdown = hirn_bench::nlu_eval::render_markdown(&result);
+    println!("{markdown}");
+
+    if let Some(path) = markdown_output {
+        if let Err(error) = std::fs::write(&path, &markdown) {
+            eprintln!("Error writing {path}: {error}");
+            std::process::exit(1);
+        }
+    }
+    if let Some(path) = json_output {
+        let json = serde_json::to_string_pretty(&result).expect("serializable result");
+        if let Err(error) = std::fs::write(&path, json) {
+            eprintln!("Error writing {path}: {error}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn run_cognitive(
     benchmark: String,
     data_dir: Option<String>,
@@ -1155,6 +1286,8 @@ fn run_cognitive(
     retrieval_profile: String,
     execution_surface: String,
     query_text_hybrid: bool,
+    disable_nlu: bool,
+    typed_temporal_extraction: bool,
     outputs: ArtifactOutputArgs,
     tracker_path: Option<String>,
     runs: usize,
@@ -1220,6 +1353,8 @@ fn run_cognitive(
         execution_surface,
         query_text_hybrid,
         embedder_policy: Default::default(),
+        nlu_enabled: !disable_nlu,
+        typed_temporal_extraction,
     };
     let repro_threshold = repro_threshold_percent / 100.0;
     let mut corpus_embedding_source = embeddings_path.as_ref().map_or_else(
@@ -1435,6 +1570,7 @@ fn run_cognitive(
     let final_score = cognitive::compute_final_score(&results);
     let geometric_mean = cognitive::compute_geometric_mean(&results);
     let min_suite_score = cognitive::compute_min_suite_score(&results);
+    let competitive_gates_evaluated = cognitive::competitive_gates_evaluated(&results);
     let all_competitive = cognitive::all_suites_competitive(&results);
     let resolved_query_embedding_source = query_embedding_source
         .expect("at least one benchmark run should record a query embedding source");
@@ -1505,6 +1641,7 @@ fn run_cognitive(
         final_score,
         geometric_mean,
         min_suite_score,
+        competitive_gates_evaluated,
         all_competitive,
     };
 
@@ -1557,6 +1694,8 @@ fn run_external(
     retrieval_profile: String,
     execution_surface: String,
     query_text_hybrid: bool,
+    disable_nlu: bool,
+    typed_temporal_extraction: bool,
     runs: usize,
     repro_threshold_percent: f64,
     no_baselines: bool,
@@ -1801,6 +1940,8 @@ fn run_external(
         execution_surface,
         query_text_hybrid,
         embedder_policy: Default::default(),
+        nlu_enabled: !disable_nlu,
+        typed_temporal_extraction,
     };
     let repro_threshold = repro_threshold_percent / 100.0;
     let mut corpus_embedding_source = embeddings_path.as_ref().map_or_else(
@@ -1967,6 +2108,7 @@ fn run_external(
     let final_score = cognitive::compute_final_score(single_result);
     let geometric_mean = cognitive::compute_geometric_mean(single_result);
     let min_suite_score = cognitive::compute_min_suite_score(single_result);
+    let competitive_gates_evaluated = cognitive::competitive_gates_evaluated(single_result);
     let all_competitive = cognitive::all_suites_competitive(single_result);
     let total_time_secs = result.total_time_secs;
     let suite_result = cognitive::CognitiveSuiteResult {
@@ -2011,6 +2153,7 @@ fn run_external(
         final_score,
         geometric_mean,
         min_suite_score,
+        competitive_gates_evaluated,
         all_competitive,
         total_time_secs,
     };
@@ -2039,17 +2182,86 @@ fn run_reader_and_judge(
         args.reader_temperature,
     );
 
-    eprintln!(
-        "Running LLM reader over {} retrieved contexts (model={reader_model}, temperature={}, concurrency={})",
-        inputs.len(),
-        args.reader_temperature,
-        args.reader_concurrency,
-    );
-    let answers = reader::generate_answers(inputs, &reader_config, args.reader_concurrency)
-        .unwrap_or_else(|error| {
-            eprintln!("Error: {error}");
-            std::process::exit(1);
+    // Report before generating: a null result is only interpretable next to
+    // the share of prompts the mechanism actually reached. Broken out per
+    // category because a ledger attached to a question that is not about dates
+    // is a cost, not a benefit — it spends tokens and adds a block of date
+    // arithmetic the reader has to ignore.
+    if args.no_temporal_ledger {
+        eprintln!("Temporal ledger DISABLED (--no-temporal-ledger): control arm");
+    } else {
+        let overall = reader::ledger_coverage(inputs);
+        eprintln!(
+            "Temporal ledger attached to {}/{} prompts ({:.1}%)",
+            overall.prompts_with_ledger,
+            overall.prompts_total,
+            overall.share() * 100.0,
+        );
+        let mut categories: Vec<&str> = inputs.iter().map(|i| i.category.as_str()).collect();
+        categories.sort_unstable();
+        categories.dedup();
+        for category in categories {
+            let slice: Vec<reader::ReaderInput> = inputs
+                .iter()
+                .filter(|input| input.category == category)
+                .cloned()
+                .collect();
+            let coverage = reader::ledger_coverage(&slice);
+            eprintln!(
+                "    {category:<28} {}/{} ({:.1}%)",
+                coverage.prompts_with_ledger,
+                coverage.prompts_total,
+                coverage.share() * 100.0,
+            );
+        }
+    }
+
+    let cached = args
+        .reader_answers
+        .as_deref()
+        .filter(|path| path.exists())
+        .map(|path| {
+            reader::load_answers(path, inputs).unwrap_or_else(|error| {
+                eprintln!("Error: {error}");
+                std::process::exit(1);
+            })
         });
+
+    let answers = if let Some(answers) = cached {
+        eprintln!(
+            "Reusing {} cached reader answers from {} (no reader calls issued)",
+            answers.len(),
+            args.reader_answers.as_deref().unwrap_or(std::path::Path::new("")).display(),
+        );
+        answers
+    } else {
+        eprintln!(
+            "Running LLM reader over {} retrieved contexts (model={reader_model}, temperature={}, concurrency={})",
+            inputs.len(),
+            args.reader_temperature,
+            args.reader_concurrency,
+        );
+        let answers = reader::generate_answers_with(
+            inputs,
+            &reader_config,
+            args.reader_concurrency,
+            !args.no_temporal_ledger,
+        )
+            .unwrap_or_else(|error| {
+                eprintln!("Error: {error}");
+                std::process::exit(1);
+            });
+        if let Some(path) = args.reader_answers.as_deref() {
+            // Persist before judging: the judge stage is what historically
+            // failed after the answers were already paid for.
+            if let Err(error) = reader::save_answers(path, &answers) {
+                eprintln!("Warning: {error}");
+            } else {
+                eprintln!("Cached {} reader answers to {}", answers.len(), path.display());
+            }
+        }
+        answers
+    };
 
     let protocol = reader::JudgeProtocol::for_format_name(format_name);
     let judged = args.judge.as_deref().map(|judge_model| {
@@ -2064,7 +2276,7 @@ fn run_reader_and_judge(
             judge_model.to_string(),
             0.0,
         );
-        reader::judge_answers(
+        let outcome = reader::judge_answers(
             protocol,
             inputs,
             &answers,
@@ -2074,7 +2286,35 @@ fn run_reader_and_judge(
         .unwrap_or_else(|error| {
             eprintln!("Error: {error}");
             std::process::exit(1);
-        })
+        });
+
+        if !outcome.failures.is_empty() {
+            let rate = outcome.failures.len() as f64 / answers.len().max(1) as f64;
+            eprintln!(
+                "  WARNING: {} of {} judge calls failed ({:.1}%); \
+                 these queries are excluded from the accuracy denominator",
+                outcome.failures.len(),
+                answers.len(),
+                rate * 100.0,
+            );
+            for failure in outcome.failures.iter().take(5) {
+                eprintln!("    {}: {}", failure.query_id, failure.reason);
+            }
+            if outcome.failures.len() > 5 {
+                eprintln!("    ... and {} more", outcome.failures.len() - 5);
+            }
+            if rate > reader::MAX_JUDGE_FAILURE_RATE {
+                eprintln!(
+                    "Error: judge failure rate {:.1}% exceeds the {:.1}% limit; \
+                     the surviving subset is not a trustworthy sample. \
+                     Re-run the judge stage rather than reporting this number.",
+                    rate * 100.0,
+                    reader::MAX_JUDGE_FAILURE_RATE * 100.0,
+                );
+                std::process::exit(1);
+            }
+        }
+        outcome
     });
 
     let report = reader::summarize(
@@ -2083,7 +2323,7 @@ fn run_reader_and_judge(
         args.judge.as_deref().map(|_| protocol),
         args.reader_temperature,
         &answers,
-        judged.as_deref(),
+        judged.as_ref(),
     );
 
     match report.official_reader_accuracy {

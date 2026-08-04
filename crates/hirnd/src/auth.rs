@@ -160,10 +160,10 @@ pub struct RevocationList {
 
 #[derive(Default)]
 struct RevocationInner {
-    /// jti → token `exp` (seconds since epoch).
-    jtis: HashMap<String, u64>,
-    /// issuer kid → revocation timestamp (seconds since epoch).
-    issuers: HashMap<String, u64>,
+    /// (realm, jti) → token `exp` (seconds since epoch).
+    jtis: HashMap<(String, String), u64>,
+    /// (realm, issuer kid) → revocation timestamp (seconds since epoch).
+    issuers: HashMap<(String, String), u64>,
 }
 
 impl RevocationList {
@@ -173,7 +173,7 @@ impl RevocationList {
 
     /// Revoke a single token by its `jti`. `exp` is the token's expiry;
     /// the entry is pruned once the token would have expired on its own.
-    pub fn revoke_jti(&self, jti: impl Into<String>, exp: u64) {
+    pub fn revoke_jti(&self, realm: impl Into<String>, jti: impl Into<String>, exp: u64) {
         let now = Self::now();
         let mut inner = self.inner.write();
         // Amortized TTL-bound: drop entries for tokens that are already
@@ -181,27 +181,33 @@ impl RevocationList {
         inner
             .jtis
             .retain(|_, entry_exp| entry_exp.saturating_add(REVOCATION_PRUNE_LEEWAY_SECS) > now);
-        inner.jtis.insert(jti.into(), exp);
+        inner.jtis.insert((realm.into(), jti.into()), exp);
     }
 
     /// Revoke every outstanding token issued by the credential with this kid.
-    pub fn revoke_issuer(&self, kid: impl Into<String>) {
-        self.inner.write().issuers.insert(kid.into(), Self::now());
+    pub fn revoke_issuer(&self, realm: impl Into<String>, kid: impl Into<String>) {
+        self.inner
+            .write()
+            .issuers
+            .insert((realm.into(), kid.into()), Self::now());
     }
 
     /// Whether this `jti` has been revoked (and would not have expired anyway).
-    pub fn is_jti_revoked(&self, jti: &str) -> bool {
-        self.inner.read().jtis.contains_key(jti)
+    pub fn is_jti_revoked(&self, realm: &str, jti: &str) -> bool {
+        self.inner
+            .read()
+            .jtis
+            .contains_key(&(realm.to_owned(), jti.to_owned()))
     }
 
     /// Whether tokens issued by `kid` at `iat` are revoked. Tokens minted
     /// strictly after the revocation timestamp are accepted again (the
     /// credential was re-added / re-trusted).
-    pub fn is_issuer_revoked(&self, kid: &str, iat: u64) -> bool {
+    pub fn is_issuer_revoked(&self, realm: &str, kid: &str, iat: u64) -> bool {
         self.inner
             .read()
             .issuers
-            .get(kid)
+            .get(&(realm.to_owned(), kid.to_owned()))
             .is_some_and(|revoked_at| *revoked_at >= iat)
     }
 
@@ -265,6 +271,36 @@ pub(crate) fn token_allows_namespace(
             "shared" => effective_namespace == shared_name,
             other => effective_namespace == other,
         })
+}
+
+/// Resolve a token namespace claim into concrete engine namespaces.
+///
+/// An empty claim retains the token default of private + shared. Aliases are
+/// normalized before the scope is intersected with engine authorization by
+/// `HirnDB::as_agent_with_namespaces`.
+pub(crate) fn token_namespace_scope(
+    agent_id: &AgentId,
+    allowed_namespaces: &[String],
+) -> Result<Vec<Namespace>, String> {
+    let private = Namespace::private_for(agent_id);
+    let shared = Namespace::shared();
+    if allowed_namespaces.is_empty() {
+        return Ok(vec![private, shared]);
+    }
+
+    let mut resolved = Vec::with_capacity(allowed_namespaces.len());
+    for allowed in allowed_namespaces {
+        let namespace = match allowed.as_str() {
+            "private" | "default" => private,
+            "shared" => shared,
+            other => Namespace::new(other)
+                .map_err(|error| format!("invalid token namespace '{other}': {error}"))?,
+        };
+        if !resolved.contains(&namespace) {
+            resolved.push(namespace);
+        }
+    }
+    Ok(resolved)
 }
 
 /// Shared authentication state.
@@ -348,8 +384,9 @@ impl AuthState {
     ///
     /// Call this when an API key is rotated out or removed so already-minted
     /// tokens die with the key instead of remaining valid until `exp`.
-    pub fn revoke_api_key(&self, key: &str) {
-        self.revocations.revoke_issuer(credential_kid("key", key));
+    pub fn revoke_api_key(&self, realm: &str, key: &str) {
+        self.revocations
+            .revoke_issuer(realm, credential_kid("key", key));
     }
 
     /// Validate an API key using constant-time comparison to prevent timing
@@ -481,11 +518,17 @@ impl AuthState {
         }
 
         // Revocation checks: the token itself, then its issuing credential.
-        if self.revocations.is_jti_revoked(&data.claims.jti) {
+        if self
+            .revocations
+            .is_jti_revoked(&data.claims.realm, &data.claims.jti)
+        {
             return Err(TokenError::Revoked);
         }
         if let Some(kid) = data.claims.iss_kid.as_deref() {
-            if self.revocations.is_issuer_revoked(kid, data.claims.iat) {
+            if self
+                .revocations
+                .is_issuer_revoked(&data.claims.realm, kid, data.claims.iat)
+            {
                 return Err(TokenError::Revoked);
             }
         }
@@ -817,6 +860,33 @@ mod tests {
     }
 
     #[test]
+    fn token_namespace_scope_normalizes_without_widening() {
+        let agent = AgentId::new("agent-a").unwrap();
+        let defaults = token_namespace_scope(&agent, &[]).unwrap();
+        assert_eq!(
+            defaults,
+            vec![Namespace::private_for(&agent), Namespace::shared()]
+        );
+
+        let claimed = vec![
+            "private".to_owned(),
+            "default".to_owned(),
+            "shared".to_owned(),
+            "team-a".to_owned(),
+        ];
+        let resolved = token_namespace_scope(&agent, &claimed).unwrap();
+        assert_eq!(
+            resolved,
+            vec![
+                Namespace::private_for(&agent),
+                Namespace::shared(),
+                Namespace::new("team-a").unwrap(),
+            ]
+        );
+        assert!(token_namespace_scope(&agent, &["bad namespace".to_owned()]).is_err());
+    }
+
+    #[test]
     fn issued_tokens_carry_issuer_and_realm_audience() {
         let state = auth_state_with_tokens();
         let token = state
@@ -857,7 +927,9 @@ mod tests {
 
         // Both valid (unexpired) before revocation.
         let claims = state.validate_token(&revoked).unwrap();
-        state.revocations().revoke_jti(claims.jti, claims.exp);
+        state
+            .revocations()
+            .revoke_jti(&claims.realm, claims.jti, claims.exp);
 
         // Unexpired but revoked → rejected.
         assert!(matches!(
@@ -874,14 +946,27 @@ mod tests {
         let now = jsonwebtoken::get_current_timestamp();
 
         // Entry for a token that expired long ago (past the prune leeway).
-        list.revoke_jti("stale-jti", now - 10_000);
+        list.revoke_jti("realm-a", "stale-jti", now - 10_000);
         assert_eq!(list.jti_entries(), 1);
 
         // The next insert prunes the stale entry.
-        list.revoke_jti("live-jti", now + 3600);
+        list.revoke_jti("realm-a", "live-jti", now + 3600);
         assert_eq!(list.jti_entries(), 1);
-        assert!(list.is_jti_revoked("live-jti"));
-        assert!(!list.is_jti_revoked("stale-jti"));
+        assert!(list.is_jti_revoked("realm-a", "live-jti"));
+        assert!(!list.is_jti_revoked("realm-a", "stale-jti"));
+    }
+
+    #[test]
+    fn revocations_are_isolated_by_realm() {
+        let list = RevocationList::default();
+        let exp = jsonwebtoken::get_current_timestamp() + 3600;
+        list.revoke_jti("realm-a", "shared-jti", exp);
+        list.revoke_issuer("realm-a", "shared-kid");
+
+        assert!(list.is_jti_revoked("realm-a", "shared-jti"));
+        assert!(!list.is_jti_revoked("realm-b", "shared-jti"));
+        assert!(list.is_issuer_revoked("realm-a", "shared-kid", 0));
+        assert!(!list.is_issuer_revoked("realm-b", "shared-kid", 0));
     }
 
     #[test]
@@ -903,7 +988,7 @@ mod tests {
         state.validate_token(&t1).unwrap();
         state.validate_token(&t2).unwrap();
 
-        state.revoke_api_key("the-api-key");
+        state.revoke_api_key("default", "the-api-key");
 
         assert!(matches!(
             state.validate_token(&t1),
@@ -921,7 +1006,7 @@ mod tests {
     fn tokens_minted_after_issuer_revocation_are_accepted() {
         let state = auth_state_with_tokens();
         let kid = credential_kid("key", "rotating-key");
-        state.revocations().revoke_issuer(kid.clone());
+        state.revocations().revoke_issuer("default", kid.clone());
 
         // A token whose iat is strictly after the revocation timestamp
         // (credential re-added later) validates again.

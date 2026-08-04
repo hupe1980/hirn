@@ -197,11 +197,17 @@ async fn public_resource_workflow_smoke_uses_preview_hydration() {
         .embed_text("card declined checkout screenshot")
         .await
         .unwrap();
+    // Recall fails closed: a caller that names neither a namespace, an
+    // allowlist, nor `unrestricted` matches nothing, so cross-tenant leakage
+    // cannot happen by omission. This is the single-tenant embedded facade,
+    // which owns all data in-process, so it reads across namespaces
+    // explicitly.
     let recalled = mem
         .db()
         .recall_view()
         .query(query)
         .agent_id(agent().as_str())
+        .unrestricted()
         .limit(3)
         .execute()
         .await

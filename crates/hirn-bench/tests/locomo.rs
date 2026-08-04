@@ -180,6 +180,7 @@ fn run_locomo_benchmark(data_dir: &Path) -> CognitiveResult {
         execution_surface: hirn_bench::cognitive::BenchmarkExecutionSurface::DirectBuilders,
         query_text_hybrid: false,
         embedder_policy: Default::default(),
+        ..Default::default()
     };
     hirn_bench::cognitive::runner::run(&dataset, &config, &db_path, "locomo-test")
 }

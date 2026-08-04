@@ -408,6 +408,7 @@ fn recall_rows_from_batch(
                 surprise: optional_f32_value(surprises, row),
                 evidence_count: optional_u32_value(evidence_counts, row),
                 invocation_count: optional_u64_value(invocation_counts, row),
+                embedding: None,
             },
             activation_score: optional_f32_value(activation_scores, row),
             activation_depth: optional_u32_value(activation_depths, row),

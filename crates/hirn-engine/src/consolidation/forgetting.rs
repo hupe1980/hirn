@@ -171,6 +171,10 @@ pub async fn run_forgetting(
         .unwrap_or(hirn_config.decay_lambda);
     let archive_threshold = hirn_config.archive_threshold;
     let purge_threshold = hirn_config.purge_threshold;
+    // A record whose intrinsic importance is at or above the floor is never
+    // hard-purged (it may still archive); pinned records are exempt from both
+    // archival and purge. Guards silent decay-driven data loss (DR-M-e7).
+    let retention_floor = hirn_config.retention_floor;
 
     // Grace period for purging: 7 days of being archived.
     let grace_period_hours = 168.0; // 7 days
@@ -234,7 +238,12 @@ pub async fn run_forgetting(
             // last access alone let a record archived this very pass be
             // hard-deleted immediately if it simply hadn't been read for a
             // week, i.e. no post-archival grace at all.
-            if ep.archived && effective_importance < purge_threshold {
+            // Pinned or floored records are never hard-purged.
+            if ep.archived
+                && effective_importance < purge_threshold
+                && !ep.pinned
+                && ep.importance < retention_floor
+            {
                 let hours_since_archival = now_dt
                     .signed_duration_since(ep.updated_at.as_datetime())
                     .num_hours() as f64;
@@ -247,8 +256,8 @@ pub async fn run_forgetting(
                 }
             }
 
-            // Check for archiving.
-            if !ep.archived && effective_importance < archive_threshold {
+            // Check for archiving. Pinned records are never auto-archived.
+            if !ep.archived && effective_importance < archive_threshold && !ep.pinned {
                 to_archive.push(ep.id);
                 records_archived += 1;
                 records_decayed += 1;
