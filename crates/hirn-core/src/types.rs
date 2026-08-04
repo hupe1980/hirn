@@ -149,7 +149,7 @@ impl MemoryRef {
     }
 }
 
-/// Edge relation types for the property graph (CONCEPT.md §6.1).
+/// Edge relation types for the property graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EdgeRelation {
     /// General association — bidirectional.

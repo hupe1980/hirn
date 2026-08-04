@@ -1,7 +1,7 @@
 //! Spreading activation engine with lateral inhibition (hot tier).
 //!
-//! Implements the activation propagation algorithm from CONCEPT.md §6.3:
-//! `A(j) += A(i) × w(i,j) × d^l` where `d` is depth decay.
+//! Propagates activation as `A(j) += A(i) × w(i,j) × d^l`, where `d` is the
+//! per-depth decay factor.
 //!
 //! The actual math lives in [`crate::activation_core`], which is shared with
 //! the cold-tier `PersistentGraph` caller in `hirn-engine`. This module only

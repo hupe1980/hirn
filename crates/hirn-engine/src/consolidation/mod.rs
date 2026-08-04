@@ -2,7 +2,7 @@
 //! thread formation, concept extraction, adaptive forgetting, and memory
 //! reconsolidation.
 //!
-//! This module implements the full memory lifecycle from CONCEPT.md §8:
+//! This module implements the full memory lifecycle:
 //! - Episode Segmentation (topic boundaries, surprise spikes, temporal gaps)
 //! - Pattern Detection (frequency, temporal clustering, causal chains)
 //! - Narrative Thread Formation (hierarchical agglomerative clustering)

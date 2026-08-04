@@ -1,6 +1,5 @@
 //! Hebbian learning: co-retrieval strengthens edge weights, solo retrieval decays them.
 //!
-//! Implements CONCEPT.md §6.5:
 //! - Co-retrieval: `weight = min(1.0, weight + η × Δ)`
 //! - Solo retrieval: `weight = max(0.01, weight × (1 - λ_decay))`
 //!
