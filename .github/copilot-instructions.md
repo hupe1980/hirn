@@ -7,31 +7,15 @@ Pearl's 3-rung causal hierarchy. Engineered as a database, not a framework.
 
 **Targets:** 30ms p50 recall (cold), 8ms simple-query, sub-ms graph activation, 30K+ recalls/sec.
 
-## Implementation Roadmap
+## Implementation Status
 
-15 backlogs in project root (`BACKLOG1.md`–`BACKLOG15.md`). The original roadmap table below covers BACKLOG1–10; BACKLOG11–14 are follow-on hardening increments that are part of the live codebase, and BACKLOG15 is the next planned expansion.
+The engine is feature-complete across the four memory layers, the HirnQL compiler and
+DataFusion execution surface, policy pushdown, write-path intelligence, lifecycle and
+namespace management, versioned semantic memory, multimodal resources, and offline
+intelligence. Current gaps and priorities are tracked in the issue tracker.
 
-| Backlog | Title | Phase | Depends On |
-|---------|-------|-------|------------|
-| **BACKLOG1** | Foundation + Core Type Hardening | Weeks 1–4 | None |
-| **BACKLOG2** | DataFusion Substrate | Weeks 5–10 | 1 |
-| **BACKLOG3** | HirnQL Compiler + Cognitive Operators | Weeks 8–14 | 2 |
-| **BACKLOG4** | Policy Pushdown + Defense | Weeks 10–14 | 3 |
-| **BACKLOG5** | Write-Path Intelligence | Weeks 12–16 | 2, 3 |
-| **BACKLOG6** | Read-Path Intelligence + SOTA | Weeks 14–18 | 2, 3 |
-| **BACKLOG7** | Causal Reasoning Engine | Weeks 16–22 | 1, 2, 3, 5 |
-| **BACKLOG8** | Agent Tools + Benchmarks | Weeks 20–26 | 4, 5, 6, 7 |
-| **BACKLOG9** | Lifecycle + Namespace + Observability | Overlap 5–9 | 2, 5, 6 |
-| **BACKLOG10** | Distribution + Polish + Production | Weeks 24–30 | 1–9 |
-
-Post-roadmap increments:
-- **BACKLOG11** — Runtime Hardening + Tokenizer Boundary Reset
-- **BACKLOG12** — Coordinator Decomposition + Public Proof
-- **BACKLOG13** — Versioned Semantic Memory + Public Revision Semantics
-- **BACKLOG14** — First-Class Multimodal + Resource Memory
-- **BACKLOG15** — Offline Intelligence + Next Cognitive Operators
-
-**Rule:** Update `.github/copilot-instructions.md` **after completing each backlog** to reflect newly implemented patterns.
+**Rule:** update this file when a change introduces a pattern worth following, so the
+guidance stays aligned with the code rather than with a plan.
 
 ## Architecture
 
