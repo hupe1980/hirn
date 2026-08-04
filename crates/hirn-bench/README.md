@@ -1,6 +1,8 @@
-# hirn-bench
+# 📊 hirn-bench
 
-> **⚠️ Experimental:** This project is under active development. APIs, on-disk formats, and behaviour may change without notice. Not recommended for production use.
+> [!WARNING]
+> **Experimental.** APIs, on-disk formats, and behaviour may change without notice.
+> Not recommended for production use.
 
 Benchmark framework for the hirn cognitive memory database. Implements evaluation suites from the cognitive memory research literature plus synthetic performance benchmarks.
 
@@ -128,15 +130,23 @@ visibility boundary. Both THINK context assembly and RECALL—including temporal
 grounding on the direct surface and query decomposition on both surfaces—remain
 inside that boundary. The active surface is recorded as
 `per-query-haystack`. The reader prompt strategy is versioned and published as
-`reader_prompt_strategy`; the current `evidence-notes-v1` strategy reconciles
+`reader_prompt_strategy`; the current `evidence-notes-v2` strategy reconciles
 updates and temporal relations internally while returning only a short final answer.
 
-The current checked-in full oracle result is **0.6500 `official_reader_accuracy`**
-over 500 questions, with 0.7913 retrieval containment and 27/30 correct abstentions.
-It is reviewable as
-[Markdown](../../bench-results/longmemeval-oracle-product-temporal-reader-v2.md) and
-[JSON](../../bench-results/longmemeval-oracle-product-temporal-reader-v2.json). It does not
-establish SOTA: preference following scores 0.2000 and temporal reasoning 0.3985.
+The current checked-in full oracle result is **0.7040 `official_reader_accuracy`** over 500
+questions, with 0.7868 retrieval containment and 27/30 correct abstentions. It is published
+with its **paired control** — the same binary, seed, and dataset hash, differing only by
+`--no-temporal-ledger` — so the temporal ledger's contribution is measured rather than
+inferred: temporal reasoning moves 0.4361 → 0.5639, a net +17 of 133 questions at a two-sided
+exact McNemar *p* = 0.0015.
+
+Reviewable as
+[ledger arm](../../bench-results/longmemeval-oracle-temporal-ledger-dated.md)
+([JSON](../../bench-results/longmemeval-oracle-temporal-ledger-dated.json)) and
+[control arm](../../bench-results/longmemeval-oracle-temporal-ledger-control.md)
+([JSON](../../bench-results/longmemeval-oracle-temporal-ledger-control.json)).
+It does not establish SOTA — Mem0 reports 0.944 on this benchmark — and preference
+following remains the weakest slice at 0.3667.
 
 | Flag | Default | Meaning |
 |------|---------|---------|
@@ -179,9 +189,10 @@ cargo run --release -p hirn-bench -- external --format-name longmemeval \
   --full-corpus --runs 1 --no-baselines --seed 0 \
   --reader gpt-4o --judge gpt-4o --reader-temperature 0.0 --reader-concurrency 4 \
   --expect-dataset-hash ff7ed687a502556b330b41fee915854b7b944c950fb54c6715a7cb28a1fa9034 \
-  --environment-label "macOS arm64; official per-query haystack; evidence-notes-v1; hydrated product temporal+RRF" \
-  --format markdown --output bench-results/longmemeval-oracle-product-temporal-reader-v2.md \
-  --json-output bench-results/longmemeval-oracle-product-temporal-reader-v2.json
+  --reader-answers /tmp/lme-answers.json \
+  --environment-label "macOS arm64; official per-query haystack; evidence-notes-v2" \
+  --format markdown --output bench-results/longmemeval-oracle-temporal-ledger-dated.md \
+  --json-output bench-results/longmemeval-oracle-temporal-ledger-dated.json
 
 # 3. Re-runs: pin the dataset bytes with the hash printed in step 2
 #    (also published as metadata.dataset_hash_blake3 in the JSON artifact)
@@ -230,3 +241,8 @@ cargo run -p hirn-bench -- bench-compare --baseline bench-results/advanced-basel
 Enable these advanced operators in production when you need audited explanation surfaces or scheduled offline cognition windows and you can afford the added review surface.
 
 Do not enable them on latency-critical paths, during uncontrolled provider spend conditions, or when you do not have a quarantine or review workflow for generated cognition.
+
+## 📚 Documentation
+
+- [Benchmarks](https://hupe1980.github.io/hirn/docs/benchmarks/) — this crate's concepts, explained
+- [Full documentation](https://hupe1980.github.io/hirn/)

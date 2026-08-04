@@ -1,6 +1,8 @@
-# hirn-graph
+# 🕸️ hirn-graph
 
-> **⚠️ Experimental:** This project is under active development. APIs, on-disk formats, and behaviour may change without notice. Not recommended for production use.
+> [!WARNING]
+> **Experimental.** APIs, on-disk formats, and behaviour may change without notice.
+> Not recommended for production use.
 
 In-memory property graph engine for hirn — spreading activation, Hebbian learning, lateral inhibition, and personalized PageRank.
 
@@ -81,3 +83,8 @@ relevance_score = strength × confidence × ln(1 + evidence_count)
 - Zero-alloc iterators: `outgoing_weighted_iter()` yields `(NodeIndex, f32, &EdgeRelation)`
 - Batch retrieval: `edges_for_nodes()` returns `HashMap<MemoryId, Vec<&GraphEdge>>`
 - All operations sub-millisecond on hot tier
+
+## 📚 Documentation
+
+- [Causal Reasoning](https://hupe1980.github.io/hirn/docs/concepts/causal/) — this crate's concepts, explained
+- [Full documentation](https://hupe1980.github.io/hirn/)

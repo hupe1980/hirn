@@ -703,7 +703,7 @@ async fn e2e_depth_scheduling_explicit() {
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_operator_count_matches_target() {
     // Validate that the execution layer has the expected number of components.
-    // These counts match GREENFIELD.md targets and are documented in copilot-instructions.md.
+    // The expected counts are recorded in .github/copilot-instructions.md.
     //
     // We verify by counting the operator module re-exports from hirn-exec.
     // This test catches accidental operator deletions during refactoring.
@@ -760,7 +760,7 @@ async fn e2e_operator_count_matches_target() {
         "topic_loom",
         "mcfa_audit_log",
     ];
-    assert_eq!(dataset_names.len(), 10, "GREENFIELD target: 10 datasets");
+    assert_eq!(dataset_names.len(), 10, "expected 10 datasets");
 
     // Verify EXPLAIN plan exercises the plan compilation pipeline
     let (mem, _dir) = open_memory().await;

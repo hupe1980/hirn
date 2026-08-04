@@ -47,7 +47,8 @@
   },
   "scripts": {
     "build": "cargo build -p hirn-node --release && node scripts/stage-local-binary.js",
-    "pretest": "npm run build",
-    "test": "node --test tests/test_hirn.mjs"
+    "pretest": "npm run build:debug",
+    "test": "node --test tests/test_hirn.mjs",
+    "build:debug": "cargo build -p hirn-node && HIRN_NODE_PROFILE=debug node scripts/stage-local-binary.js"
   }
 }

@@ -21,8 +21,16 @@ def is_excluded(path: Path) -> bool:
 
 
 def iter_markdown_files(args: list[str]) -> list[Path]:
+    """Collect markdown files from the given paths.
+
+    A path that does not exist is an error, not something to skip. Silently
+    ignoring one means a renamed directory leaves the check passing while it
+    covers nothing — which is exactly how the `docs/` → `site/` move went
+    unnoticed in CI.
+    """
     files: list[Path] = []
     seen: set[Path] = set()
+    missing: list[str] = []
     for arg in args:
         path = Path(arg)
         if path.is_dir():
@@ -33,11 +41,22 @@ def iter_markdown_files(args: list[str]) -> list[Path]:
                 if resolved not in seen:
                     seen.add(resolved)
                     files.append(child)
-        elif path.is_file() and path.suffix == ".md":
+        elif path.is_file():
+            if path.suffix != ".md":
+                missing.append(f"{arg} (not a markdown file)")
+                continue
             resolved = path.resolve()
             if resolved not in seen:
                 seen.add(resolved)
                 files.append(path)
+        else:
+            missing.append(f"{arg} (no such file or directory)")
+
+    if missing:
+        for entry in missing:
+            print(f"error: cannot check {entry}", file=sys.stderr)
+        raise SystemExit(2)
+
     return files
 
 

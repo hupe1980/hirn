@@ -89,7 +89,10 @@ fn main() {
             .flatten()
             .enumerate()
         {
-            let anchor = session_dates.get(session_index).copied().unwrap_or(question_date);
+            let anchor = session_dates
+                .get(session_index)
+                .copied()
+                .unwrap_or(question_date);
             for turn in session.as_array().into_iter().flatten() {
                 if let Some(content) = turn["content"].as_str() {
                     lines.push((content.to_owned(), anchor));

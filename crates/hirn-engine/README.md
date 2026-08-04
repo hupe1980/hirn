@@ -1,6 +1,8 @@
-# hirn-engine
+# 🧠 hirn-engine
 
-> **⚠️ Experimental:** This project is under active development. APIs, on-disk formats, and behaviour may change without notice. Not recommended for production use.
+> [!WARNING]
+> **Experimental.** APIs, on-disk formats, and behaviour may change without notice.
+> Not recommended for production use.
 
 Orchestrator crate for the hirn cognitive memory database. Wires together storage, graph, execution, query compilation, and policy enforcement into the `HirnDB` entry-point.
 
@@ -68,3 +70,8 @@ THINK  → [QueryComplexity] → HybridSearch → [GraphActivation] → [Iterati
 ```
 
 Depth scheduling: `AUTO` classifies query complexity and selects pipeline depth. Quality gate auto-escalates below threshold.
+
+## 📚 Documentation
+
+- [Write-Path Intelligence](https://hupe1980.github.io/hirn/docs/concepts/write-path/) — this crate's concepts, explained
+- [Full documentation](https://hupe1980.github.io/hirn/)

@@ -4483,7 +4483,11 @@ mod tests {
     fn superseded_preference_evidence_is_marked_but_retained() {
         let tok = test_tokenizer();
         let candidates = vec![
-            make_preference_candidate("aisle seats", hirn_core::PreferencePolarity::Positive, 1_000),
+            make_preference_candidate(
+                "aisle seats",
+                hirn_core::PreferencePolarity::Positive,
+                1_000,
+            ),
             // Same preference, different spelling, stated later.
             make_preference_candidate(
                 "Aisle-Seats",
@@ -4514,7 +4518,11 @@ mod tests {
     fn distinct_preferences_are_never_marked_superseded() {
         let tok = test_tokenizer();
         let candidates = vec![
-            make_preference_candidate("window seats", hirn_core::PreferencePolarity::Positive, 1_000),
+            make_preference_candidate(
+                "window seats",
+                hirn_core::PreferencePolarity::Positive,
+                1_000,
+            ),
             make_preference_candidate("oat milk", hirn_core::PreferencePolarity::Positive, 9_000),
         ];
 

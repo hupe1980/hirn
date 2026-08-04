@@ -81,18 +81,19 @@ cargo run -p hirn-bench -- nlu-routing \
 - [Human-readable report](nlu-routing.md)
 - [Machine-readable report](nlu-routing.json)
 
-## LongMemEval Regression Check (M-06 migration)
+## 🔁 Past Regression Check (M-06 migration)
 
-`longmemeval-oracle-nlu-migration.md` / `.json` re-run the full 500-question oracle
-protocol on the tree after the language-understanding migration, against the same pinned
-dataset hash and the same `gpt-4o` reader/judge at temperature 0.
+The language-understanding migration was re-run against the full 500-question oracle
+protocol, same pinned dataset hash and the same `gpt-4o` reader/judge at temperature 0.
 
-Retrieval is unchanged to four decimal places (containment 0.7869, recall accuracy
-0.4560, abstention 27/30) and four of six reader categories are bit-identical. Official
-reader accuracy reads 0.6740 versus the 0.6800 baseline — three queries out of 500, with
-retrieval identical, which is reader non-determinism rather than a code effect. A single
-run per arm is not a confidence interval; this rules out a material regression, nothing
-more.
+Retrieval came back unchanged to four decimal places (containment 0.7869, recall accuracy
+0.4560, abstention 27/30) with four of six reader categories bit-identical. Reader accuracy
+moved by three queries in 500 with retrieval identical — reader non-determinism, not a code
+effect. That ruled out a material regression and nothing more; a single run per arm is not a
+confidence interval.
+
+The artifact is no longer checked in. Its conclusion is the part that carried forward, and
+the protocol above is a documented command rather than a lost file.
 
 > `$LONGMEMEVAL_ORACLE_DIR` must contain **only** the oracle split. The dataset hash
 > covers every file in the directory, so a cache holding `longmemeval_s`/`_m` as well

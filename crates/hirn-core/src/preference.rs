@@ -527,7 +527,11 @@ mod tests {
             evidence_at("other", "window seats", PreferencePolarity::Negative, 3_000),
         ];
         let current = current_preferences(&observations);
-        assert_eq!(current.len(), 3, "no cross-owner or cross-target collapsing");
+        assert_eq!(
+            current.len(),
+            3,
+            "no cross-owner or cross-target collapsing"
+        );
         assert!(current.iter().all(|entry| entry.superseded.is_empty()));
     }
 

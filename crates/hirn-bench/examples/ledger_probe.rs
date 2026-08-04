@@ -67,8 +67,10 @@ fn main() {
             .collect();
 
         let reference = parse_reference(question["question_date"].as_str().unwrap_or_default());
-        let entries: Vec<(&str, Timestamp)> =
-            lines.iter().map(|line| (line.as_str(), reference)).collect();
+        let entries: Vec<(&str, Timestamp)> = lines
+            .iter()
+            .map(|line| (line.as_str(), reference))
+            .collect();
         let ledger = build_ledger(&entries);
 
         if ledger.is_useful() {

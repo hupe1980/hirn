@@ -1,6 +1,8 @@
-# hirn-provider
+# 🔌 hirn-provider
 
-> **⚠️ Experimental:** This project is under active development. APIs, on-disk formats, and behaviour may change without notice. Not recommended for production use.
+> [!WARNING]
+> **Experimental.** APIs, on-disk formats, and behaviour may change without notice.
+> Not recommended for production use.
 
 Unified embedding, LLM, tokenizer, and reranking providers for the hirn cognitive memory database.
 
@@ -95,3 +97,8 @@ the fallback rate), `hirn_nlu_abstentions_total{task,backend,reason}`,
 - **Graceful degradation:** Embed failure → store without embedding (`hirn_provider_fallback_total` metric)
 - **Abstain, never guess:** an NLU backend that cannot produce a decision it stands behind returns "no decision" so the chain can fall through — malformed model output is never coerced into a label
 - **Batch failure:** Continue without embeddings (not batch-fatal)
+
+## 📚 Documentation
+
+- [Language Understanding](https://hupe1980.github.io/hirn/docs/concepts/language-understanding/) — this crate's concepts, explained
+- [Full documentation](https://hupe1980.github.io/hirn/)

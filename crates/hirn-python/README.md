@@ -1,6 +1,8 @@
-# hirn — Python Bindings
+# 🐍 hirn — Python Bindings
 
-> **⚠️ Experimental:** This project is under active development. APIs, on-disk formats, and behaviour may change without notice. Not recommended for production use.
+> [!WARNING]
+> **Experimental.** APIs, on-disk formats, and behaviour may change without notice.
+> Not recommended for production use.
 
 Brain-inspired cognitive memory database for LLMs. Native Rust performance via PyO3.
 
@@ -269,3 +271,8 @@ maturin develop
 ## License
 
 Apache-2.0
+
+## 📚 Documentation
+
+- [Getting Started](https://hupe1980.github.io/hirn/docs/getting-started/) — install and store your first memory
+- [Full documentation](https://hupe1980.github.io/hirn/)

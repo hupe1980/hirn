@@ -122,7 +122,9 @@ class TestRegisterAgent:
 
     def test_register_agent_empty_id_fails(self, tmp_path):
         with Hirn.open(str(tmp_path / "test.hirn"), embedding_dimensions=DIM) as h:
-            with pytest.raises(QueryError):
+            # An invalid identifier is a caller error, so the binding raises
+            # ValueError rather than QueryError (see parse_agent_id).
+            with pytest.raises(ValueError):
                 h.register_agent("", "Test")
 
 
@@ -238,7 +240,7 @@ class TestForget:
     def test_forget_invalid_id_fails(self, tmp_path):
         with Hirn.open(str(tmp_path / "test.hirn"), embedding_dimensions=DIM) as h:
             h.register_agent("agent-1", "Test Agent")
-            with pytest.raises(QueryError):
+            with pytest.raises(ValueError):
                 h.forget("agent-1", "not-a-valid-ulid")
 
 
@@ -283,7 +285,7 @@ class TestInspect:
     def test_inspect_invalid_id_fails(self, tmp_path):
         with Hirn.open(str(tmp_path / "test.hirn"), embedding_dimensions=DIM) as h:
             h.register_agent("agent-1", "Test Agent")
-            with pytest.raises(QueryError):
+            with pytest.raises(ValueError):
                 h.inspect("agent-1", "bad-id")
 
 

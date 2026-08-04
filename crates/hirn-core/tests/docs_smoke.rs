@@ -1,6 +1,7 @@
 use hirn_core::HirnConfig;
 
-const PERFORMANCE_TUNING_DOC: &str = include_str!("../../../site/content/docs/operations/performance-tuning.md");
+const PERFORMANCE_TUNING_DOC: &str =
+    include_str!("../../../site/content/docs/operations/performance-tuning.md");
 
 fn fenced_blocks(markdown: &str, language: &str) -> Vec<String> {
     let fence = format!("```{language}");

@@ -1,6 +1,8 @@
-# hirn-core
+# 🧩 hirn-core
 
-> **⚠️ Experimental:** This project is under active development. APIs, on-disk formats, and behaviour may change without notice. Not recommended for production use.
+> [!WARNING]
+> **Experimental.** APIs, on-disk formats, and behaviour may change without notice.
+> Not recommended for production use.
 
 Core types, traits, configuration, and error definitions for the hirn cognitive memory database. This is the **leaf crate** — all other hirn crates depend on it, but it depends on none.
 
@@ -72,3 +74,8 @@ decision. Concrete backends live in `hirn-provider::nlu`.
 - `StringInterner` — Lock-free global interning for Namespace and AgentId
 - `text_util` — UTF-8-safe word boundary truncation
 - `tokenizer` — Character-based token estimation
+
+## 📚 Documentation
+
+- [Cognitive Model](https://hupe1980.github.io/hirn/docs/concepts/cognitive-model/) — this crate's concepts, explained
+- [Full documentation](https://hupe1980.github.io/hirn/)

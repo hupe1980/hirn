@@ -1,6 +1,8 @@
-# hirn-storage
+# 💾 hirn-storage
 
-> **⚠️ Experimental:** This project is under active development. APIs, on-disk formats, and behaviour may change without notice. Not recommended for production use.
+> [!WARNING]
+> **Experimental.** APIs, on-disk formats, and behaviour may change without notice.
+> Not recommended for production use.
 
 Cognitive storage engine for hirn — purpose-built on **Lance 9.0** + `lance-namespace`.
 
@@ -74,3 +76,8 @@ Lance creates **one fragment per `append()` call**. Excessive fragments degrade 
 
 **Always escape single quotes** with `.replace('\'', "''")` before interpolating
 into Lance filter strings — unescaped values risk filter injection.
+
+## 📚 Documentation
+
+- [Architecture](https://hupe1980.github.io/hirn/docs/concepts/architecture/) — this crate's concepts, explained
+- [Full documentation](https://hupe1980.github.io/hirn/)

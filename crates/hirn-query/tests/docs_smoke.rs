@@ -1,6 +1,7 @@
 use hirn_query::{AnalyzeContext, analyze, parse};
 
-const TROUBLESHOOTING_DOC: &str = include_str!("../../../site/content/docs/operations/troubleshooting.md");
+const TROUBLESHOOTING_DOC: &str =
+    include_str!("../../../site/content/docs/operations/troubleshooting.md");
 
 fn fenced_blocks(markdown: &str, language: &str) -> Vec<String> {
     let fence = format!("```{language}");

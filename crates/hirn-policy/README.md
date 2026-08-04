@@ -1,6 +1,8 @@
-# hirn-policy
+# 🔐 hirn-policy
 
-> **⚠️ Experimental:** This project is under active development. APIs, on-disk formats, and behaviour may change without notice. Not recommended for production use.
+> [!WARNING]
+> **Experimental.** APIs, on-disk formats, and behaviour may change without notice.
+> Not recommended for production use.
 
 Cedar-based authorization and policy enforcement for the hirn cognitive memory database.
 
@@ -66,3 +68,8 @@ action "remember", "correct", "supersede", "merge", "retract", "purge",
        "recall", "think", "forget", "consolidate", "watch", "connect",
        "execute", "admin", "recall_raw_text", "read", "write", "delete";
 ```
+
+## 📚 Documentation
+
+- [Security](https://hupe1980.github.io/hirn/docs/security/) — this crate's concepts, explained
+- [Full documentation](https://hupe1980.github.io/hirn/)

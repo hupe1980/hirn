@@ -1597,8 +1597,7 @@ fn execute_compiled_query(
     let (think_result, think_diagnostics) =
         require_query_stage(&query.id, "THINK", think_execution);
     let think_diagnostics = require_compiled_diagnostics(&query.id, "THINK", think_diagnostics);
-    let (context, context_candidates) =
-        unpack_compiled_records(&query.id, "THINK", think_result);
+    let (context, context_candidates) = unpack_compiled_records(&query.id, "THINK", think_result);
     let context = context.unwrap_or_else(|| {
         panic!(
             "benchmark THINK omitted assembled context for query `{}`",

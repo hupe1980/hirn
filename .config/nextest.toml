@@ -1,0 +1,30 @@
+# cargo-nextest configuration.
+#
+# The `ci` profile is what .github/workflows/ci.yml runs; the default profile
+# applies to local runs.
+
+[profile.default]
+# Surface slow tests rather than letting them quietly dominate the run.
+slow-timeout = { period = "30s", terminate-after = 8 }
+failure-output = "immediate-final"
+
+[profile.ci]
+# CI should report every failure in one pass, not stop at the first — a red
+# build that hides the other nine failures costs another full cycle to find them.
+fail-fast = false
+failure-output = "immediate-final"
+status-level = "retry"
+final-status-level = "slow"
+
+# Retry once before declaring a failure. This is a concession to genuinely
+# flaky infrastructure (network, filesystem timing), NOT a way to paper over
+# flaky tests: a test that only passes on retry is reported as FLAKY in the
+# summary and should be fixed, not left to the retry.
+retries = { backoff = "fixed", count = 1, delay = "1s" }
+
+# Long-running integration tests exist here (Lance datasets, daemon startup),
+# so the CI budget is more generous than the local one.
+slow-timeout = { period = "60s", terminate-after = 10 }
+
+[profile.ci.junit]
+path = "junit.xml"

@@ -301,7 +301,11 @@ pub async fn run_sleep_pass(
     coordinator: &ConsolidationCoordinator,
 ) -> SleepPassOutcome {
     use tracing::Instrument;
-    run_sleep_pass_inner(realms, tracker, coordinator)
+    // Boxed because the pass holds the record model across many awaits, which
+    // puts the future well over clippy's size threshold. One allocation per
+    // pass is immaterial on a background path that runs at most once per
+    // interval, and it keeps ~28 KB off every caller's stack.
+    Box::pin(run_sleep_pass_inner(realms, tracker, coordinator))
         .instrument(tracing::info_span!("sleep_pass"))
         .await
 }
@@ -523,7 +527,7 @@ impl SleepScheduler {
             let now = now_unix_ms();
             let last_activity = ActivityTracker::global().last_activity_ms();
             if should_run_pass(now, last_activity, self.last_pass_finished_ms, &self.cfg) {
-                self.run_pass_once().await;
+                Box::pin(self.run_pass_once()).await;
             }
         }
     }
@@ -531,8 +535,12 @@ impl SleepScheduler {
     /// Run exactly one sleep pass and record its completion timestamp.
     /// Public so operators/tests can trigger a pass without the timer loop.
     pub async fn run_pass_once(&mut self) -> SleepPassOutcome {
-        let outcome =
-            run_sleep_pass(&self.realms, ActivityTracker::global(), &self.coordinator).await;
+        let outcome = Box::pin(run_sleep_pass(
+            &self.realms,
+            ActivityTracker::global(),
+            &self.coordinator,
+        ))
+        .await;
 
         let finished_ms = now_unix_ms();
         self.last_pass_finished_ms = Some(finished_ms);

@@ -35,7 +35,7 @@ Post-roadmap increments:
 
 ## Architecture
 
-Cargo workspace with 13 crates. See [GREENFIELD.md](../GREENFIELD.md) §7 and [Architecture](../docs/architecture.md).
+Cargo workspace with 13 crates. See [Architecture](https://hupe1980.github.io/hirn/docs/concepts/architecture/) (source: `site/content/docs/concepts/architecture.md`).
 
 ### Runtime Ownership
 
@@ -170,7 +170,7 @@ See [CONTRIBUTING.md](../CONTRIBUTING.md) for coding standards, PR process, and 
 - `hirn-bench` publishable cognitive artifacts include run metadata, p50/p95/p99 query latency, token-cost estimates, executable `full-context` / `iterative-retrieval` baselines, and per-strategy reproducibility summaries
 - `hirn-bench` also ships an `advanced` benchmark family for Story 3.2 surfaces: explanation quality, dream hypothesis precision/recall, reconcile accuracy, and planning usefulness, each with p50/p95/p99 latency, token/spend envelopes, and reproducibility drift metadata
 - PR benchmark smoke paths may use pseudo embeddings, but publishable nightly runs use checked-in real embedding caches plus explicit embedding-model and environment labels
-- Operator docs live in `docs/performance-tuning.md`, `docs/troubleshooting.md`, `docs/migration.md`, `docs/cedar-patterns.md`, and `docs/glossary.md`; docs smoke tests keep config, Cedar, and HirnQL examples aligned with live code
+- Operator docs live under `site/content/docs/operations/` (`performance-tuning.md`, `troubleshooting.md`), `site/content/docs/security/cedar-patterns.md`, and `site/content/docs/glossary.md`; `docs_smoke` tests `include_str!` several of these pages so config, Cedar, and HirnQL examples stay aligned with live code
 
 ## Critical Patterns
 

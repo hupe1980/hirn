@@ -1,6 +1,8 @@
-# hirn-exec
+# ⚙️ hirn-exec
 
-> **⚠️ Experimental:** This project is under active development. APIs, on-disk formats, and behaviour may change without notice. Not recommended for production use.
+> [!WARNING]
+> **Experimental.** APIs, on-disk formats, and behaviour may change without notice.
+> Not recommended for production use.
 
 DataFusion physical operators and optimizer rules for the hirn cognitive memory database.
 
@@ -95,3 +97,8 @@ Runtime state injected into DataFusion's `SessionContext` extension mechanism:
 - Provider handles — embedder + LLM for operators that need them
 
 Operators access these via `ctx.session_config().extensions.get::<HirnSessionExt>()` — never via constructors.
+
+## 📚 Documentation
+
+- [Architecture](https://hupe1980.github.io/hirn/docs/concepts/architecture/) — this crate's concepts, explained
+- [Full documentation](https://hupe1980.github.io/hirn/)

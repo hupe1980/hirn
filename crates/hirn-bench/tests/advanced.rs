@@ -35,8 +35,9 @@ fn documentation_smoke_covers_advanced_offline_workflow() {
     let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let readme =
         std::fs::read_to_string(crate_root.join("README.md")).expect("read hirn-bench README");
-    let benchmarks_doc = std::fs::read_to_string(crate_root.join("../../site/content/docs/benchmarks.md"))
-        .expect("read benchmarks doc");
+    let benchmarks_doc =
+        std::fs::read_to_string(crate_root.join("../../site/content/docs/benchmarks.md"))
+            .expect("read benchmarks doc");
 
     for document in [&readme, &benchmarks_doc] {
         assert!(document.contains("Advanced Offline Cognition Workflow"));

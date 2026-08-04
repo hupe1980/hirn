@@ -37,11 +37,17 @@ if (!triple) {
 
 const repoRoot = path.resolve(__dirname, '..', '..', '..');
 const crateDir = path.resolve(__dirname, '..');
-const releaseDir = path.join(repoRoot, 'target', 'release');
+
+// Which cargo profile to stage from. CI builds debug because a release build of
+// the Lance/DataFusion tree dominates the job's wall clock and the tests only
+// need the module to load and behave; release stays the default so a local
+// `npm run build` still produces what is shipped.
+const profile = process.env.HIRN_NODE_PROFILE || 'release';
+const buildDir = path.join(repoRoot, 'target', profile);
 
 let sourcePath = null;
 for (const sourceName of triple.sourceNames) {
-  const candidate = path.join(releaseDir, sourceName);
+  const candidate = path.join(buildDir, sourceName);
   if (fs.existsSync(candidate)) {
     sourcePath = candidate;
     break;
@@ -50,7 +56,7 @@ for (const sourceName of triple.sourceNames) {
 
 if (!sourcePath) {
   console.error(
-    `Could not find native output in ${releaseDir}. Looked for: ${triple.sourceNames.join(', ')}`,
+    `Could not find native output in ${buildDir}. Looked for: ${triple.sourceNames.join(', ')}`,
   );
   process.exit(1);
 }

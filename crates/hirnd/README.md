@@ -1,6 +1,8 @@
-# hirnd
+# 🖥️ hirnd
 
-> **⚠️ Experimental:** This project is under active development. APIs, on-disk formats, and behaviour may change without notice. Not recommended for production use.
+> [!WARNING]
+> **Experimental.** APIs, on-disk formats, and behaviour may change without notice.
+> Not recommended for production use.
 
 Standalone cognitive memory daemon — the hirn server. Exposes gRPC, HTTP/REST, and MCP interfaces for multi-client access to HirnDB.
 
@@ -135,3 +137,8 @@ peers = [
   { node_id = 3, addr = "https://node-3.example:3000" },
 ]
 ```
+
+## 📚 Documentation
+
+- [Deployment](https://hupe1980.github.io/hirn/docs/operations/deployment/) — this crate's concepts, explained
+- [Full documentation](https://hupe1980.github.io/hirn/)

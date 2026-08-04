@@ -9,20 +9,50 @@ on:
     - cron: "0 4 * * 1" # weekly, enables the fuzz smoke job
   workflow_dispatch:
 
+# A new push to the same branch makes the in-flight run obsolete. Without this
+# a rapid series of pushes runs every one of them to completion.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-Dwarnings"
   CARGO_INCREMENTAL: "0"
-  CARGO_PROFILE_DEV_DEBUG: "1"
+  # CI never runs a debugger; full debug info costs build time and cache size.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  # Fail fast on a network hiccup rather than hanging the job.
+  CARGO_NET_RETRY: "3"
 
 jobs:
   docs-link-check:
     name: Docs Link Check
     runs-on: ubuntu-latest
+    env:
+      ZOLA_VERSION: "0.22.1"
     steps:
       - uses: actions/checkout@v4
+
+      # Cross-file links and anchors in every checked-in markdown file. The
+      # script fails on a path that does not exist, so a renamed directory
+      # breaks the build instead of quietly reducing coverage to nothing.
       - name: Check markdown links
-        run: python3 scripts/check_markdown_links.py README.md CONTRIBUTING.md docs crates/*/README.md
+        run: |
+          python3 scripts/check_markdown_links.py \
+            README.md CONTRIBUTING.md FINDINGS.md \
+            site bench-results crates .github
+
+      # Heading anchors inside the site are left to Zola, which slugifies them
+      # exactly as the renderer does; reimplementing that in the script would
+      # drift and start reporting working links as broken.
+      - name: Install Zola
+        run: |
+          curl -sSL "https://github.com/getzola/zola/releases/download/v${ZOLA_VERSION}/zola-v${ZOLA_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar xz -C /usr/local/bin zola
+
+      - name: Check site links and anchors
+        working-directory: site
+        run: zola check --skip-external-links
 
   check:
     name: Check
@@ -54,8 +84,14 @@ jobs:
       - name: Clippy
         if: runner.os == 'Linux'
         run: cargo clippy --workspace --all-targets
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      # nextest runs tests in parallel across processes; on CI hardware that is
+      # worth roughly 40% off the wall clock for a suite this size. It does not
+      # run doctests, which is why the explicit doctest step below stays.
       - name: Test
-        run: cargo test --workspace --lib --bins --tests
+        run: cargo nextest run --workspace --profile ci
       # --lib/--bins/--tests skips doctests, so run them explicitly. Feature-
       # gated doc examples (e.g. hirn-provider) are covered by the explicit
       # provider-features test step below.
@@ -69,26 +105,30 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo clippy -p hirn-provider --all-targets --features openai,anthropic,cohere,voyage,ollama
       - name: Test (provider features)
-        run: cargo test -p hirn-provider --features openai,anthropic,cohere,voyage,ollama
+        run: cargo nextest run -p hirn-provider --profile ci --features openai,anthropic,cohere,voyage,ollama
 
-  bindings:
-    name: Bindings (Python & Node)
+  # Python and Node were one sequential job that ran for over half an hour.
+  # They share no build artifacts (different crates, different profiles), so
+  # running them in parallel halves the wall clock for the same work.
+  python-bindings:
+    name: Bindings (Python)
     runs-on: ubuntu-latest
-    continue-on-error: false
     steps:
       - uses: actions/checkout@v4
       - name: Free disk space
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
           sudo apt-get clean
-          df -h
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: python-bindings
       - name: Install protobuf
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
       # maturin develop requires an active virtualenv; export it for later steps.
       - name: Set up Python venv
         run: |
@@ -100,18 +140,35 @@ jobs:
       - name: Build Python bindings
         run: maturin develop --manifest-path crates/hirn-python/Cargo.toml
       - name: Test Python bindings
-        run: pytest crates/hirn-python/tests -x
+        run: pytest crates/hirn-python/tests
+
+  node-bindings:
+    name: Bindings (Node)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          sudo apt-get clean
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: node-bindings
+      - name: Install protobuf
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-      # `npm run build` = cargo build -p hirn-node --release + stage the
-      # .node binary next to index.js (see crates/hirn-node/package.json).
-      - name: Build Node bindings
+      # `npm test` runs a debug build via the pretest hook. A release build of
+      # the Lance/DataFusion tree took most of this job's half hour and buys
+      # nothing: these tests check that the module loads and behaves, not how
+      # fast it runs. release.yml still builds optimised artifacts.
+      - name: Build and test Node bindings
         working-directory: crates/hirn-node
-        run: npm run build
-      - name: Test Node bindings
-        working-directory: crates/hirn-node
-        run: node --test tests/
+        run: |
+          npm install
+          npm test
 
   msrv:
     name: MSRV (1.91.1)
@@ -151,33 +208,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: fuzz
-      - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
       - name: Build fuzz targets
         run: cargo fuzz build
 
-  audit:
-    name: Security Audit
+  # Advisories, licences, bans, and sources in one job. These were two jobs,
+  # each spending several minutes compiling cargo-deny from source; the
+  # prebuilt binary makes the whole check faster than either install was.
+  supply-chain:
+    name: Supply Chain
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install cargo-deny
-        run: cargo install cargo-deny
-      - name: Audit
-        run: cargo deny check advisories
-
-  deny:
-    name: License & Supply Chain
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install cargo-deny
-        run: cargo install cargo-deny
-      - name: Check licenses
-        run: cargo deny check licenses
-      - name: Check bans
-        run: cargo deny check bans
-      - name: Check sources
-        run: cargo deny check sources
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: Check advisories, licences, bans, sources
+        run: cargo deny check advisories licenses bans sources

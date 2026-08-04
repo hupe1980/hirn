@@ -60,7 +60,7 @@ jobs:
       - name: Build
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-musl-gcc
-        run: cargo build --release --bin hirnd --target ${{ matrix.target }}
+        run: cargo build --release --locked --bin hirnd --target ${{ matrix.target }}
 
       - name: Package binary
         run: |
@@ -78,9 +78,13 @@ jobs:
   docker:
     name: Docker Image
     runs-on: ubuntu-latest
-    needs: []
     steps:
       - uses: actions/checkout@v4
+
+      # arm64 is emulated via QEMU. The binaries below already ship aarch64, so
+      # publishing an amd64-only image left ARM hosts pulling nothing usable.
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
 
       - uses: docker/login-action@v3
         with:
@@ -97,12 +101,19 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=sha
 
-      - uses: docker/build-push-action@v5
+      - uses: docker/build-push-action@v6
         with:
           context: .
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Layer cache across releases; a Rust image rebuild is otherwise a
+          # full cold compile every tag.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
 
   # ── Python wheels (maturin) ─────────────────────────────────────────────────
   python-wheels:
@@ -214,7 +225,7 @@ jobs:
         working-directory: crates/hirn-node
         run: |
           npm install
-          cargo build --release -p hirn-node --target ${{ matrix.target }}
+          cargo build --release --locked -p hirn-node --target ${{ matrix.target }}
 
       - name: Copy artifact
         run: |
@@ -255,24 +266,71 @@ jobs:
   publish-cargo:
     name: Publish crates.io
     runs-on: ubuntu-latest
+    # A crates.io publish cannot be undone — only yanked. Gate it behind every
+    # build that could reveal the tag is broken, so a failed binary or wheel
+    # build stops the release before anything irreversible happens.
+    needs: [build-binaries, python-wheels, node-build]
+    environment: release
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
 
       - name: Install protobuf
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      # A dry run catches metadata and packaging errors while they are still
+      # reversible. `--no-verify` is deliberately absent: the point is to build.
+      - name: Dry-run publish
+        run: |
+          for crate in hirn-core hirn-graph hirn-query hirn-storage hirn-provider \
+                       hirn-policy hirn-exec hirn-engine hirn hirnd; do
+            echo "::group::dry-run $crate"
+            cargo publish -p "$crate" --locked --dry-run --allow-dirty
+            echo "::endgroup::"
+          done
 
       - name: Publish crates (in dependency order)
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
-          # Order matters: publish leaf deps first, then dependents.
-          # Excluded: hirn-python (PyPI), hirn-node (npm), hirn-bench (internal).
-          for crate in hirn-core hirn-graph hirn-query hirn-storage hirn-provider hirn-policy hirn-exec hirn-engine hirn hirnd; do
-            echo "Publishing $crate..."
-            cargo publish -p "$crate" --allow-dirty || true
-            sleep 20  # crates.io index propagation
+          set -euo pipefail
+          # Leaf dependencies first. Excluded: hirn-python (PyPI), hirn-node
+          # (npm), hirn-bench (internal only).
+          for crate in hirn-core hirn-graph hirn-query hirn-storage hirn-provider \
+                       hirn-policy hirn-exec hirn-engine hirn hirnd; do
+            echo "::group::publish $crate"
+
+            # An already-published version is the one tolerable failure: it
+            # makes re-running a partially-failed release safe. Anything else
+            # must stop the job — silently swallowing errors ships a release
+            # that is half on crates.io and reports success.
+            if output=$(cargo publish -p "$crate" --locked 2>&1); then
+              echo "$output"
+            elif grep -q "already exists\|already uploaded" <<<"$output"; then
+              echo "$output"
+              echo "note: $crate is already published at this version; continuing"
+            else
+              echo "$output" >&2
+              echo "::error::failed to publish $crate"
+              exit 1
+            fi
+
+            # Wait for the index to carry this crate before publishing anything
+            # that depends on it. Polling beats a fixed sleep: propagation is
+            # usually seconds but occasionally much longer, and a too-short
+            # sleep makes the *next* crate fail for an unrelated-looking reason.
+            version=$(cargo metadata --no-deps --format-version 1 \
+              | python3 -c "import json,sys;print(next(p['version'] for p in json.load(sys.stdin)['packages'] if p['name']=='$crate'))")
+            for attempt in $(seq 1 30); do
+              if curl -sf "https://crates.io/api/v1/crates/$crate/$version" >/dev/null; then
+                echo "index has $crate $version after ${attempt}0s"
+                break
+              fi
+              sleep 10
+            done
+
+            echo "::endgroup::"
           done
 
   # ── GitHub Release ──────────────────────────────────────────────────────────

@@ -1,6 +1,8 @@
-# hirn-query
+# 🔍 hirn-query
 
-> **⚠️ Experimental:** This project is under active development. APIs, on-disk formats, and behaviour may change without notice. Not recommended for production use.
+> [!WARNING]
+> **Experimental.** APIs, on-disk formats, and behaviour may change without notice.
+> Not recommended for production use.
 
 HirnQL parser, typed AST, and DataFusion plan compiler for the hirn cognitive memory database.
 
@@ -96,3 +98,8 @@ let compiled = pipeline.compile(r#"RECALL episodic ABOUT "test""#)?;
 
 ### Grammar Clause Ordering
 Clauses must appear in grammar-defined order. Misordering causes parse errors. See `src/parser/hirnql.pest` for exact ordering.
+
+## 📚 Documentation
+
+- [HirnQL Reference](https://hupe1980.github.io/hirn/docs/hirnql-reference/) — this crate's concepts, explained
+- [Full documentation](https://hupe1980.github.io/hirn/)

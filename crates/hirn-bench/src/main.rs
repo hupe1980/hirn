@@ -838,15 +838,17 @@ fn main() {
             k,
             retrieval_profile,
             execution_surface,
-            query_text_hybrid,
-            disable_nlu,
-            typed_temporal_extraction,
+            CognitiveFlags {
+                query_text_hybrid,
+                disable_nlu,
+                typed_temporal_extraction,
+                no_baselines,
+            },
             outputs,
             tracker,
             runs,
             synthetic_scale,
             repro_threshold_percent,
-            no_baselines,
             environment_label,
         ),
         Command::Advanced {
@@ -1275,6 +1277,29 @@ fn run_nlu_routing(
     }
 }
 
+/// Boolean switches for [`run_cognitive`].
+///
+/// Grouped rather than passed positionally: four adjacent bools at a call site
+/// are indistinguishable from one another, so transposing two compiles cleanly
+/// and silently changes what the run measures.
+// `struct_excessive_bools` exists to catch a struct that should have been an
+// enum or a state machine. These four are independent, orthogonal CLI toggles —
+// any run may set any combination — so there is no state to model. Grouping
+// them still buys the thing that mattered: the call site names each flag
+// instead of passing four interchangeable positional bools.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Copy)]
+struct CognitiveFlags {
+    /// Pass raw question text into hybrid BM25+vector retrieval.
+    query_text_hybrid: bool,
+    /// Force every meaning-dependent decision onto its deterministic fallback.
+    disable_nlu: bool,
+    /// Extract a temporal envelope per record at ingest.
+    typed_temporal_extraction: bool,
+    /// Skip the baseline strategies and measure only the engine.
+    no_baselines: bool,
+}
+
 fn run_cognitive(
     benchmark: String,
     data_dir: Option<String>,
@@ -1285,17 +1310,20 @@ fn run_cognitive(
     k: usize,
     retrieval_profile: String,
     execution_surface: String,
-    query_text_hybrid: bool,
-    disable_nlu: bool,
-    typed_temporal_extraction: bool,
+    flags: CognitiveFlags,
     outputs: ArtifactOutputArgs,
     tracker_path: Option<String>,
     runs: usize,
     synthetic_scale: usize,
     repro_threshold_percent: f64,
-    no_baselines: bool,
     environment_label: Option<String>,
 ) {
+    let CognitiveFlags {
+        query_text_hybrid,
+        disable_nlu,
+        typed_temporal_extraction,
+        no_baselines,
+    } = flags;
     use cognitive::{
         BaselineStrategy, BenchmarkRetrievalProfile, CognitiveConfig, CognitiveSuiteResult,
     };
@@ -2231,7 +2259,10 @@ fn run_reader_and_judge(
         eprintln!(
             "Reusing {} cached reader answers from {} (no reader calls issued)",
             answers.len(),
-            args.reader_answers.as_deref().unwrap_or(std::path::Path::new("")).display(),
+            args.reader_answers
+                .as_deref()
+                .unwrap_or(std::path::Path::new(""))
+                .display(),
         );
         answers
     } else {
@@ -2247,17 +2278,21 @@ fn run_reader_and_judge(
             args.reader_concurrency,
             !args.no_temporal_ledger,
         )
-            .unwrap_or_else(|error| {
-                eprintln!("Error: {error}");
-                std::process::exit(1);
-            });
+        .unwrap_or_else(|error| {
+            eprintln!("Error: {error}");
+            std::process::exit(1);
+        });
         if let Some(path) = args.reader_answers.as_deref() {
             // Persist before judging: the judge stage is what historically
             // failed after the answers were already paid for.
             if let Err(error) = reader::save_answers(path, &answers) {
                 eprintln!("Warning: {error}");
             } else {
-                eprintln!("Cached {} reader answers to {}", answers.len(), path.display());
+                eprintln!(
+                    "Cached {} reader answers to {}",
+                    answers.len(),
+                    path.display()
+                );
             }
         }
         answers

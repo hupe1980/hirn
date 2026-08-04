@@ -211,8 +211,7 @@ impl TemporalExtractor for LlmTemporalExtractor {
             .collect();
         let user = format!(
             "Reference time (resolve relative expressions against this): {}\n\nStatement:\n{}",
-            reference,
-            sanitized
+            reference, sanitized
         );
 
         let messages = vec![

@@ -692,8 +692,12 @@ pub fn load_answers(
     path: &std::path::Path,
     inputs: &[ReaderInput],
 ) -> Result<Vec<ReaderAnswer>, String> {
-    let raw = std::fs::read_to_string(path)
-        .map_err(|error| format!("cannot read reader answers from {}: {error}", path.display()))?;
+    let raw = std::fs::read_to_string(path).map_err(|error| {
+        format!(
+            "cannot read reader answers from {}: {error}",
+            path.display()
+        )
+    })?;
     let answers: Vec<ReaderAnswer> = serde_json::from_str(&raw)
         .map_err(|error| format!("{} is not a reader-answer cache: {error}", path.display()))?;
 
@@ -1169,7 +1173,9 @@ pub fn summarize(
         reader_completion_tokens_per_query_p95: usage_percentile(&completion_tokens, 95),
         judge_prompt_tokens_total,
         judge_completion_tokens_total,
-        judge_failures: judged.map(|outcome| outcome.failures.clone()).unwrap_or_default(),
+        judge_failures: judged
+            .map(|outcome| outcome.failures.clone())
+            .unwrap_or_default(),
         per_query_verdicts: judged
             .map(|outcome| {
                 outcome
@@ -1627,15 +1633,27 @@ mod tests {
     #[test]
     fn mcnemar_p_value_matches_known_values() {
         // No movement at all: nothing to distinguish the runs.
-        let none = PairedComparison { gained: 0, lost: 0, unchanged: 50 };
+        let none = PairedComparison {
+            gained: 0,
+            lost: 0,
+            unchanged: 50,
+        };
         assert!((none.p_value() - 1.0).abs() < 1e-12);
 
         // Perfectly balanced movement is the least significant outcome.
-        let balanced = PairedComparison { gained: 5, lost: 5, unchanged: 0 };
+        let balanced = PairedComparison {
+            gained: 5,
+            lost: 5,
+            unchanged: 0,
+        };
         assert!((balanced.p_value() - 1.0).abs() < 1e-9);
 
         // 10 gains, 0 losses: two-sided exact binomial = 2 * (1/2)^10.
-        let decisive = PairedComparison { gained: 10, lost: 0, unchanged: 0 };
+        let decisive = PairedComparison {
+            gained: 10,
+            lost: 0,
+            unchanged: 0,
+        };
         assert!(
             (decisive.p_value() - 2.0 / 1024.0).abs() < 1e-12,
             "got {}",
@@ -1644,7 +1662,11 @@ mod tests {
 
         // A small lopsided change must NOT clear 0.05 — the guard against
         // reading a handful of flipped queries as a real effect.
-        let weak = PairedComparison { gained: 4, lost: 1, unchanged: 100 };
+        let weak = PairedComparison {
+            gained: 4,
+            lost: 1,
+            unchanged: 100,
+        };
         assert!(weak.p_value() > 0.05, "got {}", weak.p_value());
 
         // Cross-checked against an independent closed-form implementation of
@@ -1656,7 +1678,12 @@ mod tests {
             (20, 5, 0.004_077_32),
             (8, 2, 0.109_375),
         ] {
-            let observed = PairedComparison { gained, lost, unchanged: 0 }.p_value();
+            let observed = PairedComparison {
+                gained,
+                lost,
+                unchanged: 0,
+            }
+            .p_value();
             assert!(
                 (observed - expected).abs() < 1e-6,
                 "gained={gained} lost={lost}: got {observed}, expected {expected}"
@@ -1776,7 +1803,8 @@ mod tests {
     /// for; the report carries the failure and shrinks the denominator.
     #[test]
     fn summarize_excludes_judge_failures_from_the_accuracy_denominator() {
-        let answers: Vec<ReaderAnswer> = (0..4).map(|i| answer(&format!("q{i}"), 100, 10)).collect();
+        let answers: Vec<ReaderAnswer> =
+            (0..4).map(|i| answer(&format!("q{i}"), 100, 10)).collect();
         let outcome = JudgeOutcome {
             judged: vec![
                 judged("q0", "cat", false, true),

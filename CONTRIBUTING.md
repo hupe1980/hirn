@@ -6,9 +6,14 @@ Thank you for considering contributing to hirn! This guide will help you get set
 
 ### Prerequisites
 
-- **Rust 1.91+** (edition 2024) — install via [rustup](https://rustup.rs/)
-- **cargo-fuzz** — for fuzz testing: `cargo install cargo-fuzz`
-- **cargo-llvm-cov** — for coverage: `cargo install cargo-llvm-cov`
+- **Rust 1.91.1+** (edition 2024) — install via [rustup](https://rustup.rs/)
+- **protobuf-compiler** — `brew install protobuf` / `apt install protobuf-compiler`
+- **[just](https://github.com/casey/just)** — task runner: `brew install just`
+- **[zola](https://www.getzola.org/)** — documentation site: `brew install zola`
+
+Optional: `cargo-fuzz` (fuzzing), `cargo-llvm-cov` (coverage), `cargo-deny`
+(supply chain), `maturin` + `pytest` (Python bindings), Node 20+ (Node bindings).
+`just setup` prints the full list.
 
 ### Clone and Build
 
@@ -17,6 +22,29 @@ git clone https://github.com/hupe1980/hirn.git
 cd hirn
 cargo build --workspace
 ```
+
+### Before you push
+
+```bash
+just ci
+```
+
+That runs **exactly** what `.github/workflows/ci.yml` gates on — formatting, clippy with
+warnings denied, workspace tests, doctests, the feature-gated `hirn-provider` build, and
+both link checks. If it passes locally it passes in CI; when the two drift, the justfile is
+wrong and should be corrected against the workflow.
+
+`just` on its own lists every recipe. The ones you will reach for most:
+
+| Recipe | What it does |
+|---|---|
+| `just ci` | The full pre-push gate |
+| `just dev` | Format, then type-check — fast feedback while editing |
+| `just t <pattern>` | Run one test by name across the workspace |
+| `just test-crate <crate>` | Tests for a single crate |
+| `just site` | Serve the docs with live reload |
+| `just links` | Both link checks |
+| `just clean-incremental` | Reclaim disk when `target/` gets large |
 
 ## Running Tests
 
@@ -131,7 +159,7 @@ crates/
 ├── hirn-core      # Core types, config, error definitions
 ├── hirn-graph     # Property graph, spreading activation, Hebbian learning
 ├── hirn-query     # HirnQL parser, typed AST, compiler pipeline
-├── hirn-storage   # Lance 4.0 storage engine and PhysicalStore
+├── hirn-storage   # Lance 9 storage engine and PhysicalStore
 ├── hirn-provider  # Embedders, LLMs, tokenizers, rerankers
 ├── hirn-exec      # DataFusion operators, UDFs, optimizer rules
 ├── hirn-policy    # Cedar authorization and audit helpers
@@ -146,10 +174,10 @@ crates/
 
 1. **Fork** the repository and create a feature branch.
 2. **Write tests** before or alongside your implementation.
-3. **Run the full test suite** locally: `cargo test --workspace`.
-4. **Run clippy and fmt**: `cargo fmt --all && RUSTFLAGS="-Dwarnings" cargo clippy --workspace --all-targets`.
-5. **Open a PR** with a clear description of what changed and why.
-6. CI will run markdown link checks, workspace build/test, Linux fmt/clippy, and `cargo deny` advisory/license/source checks.
+3. **Run `just ci`** — the same gates CI enforces. Do this before pushing, not after a red build.
+4. **Open a PR** with a clear description of what changed and why.
+5. CI re-runs the `just ci` gates plus `cargo deny` advisory/license/source checks, the
+   MSRV floor, and the Python/Node bindings.
 
 ## License
 
